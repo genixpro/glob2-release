@@ -291,7 +291,7 @@ screenshots, logs and replay checksums under `artifacts/`.
 
 `.github/workflows/android-play-internal.yml` is public for review, but its
 release job runs only from the owner's `genixpro/glob2-release` mirror on
-`master` after a manual dispatch. The mirror is a separate private repository
+`master` after a manual dispatch. The mirror is a separate public repository
 with owner-only write access. Copy reviewed upstream commits into the mirror
 when ready, then manually dispatch and approve its workflow. An unprivileged
 job installs the pinned Android toolchain and dependencies, assigns a
@@ -359,7 +359,7 @@ git merge --ff-only upstream/master
 git push origin master
 ```
 
-If fast-forwarding fails because the private mirror diverged, inspect the
+If fast-forwarding fails because the release mirror diverged, inspect the
 commits and reconcile them deliberately. Do not force-push a release branch.
 
 After syncing, run **Actions → Android Play internal release → Run workflow**
@@ -420,10 +420,12 @@ included in Xcode archives for TestFlight distribution.
 ### TestFlight upload
 
 `.github/workflows/ios-testflight.yml` is kept in the public source repository,
-but its upload job runs only when manually dispatched from `master` in the
-owner-only `genixpro/glob2-release` mirror. The owner syncs the public source and
-workflow to the mirror and chooses when to run it. Dispatches in the public
-`Globulation2/glob2` repository skip the job. The mirror uses the Xcode 27 runner
+but its upload job runs only when the owner manually dispatches it from `master`
+in `genixpro/glob2-release`. The release mirror is public for free hosted Actions
+runners; only its owner has write access. The job checks the mirror's numeric
+repository ID, owner's actor ID, dispatch event and branch. The owner syncs
+reviewed public source to the mirror and chooses when to run it. Dispatches in
+`Globulation2/glob2` skip the job. The mirror uses the Xcode 27 runner
 and the registered `org.globulation2.glob2` App ID on
 team `CL2MNNYQX3`. Each run builds pinned iOS dependencies from source, compiles
 the game, archives the iPhone app, checks the bundle ID and build number, retains
@@ -440,12 +442,14 @@ it does not publish the app to the App Store.
 
 One-time mirror setup requires an App Store Connect **team** API key with
 permissions to manage signing assets and upload builds. Individual API keys cannot
-access provisioning endpoints. In the **private mirror**, create an
+access provisioning endpoints. In the **release mirror**, create an
 `ios-testflight` environment restricted to the `master` branch and store the key
 ID, issuer ID and single-line Base64 encoding of the downloaded `.p8` private
 key there as environment secrets named `IOS_ASC_KEY_ID`, `IOS_ASC_ISSUER_ID` and
-`IOS_ASC_KEY_P8_BASE64`. Do not place release credentials in the public
-repository, its Actions secrets, or source code. The workflow writes the key
+`IOS_ASC_KEY_P8_BASE64`. Do not place release credentials in the upstream
+repository, repository-wide Actions secrets, or source code. Anyone can read
+the public mirror's workflow, logs and artifacts, so none may contain secrets
+or signed upload packages. The workflow writes the key
 only to the ephemeral mirror runner, outside the checked-out repository.
 Configure the app's internal TestFlight group for automatic distribution in App
 Store Connect if testers should receive every processed build without another
@@ -459,7 +463,7 @@ processes the build afterward. Check the TestFlight build status in App Store
 Connect before expecting testers to install it.
 
 For a family tester without App Store Connect account access, dispatch an
-**external** build from the private mirror. In App Store Connect, complete the
+**external** build from the release mirror. In App Store Connect, complete the
 beta app description, feedback contact and test information, create an external
 tester group, add the processed build and submit it for TestFlight App Review.
 After Apple approves the build, enable a public invitation link for that group
