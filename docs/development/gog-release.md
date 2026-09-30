@@ -16,6 +16,15 @@ lines. GOG provides the game product IDs, a Developer Portal account and access
 to Pipeline Builder after onboarding. See GOG's
 [essentials checklist](https://docs.gog.com/basic-game-assets/).
 
+Globulation 2 already has a public release, but this GOG edition is part of an
+active revival and modernization effort. The publisher has asked GOG to treat
+the initial GOG listing as a free Early Access / beta release and to correct the
+original submission's Early Access answer. Confirm that GOG accepts this
+designation before finalizing the store page. Describe what is playable now and
+what remains in development in the listing and Early Access FAQ; do not present
+the historical release date as completion of the revival. See GOG's
+[Early Access guidance](https://docs.gog.com/games-in-development/).
+
 The release mirror's `master` branch and release tags must be protected. Require
 changes through a PR, block force pushes and tag edits, and enforce protection
 for administrators. The sole publisher may merge an inspected and validated PR
