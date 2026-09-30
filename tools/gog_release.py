@@ -113,6 +113,13 @@ def verify_manifest(depot, platform):
     info = json.loads((depot / "gog-build.json").read_text())
     if info.get("platform") != platform:
         raise ValueError("platform manifest mismatch")
+    source_root = depot / "Glob2.app/Contents/Resources" if platform == "macos" else depot
+    source_offer = source_root / "SOURCE.txt"
+    source_commit = info.get("source_commit")
+    if not source_offer.is_file() or not re.fullmatch(r"[0-9a-f]{40}", source_commit or ""):
+        raise ValueError("missing exact Corresponding Source offer")
+    if f"https://github.com/Globulation2/glob2/tree/{source_commit}" not in source_offer.read_text():
+        raise ValueError("Corresponding Source offer does not match build manifest")
     root = depot / "Glob2.app/Contents/Resources" if platform == "macos" else depot
     if platform == "linux":
         root = depot / "share/glob2"
@@ -144,8 +151,21 @@ def metadata(args, platform):
             "workflow_commit": args.workflow_commit}
 
 
+def write_source_offer(root, source_commit):
+    if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+        raise ValueError("source commit must be a full Git SHA")
+    (root / "SOURCE.txt").write_text(
+        "Globulation 2 Corresponding Source\n\n"
+        "The source code and build scripts for this exact release are available at:\n"
+        f"https://github.com/Globulation2/glob2/tree/{source_commit}\n\n"
+        "Download the source archive at:\n"
+        f"https://github.com/Globulation2/glob2/archive/{source_commit}.tar.gz\n"
+    )
+
+
 def stage_windows(args):
     stage_windows_files(ROOT, args.exe.resolve(), args.runtime.resolve(), args.output.resolve())
+    write_source_offer(args.output, args.source_commit)
     write_manifest(args.output, metadata(args, "windows"))
     verify_manifest(args.output, "windows")
 
@@ -173,6 +193,7 @@ def stage_linux(args):
     shutil.copytree(game_data, depot / "share/glob2")
     for name in ("COPYING", "docs/assets/source-attribution.md"):
         shutil.copy2(ROOT / name, depot / Path(name).name)
+    write_source_offer(depot, args.source_commit)
     launcher = depot / "start.sh"
     launcher.write_text('#!/bin/sh\nset -eu\nroot=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)\n'
                         'export GLOB2_ASSET_DIR="$root/share/glob2"\n'
@@ -206,6 +227,8 @@ def stage_macos(args):
     shutil.copytree(args.app.resolve(), depot / "Glob2.app", symlinks=True)
     if not (depot / "Glob2.app/Contents/Resources/COPYING").is_file():
         raise ValueError("macOS bundle lacks COPYING")
+    write_source_offer(depot / "Glob2.app/Contents/Resources", args.source_commit)
+    subprocess.run(["codesign", "--force", "--sign", "-", str(depot / "Glob2.app")], check=True)
     write_manifest(depot, metadata(args, "macos"))
     verify_manifest(depot, "macos")
 

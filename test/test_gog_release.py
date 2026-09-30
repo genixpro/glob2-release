@@ -12,7 +12,8 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from gog_pipeline import render, run_builder
-from gog_release import REQUIRED_ASSETS, extract_archive, preflight, verify_manifest, write_manifest
+from gog_release import (REQUIRED_ASSETS, extract_archive, preflight,
+                         verify_manifest, write_manifest, write_source_offer)
 
 
 class GOGReleaseTests(unittest.TestCase):
@@ -29,6 +30,7 @@ class GOGReleaseTests(unittest.TestCase):
         (self.depot / "glob2.exe").write_bytes(b"binary")
         self.metadata = {"platform": "windows", "version": "0.9.5.0",
                          "source_commit": "a" * 40, "workflow_commit": "b" * 40}
+        write_source_offer(self.depot, self.metadata["source_commit"])
         write_manifest(self.depot, self.metadata)
 
     def test_changed_or_unlisted_files_are_rejected(self):
@@ -65,6 +67,7 @@ class GOGReleaseTests(unittest.TestCase):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"asset")
         (linux / "start.sh").write_bytes(b"#!/bin/sh\n")
+        write_source_offer(linux, self.metadata["source_commit"])
         write_manifest(linux, {**self.metadata, "platform": "linux"})
         with self.assertRaisesRegex(ValueError, "not executable"):
             verify_manifest(linux, "linux")

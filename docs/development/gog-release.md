@@ -35,7 +35,8 @@ and no GOG credentials.
 2. Manually start **GOG release candidate** in the mirror with the tag and
    `build` mode. It builds three depots, checks the complete file manifests,
    and runs headless game fixtures on all platforms. Each depot includes its
-   game version, public source commit, workflow commit and SHA-256 file list.
+   game version, public source commit, workflow commit, SHA-256 file list and
+   a `SOURCE.txt` link to the exact Corresponding Source archive.
 3. Install the artifacts on clean Windows, macOS and Ubuntu machines. Launch
    the game offline without Galaxy, play a match, verify asset loading and save
    continuity, and inspect macOS Gatekeeper behavior. For simulation changes,
@@ -82,7 +83,10 @@ Portal. The upload job cannot publish to `Master`.
 Install and test those exact Staging builds. Submit the first release candidate
 to GOG QA in advance of launch. A maintainer promotes the tested build IDs in
 the Developer Portal, creates a separate GOG changelog entry, and confirms the
-offline installers after publication. For later stable updates, repeat this
+offline installers after publication. Make the exact Corresponding Source
+archive available from the store listing as a GOG Extra, and keep its public
+commit and archive URL accessible for as long as binaries are offered. For
+later stable updates, repeat this
 process; leave previous Master builds published so players can roll back.
 GOG documents [Staging and Master](https://docs.gog.com/build-branches/),
 [build delivery](https://docs.gog.com/build-delivery/),
