@@ -35,7 +35,7 @@ jobs:
       source_commit: ${{ steps.check.outputs.source_commit }}
       workflow_commit: ${{ steps.check.outputs.workflow_commit }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           fetch-depth: 0
       - name: Check GOG depot and upload guards
@@ -60,7 +60,7 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
-      - uses: msys2/setup-msys2@v2
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e
         with:
           msystem: MINGW64
           update: true
@@ -74,7 +74,7 @@ jobs:
             mingw-w64-x86_64-fribidi mingw-w64-x86_64-pcre
             mingw-w64-x86_64-openssl mingw-w64-x86_64-boost
             mingw-w64-x86_64-libepoxy mingw-w64-x86_64-libsystre
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Build and stage Windows depot
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
@@ -88,7 +88,7 @@ jobs:
             --version "$VERSION" --source-commit "$SOURCE_COMMIT" \
             --workflow-commit "$WORKFLOW_COMMIT"
           tar -C artifacts/gog/windows -czf artifacts/gog/windows.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gog-windows
           path: artifacts/gog/windows.tar.gz
@@ -98,12 +98,12 @@ jobs:
     needs: windows
     runs-on: windows-2022
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           path: fixture
           sparse-checkout: games/cross-replay.game.gz
           sparse-checkout-cone-mode: false
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: gog-windows
           path: ${{ runner.temp }}/gog
@@ -124,7 +124,7 @@ jobs:
     needs: preflight
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install build tools
         run: |
           sudo apt-get update -qq
@@ -149,7 +149,7 @@ jobs:
           GLOB2_USER_DATA_DIR="$PWD/artifacts/gog-profile" \
             artifacts/gog/linux/start.sh --nox "$PWD/games/cross-replay.game.gz" 10 1
           tar -C artifacts/gog/linux -czf artifacts/gog/linux.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gog-linux
           path: artifacts/gog/linux.tar.gz
@@ -159,7 +159,7 @@ jobs:
     needs: preflight
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Install build tools
         run: |
           brew install scons sdl2 sdl2_image sdl2_net sdl2_ttf \
@@ -183,7 +183,7 @@ jobs:
               ./Contents/MacOS/glob2 --nox "$GITHUB_WORKSPACE/games/cross-replay.game.gz" 10 1
           )
           tar -C artifacts/gog/macos -czf artifacts/gog/macos.tar.gz .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: gog-macos
           path: artifacts/gog/macos.tar.gz
@@ -201,8 +201,8 @@ jobs:
     runs-on: ubuntu-24.04
     environment: gog-staging
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           pattern: gog-*
           path: artifacts/gog/archives
