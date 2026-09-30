@@ -26,6 +26,7 @@ jobs:
     if: >-
       github.repository_id == 1397722696 &&
       github.actor_id == 6193625 &&
+      github.triggering_actor == 'genixpro' &&
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
@@ -189,7 +190,13 @@ jobs:
           if-no-files-found: error
 
   upload-staging:
-    if: inputs.mode == 'stage'
+    if: >-
+      inputs.mode == 'stage' &&
+      github.repository_id == 1397722696 &&
+      github.actor_id == 6193625 &&
+      github.triggering_actor == 'genixpro' &&
+      github.event_name == 'workflow_dispatch' &&
+      github.ref == 'refs/heads/master'
     needs: [preflight, windows-smoke, linux, macos]
     runs-on: ubuntu-24.04
     environment: gog-staging
