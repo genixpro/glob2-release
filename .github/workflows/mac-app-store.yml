@@ -61,11 +61,11 @@ jobs:
           test "${sdk_version%%.*}" -ge 26
           test "$(uname -m)" = arm64
 
-      - name: Compile game; package app in release mirror
+      - name: Compile game; bundle only in release mirror
         run: |
           openssl="$(brew --prefix openssl@3)"
           if [[ "$GITHUB_REPOSITORY" == genixpro/glob2-release ]]; then
-            scons release=1 package -j2 \
+            scons release=1 bundle -j2 \
               CXXFLAGS="-I$openssl/include" \
               LINKFLAGS="-L$openssl/lib"
           else
