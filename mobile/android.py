@@ -108,6 +108,12 @@ def main():
             staged = project/source_tree
             if staged.exists(): shutil.rmtree(staged)
         shutil.copytree(ROOT/'mobile/android',project,dirs_exist_ok=True)
+        if args.amazon_apk:
+            manifest=project/'app/src/main/AndroidManifest.xml'
+            contents=manifest.read_text()
+            opening='<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+            if contents.count(opening)!=1: raise ValueError('Unexpected Android manifest root')
+            manifest.write_text(contents.replace(opening,opening+'\n    <uses-permission android:name="android.permission.INTERNET" />',1))
         shutil.copy2(LOCK,project/'glob2-toolchain.json')
         native_command=[sys.executable,str(ROOT/'mobile/android.py'),'configure','--arch',args.arch,
             '--android-sdk',str(sdk),'--version-code',str(args.version_code)]

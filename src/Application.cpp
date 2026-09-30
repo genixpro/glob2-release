@@ -162,10 +162,12 @@ void Application::choose(int choice)
 		screens.push(std::make_unique<EditorMainMenu>(screens));
 		break;
 	case MainMenuScreen::MULTIPLAYERS_LAN:
+#if !defined(GLOB2_MOBILE) || defined(GLOB2_AMAZON_RELEASE)
 		screens.push(std::make_unique<LANMenuScreen>(screens));
+#endif
 		break;
 	case MainMenuScreen::MULTIPLAYERS_YOG:
-#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE)
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE) && !defined(GLOB2_MOBILE)
 		screens.push(std::make_unique<YOGLoginScreen>(screens, std::make_shared<YOGClient>()));
 #endif
 		break;

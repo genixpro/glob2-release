@@ -4,6 +4,14 @@ Android and iOS use the shared game sources and SDL renderer. The mobile targets
 have isolated toolchains, dependency archives and output directories; they do not
 use host libraries or install into the desktop application's directories.
 
+Google Play Android and iOS builds currently omit YOG and LAN multiplayer while
+the networking and server are being renewed. Local play remains available. The
+Google Play Android package does not request Internet access. Restore multiplayer
+access and update store access, privacy, and data declarations before distributing
+a network-enabled Play build. The Android More menu links to the corresponding
+store edition's privacy policy. The Amazon Fire edition retains LAN play as
+described below.
+
 The phone presentation shares simulation, game orders, settings persistence and
 lobby setup with desktop. `InterfacePresentation.h` selects the presentation;
 `GameGUITouch` owns gameplay gestures and phone panels. Menus and dialogs are
