@@ -17,12 +17,12 @@ to Pipeline Builder after onboarding. See GOG's
 [essentials checklist](https://docs.gog.com/basic-game-assets/).
 
 The release mirror's `master` branch and release tags must be protected. Require
-an independent PR approval on `master`, dismiss stale reviews and require the
-last push to be reviewed. Keep write access limited to release maintainers.
-Create a GitHub environment named `gog-staging`, restrict it to `master`, and
-require approval from a different trusted maintainer than the run initiator.
-Before adding GOG credentials, appoint that reviewer and enable GitHub's
-`prevent_self_review` option. Put all
+changes through a PR, block force pushes and tag edits, and enforce protection
+for administrators. The sole publisher may merge an inspected and validated PR
+without waiting for another maintainer. Keep write access limited to release
+maintainers. Create a GitHub environment named `gog-staging`, restrict it to
+`master`, and require the publisher's explicit approval for each upload. The
+publisher may approve their own dispatch while operating alone. Put all
 GOG secrets and variables in that environment, never in the game source or
 workflow. The workflow permits only owner dispatch on the mirror's protected
 `master` branch. Build and smoke-test jobs have read-only GitHub permissions
