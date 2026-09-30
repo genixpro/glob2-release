@@ -59,12 +59,12 @@ fills one depot and one primary launch task per operating system.
 
 ## Upload to Staging
 
-After GOG grants access, set these **environment variables** in `gog-staging`:
+After GOG grants access, commit the nonsecret product and base product IDs and
+the approved Linux Pipeline Builder SHA-256 to `gog/release-config.json` through
+review. Set these **secrets** in `gog-staging`:
 
 | Name | Type | Purpose |
 | --- | --- | --- |
-| `GOG_PRODUCT_ID`, `GOG_BASE_PRODUCT_ID` | Variable | IDs from the Developer Portal |
-| `GOG_BUILDER_SHA256` | Variable | SHA-256 of the Linux Pipeline Builder executable |
 | `GOG_BUILDER_URL` | Secret | HTTPS URL from which the runner can retrieve that exact executable |
 | `GOG_USERNAME`, `GOG_PASSWORD` | Secret | Dedicated upload account credentials |
 | `GOG_STAGING_PASSWORD` | Secret | Password for the private Staging branch |
