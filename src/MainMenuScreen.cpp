@@ -120,7 +120,7 @@ Element MainMenuScreen::build(const Presentation &p)
 #if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
 			content.push_back(action("[yog]", MULTIPLAYERS_YOG, rowStyle));
 #endif
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
 			content.push_back(action("[lan]", MULTIPLAYERS_LAN, rowStyle));
 #endif
 			content.push_back(action("[editor]", EDITOR, rowStyle));
@@ -171,7 +171,7 @@ Element MainMenuScreen::build(const Presentation &p)
 #if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
 	content.push_back(action("[yog]", MULTIPLAYERS_YOG, utility));
 #endif
-#ifndef __EMSCRIPTEN__
+#if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
 	content.push_back(action("[lan]", MULTIPLAYERS_LAN, utility));
 #endif
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));

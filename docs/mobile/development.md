@@ -4,10 +4,10 @@ Android and iOS use the shared game sources and SDL renderer. The mobile targets
 have isolated toolchains, dependency archives and output directories; they do not
 use host libraries or install into the desktop application's directories.
 
-Mobile builds currently omit the YOG online sign-in entry while its server is
-offline. Local and LAN play remain available. Restore YOG access when the server
-is ready for multiplayer testing, and update store access and data declarations
-before distributing a build that offers account sign-in.
+Mobile builds currently omit YOG and LAN multiplayer while the networking and
+server are being renewed. Local play remains available. The Android package does
+not request Internet access. Restore multiplayer access and update store access,
+privacy, and data declarations before distributing a network-enabled build.
 The Android More menu links to the [Android privacy policy](privacy-policy.md).
 
 The phone presentation shares simulation, game orders, settings persistence and

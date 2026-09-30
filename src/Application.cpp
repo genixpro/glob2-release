@@ -162,7 +162,9 @@ void Application::choose(int choice)
 		screens.push(std::make_unique<EditorMainMenu>(screens));
 		break;
 	case MainMenuScreen::MULTIPLAYERS_LAN:
+#ifndef GLOB2_MOBILE
 		screens.push(std::make_unique<LANMenuScreen>(screens));
+#endif
 		break;
 	case MainMenuScreen::MULTIPLAYERS_YOG:
 #if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
