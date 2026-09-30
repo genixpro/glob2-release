@@ -4,6 +4,7 @@
 #include "GlobalContainer.h"
 #include <algorithm>
 #include <cmath>
+#include <SDL_misc.h>
 
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
@@ -116,7 +117,7 @@ Element MainMenuScreen::build(const Presentation &p)
 			ButtonOptions back = small;
 			back.shortcut = SDLK_ESCAPE;
 			content.push_back(button("menu/back", tr("[Back]"), [this] { showMore(false); }, back));
-#ifndef GLOB2_CHINA_RELEASE
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
 			content.push_back(action("[yog]", MULTIPLAYERS_YOG, rowStyle));
 #endif
 #ifndef __EMSCRIPTEN__
@@ -124,6 +125,11 @@ Element MainMenuScreen::build(const Presentation &p)
 #endif
 			content.push_back(action("[editor]", EDITOR, rowStyle));
 			content.push_back(action("[credits]", CREDITS, rowStyle));
+#if defined(GLOB2_MOBILE) && defined(__ANDROID__)
+			content.push_back(button("menu/privacy", "Privacy policy", [] {
+				SDL_OpenURL("https://github.com/genixpro/glob2-release/blob/master/docs/mobile/privacy-policy.md");
+			}, rowStyle));
+#endif
 #if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
 			content.push_back(action("[quit]", QUIT, rowStyle));
 #endif
@@ -162,7 +168,7 @@ Element MainMenuScreen::build(const Presentation &p)
 	content.push_back(action("[load game]", LOAD_GAME, launch));
 	content.push_back(action("[tutorial]", TUTORIAL, launch));
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
-#ifndef GLOB2_CHINA_RELEASE
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
 	content.push_back(action("[yog]", MULTIPLAYERS_YOG, utility));
 #endif
 #ifndef __EMSCRIPTEN__
@@ -171,6 +177,11 @@ Element MainMenuScreen::build(const Presentation &p)
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
 	std::vector<Element> utilities{action("[settings]", GAME_SETUP, utility), action("[editor]", EDITOR, utility),
 								   action("[credits]", CREDITS, utility), action("[quit]", QUIT, utility)};
+#if defined(GLOB2_MOBILE) && defined(__ANDROID__)
+	utilities.push_back(button("menu/privacy", "Privacy policy", [] {
+		SDL_OpenURL("https://github.com/genixpro/glob2-release/blob/master/docs/mobile/privacy-policy.md");
+	}, utility));
+#endif
 	WrapOptions grid;
 	grid.maxColumns = 2;
 	grid.minChildWidth = 1;
