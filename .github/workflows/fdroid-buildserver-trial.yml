@@ -80,9 +80,15 @@ jobs:
           source /etc/profile.d/bsenv.sh
           test -n "$fdroidserver"
           test -n "$home_vagrant"
+          fdroidserver="$home_vagrant/fdroidserver-trial"
           export ANDROID_HOME=/opt/android-sdk
           apt-get update -qq
-          apt-get install -y --no-install-recommends sudo git
+          apt-get install -y --no-install-recommends sudo git fdroidserver
+          git clone --shallow-since=2026-07-13 \
+            https://gitlab.com/fdroid/fdroidserver.git "$fdroidserver"
+          git -C "$fdroidserver" config transfer.fsckObjects true
+          git -C "$fdroidserver" checkout --detach a35fdfddd9c66823987a410566a6101186e39c84
+          chown -R vagrant:vagrant "$fdroidserver"
           chown -R vagrant:vagrant "$GITHUB_WORKSPACE"
           sudo --preserve-env --user vagrant env \
             HOME="$home_vagrant" ANDROID_HOME="$ANDROID_HOME" \
