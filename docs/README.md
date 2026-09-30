@@ -17,6 +17,7 @@ dated reports and pull-request artifacts do not belong here.
   [Mac App Store release](development/mac-app-store.md),
   [mainland China release](development/china-release.md),
   [menus and dialogs on the declarative UI framework](development/ui-framework.md),
+  [release packaging](development/releasing.md),
   [headless replays](development/headless-replays.md),
   [performance telemetry](development/performance-telemetry.md),
   [save continuation](development/savegame-continuation.md), and the
@@ -28,7 +29,8 @@ dated reports and pull-request artifacts do not belong here.
 - **Map generators:** [design and implementation index](map-generators/README.md).
 - **Tools:** [distributed tournaments](tools/tournaments.md).
 
-- **Mobile platforms:** [builds, responsive UI and verification](mobile/development.md).
+- **Mobile platforms:** [builds, responsive UI and verification](mobile/development.md),
+  [Android privacy policy](mobile/privacy-policy.md).
 
 - **Browser platform:** [build and play](../browser/README.md),
   [architecture](browser/implementation.md), [storage](browser/storage.md),
