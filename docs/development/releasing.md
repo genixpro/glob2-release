@@ -31,11 +31,11 @@ Before tagging a new release, choose an unused version, update
 `PACKAGE_VERSION` in `scons/build_layout.py`, `vcpkg.json`, and
 `fedora/glob2.spec`, and add its AppStream release notes. Do not move an
 existing tag.
-Build-only runs leave Flatpak off by default while its first listing metadata is
-being prepared; select `build_flatpak` after adding AppStream release notes to
-exercise that recipe. Flathub's linter rejects the current metadata until those
-notes exist. The GitHub
-publication run builds it.
+Build-only runs leave Flatpak off by default because it takes longer to build;
+select `build_flatpak` to exercise that recipe. An untagged run builds its other
+packages from the mirror checkout and pins the Flatpak recipe to the latest
+public source commit contained in that checkout. Tagged publication builds pin
+the selected public tag. The GitHub publication run builds Flatpak.
 Publication also requires matching AppStream release notes and a hosted gameplay
 screenshot. A native Linux capture of the active menu colony is in
 `data/screenshots/`; its `master` URL is in the AppStream metadata. Keep that
@@ -102,7 +102,11 @@ BuildPatchTool from the product's Epic Artifacts and Binaries page and set
 `EPIC_BPT_SHA256` to the ZIP's SHA-256 digest. The upload job downloads from
 Epic's official endpoint and checks this digest before use. An Epic tool
 update intentionally stops the job until its digest is reviewed and refreshed.
-Never put BPT credentials in the public source tree.
+Never put BPT credentials in the public source tree or GitHub Actions
+variables. If the client secret is ever stored as a variable or the release
+repository becomes public, delete that variable, make the repository private,
+and rotate the BPT client before uploading. The Epic workflow checks both
+conditions before use.
 
 After each upload, retain the workflow's staged manifest, version, source
 commit, and BPT log. Install through Epic on a fresh Windows machine and check
