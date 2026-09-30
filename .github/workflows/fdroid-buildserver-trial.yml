@@ -47,6 +47,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch --no-tags https://github.com/Globulation2/glob2.git "$SOURCE_COMMIT"
           test "$(git rev-parse FETCH_HEAD)" = "$SOURCE_COMMIT"
           git fetch --tags https://github.com/Globulation2/glob2.git
