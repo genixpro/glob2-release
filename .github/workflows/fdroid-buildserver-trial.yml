@@ -68,9 +68,10 @@ jobs:
               raise ValueError('Expected three release-tag recipe entries')
           path.write_text(text.replace(tag, 'commit: ' + os.environ['SOURCE_COMMIT']))
           PY
-          curl -fsSL --retry 3 \
-            https://gitlab.com/fdroid/fdroiddata/-/raw/master/config/categories.yml \
-            -o config/categories.yml
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://gitlab.com/fdroid/fdroiddata.git "$RUNNER_TEMP/fdroiddata-config"
+          git -C "$RUNNER_TEMP/fdroiddata-config" sparse-checkout set config
+          cp -a "$RUNNER_TEMP/fdroiddata-config/config/." config/
       - name: Build the exact ABI recipe inside F-Droid's buildserver image
         env:
           ARCH: ${{ inputs.arch }}
