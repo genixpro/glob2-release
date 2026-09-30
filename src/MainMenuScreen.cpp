@@ -117,17 +117,21 @@ Element MainMenuScreen::build(const Presentation &p)
 			ButtonOptions back = small;
 			back.shortcut = SDLK_ESCAPE;
 			content.push_back(button("menu/back", tr("[Back]"), [this] { showMore(false); }, back));
-#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE) && !defined(GLOB2_MOBILE)
 			content.push_back(action("[yog]", MULTIPLAYERS_YOG, rowStyle));
 #endif
-#if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
+#if !defined(__EMSCRIPTEN__) && (!defined(GLOB2_MOBILE) || defined(GLOB2_AMAZON_RELEASE))
 			content.push_back(action("[lan]", MULTIPLAYERS_LAN, rowStyle));
 #endif
 			content.push_back(action("[editor]", EDITOR, rowStyle));
 			content.push_back(action("[credits]", CREDITS, rowStyle));
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 			content.push_back(button("menu/privacy", "Privacy policy", [] {
+#if defined(GLOB2_AMAZON_RELEASE)
+				SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
+#else
 				SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
+#endif
 			}, rowStyle));
 #endif
 #if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
@@ -168,10 +172,10 @@ Element MainMenuScreen::build(const Presentation &p)
 	content.push_back(action("[load game]", LOAD_GAME, launch));
 	content.push_back(action("[tutorial]", TUTORIAL, launch));
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
-#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_MOBILE)
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE) && !defined(GLOB2_MOBILE)
 	content.push_back(action("[yog]", MULTIPLAYERS_YOG, utility));
 #endif
-#if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
+#if !defined(__EMSCRIPTEN__) && (!defined(GLOB2_MOBILE) || defined(GLOB2_AMAZON_RELEASE))
 	content.push_back(action("[lan]", MULTIPLAYERS_LAN, utility));
 #endif
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
@@ -179,7 +183,11 @@ Element MainMenuScreen::build(const Presentation &p)
 								   action("[credits]", CREDITS, utility), action("[quit]", QUIT, utility)};
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 	utilities.push_back(button("menu/privacy", "Privacy policy", [] {
+#if defined(GLOB2_AMAZON_RELEASE)
+		SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
+#else
 		SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
+#endif
 	}, utility));
 #endif
 	WrapOptions grid;
