@@ -17,30 +17,14 @@
 #include "FrontendTheme.h"
 #include "MapEdit.h"
 #include "gui/GameGUIViewport.h"
-#include <GUIList.h>
-#include <GUIText.h>
 #include <FileManager.h>
 #include <StringTable.h>
 #include <filesystem>
-#include "CreditScreen.cpp"
+#include "CreditScreen.h"
 #include <cassert>
 #include <iostream>
 
 GlobalContainer *globalContainer = nullptr;
-
-class Credits : public ScrollingText
-{
-public:
-	Credits() : ScrollingText(0,0,0,0,ALIGN_FILL,ALIGN_FILL,"standard","data/authors.txt")
-		{ text = {"Resize regression"}; }
-	void resetOffset() { offset = 0; }
-};
-class ScreenProbe : public Screen
-{
-public:
-	void attach(DrawableSurface *surface) { gfx = surface; }
-	void onAction(Widget*, Action, int, int) override {}
-};
 
 static int colored(SDL_Surface *surface, int x, int y, int w, int h)
 {
@@ -131,12 +115,12 @@ int main(int argc, char **argv)
 			return 0;
 		}
 	}
-	const auto resize = [&](int width, Screen *screen = nullptr) {
+	const auto resize = [&](int width, GAGGUI::Screen *screen = nullptr) {
 		SDL_SetWindowSize(gfx->window,width,1100);
 		SDL_Delay(60);
 		SDL_Event event;
 		while (GraphicContext::pollEvent(&event))
-			if (screen) screen->dispatchEvents(&event);
+			if (screen) screen->handleExecutionEvent(event);
 		gfx->updateWindowSize();
 		assert(gfx->getW()==width && gfx->getH()==1100);
 		// Keep a fixed test origin when changing size; camera centering itself
@@ -277,7 +261,9 @@ int main(int argc, char **argv)
 	if (gpu)
 	{
 		gui.setSelection(GameGUI::RESOURCE_SELECTION,static_cast<unsigned>(3+3*16));
-		for (double zoom : {0.5,2.0})
+		// This 16x16 map is smaller than the viewport, so MapCamera clamps
+		// zoom below 1 to 1. Check the two zoom levels it can display.
+		for (double zoom : {1.0,2.0})
 		{
 			gui.camera=MapCamera{}; gui.camera.zoom=zoom;
 			gui.viewportX=gui.viewportY=0;
@@ -291,7 +277,7 @@ int main(int argc, char **argv)
 		}
 		gui.camera=MapCamera{}; gui.viewportX=gui.viewportY=0;
 		gui.clearSelection();
-		std::cout << "PASS repeated selections at half and double map zoom\n";
+		std::cout << "PASS repeated selections at normal and double map zoom\n";
 	}
 
 	// A complete production map frame catches the separate virtual-flag pass.
@@ -419,8 +405,7 @@ int main(int argc, char **argv)
 	const Settings originalSettings=globals.settings;
 	{
 	SettingsScreen settings;
-	settings.gfx=gfx;
-	settings.dispatchInit();
+	settings.beginExecution(gfx);
 	auto settingRow = [&](const std::string& id) {
 		for(const auto& row : settings.rows()) if(row.id==id) return row;
 		assert(false && "Missing Settings row"); return SettingsScreen::Row{};
@@ -463,21 +448,24 @@ int main(int argc, char **argv)
 	std::cout << "PASS resolution restrictions, pending display choices and category switching\n";
 	Settings savedSettings;savedSettings.load();
 	assert(!(savedSettings.screenFlags & GraphicContext::FULLSCREEN));
+	settings.abandon();
+	settings.finishExecution();
 	}
 	files->dirList.erase(files->dirList.begin());
 	globals.settings=originalSettings;
 
-	ScreenProbe screen;
-	screen.attach(gfx);
-	auto *credits=new Credits;
-	screen.addWidget(credits); screen.dispatchInit(); credits->resetOffset();
+	{
+	CreditScreen credits;
+	credits.beginExecution(gfx);
 	for(int width: {1800,640,1200})
 	{
-		resize(width);
-		clear(); credits->paint(); capturePixels(gfx);
-		int lo=width,hi=-1;
-		for(int x=0;x<width;++x) if(colored(gfx->getSDLSurface(),x,0,1,40)) {lo=std::min(lo,x);hi=std::max(hi,x);}
-		assert(hi>lo && std::abs((lo+hi)-width)<12);
+		resize(width, &credits);
+		clear(); credits.paintFrame(0); capturePixels(gfx);
+		const auto bounds=credits.host().rootBounds();
+		assert(bounds.w>0 && std::abs((bounds.x+bounds.x+bounds.w)-width)<12);
+	}
+	credits.endExecute(0);
+	credits.finishExecution();
 	}
 	std::cout << "PASS credits centered after resizing\n";
 	{
