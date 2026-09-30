@@ -127,7 +127,7 @@ Element MainMenuScreen::build(const Presentation &p)
 			content.push_back(action("[credits]", CREDITS, rowStyle));
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 			content.push_back(button("menu/privacy", "Privacy policy", [] {
-				SDL_OpenURL("https://github.com/genixpro/glob2-release/blob/master/docs/mobile/privacy-policy.md");
+				SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
 			}, rowStyle));
 #endif
 #if !defined(__EMSCRIPTEN__) && !defined(GLOB2_MOBILE)
@@ -179,7 +179,7 @@ Element MainMenuScreen::build(const Presentation &p)
 								   action("[credits]", CREDITS, utility), action("[quit]", QUIT, utility)};
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 	utilities.push_back(button("menu/privacy", "Privacy policy", [] {
-		SDL_OpenURL("https://github.com/genixpro/glob2-release/blob/master/docs/mobile/privacy-policy.md");
+		SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
 	}, utility));
 #endif
 	WrapOptions grid;
