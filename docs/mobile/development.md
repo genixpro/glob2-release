@@ -229,6 +229,11 @@ installed and review both the adaptive foreground and opaque icon before committ
 
 ## Android
 
+Android builds support Android 7.0 (API 24) and newer. The application,
+native dependencies and APK minimum must use the same minimum API; changing only
+the APK manifest does not backport native libraries. Newer Java APIs need guarded
+fallbacks. Keep the current compile/target SDK when supporting older devices.
+
 Install Python, SCons, Git, make, autotools and pkg-config. Bootstrap the pinned
 NDK and packaging tools, then build target dependencies and stage the project:
 
@@ -283,8 +288,8 @@ Native startup failures are also written to Android logcat under `SDL/APP`.
 ### Amazon Appstore Fire tablet release
 
 The Amazon candidate is one release APK with `arm64-v8a` and `armeabi-v7a`
-libraries. It keeps Android API 26 as its minimum, so the first release can
-target qualified Fire OS 7/8 tablets, not Fire OS 5/6. Build both dependency
+libraries and an Android 7.0 (API 24) minimum. Amazon release qualification
+remains limited to Fire OS 7/8 tablets; Fire OS 5/6 are not qualified. Build both dependency
 sets, then package the APK from the arm64 configuration:
 
 ```sh
@@ -386,7 +391,7 @@ Each subsequent Play upload needs a higher `--version-code`. The bundle command
 restores gzip assets that Android packaging expands, verifies the complete game
 asset index, and checks the packaged native build ID against retained symbols.
 The unsigned bundle is written to
-`build/android/device/arm64-v8a/26/client/release/android-project/app/build/outputs/bundle/release/app-release.aab`.
+`build/android/device/arm64-v8a/24/client/release/android-project/app/build/outputs/bundle/release/app-release.aab`.
 Keep a private upload keystore outside the repository and back it up securely.
 Create the key with Android Studio's **Generate Signed Bundle/APK** flow or
 `keytool`. Set `GLOB2_PLAY_STORE_PASSWORD` and `GLOB2_PLAY_KEY_PASSWORD` in the
@@ -500,25 +505,25 @@ declaration, complete that in Play Console before rerunning the workflow.
 
 ### Native tests on a connected Android device
 
-After configuring the release project above, build the isolated CppUnit dependency
-and cross-compile the unit suite and client integration harnesses:
+After configuring the release project above, cross-compile the two doctest
+binaries (`glob2-unit-tests` and `glob2-engine-tests`, from `test/tests.py`):
 
 ```sh
-python3 mobile/dependencies.py --arch arm64-v8a --release --tests
-scons target=android arch=arm64-v8a release=1 android-tests android-unit-tests -j4
+python3 mobile/dependencies.py --arch arm64-v8a --release
+scons target=android arch=arm64-v8a release=1 android-tests -j4
 python3 mobile/android_device_tests.py --serial DEVICE_SERIAL \
   --android-sdk "$ANDROID_SDK_ROOT" --output artifacts/android/device-tests
 ```
 
 For an SDK outside the default task-local directory, pass `--android-sdk PATH`
 to the Python build commands and `android_sdk=PATH` to SCons. Keep the dependency,
-project and test architecture consistent. `--harness NAME` runs a selected suite.
+project and test architecture consistent. `--binary NAME` runs one of the two.
 The runner checks the device ABI, stages stripped binaries and packaged assets in
-an isolated `/data/local/tmp` directory, and records each exit code and log. It
-retains those fixtures for diagnosis and never clears the installed app's data.
+an isolated `/data/local/tmp` directory, runs every case except the `[display]`
+ones in-process, and records each exit code, log and JUnit report. It retains
+those fixtures for diagnosis and never clears the installed app's data.
 
-The CppUnit source list is shared with the host suite. Integration harnesses reuse
-the production client objects. `mobile/NativeTestMain.cpp` supplies only the
+The engine binary reuses the production client objects. `mobile/NativeTestMain.cpp` supplies only the
 shell platform bridges: filesystem assets, SDL main readiness, absent Activity,
 and unavailable audio. SDL dummy video runs without a Java UI. These tests execute
 on the device CPU but do **not** establish real rendering, audio, native keyboard,
@@ -606,16 +611,14 @@ App Store release step separate.
 
 ```sh
 python3 -m unittest discover -s tests/build_system -v
-scons release=1 portable-renderer-test mobile-input-test gameplay-touch-test ui-presentation-test
-build/darwin/client/release/libgag/src/MobileInputHarness
-build/darwin/client/release/libgag/src/PortableRendererHarness
-mkdir -p artifacts/mobile-ui/gameplay artifacts/mobile-ui/presentation
-GLOB2_USER_DATA_DIR="$PWD/artifacts/mobile-ui/gameplay" build/darwin/client/release/src/gameplay-touch-test
-(cd artifacts/mobile-ui/presentation && GLOB2_USER_DATA_DIR="$PWD" SDL_VIDEODRIVER=dummy SDL_RENDER_DRIVER=software ../../../build/darwin/client/release/src/ui-presentation-test capture)
+scons release=1 tests
+python3 test/run_tests.py --binary unit --filter 'MobileInput/*' --filter 'MobileDocuments/*'
+python3 test/run_tests.py --filter 'PortableRenderer/*' --filter 'GameGUITouch/*' --filter 'UIPresentation/*'
 ```
 
-Substitute the host toolchain directory on Linux or Windows. The renderer harness
-needs an accelerated SDL display. These checks cover build isolation, artifact
+The display cases need an SDL display (Xvfb on Linux, opened by the runner) and
+copy their screenshots into `artifacts/tests/<suite>/<case>/`. These checks cover
+build isolation, artifact
 validation, rendering and input geometry; they do not replace device gameplay,
 background recovery, document-picker or cross-platform simulation checks.
 
@@ -745,8 +748,8 @@ desktop viewports, with platform gutters, in touch and pointer presentations:
 interactive elements inside the safe rectangle, minimum touch targets, no
 overlapping controls, unique keys and valid focus after resize. The menu colony
 harness's `navigation` mode drives every menu through the screen stack and back
-out with Escape. Run these alongside the gameplay-touch, settings and
-custom-setup harnesses after shared frontend changes. Preserve the previous
+out with Escape. Run these alongside the `GameGUITouch` and `Settings` suites and
+the custom-setup harness after shared frontend changes. Preserve the previous
 gallery directory as the visual baseline; feedback keys must never be
 renumbered.
 
