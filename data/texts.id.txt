@@ -92,6 +92,10 @@ Warrush
 Pembangun kuat yang menurunkan pasukan penyerang terlatih.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Pengendali yang menggunakan modul kode sumber JavaScript tertanam.
 [Alga]
 Ganggang
 [algae]
@@ -3064,8 +3068,6 @@ Peta mini
 Percepat
 [Hide keyboard]
 Sembunyikan papan ketik
-[Dialog text size]
-Ukuran teks dialog
 [Player slot]
 Slot pemain
 [Team color]
@@ -3146,6 +3148,30 @@ Simpan permainan secara otomatis kira-kira setiap menit.
 Lawan AI
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Tata letak lapang menggunakan panel samping jika ada ruang. Tata letak ringkas menggunakan bilah alat dan panel yang dapat dibuka.
+[settings One-finger zoom]
+Zoom satu jari
+[settings Double-tap the map, hold, then drag to zoom.]
+Ketuk peta dua kali, tahan, lalu seret untuk zoom.
+[settings Platform default]
+Bawaan sistem
+[settings Drag up zooms in]
+Seret ke atas untuk memperbesar
+[settings Drag down zooms in]
+Seret ke bawah untuk memperbesar
+[settings Thumb side]
+Sisi ibu jari
+[settings Phone controls gather in this bottom corner.]
+Kontrol ponsel berkumpul di sudut bawah ini.
+[settings Right]
+Kanan
+[settings Left]
+Kiri
+[Undo stroke]
+Urungkan
+[No overlay]
+Tanpa lapisan
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Ditugaskan %0 · Target %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ Peluang menang: %0 · Kekuatan: %1
 Tingkat minimum: %0
 [Confirm %0]
 Oke: %0
-[Dialog text size %0]
-Ukuran teks dialog: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ Lanjutkan Permainan
 Permainan
 [Add AI]
 Tambah AI
+[settings Experiments]
+Eksperimen
+[settings Try features we are still testing. They can change balance and pacing.]
+Coba fitur yang masih kami uji. Fitur ini dapat mengubah keseimbangan dan tempo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Eksperimen berlaku untuk permainan baru yang Anda mulai atau jadi tuan rumahnya, tidak pernah untuk misi kampanye. Permainan tersimpan mempertahankan eksperimen yang dipakai saat dimulai.
+[Experiments set by the host]
+Eksperimen pilihan tuan rumah
+[settings No experiments in this build.]
+Tidak ada eksperimen dalam versi ini.
+[Experiments]
+Eksperimen
+[experiment guard-area-balancing]
+Penyeimbangan area jaga
+[experiment guard-area-balancing help]
+Prajurit bebas menyebar di antara area jaga yang dilukis alih-alih semuanya ke yang terdekat: area yang lebih besar mendapat lebih banyak, dan area yang terlalu penuh perlahan mengalir ke area lain.
+[settings Touch scrolling]
+Gulir sentuh
+[settings List momentum]
+Momentum daftar
+[settings How far lists and panels keep scrolling after a flick.]
+Seberapa jauh daftar dan panel terus bergulir setelah jentikan.
+[settings List bounce]
+Pantulan daftar
+[settings How much lists and panels stretch past their ends and spring back.]
+Seberapa jauh daftar dan panel meregang melewati ujungnya lalu memantul kembali.
+[settings Map momentum]
+Momentum peta
+[settings How far the map keeps panning after a flick.]
+Seberapa jauh peta terus bergeser setelah jentikan.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Rasa gulir sentuh. 0 mematikan efek; 50 adalah bawaan.
+[List momentum]
+Momentum daftar
+[List bounce]
+Pantulan daftar
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Momentum peta

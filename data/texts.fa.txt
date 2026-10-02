@@ -84,6 +84,10 @@ V (Vision): نشان دادن محل همه‌ی ساختمانها
 سازنده‌ای قدرتمند که نیروهای مهاجم آموزش‌دیده به میدان می‌آورد.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+کنترل‌گری که از یک ماژول کد منبع JavaScript تعبیه‌شده استفاده می‌کند.
 [Alga]
 جلبک
 [algae]
@@ -3066,8 +3070,6 @@ Emoji
 جلو بردن سریع
 [Hide keyboard]
 پنهان کردن صفحه‌کلید
-[Dialog text size]
-اندازه متن گفتگو
 [Player slot]
 جایگاه بازیکن
 [Team color]
@@ -3148,6 +3150,30 @@ Emoji
 حریفان هوش مصنوعی
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 چیدمان جادار در صورت وجود فضا از پنل کناری استفاده می‌کند. چیدمان فشرده از نوار ابزار و پنل‌های بازشو استفاده می‌کند.
+[settings One-finger zoom]
+بزرگ‌نمایی با یک انگشت
+[settings Double-tap the map, hold, then drag to zoom.]
+روی نقشه دو بار ضربه بزنید، نگه دارید و برای بزرگ‌نمایی بکشید.
+[settings Platform default]
+پیش‌فرض سیستم
+[settings Drag up zooms in]
+کشیدن به بالا بزرگ‌نمایی می‌کند
+[settings Drag down zooms in]
+کشیدن به پایین بزرگ‌نمایی می‌کند
+[settings Thumb side]
+سمت انگشت شست
+[settings Phone controls gather in this bottom corner.]
+کنترل‌های گوشی در این گوشهٔ پایین جمع می‌شوند.
+[settings Right]
+راست
+[settings Left]
+چپ
+[Undo stroke]
+واگرد
+[No overlay]
+بدون لایه
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 تخصیص‌یافته %0 · هدف %1
 [Range: %0]
@@ -3382,8 +3408,6 @@ Emoji
 حداقل رتبه‌ی لازم: %0
 [Confirm %0]
 قبول!: %0
-[Dialog text size %0]
-اندازه متن گفتگو: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3392,3 +3416,117 @@ Emoji
 بازی‌ها
 [Add AI]
 افزودن هوش مصنوعی
+[settings Experiments]
+آزمایش‌ها
+[settings Try features we are still testing. They can change balance and pacing.]
+قابلیت‌هایی را امتحان کنید که هنوز در حال آزمایش آن‌ها هستیم. ممکن است تعادل و سرعت بازی را تغییر دهند.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+آزمایش‌ها برای بازی‌های جدیدی که شروع یا میزبانی می‌کنید اعمال می‌شوند، اما هرگز برای مأموریت‌های کارزار نه. بازی ذخیره‌شده آزمایش‌هایی را که با آن‌ها شروع شده نگه می‌دارد.
+[Experiments set by the host]
+آزمایش‌های انتخاب‌شده توسط میزبان
+[settings No experiments in this build.]
+در این نسخه آزمایشی وجود ندارد.
+[Experiments]
+آزمایش‌ها
+[experiment guard-area-balancing]
+توازن مناطق نگهبانی
+[experiment guard-area-balancing help]
+جنگجویان آزاد به جای اینکه همه به نزدیک‌ترین منطقه بروند، بین مناطق نگهبانی رنگ‌شده پخش می‌شوند: منطقهٔ بزرگ‌تر تعداد بیشتری می‌گیرد و منطقهٔ بیش از حد پر به‌تدریج به مناطق دیگر خالی می‌شود.
+[settings Touch scrolling]
+پیمایش لمسی
+[settings List momentum]
+شتاب فهرست‌ها
+[settings How far lists and panels keep scrolling after a flick.]
+فهرست‌ها و پنل‌ها پس از یک تلنگر تا کجا به پیمایش ادامه می‌دهند.
+[settings List bounce]
+واجهش فهرست‌ها
+[settings How much lists and panels stretch past their ends and spring back.]
+فهرست‌ها و پنل‌ها چقدر از لبه‌هایشان فراتر کشیده می‌شوند و برمی‌گردند.
+[settings Map momentum]
+شتاب نقشه
+[settings How far the map keeps panning after a flick.]
+نقشه پس از یک تلنگر تا کجا به حرکت ادامه می‌دهد.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+حس پیمایش لمسی. 0 یک جلوه را خاموش می‌کند؛ 50 مقدار پیش‌فرض است.
+[List momentum]
+شتاب فهرست‌ها
+[List bounce]
+واجهش فهرست‌ها
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+شتاب نقشه

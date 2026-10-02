@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Glob2Test.h"
+#include <SDL.h>
 #include <string>
 #include <filesystem>
 #include <cstdio>
@@ -95,7 +96,9 @@ namespace glob2test
 
 	std::filesystem::path profileDir()
 	{
-		const char* dir = std::getenv("GLOB2_USER_DATA_DIR");
+		// SDL owns this variable in TestMain and FileManager. On Windows its
+		// environment can differ from the executable's CRT getenv cache.
+		const char* dir = SDL_getenv("GLOB2_USER_DATA_DIR");
 		GLOB2_REQUIRE(dir && *dir, "GLOB2_USER_DATA_DIR must name the disposable profile (TestMain sets it)");
 		return std::filesystem::path(dir);
 	}
@@ -167,6 +170,12 @@ namespace glob2test
 		return value && *value && std::string(value) != "0";
 	}
 
+	bool fullscreenEnabled()
+	{
+		const char* value = std::getenv("GLOB2_TEST_FULLSCREEN");
+		return value && std::string(value) == "1";
+	}
+
 	void expectGolden(const std::string& relative, const std::string& actual)
 	{
 		const std::filesystem::path path = fixture(relative);
@@ -233,6 +242,24 @@ namespace glob2test
 	{
 		std::ofstream out(path, std::ios::binary);
 		out << text;
+	}
+
+	void setEnv(const char* name, const char* value)
+	{
+#ifdef _WIN32
+		_putenv_s(name, value);
+#else
+		setenv(name, value, 1);
+#endif
+	}
+
+	void unsetEnv(const char* name)
+	{
+#ifdef _WIN32
+		_putenv_s(name, ""); // An empty value removes the variable on Windows.
+#else
+		unsetenv(name);
+#endif
 	}
 
 	int retainFromProfile(const std::string& extension)

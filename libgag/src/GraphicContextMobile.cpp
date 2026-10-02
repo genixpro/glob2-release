@@ -10,6 +10,9 @@
 namespace GAGCore {
     double GraphicContext::logicalUnitsPerPoint() const
     {
+        // Desktop layout constants remain logical units; output density and
+        // whole-view scaling are already applied by the native raster target.
+        if (nativeDesktop) return 1;
         float density=1;
 #ifdef __ANDROID__
         float dpi=160;
@@ -17,6 +20,11 @@ namespace GAGCore {
 #endif
         if (!windowW || !windowH || !sdlsurface) return 1;
         return density*uiScale / std::min(double(windowW)/sdlsurface->w, double(windowH)/sdlsurface->h);
+    }
+
+    double GraphicContext::textUnitsPerPoint() const
+    {
+        return logicalUnitsPerPoint() * (userTextScale > 0 ? userTextScale : 1);
     }
 
     bool GraphicContext::refreshPresentation()
@@ -54,6 +62,7 @@ namespace GAGCore {
     bool GraphicContext::setResponsiveViewport(bool enabled, int minimumWidth, int minimumHeight)
     {
         if (!sdlsurface) return false;
+        if (nativeDesktop) { responsiveViewport=false; updateWindowSize(); return false; }
         applyWindowMinimumSize();
         enabled = enabled && phonePresentationRequested();
 #ifdef GLOB2_MOBILE
@@ -105,18 +114,21 @@ namespace GAGCore {
 
 void GraphicContext::beginSoftwareTransform()
 {
+    prepareDraw();
     if (renderer || (optionFlags & USEGPU)) return;
     if (!softwareRasterizer) softwareRasterizer=makeSoftwareRenderBackend(sdlsurface);
-    renderer=std::move(softwareRasterizer);softwareTransform=true;
+    renderer=softwareRasterizer.get();softwareTransform=true;
 }
 void GraphicContext::endSoftwareTransform()
 {
     if (!softwareTransform) return;
-    renderer->flush();softwareRasterizer=std::move(renderer);softwareTransform=false;
+    renderer->flush();renderer=nullptr;softwareTransform=false;
 }
 
 void GraphicContext::setUITransform(float scale, float x, float y, const SDL_Rect* bounds)
 {
+	if (renderBatch)
+		renderBatch->stateChange();
     const bool reset=scale==1 && x==0 && y==0 && !bounds;
     if (uiTransformActive) {
         if (renderer) renderer->transform(1,0,0,nullptr);

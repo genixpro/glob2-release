@@ -139,6 +139,7 @@ GAGCore::CooperativeTask GameGUI::loadTask(GAGCore::InputStream *stream, bool ig
 		stream->readLeaveSection();
 	}
 
+	game.mapscript.restorePresentation(*this);
 	minimap.setGame(game);
 
 	co_return true;
@@ -198,6 +199,11 @@ void GameGUI::viewportResized(int oldWidth, int oldHeight, int width, int height
     updateCamera();
     viewportChanged(oldX, viewportX, oldY, viewportY);
     if (auto *dialog = activeDialog()) dialog->cancelInput();
+}
+
+void GameGUI::stopViewportMotion()
+{
+    if (touch) touch->stopMapMotion();
 }
 
 void GameGUI::suspendInput()

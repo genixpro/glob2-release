@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "TextLayout.h"
+#include "Icon.h"
 #include <functional>
 #include <memory>
 
@@ -13,7 +14,7 @@ class Sprite;
 namespace GAGGUI::ui
 {
 // Drawing surface abstraction so controls paint without a window and tests can
-// record what was drawn. Text drawing honours the presentation text scale.
+// record what was drawn. Text is drawn at the presentation's text unit.
 class Canvas
 {
   public:
@@ -33,6 +34,7 @@ class Canvas
 	virtual void drawSurface(Rect destination, GAGCore::DrawableSurface *surface,
 							 unsigned char alpha = 255) = 0;
 	virtual void drawSprite(Point at, GAGCore::Sprite *sprite, int frame) = 0;
+	virtual void drawIcon(Rect destination, const IconAsset &asset, GAGCore::Color color) = 0;
 	// Run a legacy painter with a scale and translation applied to the surface.
 	virtual void transformed(double scale, Point origin, Rect bounds,
 							 const std::function<void()> &paint) = 0;
@@ -59,6 +61,7 @@ class SurfaceCanvas : public Canvas
 	void drawSurface(Rect destination, GAGCore::DrawableSurface *surface,
 					 unsigned char alpha) override;
 	void drawSprite(Point at, GAGCore::Sprite *sprite, int frame) override;
+	void drawIcon(Rect destination, const IconAsset &asset, GAGCore::Color color) override;
 	void transformed(double scale, Point origin, Rect bounds,
 					 const std::function<void()> &paint) override;
 	GAGCore::DrawableSurface *surface() override { return &target; }
@@ -72,7 +75,7 @@ class SurfaceCanvas : public Canvas
 	void applyClip();
 };
 
-// Measures through Toolkit fonts, scaled by the presentation text scale.
+// Measures through Toolkit fonts at the presentation's text unit.
 class ToolkitTextMeasurer : public TextMeasurer
 {
   public:

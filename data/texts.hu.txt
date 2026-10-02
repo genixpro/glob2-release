@@ -84,6 +84,10 @@ MIWarrush
 Erős építő, amely képzett támadóerőket állít ki.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Beágyazott JavaScript-forrásmodult használó vezérlő.
 [Alga]
 Alga
 [algae]
@@ -3068,8 +3072,6 @@ Minitérkép
 Gyors előretekerés
 [Hide keyboard]
 Billentyűzet elrejtése
-[Dialog text size]
-Párbeszédszöveg mérete
 [Player slot]
 Játékoshely
 [Team color]
@@ -3150,6 +3152,30 @@ A játék automatikus mentése körülbelül percenként.
 Gépi ellenfelek
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 A tágas elrendezés oldalsó panelt használ, ha van elég hely. A kompakt elrendezés eszköztárat és kinyitható paneleket használ.
+[settings One-finger zoom]
+Nagyítás egy ujjal
+[settings Double-tap the map, hold, then drag to zoom.]
+Koppints duplán a térképre, tartsd lenyomva, majd húzd a nagyításhoz.
+[settings Platform default]
+Rendszer alapértelmezése
+[settings Drag up zooms in]
+Felfelé húzás nagyít
+[settings Drag down zooms in]
+Lefelé húzás nagyít
+[settings Thumb side]
+Hüvelykujj oldala
+[settings Phone controls gather in this bottom corner.]
+Telefonon a kezelőszervek ebben az alsó sarokban gyűlnek össze.
+[settings Right]
+Jobb
+[settings Left]
+Bal
+[Undo stroke]
+Visszavonás
+[No overlay]
+Nincs réteg
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Kiosztva %0 · Cél %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Nyerési esély: %0 · Erősség: %1
 Minimális szükséges szint: %0
 [Confirm %0]
 Rendben: %0
-[Dialog text size %0]
-Párbeszédszöveg mérete: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Játék folytatása
 Játékok
 [Add AI]
 MI hozzáadása
+[settings Experiments]
+Kísérletek
+[settings Try features we are still testing. They can change balance and pacing.]
+Próbáld ki a még tesztelés alatt álló funkciókat. Megváltoztathatják az egyensúlyt és a tempót.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+A kísérletek az általad indított vagy hosztolt új játékokra vonatkoznak, a kampányküldetésekre soha. A mentett játék megtartja azokat, amelyekkel elkezdődött.
+[Experiments set by the host]
+A házigazda által választott kísérletek
+[settings No experiments in this build.]
+Ebben a kiadásban nincsenek kísérletek.
+[Experiments]
+Kísérletek
+[experiment guard-area-balancing]
+Őrterületek kiegyensúlyozása
+[experiment guard-area-balancing help]
+A szabad harcosok eloszlanak a kijelölt őrterületek között ahelyett, hogy mind a legközelebbibe mennének: a nagyobb terület többet kap belőlük, a túlzsúfolt terület pedig fokozatosan a többibe ürül.
+[settings Touch scrolling]
+Érintéses görgetés
+[settings List momentum]
+Listák lendülete
+[settings How far lists and panels keep scrolling after a flick.]
+Milyen messzire görögnek tovább a listák és panelek egy pöccintés után.
+[settings List bounce]
+Listák visszapattanása
+[settings How much lists and panels stretch past their ends and spring back.]
+Mennyire nyúlnak túl a listák és panelek a szélükön, mielőtt visszaugranak.
+[settings Map momentum]
+Térkép lendülete
+[settings How far the map keeps panning after a flick.]
+Milyen messzire mozog tovább a térkép egy pöccintés után.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Az érintéses görgetés érzete. 0 kikapcsol egy hatást; 50 az alapértelmezés.
+[List momentum]
+Listák lendülete
+[List bounce]
+Listák visszapattanása
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Térkép lendülete

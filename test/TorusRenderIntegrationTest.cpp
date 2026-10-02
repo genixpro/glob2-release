@@ -2,6 +2,7 @@
 // Real game rendering regression. Run with an isolated GLOB2_USER_DIR and
 // either -g (OpenGL) or -G (software). No desktop input is generated.
 #include "EngineFixtures.h"
+#include "ScopedEnvironment.h"
 #include <vector>
 #include <algorithm>
 #include <utility>
@@ -18,6 +19,7 @@
 #include "GameGUIInternal.h"
 #include "gui/GameGUIViewport.h"
 #include "Engine.h"
+#include "Utilities.h"
 #include "Team.h"
 #include "TorusMapFixture.h"
 #include "Unit.h"
@@ -218,7 +220,15 @@ static void run(bool gpu, int width, int height)
             SettingsScreen options;
             const int oldMute = globalContainer->settings.mute;
             const bool oldHighResolution = globalContainer->settings.highResolutionArtwork;
-            REQUIRE(options.changeSetting("graphics.torus",1));
+            if (gpu) { REQUIRE(options.changeSetting("graphics.torus",1)); }
+            else
+            {
+                REQUIRE(!options.changeSetting("graphics.torus",1));
+                REQUIRE(!globalContainer->settings.automaticTorus);
+                // An unavailable control retains an existing saved preference.
+                globalContainer->settings.automaticTorus=true;
+                REQUIRE(globalContainer->settings.save());
+            }
             REQUIRE(globalContainer->settings.automaticTorus);
             REQUIRE(globalContainer->settings.mute == oldMute);
             REQUIRE(globalContainer->settings.highResolutionArtwork == oldHighResolution);
@@ -231,7 +241,14 @@ static void run(bool gpu, int width, int height)
             SettingsScreen options;
             // Discrete settings save immediately, including when the screen
             // closes without a separate Save action.
-            REQUIRE(options.changeSetting("graphics.torus",0));
+            if (gpu) { REQUIRE(options.changeSetting("graphics.torus",0)); }
+            else
+            {
+                REQUIRE(!options.changeSetting("graphics.torus",0));
+                REQUIRE(globalContainer->settings.automaticTorus);
+                globalContainer->settings.automaticTorus=false;
+                REQUIRE(globalContainer->settings.save());
+            }
             REQUIRE(!globalContainer->settings.automaticTorus);
             restored.load();
             REQUIRE(!restored.automaticTorus);
@@ -338,14 +355,27 @@ static void run(bool gpu, int width, int height)
             {
                 view.amount = amount;
                 view.lastFrame = SDL_GetTicks();
+                const auto randomState=syncRandEngine();
                 REQUIRE(view.draw(gui.game, 0, Game::DRAW_WHOLE_MAP, x, y, 960, 720));
                 REQUIRE(glGetError() == GL_NO_ERROR);
+                REQUIRE(syncRandEngine()==randomState);
             };
             view.toggle();
             REQUIRE(view.active());
             draw(0);
             for (float phase : {.01f, .25f, .5f, .75f, 1.f})
                 draw(phase);
+            {
+                GLint viewport[4]; glGetIntegerv(GL_VIEWPORT,viewport);
+                const int w=viewport[2],h=viewport[3];
+                std::vector<unsigned char> pixels(size_t(w)*h*4),upright(pixels.size());
+                glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                for(int y=0;y<h;++y) std::copy_n(pixels.data()+size_t(y)*w*4,w*4,upright.data()+size_t(h-1-y)*w*4);
+                auto *frame=SDL_CreateRGBSurfaceWithFormatFrom(upright.data(),w,h,32,w*4,SDL_PIXELFORMAT_RGBA32);
+                REQUIRE(frame!=nullptr);
+                REQUIRE(SDL_SaveBMP(frame,(glob2test::artifactDir()/"torus-native.bmp").string().c_str())==0);
+                SDL_FreeSurface(frame);
+            }
             gui.gamePaused = true;
             const int pausedTime = gui.game.mapAnimationTime;
             draw(1);
@@ -439,7 +469,7 @@ static void run(bool gpu, int width, int height)
                 std::cout << "Torus selection markers passed\n";
             }
             // Test navigation separately from the expensive cloud layer.
-            globalContainer->settings.optionFlags |= GlobalContainer::OPTION_LOW_SPEED_GFX;
+            globalContainer->settings.setGraphicsDetail(false);
             for (int i = 0; i < 20; ++i)
             {
                 view.setViewport((x + 3) & gui.game.map.getMaskW(), (y + 5) & gui.game.map.getMaskH());
@@ -599,8 +629,7 @@ TEST_SUITE("TorusRender")
 	TEST_CASE("game rendering; picking and cache changes in OpenGL [display][writes-preferences]") { TorusRenderIntegrationTest::run(true, 1120, 720); }
 	TEST_CASE("game rendering at triple UI scale in OpenGL [display:1920x1440][writes-preferences]")
 	{
-		SDL_setenv("GLOB2_UI_SCALE", "3", 1);
+		glob2test::ScopedEnvironment scale("GLOB2_UI_SCALE", "3");
 		TorusRenderIntegrationTest::run(true, 1920, 1440);
-		unsetenv("GLOB2_UI_SCALE");
 	}
 }

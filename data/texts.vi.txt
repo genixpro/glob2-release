@@ -92,6 +92,10 @@ Warrush
 Giỏi xây dựng và triển khai lực lượng tấn công đã huấn luyện.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Bộ điều khiển sử dụng mô-đun mã nguồn JavaScript nhúng.
 [Alga]
 Tảo
 [algae]
@@ -3064,8 +3068,6 @@ Bản đồ nhỏ
 Tua nhanh
 [Hide keyboard]
 Ẩn bàn phím
-[Dialog text size]
-Cỡ chữ hộp thoại
 [Player slot]
 Vị trí người chơi
 [Team color]
@@ -3146,6 +3148,30 @@ Tự động lưu trò chơi khoảng mỗi phút.
 Đối thủ máy
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Bố cục rộng rãi dùng bảng bên khi đủ chỗ. Bố cục gọn dùng thanh công cụ và các bảng có thể mở rộng.
+[settings One-finger zoom]
+Thu phóng bằng một ngón
+[settings Double-tap the map, hold, then drag to zoom.]
+Chạm hai lần vào bản đồ, giữ rồi kéo để thu phóng.
+[settings Platform default]
+Mặc định hệ thống
+[settings Drag up zooms in]
+Kéo lên để phóng to
+[settings Drag down zooms in]
+Kéo xuống để phóng to
+[settings Thumb side]
+Phía ngón cái
+[settings Phone controls gather in this bottom corner.]
+Trên điện thoại, các nút điều khiển tập trung ở góc dưới này.
+[settings Right]
+Phải
+[settings Left]
+Trái
+[Undo stroke]
+Hoàn tác
+[No overlay]
+Không lớp phủ
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Đã phân công %0 · Mục tiêu %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ Khả năng thắng: %0 · Sức mạnh: %1
 Cấp tối thiểu: %0
 [Confirm %0]
 Đồng ý: %0
-[Dialog text size %0]
-Cỡ chữ hộp thoại: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ Tiếp tục trò chơi
 Trò chơi
 [Add AI]
 Thêm trí tuệ nhân tạo
+[settings Experiments]
+Thử nghiệm
+[settings Try features we are still testing. They can change balance and pacing.]
+Hãy thử các tính năng chúng tôi vẫn đang thử nghiệm. Chúng có thể thay đổi cân bằng và nhịp độ.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Thử nghiệm áp dụng cho các ván mới bạn bắt đầu hoặc làm chủ, không bao giờ cho nhiệm vụ chiến dịch. Ván đã lưu giữ các thử nghiệm mà nó bắt đầu cùng.
+[Experiments set by the host]
+Thử nghiệm do chủ phòng chọn
+[settings No experiments in this build.]
+Không có thử nghiệm nào trong bản dựng này.
+[Experiments]
+Thử nghiệm
+[experiment guard-area-balancing]
+Cân bằng vùng canh gác
+[experiment guard-area-balancing help]
+Chiến binh rảnh rỗi phân bố giữa các vùng canh gác đã vẽ thay vì tất cả đi đến vùng gần nhất: vùng lớn hơn nhận nhiều hơn, và vùng quá đông dần dần vơi sang các vùng khác.
+[settings Touch scrolling]
+Cuộn bằng cảm ứng
+[settings List momentum]
+Quán tính danh sách
+[settings How far lists and panels keep scrolling after a flick.]
+Danh sách và bảng tiếp tục cuộn bao xa sau một cú lướt.
+[settings List bounce]
+Nảy của danh sách
+[settings How much lists and panels stretch past their ends and spring back.]
+Danh sách và bảng kéo giãn qua mép bao nhiêu rồi bật lại.
+[settings Map momentum]
+Quán tính bản đồ
+[settings How far the map keeps panning after a flick.]
+Bản đồ tiếp tục di chuyển bao xa sau một cú lướt.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Cảm giác cuộn bằng cảm ứng. 0 tắt hiệu ứng; 50 là mặc định.
+[List momentum]
+Quán tính danh sách
+[List bounce]
+Nảy của danh sách
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Quán tính bản đồ

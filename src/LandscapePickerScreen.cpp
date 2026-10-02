@@ -251,7 +251,7 @@ LandscapePickerScreen::LandscapePickerScreen(const std::string &title, std::vect
 	: title(title), entries(std::move(entries)), tiles(this->entries.size()), redraws(this->entries.size(), 0),
 	  filterCategories(categoriesOf(this->entries)), filters(filterCategories.size()),
 	  selected(std::clamp(selected, 0, std::max(0, int(this->entries.size()) - 1))), sortOrder(sortOrder),
-	  previewer(requestsOf(this->entries), 1, true)
+	  previewer(requestsOf(this->entries), 2, true)
 {
 	recomputeIncompatible();
 	rebuild();
@@ -416,7 +416,9 @@ Element LandscapePickerScreen::tile(int i, const Presentation &p, bool compact)
 		box.color = theme().palette.disabled;
 		box.shadow = false;
 		box.padding = p.pt(12);
-		picture = fe::sized({image, image}, fe::card(fe::paragraph(incompatible[std::size_t(i)], {fe::FontRole::Support, true}), box));
+		// At least the preview's square, taller when the explanation needs it.
+		picture = fe::constrained({image, image, image, fe::Constraints::Unbounded},
+								  fe::card(fe::paragraph(incompatible[std::size_t(i)], {fe::FontRole::Support, true}), box));
 	}
 	else if (tileState.widget && tileState.widget->isThumbnailLoaded())
 	{
@@ -466,7 +468,8 @@ Element LandscapePickerScreen::tile(int i, const Presentation &p, bool compact)
 							 [widget](fe::Canvas &c, fe::Rect r, const fe::Frame &)
 							 {
 								 widget->setScreenRectangle(r.x, r.y, r.w, r.h);
-								 widget->paint(c.surface());
+								 if (auto *surface = c.surface()) // null on a recording canvas
+									 widget->paint(surface);
 							 },
 							 options);
 		note = std::to_string(widget->getLastWidth()) + " x " + std::to_string(widget->getLastHeight()) + "  /  " +
@@ -566,7 +569,8 @@ Element LandscapePickerScreen::build(const Presentation &p)
 													   [this, control](int index) { setShared(control, control.valueAt(index)); }))},
 							  {p.pt(4), fe::CrossAlign::Center}));
 	}
-	header.push_back(fe::wrap(std::move(bar), {p.pt(6), p.pt(140)}));
+	// Larger mobile text needs wider fields, rather than wrapping numeric choices.
+	header.push_back(fe::wrap(std::move(bar), {p.pt(6), p.pt(140 * (p.touch ? p.textScale : 1))}));
 	std::vector<Element> cards;
 	for (int i : visible)
 		cards.push_back(tile(i, p, compact));
@@ -597,10 +601,14 @@ Element LandscapePickerScreen::build(const Presentation &p)
 									   resetParameters();
 							   },
 							   more);
-		actionRow = fe::row({fe::button("landscape/back", tr("Back"), [this] { endExecute(CANCEL); }, {false, false, true, false, false, false, SDLK_ESCAPE}),
-							 fe::expanded(menu),
-							 fe::expanded(fe::button("landscape/use", useLabel, [this] { confirm(); }, {true, false, valid && chosenSeed().has_value()}))},
-							{p.pt(6), fe::CrossAlign::Stretch});
+		actionRow =
+			fe::row({fe::compactButton("landscape/back", tr("Back"), fe::UIIcon::Back,
+									   [this] { endExecute(CANCEL); }, p,
+									   {false, false, true, false, false, false, SDLK_ESCAPE}),
+					 fe::expanded(menu),
+					 fe::expanded(fe::button("landscape/use", useLabel, [this] { confirm(); },
+											 {true, false, valid && chosenSeed().has_value()}))},
+					{p.pt(6), fe::CrossAlign::Stretch});
 	}
 	else
 		actionRow = fe::actions({{"landscape/back", tr("Back"), [this] { endExecute(CANCEL); }, false, SDLK_ESCAPE},

@@ -5,6 +5,7 @@
 #include <GraphicContext.h>
 #include <algorithm>
 #include <cmath>
+#include <stdexcept>
 
 namespace GAGGUI::ui
 {
@@ -95,9 +96,14 @@ class Button : public Node
 		: text(std::move(text)), action(std::move(action)), options(options)
 	{
 		this->key = std::move(key);
+		if (this->text.empty() && options.icon && options.accessibleLabel.empty())
+			throw std::invalid_argument("ui: icon-only button requires an accessible label");
+		if (options.icon && !options.icon->available() && this->text.empty())
+			this->text = options.accessibleLabel;
 	}
 	const char *name() const override { return "button"; }
 	std::string accessibleText() const override { return text.empty() ? options.accessibleLabel : text; }
+	std::string tooltipText() const override { return options.tooltip; }
 	bool interactive() const override { return true; }
 	bool enabled() const override { return options.enabled; }
 	SDL_Keycode shortcut() const override { return options.shortcut; }
@@ -105,6 +111,7 @@ class Button : public Node
 	{
 		if (!options.enabled)
 			return;
+		host.dismissTooltip(key);
 		auto callback = action;
 		host.invalidate();
 		if (callback)
@@ -119,10 +126,17 @@ class Button : public Node
 	Size measure(const LayoutContext &ctx, Constraints c) override
 	{
 		const int pad = ctx.metrics.padding;
-		const int natural = ctx.text.width(options.role, text) + 2 * pad;
+		const int iconWidth =
+			options.icon && options.icon->available() ? ctx.presentation.pt(options.iconSize) : 0;
+		const int extra = iconWidth + (iconWidth && !text.empty() ? ctx.presentation.pt(6) : 0);
+		const int natural = ctx.text.width(options.role, text) + extra + 2 * pad;
 		const int width = c.boundedW() ? std::min(natural, c.maxW) : natural;
-		const auto block = layoutText(ctx.text, options.role, text, std::max(1, width - 2 * ctx.metrics.halfGap), ctx.metrics.lineGap);
-		const int height = std::max(minHeight(ctx), block.height + 2 * ctx.metrics.halfGap);
+		// Wrap to the width paint() leaves the text, or larger text paints more
+		// lines than the height reserves and spills into its neighbours.
+		const auto block = layoutText(ctx.text, options.role, text,
+									  std::max(1, width - 2 * textInset(ctx.metrics) - extra), ctx.metrics.lineGap);
+		const int height =
+			std::max(minHeight(ctx), std::max(block.height, iconWidth) + 2 * ctx.metrics.halfGap);
 		return c.clamp({width, height});
 	}
 	void paint(Frame &frame) override
@@ -150,12 +164,33 @@ class Button : public Node
 				frame.canvas.strokeRect(bounds, options.primary ? p.accentInk.applyAlpha(60) : p.line);
 		}
 		const auto &m = frame.canvas.measurer();
-		const int inset = frame.layout.metrics.halfGap * 2;
-		const Rect textRect = bounds.inset(Insets::symmetric(inset, frame.layout.metrics.halfGap));
-		const auto block = layoutText(m, options.role, text, std::max(1, textRect.w), frame.layout.metrics.lineGap);
+		const int inset = textInset(frame.layout.metrics);
+		Rect textRect = bounds.inset(Insets::symmetric(inset, frame.layout.metrics.halfGap));
+		const bool hasIcon = options.icon && options.icon->available();
+		const int side = hasIcon ? std::min({frame.layout.presentation.pt(options.iconSize),
+											 std::max(0, textRect.w), std::max(0, textRect.h)})
+								 : 0;
+		const int extra = side + (side && !text.empty() ? frame.layout.presentation.pt(6) : 0);
+		const auto block = layoutText(m, options.role, text, std::max(1, textRect.w - extra),
+									  frame.layout.metrics.lineGap);
 		GAGCore::Color ink = options.primary || classic ? p.accentInk : inkFor(frame, options.enabled, false);
 		if (options.danger && options.enabled)
 			ink = p.danger;
+		if (hasIcon)
+		{
+			int textWidth = 0;
+			for (const auto &line : block.lines)
+				textWidth = std::max(textWidth, m.width(options.role, line));
+			const int start = options.alignLeft
+								  ? textRect.x
+								  : textRect.x + std::max(0, (textRect.w - extra - textWidth) / 2);
+			frame.canvas.drawIcon({start, bounds.y + (bounds.h - side) / 2, side, side},
+								  *options.icon, ink);
+			textRect.x = start + extra;
+			textRect.w = std::max(0, bounds.right() - inset - textRect.x);
+			if (!options.alignLeft)
+				textRect.w = textWidth;
+		}
 		drawLines(frame, textRect, options.role, block.lines,
 				  options.alignLeft ? TextAlign::Left : TextAlign::Center, ink,
 				  frame.layout.metrics.lineGap);
@@ -165,6 +200,8 @@ class Button : public Node
 	std::string text;
 	std::function<void()> action;
 	ButtonOptions options;
+	// Horizontal inset of the label on each side.
+	int textInset(const Metrics &m) const { return m.halfGap * (text.empty() && options.icon ? 1 : 2); }
 };
 
 class Toggle : public Node
@@ -365,7 +402,7 @@ class Stepper : public Node
 	}
 	void tap(Point point, Host &host) override
 	{
-		const int side = sideWidth;
+		const int side = std::min(sideWidth, bounds.w / 2);
 		if (point.x < bounds.x + side)
 			step(host, -1);
 		else if (point.x >= bounds.right() - side)
@@ -390,7 +427,9 @@ class Stepper : public Node
 	{
 		sideWidth = ctx.metrics.stepperSide;
 		const int natural = 2 * sideWidth + ctx.text.width(FontRole::Body, valueText()) + 2 * ctx.metrics.padding;
-		return c.clamp({c.boundedW() ? std::min(std::max(natural, c.minW), c.maxW) : natural, ctx.metrics.control});
+		// Taller than the control height when larger text needs it.
+		const int height = std::max(ctx.metrics.control, ctx.text.lineHeight(FontRole::Body) + ctx.metrics.gap);
+		return c.clamp({c.boundedW() ? std::min(std::max(natural, c.minW), c.maxW) : natural, height});
 	}
 	void paint(Frame &frame) override
 	{
@@ -398,8 +437,10 @@ class Stepper : public Node
 		const auto &mt = frame.layout.metrics;
 		frame.canvas.fillRounded(bounds, mt.radius, options.enabled ? p.field : p.disabled);
 		frame.canvas.strokeRect(bounds, p.line);
-		const Rect left{bounds.x, bounds.y, sideWidth, bounds.h};
-		const Rect right{bounds.right() - sideWidth, bounds.y, sideWidth, bounds.h};
+		// Squeezed below its natural width, the sides share what is left.
+		const int sideW = std::min(sideWidth, bounds.w / 2);
+		const Rect left{bounds.x, bounds.y, sideW, bounds.h};
+		const Rect right{bounds.right() - sideW, bounds.y, sideW, bounds.h};
 		auto side = [&](Rect r, const char *glyph, bool ok)
 		{
 			if (ok && frame.hovered(r))
@@ -868,13 +909,23 @@ class TextEditor : public Node
 	bool focusable() const override { return true; }
 	bool stateful() const override { return true; }
 	bool scrollable() const override { return true; }
+	bool inertial() const override { return true; }
 	bool clipsChildren() const override { return true; }
 	int scrollOffset() const override { return offset; }
 	int scrollMaximum() const override { return maximum; }
+	int overscroll() const override { return over; }
+	void setOverscroll(int pixels, Host &host) override
+	{
+		if (pixels == over)
+			return;
+		over = pixels;
+		host.relayout();
+	}
 	void restore(const NodeState &state, const LayoutContext &) override
 	{
 		cursor = std::min(state.cursor, value.size());
 		offset = state.scroll;
+		over = 0;
 		restored = state.detail != 0;
 	}
 	void save(NodeState &state) const override
@@ -883,14 +934,16 @@ class TextEditor : public Node
 		state.scroll = offset;
 		state.detail = 1;
 	}
-	void scrollBy(int pixels, Host &host) override
+	void scrollBy(int pixels, Host &host) override { scrollTo(offset + pixels, host); }
+	int scrollTo(int pixels, Host &host) override
 	{
-		const int next = std::clamp(offset + pixels, 0, maximum);
+		const int next = std::clamp(pixels, 0, maximum);
 		if (next != offset)
 		{
 			offset = next;
 			host.relayout();
 		}
+		return offset;
 	}
 	void tap(Point point, Host &host) override
 	{
@@ -900,7 +953,7 @@ class TextEditor : public Node
 		// Place the cursor at the tapped glyph.
 		const auto &m = *measurerForHit;
 		const int lineHeight = m.lineHeight(FontRole::Body) + lineGap;
-		const int line = std::clamp((point.y - bounds.y - pad + offset) / std::max(1, lineHeight), 0, int(lines.size()) - 1);
+		const int line = std::clamp((point.y - bounds.y - pad + offset + over) / std::max(1, lineHeight), 0, int(lines.size()) - 1);
 		if (lines.empty())
 		{
 			cursor = 0;
@@ -1133,7 +1186,7 @@ class TextEditor : public Node
 		}
 		const int lineHeight = m.lineHeight(FontRole::Body) + lineGap;
 		frame.canvas.pushClip(bounds.inset(1));
-		int y = bounds.y + pad - offset;
+		int y = bounds.y + pad - offset - over;
 		for (std::size_t i = 0; i < lines.size(); ++i, y += lineHeight)
 		{
 			if (y + lineHeight < bounds.y || y > bounds.bottom())
@@ -1181,7 +1234,7 @@ class TextEditor : public Node
 	TextEditorOptions options;
 	std::vector<Line> lines;
 	std::size_t cursor = 0;
-	int offset = 0, maximum = 0, pad = 8, lineGap = 2, lineHeightCached = 16, lastContent = -1;
+	int offset = 0, over = 0, maximum = 0, pad = 8, lineGap = 2, lineHeightCached = 16, lastContent = -1;
 	bool follow = false, restored = false, bound = false;
 	const TextMeasurer *measurerForHit = nullptr;
 };
@@ -1202,12 +1255,22 @@ class ListView : public Node
 	bool interactive() const override { return true; }
 	bool stateful() const override { return true; }
 	bool scrollable() const override { return true; }
+	bool inertial() const override { return true; }
 	bool clipsChildren() const override { return true; }
 	int scrollOffset() const override { return offset; }
 	int scrollMaximum() const override { return maximum; }
+	int overscroll() const override { return over; }
+	void setOverscroll(int pixels, Host &host) override
+	{
+		if (pixels == over)
+			return;
+		over = pixels;
+		host.relayout();
+	}
 	void restore(const NodeState &state, const LayoutContext &) override
 	{
 		offset = state.scroll;
+		over = 0;
 		revealed = state.detail == selected + 1;
 	}
 	void save(NodeState &state) const override
@@ -1215,20 +1278,22 @@ class ListView : public Node
 		state.scroll = offset;
 		state.detail = selected + 1;
 	}
-	void scrollBy(int pixels, Host &host) override
+	void scrollBy(int pixels, Host &host) override { scrollTo(offset + pixels, host); }
+	int scrollTo(int pixels, Host &host) override
 	{
-		const int next = std::clamp(offset + pixels, 0, maximum);
+		const int next = std::clamp(pixels, 0, maximum);
 		if (next != offset)
 		{
 			offset = next;
 			host.relayout();
 		}
+		return offset;
 	}
 	int rowAt(Point point) const
 	{
 		if (rowHeight <= 0)
 			return -1;
-		const int index = (point.y - bounds.y + offset) / rowHeight;
+		const int index = (point.y - bounds.y + offset + over) / rowHeight;
 		return index >= 0 && index < int(items.size()) ? index : -1;
 	}
 	bool rowEnabled(int index) const { return options.enabled.empty() || options.enabled[std::size_t(index)]; }
@@ -1237,7 +1302,7 @@ class ListView : public Node
 		std::vector<SubTarget> rows;
 		for (int i = 0; rowHeight > 0 && i < int(items.size()); ++i)
 		{
-			const Rect row{bounds.x, bounds.y + i * rowHeight - offset, bounds.w, rowHeight};
+			const Rect row{bounds.x, bounds.y + i * rowHeight - offset - over, bounds.w, rowHeight};
 			if (row.bottom() > bounds.y && row.y < bounds.bottom())
 				rows.push_back({std::to_string(i), row, items[std::size_t(i)]});
 		}
@@ -1344,7 +1409,7 @@ class ListView : public Node
 			frame.canvas.text({bounds.x + mt.gap, bounds.y + mt.gap}, FontRole::Body, ellipsize(m, FontRole::Body, options.emptyText, bounds.w - 2 * mt.gap), p.muted);
 		for (int i = 0; i < int(items.size()); ++i)
 		{
-			const Rect row{bounds.x + 1, bounds.y + i * rowHeight - offset, bounds.w - 2 - barSpace, rowHeight};
+			const Rect row{bounds.x + 1, bounds.y + i * rowHeight - offset - over, bounds.w - 2 - barSpace, rowHeight};
 			if (row.bottom() < bounds.y || row.y > bounds.bottom())
 				continue;
 			const bool ok = rowEnabled(i);
@@ -1405,7 +1470,7 @@ class ListView : public Node
 	int selected;
 	std::function<void(int)> select;
 	ListOptions options;
-	int rowHeight = 24, checkWidth = 0, offset = 0, maximum = 0, grab = 0, lastScrollbar = 6;
+	int rowHeight = 24, checkWidth = 0, offset = 0, over = 0, maximum = 0, grab = 0, lastScrollbar = 6;
 	bool revealed = false;
 };
 
@@ -1611,6 +1676,37 @@ Element heading(const std::string &text) { return std::make_shared<Paragraph>(te
 Element title(const std::string &text) { return std::make_shared<Paragraph>(text, TextOptions{FontRole::Title}); }
 Element caption(const std::string &text, bool muted) { return std::make_shared<Paragraph>(text, TextOptions{FontRole::Support, muted}); }
 Element paragraph(const std::string &text, TextOptions options) { return std::make_shared<Paragraph>(text, options); }
+namespace
+{
+class IconNode : public Node
+{
+	IconRef asset;
+	IconOptions options;
+
+  public:
+	IconNode(IconRef asset, IconOptions options) : asset(std::move(asset)), options(options) {}
+	const char *name() const override { return "icon"; }
+	Size measure(const LayoutContext &ctx, Constraints c) override
+	{
+		const int side = ctx.presentation.pt(options.size);
+		return c.clamp({side, side});
+	}
+	void paint(Frame &frame) override
+	{
+		if (!asset || !asset->available())
+			return;
+		const int side = std::min(bounds.w, bounds.h);
+		frame.canvas.drawIcon(
+			{bounds.x + (bounds.w - side) / 2, bounds.y + (bounds.h - side) / 2, side, side},
+			*asset, options.color.value_or(frame.layout.theme.palette.ink));
+	}
+};
+} // namespace
+Element icon(IconRef asset, IconOptions options)
+{
+	return std::make_shared<IconNode>(std::move(asset), options);
+}
+
 Element button(const std::string &key, const std::string &text, std::function<void()> action, ButtonOptions options)
 {
 	return std::make_shared<Button>(key, text, std::move(action), options);

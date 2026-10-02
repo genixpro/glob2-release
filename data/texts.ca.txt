@@ -84,6 +84,10 @@ AIWarrush
 Un constructor eficaç que desplega forces d’atac entrenades.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Un controlador que utilitza un mòdul de codi JavaScript integrat.
 [Alga]
 Algues
 [algae]
@@ -3076,8 +3080,6 @@ Minimapa
 Avanç ràpid
 [Hide keyboard]
 Amaga el teclat
-[Dialog text size]
-Mida del text dels diàlegs
 [Player slot]
 Plaça de jugador
 [Team color]
@@ -3158,6 +3160,30 @@ Desa la partida automàticament cada minut aproximadament.
 Adversaris d’IA
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 La disposició espaiosa usa un panell lateral quan hi ha espai. La compacta usa una barra d’eines i panells desplegables.
+[settings One-finger zoom]
+Zoom amb un dit
+[settings Double-tap the map, hold, then drag to zoom.]
+Toca dues vegades el mapa, mantén premut i arrossega per fer zoom.
+[settings Platform default]
+Predeterminat del sistema
+[settings Drag up zooms in]
+Arrossegar amunt apropa
+[settings Drag down zooms in]
+Arrossegar avall apropa
+[settings Thumb side]
+Costat del polze
+[settings Phone controls gather in this bottom corner.]
+Els controls del mòbil es col·loquen en aquest cantó inferior.
+[settings Right]
+Dreta
+[settings Left]
+Esquerra
+[Undo stroke]
+Desfés
+[No overlay]
+Sense capa
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Assignats %0 · Objectiu %1
 [Range: %0]
@@ -3392,8 +3418,6 @@ Probabilitat de guanyar: %0 · Aptitud: %1
 Nivell mínim requerit: %0
 [Confirm %0]
 OK: %0
-[Dialog text size %0]
-Mida del text dels diàlegs: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3402,3 +3426,117 @@ Reprèn la partida
 Partides
 [Add AI]
 Afegeix IA
+[settings Experiments]
+Funcions experimentals
+[settings Try features we are still testing. They can change balance and pacing.]
+Prova funcions que encara estem provant. Poden canviar l'equilibri i el ritme.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Les funcions experimentals s'apliquen a les partides noves que inicies o allotges, mai a les missions de campanya. Una partida desada conserva les que tenia en començar.
+[Experiments set by the host]
+Funcions experimentals triades per l'amfitrió
+[settings No experiments in this build.]
+No hi ha funcions experimentals en aquesta versió.
+[Experiments]
+Funcions experimentals
+[experiment guard-area-balancing]
+Equilibri de les zones de guàrdia
+[experiment guard-area-balancing help]
+Els guerrers lliures es reparteixen entre les zones de guàrdia pintades en lloc d'anar tots a la més propera: una zona més gran en rep més, i una zona massa plena es buida a poc a poc cap a les altres.
+[settings Touch scrolling]
+Desplaçament tàctil
+[settings List momentum]
+Inèrcia de les llistes
+[settings How far lists and panels keep scrolling after a flick.]
+Fins on continuen desplaçant-se les llistes i els panells després d'un gest.
+[settings List bounce]
+Rebot de les llistes
+[settings How much lists and panels stretch past their ends and spring back.]
+Quant s'estiren les llistes i els panells més enllà dels seus extrems abans de tornar.
+[settings Map momentum]
+Inèrcia del mapa
+[settings How far the map keeps panning after a flick.]
+Fins on continua movent-se el mapa després d'un gest.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Sensació del desplaçament tàctil. 0 desactiva un efecte; 50 és el valor per defecte.
+[List momentum]
+Inèrcia de les llistes
+[List bounce]
+Rebot de les llistes
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Inèrcia del mapa

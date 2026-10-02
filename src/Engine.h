@@ -30,6 +30,7 @@ class Engine
 	friend struct CustomGameSetupHarness;
 	friend struct HeadlessRunner;
 	std::string headlessOutput;
+	std::string initializationDiagnostic;
 	int headlessSaveInterval = 0;
 	int previousCustomSpeed = -1;
 	friend class HighResolutionIntegrationHarness;
@@ -69,6 +70,7 @@ public:
     GAGCore::CooperativeTask initCampaignTask(std::string filename, Campaign* campaign = nullptr, std::string mission = {});
     GAGCore::CooperativeTask loadReplayTask(std::string filename);
     void cancelInitialization();
+    const std::string& getInitializationDiagnostic() const { return initializationDiagnostic; }
     void suspendInput() { gui.suspendInput(); }
     void viewportResized(int oldWidth, int oldHeight, int width, int height) { gui.viewportResized(oldWidth, oldHeight, width, height); }
 
@@ -102,6 +104,8 @@ public:
     void beginSession(Uint64 now);
     bool stepSession(Uint64 now);
     bool stepSession(Uint64 now, const std::vector<SDL_Event>& events);
+    // Stop a failed session before control returns to its host.
+    void abortSession() noexcept;
     void drawSession();
     Uint32 sessionDelay(Uint64 now);
     struct PendingLoad { std::string filename; bool replay; };
@@ -130,8 +134,16 @@ public:
 
 	///This will load the game header of the game with the given filename
 	static GameHeader loadGameHeader(const std::string &filename);
+
+	/// Copies the player's Settings > Experiments into the header of a new game.
+	/// A saved game keeps the set it was started with, so this leaves one alone.
+	/// The one place the new-game rule lives: the custom lobby, map files, headless
+	/// test games and hosted multiplayer call it; campaign missions and joined
+	/// multiplayer games deliberately do not (docs/features/experimental-features.md).
+	static void applyLocalExperiments(GameHeader &header, const MapHeader &map);
 	
 private:
+    bool stepSessionImpl(Uint64 now, const std::vector<SDL_Event>& events);
 	/// Initiates a game, provided the map and game header. This initiates the net
 	/// as well. When setGameHeader is true, the gameHeader given will replace the
 	/// one loaded with the map. When ignore GUI info is set, the game will ignore

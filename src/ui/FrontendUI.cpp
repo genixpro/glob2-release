@@ -7,9 +7,62 @@
 #include <GUIStyle.h>
 #include <StringTable.h>
 #include <Toolkit.h>
+#include <cstdio>
+#include <array>
+#include <map>
 
 namespace Glob2UI
 {
+IconRef uiIcon(UIIcon icon)
+{
+	static std::map<std::string, std::weak_ptr<const IconAsset>> assets;
+	static constexpr std::array names = {"settings",       "pencil",     "folder-open",
+										 "device-desktop", "volume",     "adjustments-horizontal",
+										 "building",       "keyboard",   "user",
+										 "player-play",    "flag",       "book",
+										 "world",          "network",    "info-circle",
+										 "logout",         "arrow-left", "dots",
+										 "send",           "x",          "refresh",
+										 "info-circle",    "flask"};
+	static_assert(names.size() == static_cast<std::size_t>(UIIcon::Count));
+	const char *name = names.at(static_cast<std::size_t>(icon));
+	if (auto asset = assets[name].lock())
+		return asset;
+	auto asset = std::make_shared<IconAsset>();
+	asset->name = name;
+	for (int pixels : {20, 24, 40, 48, 60, 72})
+	{
+		auto surface = std::make_shared<GAGCore::DrawableSurface>(1, 1);
+		const std::string path =
+			"data/gui/tabler-" + asset->name + "-" + std::to_string(pixels) + ".png";
+		if (surface->loadImage(path))
+			asset->rasters.push_back({pixels, std::move(surface)});
+		else
+			std::fprintf(stderr, "ui: missing icon raster %s\n", path.c_str());
+	}
+	assets[name] = asset;
+	return asset;
+}
+
+Element compactButton(const std::string &key, const std::string &label, UIIcon icon,
+					  std::function<void()> action, const Presentation &p, ButtonOptions options)
+{
+	if (!p.touch)
+		return button(key, label, std::move(action), options);
+	options.icon = uiIcon(icon);
+	options.iconSize = 24;
+	options.minHeight = std::max(48.0, options.minHeight);
+	options.accessibleLabel = label;
+	options.tooltip = label;
+	if (!options.icon->available())
+		return button(key, label, std::move(action), options);
+	return width(p.pt(48), button(key, "", std::move(action), options));
+}
+
+// Every touch theme shares one text size, so menus, dialogs over gameplay and
+// the end-of-game sheet read alike; the player's preference multiplies it.
+constexpr double touchTextBase = 1.15;
+
 const Theme &frontendTheme()
 {
 	static const Theme theme = []
@@ -17,6 +70,7 @@ const Theme &frontendTheme()
 		Theme t;
 		t.fonts = {"front-title", "menu", "standard", "little", "front-caption"};
 		t.touchFonts = {"front-title", "menu", "frontend-body", "frontend-support", "front-caption"};
+		t.touchTextScale = touchTextBase;
 		return t;
 	}();
 	return theme;
@@ -29,6 +83,7 @@ const Theme &inGameTheme()
 		Theme t;
 		t.fonts = {"menu", "menu", "standard", "little", "little"};
 		t.touchFonts = {"menu", "menu", "frontend-body", "frontend-support", "frontend-support"};
+		t.touchTextScale = touchTextBase;
 		// The dark in-match look of the touch HUD, so dialogs sit on the map without
 		// borrowing the frontend's paper.
 		auto &c = t.palette;
@@ -109,21 +164,8 @@ std::string tr(const std::string &key)
 	return GAGCore::Toolkit::getStringTable()->getString(key);
 }
 
-double frontendTextScale(const Presentation &presentation)
-{
-	if (!presentation.touch)
-		return 1;
-	const int percent = globalContainer ? globalContainer->settings.mobileDialogTextPercent : 100;
-	return 1.15 * (percent > 0 ? percent : 100) / 100.0;
-}
-
 Screen::Screen() : UIScreen(frontendTheme()) {}
 Screen::~Screen() = default;
-
-double Screen::textScale(const Presentation &presentation) const
-{
-	return frontendTextScale(presentation);
-}
 
 void Screen::paintBackground(Canvas &canvas)
 {
@@ -142,19 +184,9 @@ void Screen::beforePaint()
 
 Dialog::Dialog() : UIDialog(frontendTheme()) {}
 
-double Dialog::textScale(const Presentation &presentation) const
-{
-	return frontendTextScale(presentation);
-}
-
 InGameDialog::InGameDialog()
 	: UIDialog(touchPresentation() ? inGameTheme() : classicInGameTheme()), classicLook(!touchPresentation())
 {
-}
-
-double InGameDialog::textScale(const Presentation &presentation) const
-{
-	return frontendTextScale(presentation);
 }
 
 void InGameDialog::paintPanel(Canvas &canvas, Rect panel)
@@ -211,7 +243,7 @@ Element actionButton(const MenuAction &action, bool large)
 	options.enabled = action.enabled;
 	if (large)
 	{
-		options.minHeight = 48;
+		options.minHeight = std::max(48.0, options.minHeight);
 		options.role = FontRole::Heading;
 	}
 	return button(action.key, action.label, action.action, options);
@@ -249,8 +281,8 @@ Element menu(const std::string &titleText, std::vector<MenuAction> items, const 
 		std::vector<Element> body;
 		if (!titleText.empty())
 			body.push_back(paragraph(titleText, {FontRole::Heading, false, TextAlign::Center}));
-		body.push_back(column(std::move(parts), {p.pt(20)}));
-		body.push_back(expandedSpacer());
+		// Scrolls when larger text makes the buttons outgrow the fixed panel.
+		body.push_back(expanded(scroll("menu/items", column(std::move(parts), {p.pt(20)}))));
 		if (escape)
 			body.push_back(escape);
 		CardOptions cardOptions;
@@ -406,7 +438,8 @@ Element mapPreview(const std::string &key, ::MapPreview &preview, double points,
 						  [widget](Canvas &c, Rect r, const Frame &)
 						  {
 							  widget->setScreenRectangle(r.x, r.y, r.w, r.h);
-							  widget->paint(c.surface());
+							  if (auto *surface = c.surface()) // null on a recording canvas
+								  widget->paint(surface);
 						  },
 						  options);
 	if (flexible)

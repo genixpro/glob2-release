@@ -84,6 +84,10 @@ AIWarrush
 擅长建设，并派出训练有素的进攻部队。
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+使用嵌入式 JavaScript 源代码模块的控制器。
 [Alga]
 海藻
 [algae]
@@ -3064,8 +3068,6 @@ Emoji
 快进
 [Hide keyboard]
 隐藏键盘
-[Dialog text size]
-对话框文字大小
 [Player slot]
 玩家槽位
 [Team color]
@@ -3146,6 +3148,30 @@ Emoji
 电脑对手
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 宽敞布局在空间足够时使用侧边面板。紧凑布局使用工具栏和可展开的面板。
+[settings One-finger zoom]
+单指缩放
+[settings Double-tap the map, hold, then drag to zoom.]
+在地图上点按两次并按住，然后拖动即可缩放。
+[settings Platform default]
+系统默认
+[settings Drag up zooms in]
+向上拖动放大
+[settings Drag down zooms in]
+向下拖动放大
+[settings Thumb side]
+拇指侧
+[settings Phone controls gather in this bottom corner.]
+手机上的控件会集中在这个下方角落。
+[settings Right]
+右侧
+[settings Left]
+左侧
+[Undo stroke]
+撤销
+[No overlay]
+无图层
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 已分配 %0 · 目标 %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ CPU %0%
 最小等级需求: %0
 [Confirm %0]
 确定: %0
-[Dialog text size %0]
-对话框文字大小: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ CPU %0%
 游戏
 [Add AI]
 添加人工智能
+[settings Experiments]
+实验功能
+[settings Try features we are still testing. They can change balance and pacing.]
+试用我们仍在测试的功能。它们可能改变平衡和节奏。
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+实验功能适用于你开始或主持的新游戏，从不适用于战役任务。已保存的游戏保留其开始时的实验功能。
+[Experiments set by the host]
+主机选择的实验功能
+[settings No experiments in this build.]
+此版本中没有实验功能。
+[Experiments]
+实验功能
+[experiment guard-area-balancing]
+警戒区均衡
+[experiment guard-area-balancing help]
+空闲的战士会分散到各个已绘制的警戒区，而不是全部涌向最近的一个：更大的区域获得更多战士，过于拥挤的区域会逐渐向其他区域分流。
+[settings Touch scrolling]
+触摸滚动
+[settings List momentum]
+列表惯性
+[settings How far lists and panels keep scrolling after a flick.]
+轻扫后列表和面板继续滚动的距离。
+[settings List bounce]
+列表回弹
+[settings How much lists and panels stretch past their ends and spring back.]
+列表和面板越过边缘后拉伸并回弹的程度。
+[settings Map momentum]
+地图惯性
+[settings How far the map keeps panning after a flick.]
+轻扫后地图继续移动的距离。
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+触摸滚动手感。0 关闭该效果；50 为默认值。
+[List momentum]
+列表惯性
+[List bounce]
+列表回弹
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+地图惯性

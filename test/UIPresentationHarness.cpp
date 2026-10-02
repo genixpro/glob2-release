@@ -3,6 +3,8 @@
 // platform gutters and text scales, checking the framework invariants and saving
 // captures for review. Run with SDL_VIDEODRIVER=dummy and a disposable profile.
 #include "EngineFixtures.h"
+#include "UIRecordingCanvas.h"
+#include <InterfacePresentation.h>
 #include <vector>
 #include <string>
 #include <memory>
@@ -108,6 +110,16 @@ template <class Tab, class... Args> std::unique_ptr<GAGGUI::Screen> session(Args
 	auto client = std::make_shared<YOGClient>();
 	return std::make_unique<SessionFixture<Tab>>(client, nullptr, std::make_unique<Tab>(std::forward<Args>(args)..., client), false);
 }
+
+// Like offline session tabs above, show the connected upload form without an
+// unrelated connection-loss child covering it before its first layout. The real
+// form, controls and preview still render and receive navigation events.
+class MapUploadFixture final : public YOGClientMapUploadScreen
+{
+  public:
+	using YOGClientMapUploadScreen::YOGClientMapUploadScreen;
+	void onTimer(Uint32) override {}
+};
 std::unique_ptr<GAGGUI::Screen> gameRoom(GAGGUI::ScreenStack &s)
 {
 	auto client = std::make_shared<YOGClient>();
@@ -123,6 +135,7 @@ std::vector<Fixture> fixtures()
 	auto &strings = *GAGCore::Toolkit::getStringTable();
 	return {
 		{"main-menu", [](GAGGUI::ScreenStack &) { return std::make_unique<MainMenuScreen>(); }},
+		{"main-menu-more", [](GAGGUI::ScreenStack &) { return std::make_unique<MainMenuScreen>(); }},
 		{"campaign-menu", [](GAGGUI::ScreenStack &s) { return std::make_unique<CampaignMainMenu>(s); }},
 		{"editor-menu", [](GAGGUI::ScreenStack &s) { return std::make_unique<EditorMainMenu>(s); }},
 		{"lan-menu", [](GAGGUI::ScreenStack &s) { return std::make_unique<LANMenuScreen>(s); }},
@@ -148,6 +161,16 @@ std::vector<Fixture> fixtures()
 			 return lobby;
 		 }},
 		{"new-map", [](GAGGUI::ScreenStack &s) { return std::make_unique<NewMapScreen>(GeneratorRegistry::builtins(), &s); }},
+		{"landscape-navigation", [](GAGGUI::ScreenStack &)
+		 {
+			 // Navigation needs a production picker, without running every generator.
+			 GenerationRequest request;
+			 request.setMethodDefaults(GenerationRequest::eSWAMP);
+			 request.wDec = request.hDec = 6;
+			 request.nbTeams = 2;
+			 return std::make_unique<LandscapePickerScreen>("Choose a landscape",
+				 std::vector<LandscapePickerScreen::Entry>{{GenerationRequest::methodName(request.method), request, request.method}}, 0);
+		 }},
 		{"landscape", [](GAGGUI::ScreenStack &)
 		 {
 			 GenerationRequest request;
@@ -189,9 +212,14 @@ std::vector<Fixture> fixtures()
 		{"lan-find", [](GAGGUI::ScreenStack &s) { return std::make_unique<LANFindScreen>(s); }},
 		{"online-login", [](GAGGUI::ScreenStack &s) { return std::make_unique<YOGLoginScreen>(s, std::make_shared<YOGClient>()); }},
 		{"online-register", [](GAGGUI::ScreenStack &) { return std::make_unique<YOGRegisterScreen>(std::make_shared<YOGClient>()); }},
-		{"map-upload", [](GAGGUI::ScreenStack &s) { return std::make_unique<YOGClientMapUploadScreen>(s, std::make_shared<YOGClient>(), "maps/balanced.map"); }, false},
+		{"map-upload", [](GAGGUI::ScreenStack &s) { return std::make_unique<MapUploadFixture>(s, std::make_shared<YOGClient>(), "maps/balanced.map"); }},
 		{"game-room", gameRoom},
-		{"online-lobby", [](GAGGUI::ScreenStack &s) { return session<YOGClientLobbyScreen>(s); }},
+		{"online-lobby", [](GAGGUI::ScreenStack &s)
+		 {
+			 auto client = std::make_shared<YOGClient>();
+			 return std::make_unique<SessionFixture<YOGClientLobbyScreen>>(
+				 client, nullptr, std::make_unique<YOGClientLobbyScreen>(s, client, false), false);
+		 }},
 		{"online-maps", [](GAGGUI::ScreenStack &s) { return session<YOGClientMapDownloadScreen>(s); }},
 		{"online-options", [](GAGGUI::ScreenStack &) { return session<YOGClientOptionsScreen>(); }},
 		{"setup-options", [](GAGGUI::ScreenStack &)
@@ -253,7 +281,7 @@ void verifyOrDump(UIScreen &screen, const std::string &label)
 	{
 		verify(screen, label);
 	}
-	catch (const std::exception &)
+	catch (...)
 	{
 		if (SDL_getenv("GLOB2_UI_DUMP"))
 			dump(*screen.host().root(), 0);
@@ -329,80 +357,145 @@ void verify(UIScreen &screen, const std::string &label)
 								interactive[j]->key + " overlap");
 		}
 	require(host.focusOrder().size() >= 1, label + ": nothing is focusable");
+	// Text never spills out of the control that measured it, at any text size.
+	ToolkitTextMeasurer measurer(screen.theme(), p.touch, p.textUnit);
+	glob2test::RecordingCanvas canvas(p.viewport.size(), measurer);
+	host.paint(canvas, 0);
+	const auto spill = glob2test::textSpill(canvas, interactive,
+											[&](Node &node) { return visibleRect(*host.root(), node); });
+	require(spill.empty(), label + ": " + spill);
 }
-void run()
+void run(const Viewport &viewport)
 {
+	if (const char *only = SDL_getenv("GLOB2_UI_VIEWPORT");
+		only && *only && std::string(only) != viewport.name)
+		return;
 	glob2test::GlobalsOptions options{.display = true, .loadStrings = true, .width = 800, .height = 600,
 	                                  .screenFlags = GAGCore::GraphicContext::PORTABLEGPU | GAGCore::GraphicContext::RESIZABLE};
 	glob2test::HeadlessGlobals globals(options);
 	auto theme = std::make_unique<FrontendTheme>();
 	int checked = 0;
 	const bool capture = true;
+	const auto captures = glob2test::artifactDir();
+	const std::string capturePath = glob2test::artifactDirFromWorkingDirectory();
 	for (const char *presentation : {"0", "1"})
 	{
 		SDL_setenv("GLOB2_MOBILE_UI", presentation, 1);
-		for (const auto &viewport : viewports)
+		if (presentation[0] == '0' && viewport.width < 600)
+			continue;
+		resize(viewport.width, viewport.height);
+		for (const auto &fixture : fixtures())
 		{
-			if (presentation[0] == '0' && viewport.width < 600)
+			if (const char *only = SDL_getenv("GLOB2_UI_ONLY"); only && *only && std::string(only) != fixture.name)
 				continue;
-			resize(viewport.width, viewport.height);
+			// Keep generated previews while the same viewport changes safe insets.
+			// Separate viewport cases remain independently shardable in CI.
+			std::fprintf(stderr, "UI presentation fixture: %s touch=%s\n", fixture.name, presentation);
+			GAGGUI::ScreenStack stack(*globalContainer->gfx);
+			auto owned = fixture.make(stack);
+			auto *screen = dynamic_cast<UIScreen *>(owned.get());
+			require(screen != nullptr, std::string(fixture.name) + " is not a UIScreen");
+			stack.push(std::move(owned));
+			Uint32 tick = SDL_GetTicks();
+			auto frame = [&](const std::vector<SDL_Event> &events = {})
+			{
+				stack.frame(tick, events);
+				tick += 40;
+			};
+			// Every screen at the authored text size and at the largest text size.
+			for (const int percent : {100, 150})
 			for (const auto &insets : insetSets)
 			{
+				GAGCore::userTextScale = percent / 100.0;
 				GAGCore::mobileSafeInsetsForTesting = insets;
-				for (const auto &fixture : fixtures())
+				frame();
+				frame();
+				if (std::string(fixture.name) == "main-menu-more")
+					if (auto *more = screen->host().find("menu/more"))
+					{
+						const auto r = more->bounds;
+						screen->host().tapAt({r.x + r.w / 2, r.y + r.h / 2});
+						frame();
+					}
+				require(stack.running(), std::string(fixture.name) + " ended during warm-up");
+				const std::string label = std::string(fixture.name) + " " + viewport.name +
+										  " touch=" + presentation + " text=" + std::to_string(percent) +
+										  " bottom=" + std::to_string(int(insets.bottom));
+				if (const char *reveal = SDL_getenv("GLOB2_UI_REVEAL"); reveal && *reveal)
 				{
-					if (const char *only = SDL_getenv("GLOB2_UI_ONLY"); only && *only && std::string(only) != fixture.name)
-						continue;
-					GAGGUI::ScreenStack stack(*globalContainer->gfx);
-					auto owned = fixture.make(stack);
-					auto *screen = dynamic_cast<UIScreen *>(owned.get());
-					require(screen != nullptr, std::string(fixture.name) + " is not a UIScreen");
-					stack.push(std::move(owned));
-					stack.frame(0, {});
-					stack.frame(40, {});
-					require(stack.running(), std::string(fixture.name) + " ended during warm-up");
-					const std::string label = std::string(fixture.name) + " " + viewport.name +
-											  " touch=" + presentation + " bottom=" +
-											  std::to_string(int(insets.bottom));
-					if (capture && insets.bottom == 0)
-						globalContainer->gfx->printScreen("ui-" + std::string(fixture.name) + "-" +
-														  viewport.name + "-touch" + presentation + ".bmp");
-					verifyOrDump(*screen, label);
-					stack.frame(80, {});
-					// Tab reaches every control and never throws.
-					for (std::size_t i = 0; fixture.navigable && i < screen->host().focusOrder().size(); ++i)
-					{
-						SDL_Event tab{};
-						tab.type = SDL_KEYDOWN;
-						tab.key.keysym.sym = SDLK_TAB;
-						stack.frame(120 + Uint32(i), {tab});
-					}
-					if (fixture.navigable && screen->host().focused().empty())
-					{
-						std::string order;
-						for (const auto &key : screen->host().focusOrder())
-							order += key + " ";
-						require(false, label + ": tab never focused a control (order: " + order + ", editing: " + screen->host().editing() + ")");
-					}
-					screen->endExecute(0);
-					stack.frame(200, {});
-					++checked;
+					screen->host().scrollIntoView(reveal);
+					frame();
 				}
+				require(stack.top() == screen, label + ": fixture is hidden beneath a child screen");
+				std::string screenshot;
+				if (capture && insets.bottom == 0)
+				{
+					screenshot = "ui-" + std::string(fixture.name) + "-" + viewport.name + "-touch" +
+						presentation + (percent == 100 ? "" : "-text" + std::to_string(percent)) + ".bmp";
+					// Retain captures directly; profile fallback can write to the
+					// source tree, and copying captures doubles disk requirements.
+					std::filesystem::remove(captures / screenshot);
+					globalContainer->gfx->printScreen(capturePath + "/" + screenshot);
+				}
+				verifyOrDump(*screen, label);
+				frame();
+				if (!screenshot.empty())
+					require(std::filesystem::exists(captures / screenshot) &&
+						std::filesystem::file_size(captures / screenshot) > 0,
+						label + ": screenshot was not retained");
+				// Tab reaches every control and never throws.
+				for (std::size_t i = 0; fixture.navigable && i < screen->host().focusOrder().size(); ++i)
+				{
+					SDL_Event tab{};
+					tab.type = SDL_KEYDOWN;
+					tab.key.keysym.sym = SDLK_TAB;
+					frame({tab});
+				}
+				if (fixture.navigable && screen->host().focused().empty())
+				{
+					std::string order;
+					for (const auto &key : screen->host().focusOrder())
+						order += key + " ";
+					require(false, label + ": tab never focused a control (order: " + order + ", editing: " + screen->host().editing() + ")");
+				}
+				++checked;
 			}
+			screen->endExecute(0);
+			frame();
 		}
 	}
 	GAGCore::mobileSafeInsetsForTesting.reset();
+	GAGCore::userTextScale = 1;
 	theme.reset();
 	SDL_setenv("GLOB2_MOBILE_UI", "0", 1);
-	glob2test::retainFromProfile(".bmp");
 	std::printf("PASS ui presentation: %d screen/viewport combinations verified\n", checked);
 }
 } // namespace
 
 TEST_SUITE("UIPresentation")
 {
-	TEST_CASE("every screen lays out; navigates and captures across viewports; presentations and insets [display:1600x1400][artifacts][slow]")
+	TEST_CASE("every screen lays out; navigates and captures at small portrait across presentations and insets [display:1600x1400][artifacts][slow]")
 	{
-		run();
+		run(viewports[0]);
+	}
+	TEST_CASE("every screen lays out; navigates and captures at small landscape across presentations and insets [display:1600x1400][artifacts][slow]")
+	{
+		run(viewports[1]);
+	}
+	TEST_CASE("every screen lays out; navigates and captures at tablet portrait across presentations and insets [display:1600x1400][artifacts][slow]")
+	{
+		run(viewports[2]);
+	}
+	TEST_CASE("every screen lays out; navigates and captures at tablet landscape across presentations and insets [display:1600x1400][artifacts][slow]")
+	{
+		run(viewports[3]);
+	}
+	TEST_CASE("every screen lays out; navigates and captures at laptop across presentations and insets [display:1600x1400][artifacts][slow]")
+	{
+		run(viewports[4]);
+	}
+	TEST_CASE("every screen lays out; navigates and captures at fullhd across presentations and insets [display:1600x1400][artifacts][slow]")
+	{
+		run(viewports[5]);
 	}
 }

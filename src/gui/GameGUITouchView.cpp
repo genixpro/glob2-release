@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <FormatableString.h>
+#include <algorithm>
 // Presentation-only composition. Input and commands live in the coordinator,
 // placement session, and action modules; no desktop composed screen is reused.
 #include "GameGUITouch.h"
 #include "InGameTouchTheme.h"
+#include "TouchReadout.h"
+#include "Brush.h"
+#include "BrushCoverage.h"
 #include "GameGUI.h"
 #include "GameGUIInternal.h"
 #include "GlobalContainer.h"
@@ -19,26 +23,30 @@ void GameGUITouch::drawControls()
 {
 	if (usesHUD() && gui.selectionMode == GameGUI::BRUSH_SELECTION && !activeDialog())
 	{
-		const auto rect = controls();
+		// Zone choices then Done along the bar, Done under the thumb; brush size,
+		// Paint/Erase, Pan and Undo on the rail above it.
 		auto *gfx = globalContainer->gfx;
-		const std::string zones[] = {GAGCore::Toolkit::getStringTable()->getString("[Forbidden]"),
-									 GAGCore::Toolkit::getStringTable()->getString("[Guard]"),
-									 GAGCore::Toolkit::getStringTable()->getString("[Clear]")};
-		const std::string labels[] = {
-			zones[gui.toolManager.getZoneType()],
-			GAGCore::FormattableString(GAGCore::Toolkit::getStringTable()->getString("[Brush %0]"))
-				.arg(gui.brush.getFigure() + 1),
-			gui.brush.getType() == BrushTool::MODE_ADD
-				? GAGCore::Toolkit::getStringTable()->getString("[Paint]")
-				: GAGCore::Toolkit::getStringTable()->getString("[Erase]"),
-			GAGCore::Toolkit::getStringTable()->getString("[Done]")};
+		auto *strings = GAGCore::Toolkit::getStringTable();
+		const std::string labels[] = {strings->getString("[Forbidden]"), strings->getString("[Guard]"),
+									  strings->getString("[Clear]"), strings->getString("[Done]")};
+		const auto buttons = brushBarButtons();
 		for (int i = 0; i < 4; ++i)
 		{
-			const ViewRect button{rect.x + i * rect.w / 4, rect.y, rect.w / 4 - 1, rect.h};
-			gfx->drawFilledRect(int(button.x), int(button.y), int(button.w), int(button.h),
-								InGameTouchTheme::field);
-			drawPointLabel(button, labels[i], .9);
+			const auto &b = buttons[i];
+			gfx->drawFilledRect(int(b.x), int(b.y), int(b.w) - 1, int(b.h),
+								i == int(gui.toolManager.getZoneType()) ? InGameTouchTheme::selected
+																		: InGameTouchTheme::field);
+			drawPointLabel(b, labels[i], .9);
 		}
+		BrushHUD::State state;
+		state.figure = gui.brush.getFigure();
+		state.erase = gui.brush.getType() == BrushTool::MODE_DEL;
+		state.pan = brushPan;
+		state.touched = railTouched;
+		state.modeLabel = state.erase ? strings->getString("[Erase]") : strings->getString("[Paint]");
+		state.panLabel = strings->getString("[Pan]");
+		state.undoLabel = strings->getString("[Undo stroke]");
+		BrushHUD::draw(brushHUD(), state);
 		return;
 	}
 	if (!active() || gui.selectionMode != GameGUI::TOOL_SELECTION || gui.inGameMenu ||
@@ -56,11 +64,11 @@ void GameGUITouch::drawControls()
 			.9);
 		return;
 	}
-	const int half = int(rect.w / 2);
+	const auto confirm = confirmRect(), cancelBox = cancelRect();
 	gfx->setClipRect(int(rect.x), int(rect.y), int(rect.w), int(rect.h));
-	gfx->drawFilledRect(int(rect.x), int(rect.y), half, int(rect.h),
+	gfx->drawFilledRect(int(confirm.x), int(confirm.y), int(confirm.w), int(confirm.h),
 						Color(preview ? 35 : 55, preview ? 90 : 55, 45, 245));
-	gfx->drawFilledRect(int(rect.x) + half, int(rect.y), int(rect.w) - half, int(rect.h),
+	gfx->drawFilledRect(int(cancelBox.x), int(cancelBox.y), int(cancelBox.w), int(cancelBox.h),
 						Color(100, 35, 35, 245));
 	if (!confirmLabel)
 	{
@@ -80,10 +88,11 @@ void GameGUITouch::drawControls()
 	for (int index = 0; index < 2; ++index)
 	{
 		auto *label = index ? cancelLabel.get() : confirmLabel.get();
-		const double factor = std::min(rect.h * 0.42 / label->getH(), half * 0.8 / label->getW());
+		const auto box = index ? cancelBox : confirm;
+		const double factor = std::min(box.h * 0.42 / label->getH(), box.w * 0.8 / label->getW());
 		const int width = int(label->getW() * factor), height = int(label->getH() * factor);
-		gfx->drawSurface(int(rect.x) + index * half + (half - width) / 2,
-						 int(rect.y) + (int(rect.h) - height) / 2, width, height, label);
+		gfx->drawSurface(int(box.x + (box.w - width) / 2), int(box.y + (box.h - height) / 2), width,
+						 height, label);
 	}
 	gfx->setClipRect();
 }
@@ -97,6 +106,17 @@ void GameGUITouch::drawPanel()
 		return;
 	auto *gfx = globalContainer->gfx;
 	gfx->setClipRect();
+	if (inspectedBuilding() && usesDial())
+	{
+		drawDial();
+		drawAllocation();
+		return;
+	}
+	if (lensVisible())
+	{
+		drawLenses();
+		return;
+	}
 	gfx->drawFilledRect(int(panel.x), int(panel.y), int(panel.w), int(panel.h),
 						InGameTouchTheme::paper);
 	if (showsBuildPalette())
@@ -142,30 +162,39 @@ void GameGUITouch::drawHUD()
 	const auto ui = layout();
 	const double unit = gfx->logicalUnitsPerPoint();
 	gfx->setClipRect();
-	// A stroke preview is transient presentation state. Painting the actual
-	// map starts only after release, so this trail can disappear on cancellation.
-	if (stroke.points.size() > 1)
+	// Pending brush cells are transient presentation state: painting the map
+	// starts only after release (or after a held tap's window), so the preview
+	// can vanish on cancellation. Cells match the zone orders exactly.
+	const auto &pending = !stroke.points.empty() ? stroke
+						  : deferredStroke     ? deferredStroke->stroke
+											   : stroke;
+	if (!pending.points.empty() && gui.selectionMode == GameGUI::BRUSH_SELECTION)
 	{
-		auto screenPoint = [&](ViewPoint p)
+		const auto &map = gui.game.map;
+		std::vector<BrushCoverage::Cell> centres;
+		for (const auto &p : pending.points)
+			centres.push_back({(int(p.x) >> 5) & map.getMaskW(), (int(p.y) >> 5) & map.getMaskH()});
+		const auto area = world();
+		const int zone = std::clamp(pending.zone, 0, 2);
+		const Color fill = pending.mode == BrushTool::MODE_DEL ? InGameTouchTheme::erasePreview
+																 : InGameTouchTheme::zonePreview[zone];
+		const int size = std::max(2, int(std::ceil(32 * gui.camera.zoom)));
+		auto wrap = [](double value, double extent) { return value - std::floor(value / extent) * extent; };
+		gfx->setClipRect(int(area.x), int(area.y), int(area.w), int(area.h));
+		for (const auto &[x, y] : BrushCoverage::cells(pending.figure, centres))
 		{
-			auto wrap = [](double value, double extent)
-			{ return value - std::floor(value / extent) * extent; };
-			return ViewPoint{(wrap(p.x - gui.viewportX * 32, gui.game.map.getW() * 32) -
-							  gui.camera.fractionX()) *
-									 gui.camera.zoom +
-								 gui.camera.offsetX,
-							 (wrap(p.y - gui.viewportY * 32, gui.game.map.getH() * 32) -
-							  gui.camera.fractionY()) *
-									 gui.camera.zoom +
-								 gui.camera.offsetY};
-		};
-		for (size_t i = 1; i < stroke.points.size(); ++i)
-		{
-			const auto a = screenPoint(stroke.points[i - 1]), b = screenPoint(stroke.points[i]);
-			if (world().contains(a) && world().contains(b) &&
-				std::hypot(a.x - b.x, a.y - b.y) < world().w / 2)
-				gfx->drawLine(int(a.x), int(a.y), int(b.x), int(b.y), InGameTouchTheme::border);
+			const double sx = (wrap(x * 32.0 - gui.viewportX * 32, map.getW() * 32) - gui.camera.fractionX()) *
+								  gui.camera.zoom +
+							  gui.camera.offsetX,
+						 sy = (wrap(y * 32.0 - gui.viewportY * 32, map.getH() * 32) - gui.camera.fractionY()) *
+								  gui.camera.zoom +
+							  gui.camera.offsetY;
+			if (sx >= area.x + area.w || sy >= area.y + area.h || sx + size <= area.x || sy + size <= area.y)
+				continue;
+			gfx->drawFilledRect(int(sx), int(sy), size, size, fill);
+			gfx->drawRect(int(sx), int(sy), size, size, InGameTouchTheme::zonePreviewEdge[zone]);
 		}
+		gfx->setClipRect();
 	}
 	const double available =
 		std::min(ui.world.x + ui.world.w, minimapRect().x - 4 * unit) - ui.world.x;
@@ -229,7 +258,17 @@ void GameGUITouch::drawHUD()
 		drawTutorial();
 		drawPanel();
 	}
+	if (statsOpen && !activeDialog())
+		drawStats();
 	drawMinimap();
+	if (!activeDialog())
+	{
+		drawOverlayLegend();
+		if (peekOpen)
+			drawPeek();
+	}
+	if (gesture.zoomDragging())
+		TouchReadout::draw(touchPoint, zoomReadout(), ui.safe);
 	if (activeDialog())
 		return;
 	if (gui.selectionMode == GameGUI::TOOL_SELECTION ||
@@ -276,14 +315,15 @@ ViewRect GameGUITouch::tutorialRect() const
 	rect.w = std::min(rect.w - 16 * unit, 560 * unit);
 	rect.h = std::max(0.0, layout().actions.y - rect.y);
 	rect.h = tutorialCollapsed ? 48 * unit
-							   : std::min(rect.h, (std::min<size_t>(3, tutorialLines.size()) * 24 +
-												   16 + (gui.swallowSpaceKey ? 48 : 0)) *
+							   : std::min(rect.h, (std::min<size_t>(3, tutorialLines.size()) *
+														   InGameTouchTheme::tutorialPitch() +
+													   16 + (gui.swallowSpaceKey ? 48 : 0)) *
 													  unit);
 	return rect;
 }
 void GameGUITouch::prepareTutorial()
 {
-	std::string text = gui.game.sgslScript.isTextShown ? gui.game.sgslScript.textShown : "";
+	std::string text = gui.game.legacyScriptActive() && gui.game.sgslScript.isTextShown ? gui.game.sgslScript.textShown : "";
 	if (!gui.scriptText.empty())
 	{
 		if (!text.empty())
@@ -291,7 +331,8 @@ void GameGUITouch::prepareTutorial()
 		text += gui.scriptText;
 	}
 	const double width =
-		std::min(layout().world.w / globalContainer->gfx->logicalUnitsPerPoint() - 16, 560.0) - 64;
+		(std::min(layout().world.w / globalContainer->gfx->logicalUnitsPerPoint() - 16, 560.0) - 64) /
+		InGameTouchTheme::textGrowth();
 	if (text == tutorialText && width == tutorialWidth)
 		return;
 	tutorialCollapsed = false;
@@ -354,20 +395,24 @@ void GameGUITouch::drawTutorial()
 	const double footerHeight = gui.swallowSpaceKey ? 48 * unit : 0;
 	SDL_Rect clip{int(rect.x), int(rect.y), int(rect.w - 48 * unit),
 				  int(std::max(0.0, rect.h - footerHeight))};
-	const size_t first = std::min(tutorialLines.size(), size_t(tutorialScroll / 24));
-	gfx->setUITransform(1.0 * unit, rect.x + 8 * unit,
-						rect.y + (8 - tutorialScroll + first * 24) * unit, &clip);
-	const size_t end = std::min(tutorialLines.size(), first + size_t(rect.h / unit / 24) + 1);
+	// Lines are tutorialLine authored pixels apart and drawn at the text unit,
+	// so they sit tutorialPitch() points apart.
+	const double pitch = InGameTouchTheme::tutorialPitch();
+	const size_t first = std::min(tutorialLines.size(), size_t(std::max(0.0, tutorialScroll) / pitch));
+	gfx->setUITransform(gfx->textUnitsPerPoint(), rect.x + 8 * unit,
+						rect.y + (8 - tutorialScroll + first * pitch) * unit, &clip);
+	const size_t end = std::min(tutorialLines.size(), first + size_t(rect.h / unit / pitch) + 1);
 	for (size_t i = first; i < end; ++i)
-		gfx->drawString(0, int((i - first) * 24), globalContainer->standardFont, tutorialLines[i]);
+		gfx->drawString(0, int((i - first) * InGameTouchTheme::tutorialLine), globalContainer->standardFont,
+						tutorialLines[i]);
 	gfx->setUITransform();
 	gfx->setClipRect();
 	const double textHeight = std::max(1.0, rect.h - footerHeight),
-				 content = tutorialLines.size() * 24 * unit;
+				 content = tutorialLines.size() * pitch * unit;
 	if (content > textHeight)
 	{
 		gfx->drawFilledRect(int(rect.x + rect.w - 3 * unit),
-							int(rect.y + tutorialScroll * unit * textHeight / content),
+							int(rect.y + std::clamp(tutorialScroll * unit, 0.0, content - textHeight) * textHeight / content),
 							std::max(1, int(2 * unit)), int(textHeight * textHeight / content),
 							Color(170, 185, 190));
 	}
@@ -377,7 +422,9 @@ void GameGUITouch::drawTutorial()
 		gfx->drawFilledRect(int(rect.x), int(rect.y + rect.h - 48 * unit), int(rect.w),
 							int(48 * unit), InGameTouchTheme::selected);
 		SDL_Rect footer{int(rect.x), int(rect.y + rect.h - 48 * unit), int(rect.w), int(48 * unit)};
-		gfx->setUITransform(1.0 * unit, rect.x + 12 * unit, rect.y + rect.h - 32 * unit, &footer);
+		// 16 points below the footer's top at the authored size, centred as text grows.
+		gfx->setUITransform(gfx->textUnitsPerPoint(), rect.x + 12 * unit,
+							rect.y + rect.h - (24 + 8 * InGameTouchTheme::textGrowth()) * unit, &footer);
 		gfx->drawString(0, 0, globalContainer->standardFont,
 						Toolkit::getStringTable()->getString("[ok]"));
 		gfx->setUITransform();
@@ -400,6 +447,8 @@ ViewRect GameGUITouch::allocationRect() const
 	auto rect = layout().panel;
 	if (!inspectedBuilding() || rect.h <= 0)
 		return {};
+	if (usesDial())
+		return dialLayout(layout()).header;
 	rect.h = InGameTouchTheme::inspectorHeader * globalContainer->gfx->logicalUnitsPerPoint();
 	return rect;
 }
@@ -417,13 +466,13 @@ std::vector<std::string> GameGUITouch::pointLines(const std::string &text, doubl
 	auto *font = globalContainer->standardFont;
 	InGameTouchTheme::TextStyle textStyle(font);
 	return wrapTouchText(font, text,
-						 width / (textScale * globalContainer->gfx->logicalUnitsPerPoint()) - 8);
+						 width / (textScale * globalContainer->gfx->textUnitsPerPoint()) - 8);
 }
 void GameGUITouch::drawPointLabel(ViewRect rect, const std::string &text, double textScale,
 								  bool leading)
 {
 	auto *gfx = globalContainer->gfx;
-	const double unit = textScale * gfx->logicalUnitsPerPoint();
+	const double unit = textScale * gfx->textUnitsPerPoint();
 	auto clipped = rect;
 	if (labelClip)
 	{
@@ -514,19 +563,7 @@ void GameGUITouch::drawMinimap()
 }
 void GameGUITouch::navigateMinimap(ViewPoint point)
 {
-	const auto rect = minimapRect();
-	int x, y;
-	hudMinimap->convertToMap(globalContainer->gfx->getW() - 128 +
-								 int((point.x - rect.x) * 128 / rect.w),
-							 int((point.y - rect.y) * 128 / rect.h), x, y);
-	gui.updateCamera();
-	const int oldX = gui.viewportX, oldY = gui.viewportY;
-	gui.camera.originX = x * 32 - gui.camera.visibleW() / 2;
-	gui.camera.originY = y * 32 - gui.camera.visibleH() / 2;
-	gui.camera.normalize();
-	gui.viewportX = gui.camera.tileX();
-	gui.viewportY = gui.camera.tileY();
-	gui.viewportChanged(oldX, gui.viewportX, oldY, gui.viewportY);
+	navigateMinimapIn(*hudMinimap, minimapRect(), 128, point);
 }
 std::vector<std::pair<std::string, int>> GameGUITouch::tacticalActions() const
 {

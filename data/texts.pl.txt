@@ -84,6 +84,10 @@ AIWarrush
 Sprawny budowniczy wystawiający wyszkolone siły szturmowe.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Kontroler korzystający z osadzonego modułu kodu JavaScript.
 [Alga]
 Algi
 [algae]
@@ -3068,8 +3072,6 @@ Minimapa
 Przewiń do przodu
 [Hide keyboard]
 Ukryj klawiaturę
-[Dialog text size]
-Rozmiar tekstu okien dialogowych
 [Player slot]
 Miejsce gracza
 [Team color]
@@ -3150,6 +3152,30 @@ Automatycznie zapisuj grę mniej więcej co minutę.
 Przeciwnicy SI
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Przestronny układ używa panelu bocznego, gdy jest miejsce. Kompaktowy używa paska narzędzi i wysuwanych paneli.
+[settings One-finger zoom]
+Powiększanie jednym palcem
+[settings Double-tap the map, hold, then drag to zoom.]
+Dotknij mapy dwukrotnie, przytrzymaj i przeciągnij, aby powiększyć.
+[settings Platform default]
+Domyślne systemu
+[settings Drag up zooms in]
+Przeciągnij w górę, aby przybliżyć
+[settings Drag down zooms in]
+Przeciągnij w dół, aby przybliżyć
+[settings Thumb side]
+Strona kciuka
+[settings Phone controls gather in this bottom corner.]
+Na telefonie przyciski gromadzą się w tym dolnym rogu.
+[settings Right]
+Prawa
+[settings Left]
+Lewa
+[Undo stroke]
+Cofnij
+[No overlay]
+Bez nakładki
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Przydzielono %0 · Cel %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Szansa na wygraną: %0 · Siła: %1
 Min. wymagany poziom: %0
 [Confirm %0]
 Ok: %0
-[Dialog text size %0]
-Rozmiar tekstu okien dialogowych: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Wznów grę
 Gry
 [Add AI]
 Dodaj SI
+[settings Experiments]
+Eksperymenty
+[settings Try features we are still testing. They can change balance and pacing.]
+Wypróbuj funkcje, które wciąż testujemy. Mogą zmienić balans i tempo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Eksperymenty dotyczą nowych gier, które zaczynasz lub hostujesz, nigdy misji kampanii. Zapisana gra zachowuje te, z którymi się zaczęła.
+[Experiments set by the host]
+Eksperymenty wybrane przez hosta
+[settings No experiments in this build.]
+Brak eksperymentów w tej wersji.
+[Experiments]
+Eksperymenty
+[experiment guard-area-balancing]
+Równoważenie stref straży
+[experiment guard-area-balancing help]
+Wolni wojownicy rozdzielają się między namalowane strefy straży, zamiast wszyscy iść do najbliższej: większa strefa dostaje ich więcej, a przepełniona strefa stopniowo opróżnia się do pozostałych.
+[settings Touch scrolling]
+Przewijanie dotykiem
+[settings List momentum]
+Rozpęd list
+[settings How far lists and panels keep scrolling after a flick.]
+Jak daleko listy i panele przewijają się po machnięciu.
+[settings List bounce]
+Odbicie list
+[settings How much lists and panels stretch past their ends and spring back.]
+Jak mocno listy i panele rozciągają się poza krawędź i wracają.
+[settings Map momentum]
+Rozpęd mapy
+[settings How far the map keeps panning after a flick.]
+Jak daleko mapa przesuwa się po machnięciu.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Odczucie przewijania dotykiem. 0 wyłącza efekt; 50 to wartość domyślna.
+[List momentum]
+Rozpęd list
+[List bounce]
+Odbicie list
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Rozpęd mapy

@@ -84,6 +84,10 @@ AIWarrush
 En stark byggare som sätter in tränade anfallsstyrkor.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+En styrenhet som använder en inbäddad JavaScript-källkodsmodul.
 [Alga]
 Alger
 [algae]
@@ -3078,8 +3082,6 @@ Minikarta
 Spola framåt
 [Hide keyboard]
 Dölj tangentbordet
-[Dialog text size]
-Dialogtextstorlek
 [Player slot]
 Spelarplats
 [Team color]
@@ -3160,6 +3162,30 @@ Spara spelet automatiskt ungefär varje minut.
 AI-motståndare
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Rymlig layout använder en sidopanel när det finns plats. Kompakt layout använder ett verktygsfält och utfällbara paneler.
+[settings One-finger zoom]
+Zooma med ett finger
+[settings Double-tap the map, hold, then drag to zoom.]
+Dubbeltryck på kartan, håll kvar och dra för att zooma.
+[settings Platform default]
+Systemstandard
+[settings Drag up zooms in]
+Dra uppåt zoomar in
+[settings Drag down zooms in]
+Dra nedåt zoomar in
+[settings Thumb side]
+Tumsida
+[settings Phone controls gather in this bottom corner.]
+På telefonen samlas kontrollerna i det här nedre hörnet.
+[settings Right]
+Höger
+[settings Left]
+Vänster
+[Undo stroke]
+Ångra
+[No overlay]
+Inget lager
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Tilldelade %0 · Mål %1
 [Range: %0]
@@ -3394,8 +3420,6 @@ Vinstchans: %0 · Styrka: %1
 Lägsta tillåtna nivå: %0
 [Confirm %0]
 Ok: %0
-[Dialog text size %0]
-Dialogtextstorlek: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3404,3 +3428,117 @@ Dialogtextstorlek: %0%
 Spel
 [Add AI]
 Lägg till AI
+[settings Experiments]
+Experiment
+[settings Try features we are still testing. They can change balance and pacing.]
+Prova funktioner som vi fortfarande testar. De kan ändra balans och tempo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Experiment gäller nya spel som du startar eller är värd för, aldrig kampanjuppdrag. Ett sparat spel behåller dem det startade med.
+[Experiments set by the host]
+Experiment valda av värden
+[settings No experiments in this build.]
+Inga experiment i den här versionen.
+[Experiments]
+Experiment
+[experiment guard-area-balancing]
+Balansering av vaktområden
+[experiment guard-area-balancing help]
+Fria krigare fördelar sig mellan de målade vaktområdena i stället för att alla ta det närmaste: ett större område får fler av dem, och ett överfullt område tunnas ut till de andra.
+[settings Touch scrolling]
+Pekrullning
+[settings List momentum]
+Listornas fart
+[settings How far lists and panels keep scrolling after a flick.]
+Hur långt listor och paneler fortsätter rulla efter ett svep.
+[settings List bounce]
+Listornas studs
+[settings How much lists and panels stretch past their ends and spring back.]
+Hur mycket listor och paneler töjs förbi kanten och fjädrar tillbaka.
+[settings Map momentum]
+Kartans fart
+[settings How far the map keeps panning after a flick.]
+Hur långt kartan fortsätter röra sig efter ett svep.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Känslan i pekrullning. 0 stänger av en effekt; 50 är standard.
+[List momentum]
+Listornas fart
+[List bounce]
+Listornas studs
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Kartans fart

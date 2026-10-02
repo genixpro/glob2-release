@@ -84,6 +84,10 @@ Warrush
 Un constructor eficaz que despliega fuerzas de ataque entrenadas.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Un controlador que utiliza un módulo de código JavaScript integrado.
 [Alga]
 Algas
 [algae]
@@ -3068,8 +3072,6 @@ Minimapa
 Avance rápido
 [Hide keyboard]
 Ocultar teclado
-[Dialog text size]
-Tamaño del texto de los diálogos
 [Player slot]
 Puesto de jugador
 [Team color]
@@ -3150,6 +3152,30 @@ Guardar la partida automáticamente cada minuto aproximadamente.
 Oponentes de IA
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 La disposición amplia usa un panel lateral cuando hay espacio. La compacta usa una barra de herramientas y paneles desplegables.
+[settings One-finger zoom]
+Zoom con un dedo
+[settings Double-tap the map, hold, then drag to zoom.]
+Toca dos veces el mapa, mantén pulsado y arrastra para hacer zoom.
+[settings Platform default]
+Predeterminado del sistema
+[settings Drag up zooms in]
+Arrastrar hacia arriba acerca
+[settings Drag down zooms in]
+Arrastrar hacia abajo acerca
+[settings Thumb side]
+Lado del pulgar
+[settings Phone controls gather in this bottom corner.]
+Los controles del móvil se agrupan en esta esquina inferior.
+[settings Right]
+Derecha
+[settings Left]
+Izquierda
+[Undo stroke]
+Deshacer
+[No overlay]
+Sin capa
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Asignados %0 · Objetivo %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Probabilidad de ganar: %0 · Aptitud: %1
 Nivel mínimo necesario: %0
 [Confirm %0]
 Aceptar: %0
-[Dialog text size %0]
-Tamaño del texto de los diálogos: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Reanudar partida
 Partidas
 [Add AI]
 Añadir IA
+[settings Experiments]
+Experimentos
+[settings Try features we are still testing. They can change balance and pacing.]
+Prueba funciones que todavía estamos probando. Pueden cambiar el equilibrio y el ritmo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Los experimentos se aplican a las partidas nuevas que inicias o alojas, nunca a las misiones de campaña. Una partida guardada conserva los que tenía al empezar.
+[Experiments set by the host]
+Experimentos elegidos por el anfitrión
+[settings No experiments in this build.]
+No hay experimentos en esta versión.
+[Experiments]
+Experimentos
+[experiment guard-area-balancing]
+Equilibrio de zonas de guardia
+[experiment guard-area-balancing help]
+Los guerreros libres se reparten entre las zonas de guardia pintadas en lugar de ir todos a la más cercana: una zona más grande recibe más, y una zona saturada se vacía poco a poco hacia las demás.
+[settings Touch scrolling]
+Desplazamiento táctil
+[settings List momentum]
+Inercia de las listas
+[settings How far lists and panels keep scrolling after a flick.]
+Cuánto siguen desplazándose las listas y paneles tras un gesto.
+[settings List bounce]
+Rebote de las listas
+[settings How much lists and panels stretch past their ends and spring back.]
+Cuánto se estiran las listas y paneles más allá de sus extremos antes de volver.
+[settings Map momentum]
+Inercia del mapa
+[settings How far the map keeps panning after a flick.]
+Cuánto sigue moviéndose el mapa tras un gesto.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Sensación del desplazamiento táctil. 0 desactiva un efecto; 50 es el valor predeterminado.
+[List momentum]
+Inercia de las listas
+[List bounce]
+Rebote de las listas
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Inercia del mapa

@@ -6,6 +6,7 @@
 
 #include "GameGUI.h"
 #include "ui/FrontendUI.h"
+#include "TeamStatChart.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -56,7 +57,6 @@ class EndGameScreen : public GAGGUI::ui::UIScreen
 	bool metricPickerOpen() { return host().popupOpen(); }
 
   protected:
-	double textScale(const Glob2UI::Presentation &presentation) const override;
 	void paintBackground(Glob2UI::Canvas &canvas) override;
 	Glob2UI::Rect available(const Glob2UI::Presentation &presentation, const Glob2UI::Metrics &metrics) override;
 	void onEscape() override;
@@ -84,9 +84,7 @@ class EndGameScreen : public GAGGUI::ui::UIScreen
 	void paintChart(Glob2UI::Canvas &canvas, Glob2UI::Rect r);
 	void paintCurves(GAGCore::DrawableSurface &surface, Glob2UI::Rect r);
 	void paintMeasurements(GAGCore::DrawableSurface &surface, Glob2UI::Rect r);
-	double getValue(double position, int team, int type) const;
-	static std::string getTimeText(int seconds);
-	static std::string getRightScaleText(int value, int digits);
+	TeamStatChart::Options chartOptions() const;
 	void saveReplay(const char *dir, const char *ext);
 	Glob2UI::Element teamRows(const Glob2UI::Presentation &p);
 };

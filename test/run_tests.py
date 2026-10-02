@@ -5,6 +5,7 @@ Every engine test case runs in its own process with a disposable profile, dummy 
 drivers unless it is tagged [display], a timeout and captured output shown only on
 failure. The unit binary runs in one process. Results are merged into one JUnit file
 and, under GitHub Actions, into the step summary with per-failure annotations.
+Fullscreen checks within display cases run only with --fullscreen.
 
 Tags are bracketed words at the end of a test-case name:
   [display]        needs a real window; xvfb on Linux, skipped on Windows and --no-display
@@ -25,6 +26,7 @@ Examples:
 """
 
 import argparse
+from collections import Counter
 import concurrent.futures
 import fnmatch
 import os
@@ -213,22 +215,55 @@ def make_jobs(cases, args, all_cases=None):
     return jobs
 
 
+def doctest_pattern(name):
+    """Quote separators in doctest's comma-separated filter grammar."""
+    return name.replace('\\', '\\\\').replace(',', '\\,')
+
+
 def doctest_filter(job):
     if job.whole:
         if job.without_benchmarks:
             return ['-tce=*[benchmark]*']
         if not job.subset:
             return []
-        # doctest takes comma-separated name patterns; test names never contain commas.
-        filters = ['-tc=' + ','.join(case.name for case in job.cases)]
+        filters = ['-tc=' + ','.join(doctest_pattern(case.name) for case in job.cases)]
         if job.cases[0].suite:
-            filters.append('-ts=' + job.cases[0].suite)
+            filters.append('-ts=' + doctest_pattern(job.cases[0].suite))
         return filters
     case = job.cases[0]
-    filters = ['-tc=' + case.name]
+    filters = ['-tc=' + doctest_pattern(case.name)]
     if case.suite:
-        filters.append('-ts=' + case.suite)
+        filters.append('-ts=' + doctest_pattern(case.suite))
     return filters
+
+
+def junit_execution_issue(job, junit_text):
+    """A successful exit must prove that every selected case actually executed."""
+    if not junit_text:
+        return 'test process produced no JUnit report'
+    try:
+        document = ET.fromstring(junit_text)
+    except ET.ParseError as error:
+        return f'invalid JUnit report: {error}'
+    executed = [case for case in document.iter('testcase') if case.find('skipped') is None]
+    if not executed:
+        return 'JUnit report contains no executed test cases'
+    expected = Counter((case.file, case.name) for case in job.cases)
+    actual = Counter((case.get('classname', ''), case.get('name', '')) for case in executed)
+    missing, unexpected = expected - actual, actual - expected
+    if missing or unexpected:
+        def describe(cases):
+            return '; '.join(f'{file}/{name} ({count})' for (file, name), count in cases.items())
+
+        details = []
+        if missing:
+            details.append('missing selected cases: ' + describe(missing))
+        if unexpected:
+            details.append('unexpected executed cases: ' + describe(unexpected))
+        return 'JUnit execution does not match selection: ' + '; '.join(details)
+    if any(case.find('failure') is not None or case.find('error') is not None for case in executed):
+        return 'JUnit records test failures despite a successful process exit'
+    return ''
 
 
 def xvfb_prefix(job):
@@ -237,7 +272,9 @@ def xvfb_prefix(job):
     xvfb = shutil.which('xvfb-run')
     if not xvfb:
         return []
-    return [xvfb, '-a', '-s', f'-screen 0 {job.screen}x24']
+    # SDL closes its last X connection between contexts. Keep Xvfb from
+    # resetting while the next context reconnects.
+    return [xvfb, '-a', '-s', f'-screen 0 {job.screen}x24 -noreset']
 
 
 def run_job(job, args, build_dir):
@@ -256,6 +293,8 @@ def run_job(job, args, build_dir):
                TMPDIR=str(root), TMP=str(root), TEMP=str(root), SDL_AUDIODRIVER='dummy')
     env.pop('GLOB2_MOBILE_UI', None)
     env.pop('GLOB2_USER_DIR', None)
+    # Always override inherited opt-in: a standard run must not take over the desktop.
+    env['GLOB2_TEST_FULLSCREEN'] = '1' if args.fullscreen else '0'
     if job.display:
         env['GLOB2_TEST_DISPLAY'] = '1'
         env.pop('SDL_VIDEODRIVER', None)
@@ -308,6 +347,12 @@ def run_job(job, args, build_dir):
             note = 'the test changed the profile preferences; tag it [writes-preferences] if that is intended'
             output += f'\n[run_tests] {note}\n'
     junit_text = junit.read_text(encoding='utf-8', errors='replace') if junit.exists() else ''
+    if status == 'pass':
+        issue = junit_execution_issue(job, junit_text)
+        if issue:
+            status = 'error'
+            note = issue
+            output += f'\n[run_tests] {issue}\n'
     if status != 'pass' and junit_text:
         output += failure_details(junit_text)
     result = Result(job, status, seconds, output, junit_text, str(root), note)
@@ -443,6 +488,7 @@ def main(argv=None):
     parser.add_argument('--timeout', type=int, default=None, help='override every timeout, in seconds')
     parser.add_argument('--in-process', action='store_true', help='run the engine binary as one process')
     parser.add_argument('--no-display', action='store_true', help='skip [display] cases')
+    parser.add_argument('--fullscreen', action='store_true', help='enable fullscreen checks within [display] cases (takes over the desktop; prefer a virtual display)')
     parser.add_argument('--quick', action='store_true', help='skip [slow] cases')
     parser.add_argument('--update-fixtures', action='store_true', help='rewrite [golden] fixtures instead of checking them')
     parser.add_argument('--junit', type=Path, default=ROOT / 'artifacts' / 'tests' / 'junit.xml')

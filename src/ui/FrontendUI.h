@@ -13,6 +13,39 @@ namespace Glob2UI
 {
 using namespace GAGGUI::ui;
 
+enum class UIIcon
+{
+	Settings,
+	Editor,
+	LoadGame,
+	Display,
+	Audio,
+	Gameplay,
+	Buildings,
+	Controls,
+	Player,
+	CustomGame,
+	Campaign,
+	Tutorial,
+	Online,
+	LAN,
+	Credits,
+	Quit,
+	Back,
+	More,
+	Send,
+	Close,
+	Refresh,
+	Info,
+	Experiments,
+	Count
+};
+IconRef uiIcon(UIIcon icon);
+// Familiar toolbar actions: a named 48-point icon button on touch, text on pointer hosts.
+Element compactButton(const std::string &key, const std::string &label, UIIcon icon,
+					  std::function<void()> action, const Presentation &p,
+					  ButtonOptions options = {});
+
 const Theme &frontendTheme();
 // The dark purple in-match look of the touch HUD.
 const Theme &inGameTheme();
@@ -23,9 +56,6 @@ bool touchPresentation();
 
 // Translated string lookup, "[key]" convention.
 std::string tr(const std::string &key);
-
-// Presentation text scale from the local settings.
-double frontendTextScale(const Presentation &presentation);
 
 // Layout helpers shared by frontend screens.
 struct MenuAction
@@ -46,7 +76,6 @@ class Screen : public UIScreen
 	~Screen() override;
 
   protected:
-	double textScale(const Presentation &presentation) const override;
 	void paintBackground(Canvas &canvas) override;
 	void beforePaint() override;
 	// Whether the content sits on a paper panel; menus and forms do, full-window views do not.
@@ -62,7 +91,6 @@ class Dialog : public UIDialog
 	Dialog();
 
   protected:
-	double textScale(const Presentation &presentation) const override;
 	bool scrim() const override { return false; }
 };
 
@@ -76,7 +104,6 @@ class InGameDialog : public UIDialog
 	bool classic() const { return classicLook; }
 
   protected:
-	double textScale(const Presentation &presentation) const override;
 	bool scrim() const override { return false; }
 	void paintPanel(GAGGUI::ui::Canvas &canvas, GAGGUI::ui::Rect panel) override;
 	// A classic button: 300 points wide, 40 tall, in the menu font.

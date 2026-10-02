@@ -4,6 +4,7 @@
 #pragma once
 
 #include "Header.h"
+#include "ExperimentalFeatures.h"
 #include <string>
 #include <map>
 #include "IntBuildingType.h"
@@ -70,13 +71,56 @@ public:
 	bool rememberUnit;
 	bool scrollWheelEnabled;
 	bool highResolutionArtwork;
+	// Local rendering preferences; never serialized into games or orders.
+	bool clouds;
+	bool cloudShadows;
+	bool buildingParticles;
+	bool fullMagicEffects;
+	bool translucentPanels;
+	bool translucentPathLines;
+	bool smoothProgressIndicators;
+	bool decorativeAnimations;
+	void setGraphicsDetail(bool full);
+	static constexpr Uint32 LEGACY_LOW_DETAIL = 0x1;
 	/// Periodically saves the game in progress as "Auto save".
 	bool autosaveGames;
+	/// Experimental features to bake into every new game this player starts or
+	/// hosts (Settings > Experiments). Saved as comma-separated keys; a key this
+	/// build no longer knows is dropped on load.
+	ExperimentSet experiments;
 	/// Simulation speed preset. Zero is the original 25 ticks/second;
 	/// higher values progressively reduce delays and then skip rendered frames.
 	int gameSpeed;
     std::string interfacePresentation = "automatic";
-    int mobileDialogTextPercent; // Local UI preference; never part of saves/orders.
+    // Size of all touch interface text, 100..150 percent: menus, dialogs and the
+    // HUD. Local UI preference; never part of saves/orders. Replaces the former
+    // mobileDialogTextPercent, which only compensated in-game dialogs and is ignored.
+    int textSizePercent = 100;
+    // Store and apply the text size (clamped) to every touch text surface.
+    void setTextSizePercent(int percent);
+    // Touch scroll feel, 0..100 each: 0 turns the effect off, 50 is the default.
+    // Local presentation preferences; never part of saves or orders.
+    int touchScrollMomentum = 50; // lists, panels and trays keep moving after a flick
+    int touchScrollBounce = 50;   // lists, panels and trays stretch past their ends
+    int mapScrollMomentum = 50;   // game and editor maps keep panning after a flick
+	/// One-finger zoom (double-tap, hold, drag) direction; local UI preference.
+	enum OneFingerZoom
+	{
+		ONE_FINGER_ZOOM_PLATFORM = 0, ///< Match the system maps app
+		ONE_FINGER_ZOOM_UP_IN = 1,
+		ONE_FINGER_ZOOM_DOWN_IN = 2,
+	};
+	int oneFingerZoomDirection;
+	/// Bottom corner the phone controls gather in; local UI preference.
+	enum ThumbSide
+	{
+		THUMB_RIGHT = 0,
+		THUMB_LEFT = 1,
+	};
+	int thumbSide;
+	/// Resolves the platform default: Google Maps (Android) zooms in on a
+	/// downward drag, Apple Maps and others on an upward drag.
+	bool dragUpZoomsIn(void) const;
 
 	enum
 	{

@@ -84,6 +84,10 @@ AIWarrush
 Silný stavitel, který nasazuje vycvičené útočné síly.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Řadič používající vložený modul zdrojového kódu JavaScript.
 [Alga]
 Řasy
 [algae]
@@ -3068,8 +3072,6 @@ Minimapa
 Rychlý posun
 [Hide keyboard]
 Skrýt klávesnici
-[Dialog text size]
-Velikost textu dialogů
 [Player slot]
 Místo hráče
 [Team color]
@@ -3150,6 +3152,30 @@ Automaticky ukládat hru přibližně každou minutu.
 Počítačoví soupeři
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Prostorné rozložení používá boční panel, pokud je dost místa. Kompaktní používá panel nástrojů a vysouvací panely.
+[settings One-finger zoom]
+Přiblížení jedním prstem
+[settings Double-tap the map, hold, then drag to zoom.]
+Dvakrát klepněte na mapu, podržte a tažením měňte přiblížení.
+[settings Platform default]
+Výchozí systému
+[settings Drag up zooms in]
+Tažením nahoru přiblížit
+[settings Drag down zooms in]
+Tažením dolů přiblížit
+[settings Thumb side]
+Strana palce
+[settings Phone controls gather in this bottom corner.]
+Ovládací prvky na telefonu se soustředí do tohoto dolního rohu.
+[settings Right]
+Vpravo
+[settings Left]
+Vlevo
+[Undo stroke]
+Zpět
+[No overlay]
+Bez vrstvy
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Přiděleno %0 · Cíl %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Kolonie %0
 Min. úroveň jednotek: %0
 [Confirm %0]
 Budiž: %0
-[Dialog text size %0]
-Velikost textu dialogů: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Pokračovat ve hře
 Hry
 [Add AI]
 Přidat počítač
+[settings Experiments]
+Experimenty
+[settings Try features we are still testing. They can change balance and pacing.]
+Vyzkoušejte funkce, které stále testujeme. Mohou změnit vyváženost a tempo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Experimenty platí pro nové hry, které založíte nebo hostujete, nikdy pro mise kampaně. Uložená hra si ponechá ty, se kterými začala.
+[Experiments set by the host]
+Experimenty zvolené hostitelem
+[settings No experiments in this build.]
+V tomto sestavení nejsou žádné experimenty.
+[Experiments]
+Experimenty
+[experiment guard-area-balancing]
+Vyvažování strážních oblastí
+[experiment guard-area-balancing help]
+Volní bojovníci se rozdělí mezi vyznačené strážní oblasti, místo aby všichni šli do nejbližší: větší oblast jich dostane více a přeplněná oblast se postupně vyprázdní do ostatních.
+[settings Touch scrolling]
+Dotykové posouvání
+[settings List momentum]
+Setrvačnost seznamů
+[settings How far lists and panels keep scrolling after a flick.]
+Jak daleko se seznamy a panely posouvají po švihnutí.
+[settings List bounce]
+Odraz seznamů
+[settings How much lists and panels stretch past their ends and spring back.]
+Jak moc se seznamy a panely natáhnou za okraj a vrátí zpět.
+[settings Map momentum]
+Setrvačnost mapy
+[settings How far the map keeps panning after a flick.]
+Jak daleko se mapa posouvá po švihnutí.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Pocit z dotykového posouvání. 0 efekt vypne; 50 je výchozí hodnota.
+[List momentum]
+Setrvačnost seznamů
+[List bounce]
+Odraz seznamů
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Setrvačnost mapy

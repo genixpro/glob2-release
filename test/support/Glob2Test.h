@@ -91,6 +91,10 @@ namespace glob2test
 	// rewrite their expected text instead of checking it.
 	bool updatingFixtures();
 
+	// Fullscreen transitions are disruptive on a desktop. Enable explicitly with
+	// run_tests.py --fullscreen (or GLOB2_TEST_FULLSCREEN=1 for a direct binary run).
+	bool fullscreenEnabled();
+
 	// Compares `actual` with test/fixtures/<relative>, line endings normalised, and
 	// reports the first differing line. Rewrites the fixture when updatingFixtures().
 	void expectGolden(const std::string& relative, const std::string& actual);
@@ -101,6 +105,10 @@ namespace glob2test
 
 	std::string readFile(const std::filesystem::path& path);
 	void writeFile(const std::filesystem::path& path, const std::string& text);
+
+	// Portable setenv/unsetenv: mingw has neither, and SDL2 cannot unset.
+	void setEnv(const char* name, const char* value);
+	void unsetEnv(const char* name);
 
 	// Copies files with the given extension (".bmp", ".png") from the disposable
 	// profile into artifactDir(), so screenshots survive the profile's removal.

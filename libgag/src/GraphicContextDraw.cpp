@@ -1,15 +1,140 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
-#include <cmath>
-#include <cassert>
-#include <algorithm>
 #include "GraphicContextPrivate.h"
+#include "OpaqueRectangleBatch.h"
+
+#include <algorithm>
+#include <cassert>
+#include <cmath>
+#include <exception>
+#include <stdexcept>
+#include <vector>
 
 namespace GAGCore
 {
+    namespace
+    {
+        // Rendering is confined to the active context's presentation thread.
+        // Scratch storage is reused across bars and bounded by the flush limit.
+        class RectangleBatchState
+        {
+        public:
+            static constexpr size_t maxRectangles = 4096;
+
+            bool owns(const GraphicContext *context) const { return owner == context; }
+
+            void begin(GraphicContext *context)
+            {
+                if (owner) throw std::logic_error("Rectangle batch scopes cannot nest");
+                owner = context;
+            }
+
+            bool append(float x, float y, float w, float h, const Color &color, RenderBackend *backend)
+            {
+                const bool startsSubmission = quads.empty();
+                renderer = backend;
+                quads.push_back({x, y, w, h, color});
+                if (quads.size() == maxRectangles) flush();
+                return startsSubmission;
+            }
+
+            void flush()
+            {
+                if (quads.empty()) return;
+                if (renderer)
+                {
+                    vertices.clear();
+                    vertices.reserve(quads.size() * 6);
+                    for (const auto &quad : quads)
+                    {
+                        const SDL_Color color{quad.color.r, quad.color.g, quad.color.b, 255};
+                        const SDL_Vertex a{{quad.x, quad.y}, color, {}},
+                                         b{{quad.x + quad.w, quad.y}, color, {}},
+                                         c{{quad.x + quad.w, quad.y + quad.h}, color, {}},
+                                         d{{quad.x, quad.y + quad.h}, color, {}};
+                        vertices.insert(vertices.end(), {a, b, c, a, c, d});
+                    }
+                    renderer->triangles(vertices);
+                }
+#ifdef HAVE_OPENGL
+                else
+                {
+                    glState.doBlend(false);
+                    glState.doTexture(false);
+                    glBegin(GL_QUADS);
+                    for (const auto &quad : quads)
+                    {
+                        // Emscripten interleaves immediate-mode attributes: each
+                        // vertex needs a color entry, even when a quad is uniform.
+                        const auto vertex = [&](float x, float y) {
+                            glColor3ub(quad.color.r, quad.color.g, quad.color.b);
+                            glVertex2f(x, y);
+                        };
+                        vertex(quad.x, quad.y);
+                        vertex(quad.x + quad.w, quad.y);
+                        vertex(quad.x + quad.w, quad.y + quad.h);
+                        vertex(quad.x, quad.y + quad.h);
+                    }
+                    glEnd();
+                }
+#endif
+                quads.clear();
+            }
+
+            void discard() noexcept
+            {
+                quads.clear();
+                vertices.clear();
+                owner = nullptr;
+                renderer = nullptr;
+            }
+
+            void finish()
+            {
+                try { flush(); }
+                catch (...) { discard(); throw; }
+                discard();
+            }
+
+        private:
+            struct Quad { float x, y, w, h; Color color; };
+            GraphicContext *owner = nullptr;
+            RenderBackend *renderer = nullptr;
+            std::vector<Quad> quads;
+            std::vector<SDL_Vertex> vertices;
+        };
+
+        RectangleBatchState rectangleBatch;
+    }
+
+    OpaqueRectangleBatch::OpaqueRectangleBatch(GraphicContext *context)
+    {
+        // CPU rectangles use direct fills; only accelerated paths batch geometry.
+        bool enabled = context->getOptionFlags() & GraphicContext::PORTABLEGPU;
+#ifdef HAVE_OPENGL
+        enabled = enabled || (context->getOptionFlags() & GraphicContext::USEGPU);
+#endif
+        if (enabled)
+        {
+            rectangleBatch.begin(context);
+            active = true;
+        }
+    }
+
+    OpaqueRectangleBatch::~OpaqueRectangleBatch() noexcept(false)
+    {
+        if (!active) return;
+        // A failed drawing operation has already aborted this pass. Discard its
+        // queued geometry instead of risking a second exception during unwinding.
+        if (std::uncaught_exceptions() > 0) rectangleBatch.discard();
+        else rectangleBatch.finish();
+    }
+
 	void GraphicContext::beginMapTransform(float zoom,float x,float y,int cx,int cy,int cw,int ch)
 	{
+		if (renderBatch)
+			renderBatch->stateChange();
         if (zoom!=1 || x!=0 || y!=0) beginSoftwareTransform();
         if (renderer) {
             assert(!mapTransformActive);
@@ -27,6 +152,8 @@ namespace GAGCore
 	}
 	void GraphicContext::endMapTransform()
 	{
+		if (renderBatch)
+			renderBatch->stateChange();
         if (renderer) { renderer->transform(1,0,0,nullptr); mapTransformActive=false; mapScale=1; endSoftwareTransform(); setClipRect(); return; }
 #ifdef HAVE_OPENGL
 		if(!mapTransformActive)return;
@@ -37,6 +164,9 @@ namespace GAGCore
 
     void GraphicContext::drawMapCopies(int pw,int ph,int vw,int vh,const std::function<void()> &draw)
     {
+		if (renderBatch)
+			renderBatch->stateChange();
+		if (renderer) prepareDraw();
         draw();
         if (renderer && pw>0 && ph>0) {
             SDL_Rect bounds{mapClipX,mapClipY,mapClipW,mapClipH};
@@ -67,6 +197,7 @@ namespace GAGCore
 
     void GraphicContext::drawMapBoundary(int x1, int y1, int x2, int y2, const Color& color)
     {
+		if (renderer) prepareDraw();
         assert(x1 == x2 || y1 == y2);
         // Snap in the actual raster target, then return to world coordinates.
         // Include periodic-copy translation: wrapped maps need the same pixel
@@ -103,6 +234,8 @@ namespace GAGCore
 
     void GraphicContext::beginScreenOverlay(int &x,int &y,int &sx,int &sy,int &sw,int &sh)
     {
+		if (renderBatch)
+			renderBatch->stateChange();
         if (renderer && mapTransformActive) {
             x=x*mapScale+mapTranslateX; y=y*mapScale+mapTranslateY;
             sx=mapClipX; sy=mapClipY; sw=mapClipW; sh=mapClipH;
@@ -120,6 +253,8 @@ namespace GAGCore
     }
     void GraphicContext::endScreenOverlay()
     {
+		if (renderBatch)
+			renderBatch->stateChange();
         if (renderer && mapTransformActive) {
             mapScale=overlayScale; SDL_Rect bounds{mapClipX,mapClipY,mapClipW,mapClipH};
             renderer->transform(mapScale,mapTranslateX,mapTranslateY,&bounds); return;
@@ -134,6 +269,8 @@ namespace GAGCore
 	// transform does not scale the way it scales filled geometry.
 	void GraphicContext::setScaledLineWidth(float width)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
 		#ifdef HAVE_OPENGL
 		glLineWidth(width * rasterScale() * mapScale);
 		#endif
@@ -141,6 +278,8 @@ namespace GAGCore
 
 	void GraphicContext::setClipRect(int x, int y, int w, int h)
 	{
+		if (renderBatch)
+			renderBatch->stateChange();
 #ifdef HAVE_OPENGL
         if (uiTransformActive && !renderer && (optionFlags & USEGPU)) {
             SDL_Rect transformed{int(std::floor(x*uiTransformScale+uiTransformX)),int(std::floor(y*uiTransformScale+uiTransformY)),
@@ -151,6 +290,7 @@ namespace GAGCore
 #endif
 		if(mapTransformActive){x=mapClipX;y=mapClipY;w=mapClipW;h=mapClipH;}
 		DrawableSurface::setClipRect(x, y, w, h);
+		if (nativeSoftware) SDL_SetClipRect(sdlsurface, nullptr);
         if (renderer) renderer->clip(mapTransformActive ? nullptr : &clipRect);
 		#ifdef HAVE_OPENGL
 		if (_gc->optionFlags & GraphicContext::USEGPU)
@@ -169,6 +309,13 @@ namespace GAGCore
 				sw = static_cast<int>(sw * scale + 0.5f);
 				sh = static_cast<int>(sh * scale + 0.5f);
 			}
+			if (nativeDesktop)
+			{
+				const double xScale=double(drawableW)/getW(), yScale=double(drawableH)/getH();
+				sx=int(std::lround(clipRect.x*xScale)); sy=int(std::lround((getH()-clipRect.y-clipRect.h)*yScale));
+				sw=int(std::lround((clipRect.x+clipRect.w)*xScale))-sx;
+				sh=int(std::lround((getH()-clipRect.y)*yScale))-sy;
+			}
 			glScissor(sx, sy, sw, sh);
 		}
 		#endif
@@ -176,6 +323,8 @@ namespace GAGCore
 
 	void GraphicContext::setClipRect(void)
 	{
+		if (renderBatch)
+			renderBatch->stateChange();
 #ifdef HAVE_OPENGL
         if (uiTransformActive && !renderer && (optionFlags & USEGPU)) {
             uiTransformActive=false;
@@ -185,6 +334,7 @@ namespace GAGCore
 #endif
 		if(mapTransformActive){setClipRect(mapClipX,mapClipY,mapClipW,mapClipH);return;}
 		DrawableSurface::setClipRect();
+		clipRect = SDL_Rect{0,0,getW(),getH()};
         if (renderer) renderer->clip(nullptr);
 		#ifdef HAVE_OPENGL
 		if (_gc->optionFlags & GraphicContext::USEGPU)
@@ -230,6 +380,23 @@ namespace GAGCore
 
 	void GraphicContext::drawRect(float x, float y, float w, float h, const Color& color)
 	{
+		if (renderBatch && renderBatch->active())
+		{
+			std::array<QueueVertex, 8> v{};
+			float xx[8] = {x, x + w, x + w, x + w, x + w, x, x, x},
+				  yy[8] = {y, y, y, y + h, y + h, y + h, y + h, y};
+			for (int i = 0; i < 8; ++i)
+			{
+				v[i].x = xx[i];
+				v[i].y = yy[i];
+				v[i].color = color;
+			}
+			renderBatch->append(
+				{QueueKey::Outline, 0, 0, false, false, true, rasterScale() * mapScale}, v, 8);
+			return;
+		}
+
+		if (renderer) prepareDraw();
         if (renderer) {
             if (w <= 0 || h <= 0) return;
             drawFilledRect(x,y,w,1.0f,color);
@@ -240,6 +407,7 @@ namespace GAGCore
 		#ifdef HAVE_OPENGL
 		if (optionFlags & GraphicContext::USEGPU)
 		{
+			if (rectangleBatch.owns(this)) rectangleBatch.flush();
 			// state change
 			glState.blendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 			glState.doBlend(true);
@@ -278,12 +446,38 @@ namespace GAGCore
 
 	void GraphicContext::drawFilledRect(float x, float y, float w, float h, const Color& color)
 	{
+		if (renderBatch && renderBatch->active())
+		{
+			std::array<QueueVertex, 8> v{};
+			float xx[8] = {x, x + w, x + w, x, x + w, x + w, x, x},
+				  yy[8] = {y, y, y + h, y + h, y, y + h, y + h, y};
+			for (int i = 0; i < 4; ++i)
+			{
+				v[i].x = xx[i];
+				v[i].y = yy[i];
+				v[i].color = color;
+			}
+			renderBatch->append(
+				{QueueKey::FilledQuad, 0, 0, false, false, color.a < 255, rasterScale() * mapScale},
+				v, 4);
+			return;
+		}
+
+        if (rectangleBatch.owns(this))
+        {
+            if (renderer && (w <= 0 || h <= 0)) return;
+            if (color.a == Color::ALPHA_OPAQUE)
+            {
+                if (rectangleBatch.append(x, y, w, h, color, renderer)) ++drawCalls;
+                return;
+            }
+            rectangleBatch.flush();
+        }
+		if (renderer) prepareDraw();
         if (renderer) {
             if (w <= 0 || h <= 0) return;
-            SDL_Color c{color.r,color.g,color.b,color.a};
-            SDL_Vertex a{{x,y},c,{0,0}}, b{{x+w,y},c,{0,0}}, d{{x,y+h},c,{0,0}}, e{{x+w,y+h},c,{0,0}};
-            const SDL_Vertex vertices[] = {a,b,e,a,e,d};
-            renderer->triangles(vertices); return;
+            renderer->fill(SDL_FRect{x,y,w,h}, SDL_Color{color.r,color.g,color.b,color.a});
+            return;
         }
 		#ifdef HAVE_OPENGL
 		if (optionFlags & GraphicContext::USEGPU)
@@ -316,6 +510,9 @@ namespace GAGCore
 
 	void GraphicContext::drawLine(int x1, int y1, int x2, int y2, const Color& color)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
+		if (renderer) prepareDraw();
         if (renderer) { drawLine(float(x1), float(y1), float(x2), float(y2), color); return; }
 		#ifdef HAVE_OPENGL
 		if (optionFlags & GraphicContext::USEGPU)
@@ -327,6 +524,9 @@ namespace GAGCore
 
 	void GraphicContext::drawLine(float x1, float y1, float x2, float y2, const Color& color)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
+		if (renderer) prepareDraw();
         if (renderer) {
             float dx=x2-x1, dy=y2-y1, length=std::hypot(dx,dy);
             if (length == 0) { drawPixel(x1,y1,color); return; }
@@ -389,6 +589,9 @@ namespace GAGCore
 
 	void GraphicContext::drawCircle(int x, int y, int radius, const Color& color)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
+		if (renderer) prepareDraw();
         if (renderer) { drawCircle(float(x), float(y), float(radius), color); return; }
 		#ifdef HAVE_OPENGL
 		if (optionFlags & GraphicContext::USEGPU)
@@ -400,6 +603,9 @@ namespace GAGCore
 
 	void GraphicContext::drawCircle(float x, float y, float radius, const Color& color)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
+		if (renderer) prepareDraw();
         if (renderer) {
             if (radius <= 0) return;
             int segments=std::max(12, int(std::ceil(radius*2)));
@@ -460,6 +666,8 @@ namespace GAGCore
 
 	void GraphicContext::drawLine(int x1, int y1, int x2, int y2, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
 		drawLine(x1, y1, x2, y2, Color(r, g, b, a));
 	}
 
@@ -512,6 +720,8 @@ namespace GAGCore
 
 	void GraphicContext::drawCircle(int x, int y, int radius, Uint8 r, Uint8 g, Uint8 b, Uint8 a)
 	{
+		if (renderBatch)
+			renderBatch->barrier();
 		drawCircle(x, y, radius, Color(r, g, b, a));
 	}
 }

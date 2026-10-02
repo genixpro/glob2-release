@@ -84,6 +84,10 @@ IAWarrush
 Um construtor forte que coloca em campo forças de ataque treinadas.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Um controlador que utiliza um módulo de código JavaScript incorporado.
 [Alga]
 Algas
 [algae]
@@ -3074,8 +3078,6 @@ Minimapa
 Avançar rapidamente
 [Hide keyboard]
 Ocultar teclado
-[Dialog text size]
-Tamanho do texto dos diálogos
 [Player slot]
 Lugar de jogador
 [Team color]
@@ -3156,6 +3158,30 @@ Guardar o jogo automaticamente a cada minuto, aproximadamente.
 Adversários de IA
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 A disposição espaçosa usa um painel lateral quando há espaço. A compacta usa uma barra de ferramentas e painéis retráteis.
+[settings One-finger zoom]
+Zoom com um dedo
+[settings Double-tap the map, hold, then drag to zoom.]
+Toque duas vezes no mapa, mantenha premido e arraste para ampliar.
+[settings Platform default]
+Predefinição do sistema
+[settings Drag up zooms in]
+Arrastar para cima amplia
+[settings Drag down zooms in]
+Arrastar para baixo amplia
+[settings Thumb side]
+Lado do polegar
+[settings Phone controls gather in this bottom corner.]
+No telemóvel, os controlos ficam neste canto inferior.
+[settings Right]
+Direita
+[settings Left]
+Esquerda
+[Undo stroke]
+Anular
+[No overlay]
+Sem camada
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Atribuídos %0 · Alvo %1
 [Range: %0]
@@ -3390,8 +3416,6 @@ Probabilidade de vitória: %0 · Aptidão: %1
 Mín. nível requerido: %0
 [Confirm %0]
 Aceitar: %0
-[Dialog text size %0]
-Tamanho do texto dos diálogos: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3400,3 +3424,117 @@ Retomar partida
 Partidas
 [Add AI]
 Adicionar IA
+[settings Experiments]
+Experiências
+[settings Try features we are still testing. They can change balance and pacing.]
+Experimente funcionalidades que ainda estamos a testar. Podem alterar o equilíbrio e o ritmo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+As experiências aplicam-se aos novos jogos que inicia ou aloja, nunca às missões da campanha. Um jogo guardado mantém as que tinha ao começar.
+[Experiments set by the host]
+Experiências escolhidas pelo anfitrião
+[settings No experiments in this build.]
+Não há experiências nesta versão.
+[Experiments]
+Experiências
+[experiment guard-area-balancing]
+Equilíbrio das zonas de guarda
+[experiment guard-area-balancing help]
+Os guerreiros livres distribuem-se pelas zonas de guarda pintadas em vez de irem todos para a mais próxima: uma zona maior recebe mais, e uma zona sobrelotada esvazia-se aos poucos para as outras.
+[settings Touch scrolling]
+Deslocamento por toque
+[settings List momentum]
+Inércia das listas
+[settings How far lists and panels keep scrolling after a flick.]
+Até onde as listas e os painéis continuam a deslizar após um gesto.
+[settings List bounce]
+Ressalto das listas
+[settings How much lists and panels stretch past their ends and spring back.]
+Quanto as listas e os painéis se esticam além das bordas antes de voltar.
+[settings Map momentum]
+Inércia do mapa
+[settings How far the map keeps panning after a flick.]
+Até onde o mapa continua a mover-se após um gesto.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Sensação do deslocamento por toque. 0 desativa um efeito; 50 é o valor predefinido.
+[List momentum]
+Inércia das listas
+[List bounce]
+Ressalto das listas
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Inércia do mapa

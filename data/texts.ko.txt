@@ -92,6 +92,10 @@ Warrush
 건설에 능하며 훈련된 공격 부대를 운용합니다.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+내장된 JavaScript 소스 모듈을 사용하는 컨트롤러.
 [Alga]
 해조류
 [algae]
@@ -3064,8 +3068,6 @@ Emoji
 빨리 감기
 [Hide keyboard]
 키보드 숨기기
-[Dialog text size]
-대화 상자 글자 크기
 [Player slot]
 플레이어 슬롯
 [Team color]
@@ -3146,6 +3148,30 @@ Emoji
 컴퓨터 상대
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 여유로운 배치는 공간이 충분하면 측면 패널을 사용합니다. 간결한 배치는 도구 모음과 펼칠 수 있는 패널을 사용합니다.
+[settings One-finger zoom]
+한 손가락 확대/축소
+[settings Double-tap the map, hold, then drag to zoom.]
+지도를 두 번 탭한 채로 드래그하면 확대/축소됩니다.
+[settings Platform default]
+시스템 기본값
+[settings Drag up zooms in]
+위로 드래그하면 확대
+[settings Drag down zooms in]
+아래로 드래그하면 확대
+[settings Thumb side]
+엄지 방향
+[settings Phone controls gather in this bottom corner.]
+휴대전화에서는 조작 버튼이 이 아래쪽 모서리에 모입니다.
+[settings Right]
+오른쪽
+[settings Left]
+왼쪽
+[Undo stroke]
+실행 취소
+[No overlay]
+오버레이 없음
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 배정 %0 · 목표 %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ CPU %0%
 최소 레벨: %0
 [Confirm %0]
 확인: %0
-[Dialog text size %0]
-대화 상자 글자 크기: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ CPU %0%
 게임
 [Add AI]
 AI 추가
+[settings Experiments]
+실험 기능
+[settings Try features we are still testing. They can change balance and pacing.]
+아직 테스트 중인 기능을 사용해 보세요. 밸런스와 진행 속도가 바뀔 수 있습니다.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+실험 기능은 직접 시작하거나 호스트하는 새 게임에 적용되며, 캠페인 임무에는 적용되지 않습니다. 저장된 게임은 시작할 때의 실험 기능을 유지합니다.
+[Experiments set by the host]
+호스트가 선택한 실험 기능
+[settings No experiments in this build.]
+이 빌드에는 실험 기능이 없습니다.
+[Experiments]
+실험 기능
+[experiment guard-area-balancing]
+경비 구역 분산
+[experiment guard-area-balancing help]
+자유로운 전사들이 가장 가까운 경비 구역에 모두 몰리는 대신 칠해진 경비 구역들 사이에 나뉘어 배치됩니다. 더 큰 구역이 더 많은 전사를 받고, 너무 붐비는 구역은 다른 구역으로 서서히 빠져나갑니다.
+[settings Touch scrolling]
+터치 스크롤
+[settings List momentum]
+목록 관성
+[settings How far lists and panels keep scrolling after a flick.]
+튕긴 뒤 목록과 패널이 얼마나 계속 스크롤되는지.
+[settings List bounce]
+목록 바운스
+[settings How much lists and panels stretch past their ends and spring back.]
+목록과 패널이 끝을 넘어 얼마나 늘어났다가 되돌아오는지.
+[settings Map momentum]
+지도 관성
+[settings How far the map keeps panning after a flick.]
+튕긴 뒤 지도가 얼마나 계속 움직이는지.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+터치 스크롤 감각. 0은 효과를 끄고 50이 기본값입니다.
+[List momentum]
+목록 관성
+[List bounce]
+목록 바운스
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+지도 관성

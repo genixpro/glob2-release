@@ -84,6 +84,10 @@ AIWarrush
 Eğitimli saldırı kuvvetleri çıkaran güçlü bir inşacı.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Gömülü bir JavaScript kaynak modülü kullanan denetleyici.
 [Alga]
 Su yosunu
 [algae]
@@ -3076,8 +3080,6 @@ Mini harita
 İleri sar
 [Hide keyboard]
 Klavyeyi gizle
-[Dialog text size]
-İletişim kutusu yazı boyutu
 [Player slot]
 Oyuncu yuvası
 [Team color]
@@ -3158,6 +3160,30 @@ Oyunu yaklaşık her dakika otomatik olarak kaydet.
 Yapay zeka rakipleri
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Geniş düzen, yer olduğunda yan panel kullanır. Kompakt düzen, araç çubuğu ve açılır paneller kullanır.
+[settings One-finger zoom]
+Tek parmakla yakınlaştırma
+[settings Double-tap the map, hold, then drag to zoom.]
+Haritaya iki kez dokunun, basılı tutun ve yakınlaştırmak için sürükleyin.
+[settings Platform default]
+Sistem varsayılanı
+[settings Drag up zooms in]
+Yukarı sürüklemek yakınlaştırır
+[settings Drag down zooms in]
+Aşağı sürüklemek yakınlaştırır
+[settings Thumb side]
+Başparmak tarafı
+[settings Phone controls gather in this bottom corner.]
+Telefonda kontroller bu alt köşede toplanır.
+[settings Right]
+Sağ
+[settings Left]
+Sol
+[Undo stroke]
+Geri al
+[No overlay]
+Katman yok
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Atanan %0 · Hedef %1
 [Range: %0]
@@ -3392,8 +3418,6 @@ Kazanma şansı: %0 · Güç: %1
 Gerekli en düşük seviye: %0
 [Confirm %0]
 Tamam: %0
-[Dialog text size %0]
-İletişim kutusu yazı boyutu: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3402,3 +3426,117 @@ Oyuna Devam Et
 Oyunlar
 [Add AI]
 Yapay zeka ekle
+[settings Experiments]
+Deneyler
+[settings Try features we are still testing. They can change balance and pacing.]
+Hâlâ test ettiğimiz özellikleri deneyin. Dengeyi ve tempoyu değiştirebilirler.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Deneyler başlattığınız veya barındırdığınız yeni oyunlar için geçerlidir, sefer görevleri için asla. Kayıtlı bir oyun başladığı deneyleri korur.
+[Experiments set by the host]
+Ev sahibinin seçtiği deneyler
+[settings No experiments in this build.]
+Bu sürümde deney yok.
+[Experiments]
+Deneyler
+[experiment guard-area-balancing]
+Nöbet alanı dengeleme
+[experiment guard-area-balancing help]
+Serbest savaşçılar hepsi en yakınına gitmek yerine boyanmış nöbet alanları arasında dağılır: daha büyük bir alan daha fazlasını alır ve aşırı dolu bir alan yavaş yavaş diğerlerine boşalır.
+[settings Touch scrolling]
+Dokunmatik kaydırma
+[settings List momentum]
+Liste ivmesi
+[settings How far lists and panels keep scrolling after a flick.]
+Listelerin ve panellerin bir fiskeden sonra ne kadar kaymaya devam ettiği.
+[settings List bounce]
+Liste sekmesi
+[settings How much lists and panels stretch past their ends and spring back.]
+Listelerin ve panellerin kenarlarını ne kadar aşıp geri yaylandığı.
+[settings Map momentum]
+Harita ivmesi
+[settings How far the map keeps panning after a flick.]
+Haritanın bir fiskeden sonra ne kadar kaymaya devam ettiği.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Dokunmatik kaydırma hissi. 0 bir efekti kapatır; 50 varsayılandır.
+[List momentum]
+Liste ivmesi
+[List bounce]
+Liste sekmesi
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Harita ivmesi

@@ -39,15 +39,23 @@ int Engine::initCampaign(const std::string& filename)
 }
 GAGCore::CooperativeTask Engine::initCampaignTask(std::string filename, Campaign* campaign, std::string mission)
 {
+    initializationDiagnostic.clear();
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
     auto map = loadMapHeader(filename);
     auto players = loadGameHeader(filename);
     if (players.getNumberOfPlayers() == 0) players = prepareCampaign(map, gui.localPlayer, gui.localTeamNo);
     else { gui.localPlayer = 0; gui.localTeamNo = players.getBasePlayer(0).teamNumber; }
     if (campaign) players.getBasePlayer(0).name = campaign->getPlayerName();
+    // Missions and the tutorial play as authored: never with experiments.
+    if (!map.getIsSavedGame()) players.getExperiments().clear();
     const bool loaded = co_await initGameTask(map, players);
     if (loaded && campaign) gui.setCampaignGame(*campaign, mission);
     co_return loaded;
+}
+void Engine::applyLocalExperiments(GameHeader& header, const MapHeader& map)
+{
+    if (!map.getIsSavedGame())
+        header.setExperiments(globalContainer->settings.experiments);
 }
 int Engine::initCustom(MapHeader& map, GameHeader& players, int localTeam, const std::string& sourceFileName)
 {
@@ -57,6 +65,7 @@ int Engine::initCustom(MapHeader& map, GameHeader& players, int localTeam, const
 }
 GAGCore::CooperativeTask Engine::initCustomTask(MapHeader map, GameHeader players, int localTeam, int speed, std::string sourceFileName)
 {
+    initializationDiagnostic.clear();
     gui.localPlayer = 0;
     gui.localTeamNo = localTeam;
     // Restored by ~Engine(); a negative speed means the caller doesn't offer
@@ -80,11 +89,13 @@ int Engine::initCustom(const std::string& filename)
 }
 GAGCore::CooperativeTask Engine::initCustomTask(std::string filename)
 {
+    initializationDiagnostic.clear();
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
     auto map = loadMapHeader(filename);
     auto players = loadGameHeader(filename);
     for (int p = 0; p < players.getNumberOfPlayers(); ++p)
         if (players.getBasePlayer(p).type == BasePlayer::P_IP) players.getBasePlayer(p).makeItAI(AI::toggleAI);
+    applyLocalExperiments(players, map);
     co_return co_await initGameTask(map, players, true, false, true, filename);
 }
 
@@ -98,6 +109,7 @@ int Engine::initMultiplayer(std::shared_ptr<MultiplayerGame> multiplayerGame, st
 
 GAGCore::CooperativeTask Engine::initMultiplayerTask(std::shared_ptr<MultiplayerGame> multiplayerGame, std::shared_ptr<YOGClient> client, int localPlayer)
 {
+    initializationDiagnostic.clear();
     if (localPlayer < 0 || localPlayer >= multiplayerGame->getGameHeader().getNumberOfPlayers()) co_return false;
 	gui.localPlayer = localPlayer;
 	gui.localTeamNo = multiplayerGame->getGameHeader().getBasePlayer(localPlayer).teamNumber;
@@ -142,7 +154,7 @@ namespace
 			long maximum;
 			std::function<void(GameHeader&, int)> apply;
 		};
-		const Rule rules[] = {
+		std::vector<Rule> rules = {
 			{"noGrowth", 1, [](GameHeader& h, int v) { h.setResourceGrowthDisabled(v); }},
 			{"scarcity", 3, [](GameHeader& h, int v) { h.setResourceScarcityLevel(v); }},
 			{"instantConstruction", 1, [](GameHeader& h, int v) { h.setInstantConstructionEnabled(v); }},
@@ -160,6 +172,9 @@ namespace
 						v ? std::optional<Uint32>(v) : std::nullopt);
 				}},
 		};
+		// One 0/1 rule per experiment, named by its key (ExperimentalFeatures.cpp).
+		for (const auto& definition : experimentDefinitions())
+			rules.push_back({definition.key, 1, [id = definition.id](GameHeader& h, int v) { h.getExperiments().set(id, v != 0); }});
 		std::stringstream list(environment);
 		std::string item;
 		while (std::getline(list, item, ','))
@@ -277,6 +292,7 @@ void Engine::createRandomGame()
 	{
 		game.setRandomSeed(globalContainer->testGamesSeed);
 	}
+	applyLocalExperiments(game, map);
 	applyTestRules(game);
 	std::cout<<"Random Seed gameheader: "<<game.getRandomSeed();
 	for (int p=0; p<game.getNumberOfPlayers(); p++)
@@ -344,6 +360,7 @@ int Engine::initGame(MapHeader& mapHeader, GameHeader& gameHeader, bool setGameH
 
 GAGCore::CooperativeTask Engine::initGameTask(MapHeader mapHeader, GameHeader gameHeader, bool setGameHeader, bool ignoreGUIData, bool saveAI, std::string sourceFileName)
 {
+	initializationDiagnostic.clear();
 	bool error = false;
 	try
 	{
@@ -351,7 +368,8 @@ GAGCore::CooperativeTask Engine::initGameTask(MapHeader mapHeader, GameHeader ga
 	}
 	catch (std::exception &e)
 	{
-		std::cerr << "Failed to load the map: exception received." << std::endl;
+		initializationDiagnostic = e.what();
+		std::cerr << "Failed to load the map: " << initializationDiagnostic << std::endl;
 		error = true;
 	}
 	if (error) {
@@ -434,6 +452,7 @@ void Engine::finishGameInit()
 
 GAGCore::CooperativeTask Engine::initCustomFromBytesTask(MapHeader map, GameHeader players, int localTeam, int speed, std::shared_ptr<std::string> bytes)
 {
+    initializationDiagnostic.clear();
     gui.localPlayer = 0;
     gui.localTeamNo = localTeam;
     if (speed >= 0)
@@ -455,7 +474,8 @@ GAGCore::CooperativeTask Engine::initCustomFromBytesTask(MapHeader map, GameHead
     }
     catch (std::exception &e)
     {
-        std::cerr << "Failed to load the generated map: exception received." << std::endl;
+        initializationDiagnostic = e.what();
+        std::cerr << "Failed to load the generated map: " << initializationDiagnostic << std::endl;
         error = true;
     }
     if (error) {
@@ -537,6 +557,7 @@ int Engine::loadReplay(const std::string& filename)
 
 GAGCore::CooperativeTask Engine::loadReplayTask(std::string fileName)
 {
+    initializationDiagnostic.clear();
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
 	// Parse the replay file before committing any global state, so a failed
 	// load leaves globalContainer as if no replay had been requested.
@@ -576,7 +597,7 @@ GAGCore::CooperativeTask Engine::loadReplayTask(std::string fileName)
 	// Finally, initialise the Game. If the map embedded in the replay fails
 	// to load, drop the replay state committed above so the next game
 	// session starts as a normal game.
-	bool loaded = co_await initGameTask(mapHeader, gameHeader, true, false, true);
+	bool loaded = co_await initGameTask(mapHeader, gameHeader, true, false, true, fileName);
 	if (!loaded)
 	{
 		clearReplayState();
@@ -598,6 +619,8 @@ void Engine::showMapLoadError()
 	// Interactive flows run the task through GameLoadScreen, which reports the
 	// failure on the screen stack; the synchronous wrappers only log it.
 	std::cerr << Toolkit::getStringTable()->getString("[ERROR_CANT_LOAD_MAP]") << std::endl;
+	if (!initializationDiagnostic.empty())
+		std::cerr << initializationDiagnostic << std::endl;
 }
 
 void Engine::finalAdjustments(void)

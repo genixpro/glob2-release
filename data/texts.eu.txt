@@ -84,6 +84,10 @@ AIWarrush
 Eraikitzaile indartsua, entrenatutako eraso-indarrak bidaltzen dituena.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+JavaScript iturburu-modulu txertatu bat erabiltzen duen kontrolatzailea.
 [Alga]
 Algak
 [algae]
@@ -3078,8 +3082,6 @@ Minimapa
 Aurreratu azkar
 [Hide keyboard]
 Ezkutatu teklatua
-[Dialog text size]
-Elkarrizketako testuaren tamaina
 [Player slot]
 Jokalariaren lekua
 [Team color]
@@ -3160,6 +3162,30 @@ Gorde jokoa automatikoki minutuero, gutxi gorabehera.
 Ordenagailuko aurkariak
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Diseinu zabalak alboko panela erabiltzen du lekua dagoenean. Trinkoak tresna-barra eta panel zabalgarriak erabiltzen ditu.
+[settings One-finger zoom]
+Hatz bakarreko zooma
+[settings Double-tap the map, hold, then drag to zoom.]
+Ukitu mapa bi aldiz, eutsi eta arrastatu zooma egiteko.
+[settings Platform default]
+Sistemaren lehenetsia
+[settings Drag up zooms in]
+Gora arrastatuz hurbildu
+[settings Drag down zooms in]
+Behera arrastatuz hurbildu
+[settings Thumb side]
+Erpuruaren aldea
+[settings Phone controls gather in this bottom corner.]
+Telefonoko kontrolak beheko izkina honetan biltzen dira.
+[settings Right]
+Eskuina
+[settings Left]
+Ezkerra
+[Undo stroke]
+Desegin
+[No overlay]
+Geruzarik ez
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Esleituta %0 · Helburua %1
 [Range: %0]
@@ -3394,8 +3420,6 @@ Irabazteko aukera: %0 · Egokitasuna: %1
 Gutxienezko maila: %0
 [Confirm %0]
 Ados: %0
-[Dialog text size %0]
-Elkarrizketako testuaren tamaina: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3404,3 +3428,117 @@ Jarraitu partida
 Partidak
 [Add AI]
 Gehitu AI
+[settings Experiments]
+Esperimentuak
+[settings Try features we are still testing. They can change balance and pacing.]
+Probatu oraindik probatzen ari garen funtzioak. Oreka eta erritmoa alda ditzakete.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Esperimentuak hasten edo ostatatzen dituzun partida berrietan aplikatzen dira, inoiz ez kanpainako misioetan. Gordetako partida batek hasieran zituenak gordetzen ditu.
+[Experiments set by the host]
+Ostalariak aukeratutako esperimentuak
+[settings No experiments in this build.]
+Ez dago esperimenturik bertsio honetan.
+[Experiments]
+Esperimentuak
+[experiment guard-area-balancing]
+Zaintza-eremuen oreka
+[experiment guard-area-balancing help]
+Gerlari libreak margotutako zaintza-eremuen artean banatzen dira, guztiak hurbilenera joan beharrean: eremu handiago batek gehiago jasotzen ditu, eta gainezka dagoen eremu bat pixkanaka husten da besteetara.
+[settings Touch scrolling]
+Ukipen bidezko korritzea
+[settings List momentum]
+Zerrenden inertzia
+[settings How far lists and panels keep scrolling after a flick.]
+Zenbat jarraitzen duten zerrendek eta panelek korritzen keinu baten ondoren.
+[settings List bounce]
+Zerrenden errebotea
+[settings How much lists and panels stretch past their ends and spring back.]
+Zenbat luzatzen diren zerrendak eta panelak ertzetatik haratago itzuli aurretik.
+[settings Map momentum]
+Maparen inertzia
+[settings How far the map keeps panning after a flick.]
+Zenbat jarraitzen duen mapak mugitzen keinu baten ondoren.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Ukipen bidezko korritzearen sentsazioa. 0 balioak efektu bat desaktibatzen du; 50 da lehenetsia.
+[List momentum]
+Zerrenden inertzia
+[List bounce]
+Zerrenden errebotea
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Maparen inertzia

@@ -84,6 +84,10 @@ Warrush
 Vahva rakentaja, joka lähettää koulutettuja hyökkäysjoukkoja.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Ohjain, joka käyttää upotettua JavaScript-lähdekoodimoduulia.
 [Alga]
 Levä
 [algae]
@@ -3068,8 +3072,6 @@ Pienoiskartta
 Pikakelaus
 [Hide keyboard]
 Piilota näppäimistö
-[Dialog text size]
-Valintaikkunoiden tekstikoko
 [Player slot]
 Pelaajapaikka
 [Team color]
@@ -3150,6 +3152,30 @@ Tallenna peli automaattisesti noin minuutin välein.
 Tietokonevastustajat
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Väljä asettelu käyttää sivupaneelia, kun tilaa on riittävästi. Tiivis asettelu käyttää työkalupalkkia ja avattavia paneeleja.
+[settings One-finger zoom]
+Yhden sormen zoomaus
+[settings Double-tap the map, hold, then drag to zoom.]
+Napauta karttaa kahdesti, pidä pohjassa ja vedä zoomataksesi.
+[settings Platform default]
+Järjestelmän oletus
+[settings Drag up zooms in]
+Ylös vetäminen lähentää
+[settings Drag down zooms in]
+Alas vetäminen lähentää
+[settings Thumb side]
+Peukalon puoli
+[settings Phone controls gather in this bottom corner.]
+Puhelimessa säätimet kootaan tähän alakulmaan.
+[settings Right]
+Oikea
+[settings Left]
+Vasen
+[Undo stroke]
+Kumoa
+[No overlay]
+Ei tasoa
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Määrätty %0 · Tavoite %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Voittomahdollisuus: %0 · Vahvuus: %1
 Alin vaadittu taso: %0
 [Confirm %0]
 Ok: %0
-[Dialog text size %0]
-Valintaikkunoiden tekstikoko: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Jatka peliä
 Pelit
 [Add AI]
 Lisää AI
+[settings Experiments]
+Kokeilut
+[settings Try features we are still testing. They can change balance and pacing.]
+Kokeile ominaisuuksia, joita vielä testaamme. Ne voivat muuttaa tasapainoa ja tempoa.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Kokeilut koskevat uusia pelejä, jotka aloitat tai joita isännöit, eivät koskaan kampanjatehtäviä. Tallennettu peli säilyttää ne, joilla se alkoi.
+[Experiments set by the host]
+Isännän valitsemat kokeilut
+[settings No experiments in this build.]
+Tässä versiossa ei ole kokeiluja.
+[Experiments]
+Kokeilut
+[experiment guard-area-balancing]
+Vartioalueiden tasapainotus
+[experiment guard-area-balancing help]
+Vapaat soturit jakautuvat maalattujen vartioalueiden kesken sen sijaan, että kaikki menisivät lähimpään: suurempi alue saa heitä enemmän, ja ylitäysi alue harvenee vähitellen muihin.
+[settings Touch scrolling]
+Kosketusvieritys
+[settings List momentum]
+Listojen liike-energia
+[settings How far lists and panels keep scrolling after a flick.]
+Kuinka pitkälle listat ja paneelit jatkavat vieritystä pyyhkäisyn jälkeen.
+[settings List bounce]
+Listojen kimmoisuus
+[settings How much lists and panels stretch past their ends and spring back.]
+Kuinka paljon listat ja paneelit venyvät reunan yli ja palautuvat.
+[settings Map momentum]
+Kartan liike-energia
+[settings How far the map keeps panning after a flick.]
+Kuinka pitkälle kartta jatkaa liikettä pyyhkäisyn jälkeen.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Kosketusvierityksen tuntuma. 0 poistaa tehosteen käytöstä; 50 on oletus.
+[List momentum]
+Listojen liike-energia
+[List bounce]
+Listojen kimmoisuus
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Kartan liike-energia

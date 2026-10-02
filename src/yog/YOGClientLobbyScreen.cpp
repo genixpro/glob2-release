@@ -23,13 +23,14 @@ namespace fe = Glob2UI;
 using fe::Element;
 using fe::Presentation;
 
-YOGClientLobbyScreen::YOGClientLobbyScreen(GAGGUI::ScreenStack &screens, std::shared_ptr<YOGClient> client) : client(client), screens(screens)
+YOGClientLobbyScreen::YOGClientLobbyScreen(GAGGUI::ScreenStack &screens, std::shared_ptr<YOGClient> client, bool connectIRC) : client(client), screens(screens)
 {
 	networkSprite = Toolkit::getSprite("data/gui/yog");
 	lobbyChat.reset(new YOGClientChatChannel(LOBBY_CHAT_CHANNEL, client));
 	ircChat.reset(new IRCTextMessageHandler);
 	ircChat->addTextMessageListener(this);
-	ircChat->startIRC(client->getUsername());
+	// Lobby chat now stays on authenticated WSS. The legacy IRC link was plaintext.
+    (void)connectIRC;
 	client->addEventListener(this);
 	client->getGameListManager()->addListener(this);
 	client->getPlayerListManager()->addListener(this);

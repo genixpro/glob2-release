@@ -24,6 +24,7 @@ the binary that now contains the test.
 scons -j8 release=1 server=0 tests          # or unit-tests / engine-tests
 python3 test/run_tests.py                   # everything this platform can run
 python3 test/run_tests.py --list --tag display
+python3 test/run_tests.py --fullscreen --tag display      # opt in to fullscreen transitions
 python3 test/run_tests.py --binary unit
 python3 test/run_tests.py --filter 'HungryDefeat/*' --verbose
 python3 test/run_tests.py --binary engine --shard 2/4 --junit artifacts/tests/junit.xml
@@ -37,10 +38,21 @@ python3 test/run_tests.py --update-fixtures --filter 'WinningConditions/*'
 a fresh `GLOB2_USER_DATA_DIR`, `HOME`, temp directory and SDL's dummy drivers, a
 timeout by tag, output captured and shown only on failure, and a check that the
 profile's preferences were not rewritten. `[display]` cases get a real video driver,
-under `xvfb-run` on Linux without `DISPLAY`; they are skipped on Windows and with
+under `xvfb-run` on Linux without `DISPLAY`, with server resets disabled so SDL
+can recreate contexts without racing X server reinitialization; they are skipped on Windows and with
 `--no-display`. Results merge into one JUnit file (`--junit`) and, under GitHub
 Actions, into the step summary with a `::error file=,line=` annotation per failure.
 `test/test_run_tests.py` covers the runner itself.
+The runner escapes commas and backslashes in selected names and checks that JUnit
+records every selected case; a successful exit with missing tests is an error.
+
+Standard runs keep display tests windowed. The HD artwork integration test's
+fullscreen camera-continuity checks and the text raster test's fullscreen
+downscaling check run only with `--fullscreen`; all their windowed checks still
+run by default, including with `--in-process`. Linux CI enables `--fullscreen`
+under its virtual display. To opt in when invoking a test binary directly, set
+`GLOB2_TEST_FULLSCREEN=1`; the Python runner overrides that variable according to
+its flag, so an inherited setting cannot enable fullscreen in a standard run.
 
 Running a binary by hand is safe too: `TestMain.cpp` creates a temporary profile
 and selects the dummy drivers when the environment does not, so
@@ -52,7 +64,7 @@ and selects the dummy drivers when the environment does not, so
 Include `Glob2Test.h` (unit tests) or `EngineFixtures.h` (engine tests) and use
 doctest's `TEST_SUITE`, `TEST_CASE`, `SUBCASE`, `CHECK`, `REQUIRE`, `CHECK_EQ` and
 `REQUIRE_MESSAGE`. Suites are named after the area (`HungryDefeat`, `MapQuery`,
-`Maxima.Combat`); case names are sentences without commas. Conditions that doctest
+`Maxima.Combat`); case names are descriptive sentences. Conditions that doctest
 cannot decompose (`a && b`) use `GLOB2_REQUIRE(cond, message)` or `GLOB2_CHECK`.
 Tags go at the end of the name, or through `GLOB2_TEST_CASE(name, "[display][slow]")`:
 
@@ -95,6 +107,15 @@ directly instead of calling `Map::setSize`; the `Sector`, `MapHeader`, `Order`,
 `test/unit/stubs/`, so every unit test shares one link surface. A test that needs a
 stub replacing a symbol another unit test links for real belongs in the engine
 binary instead.
+
+Time in input tests is injected, never read from `SDL_GetTicks`. Event
+timestamps (`event.tfinger.timestamp`, `event.common.timestamp`) and the frame
+clock a test passes to `Host::update(tick)`, `GameGUI::step(events, now)`,
+`GameGUITouch::advanceScroll(now)` or `PhoneEditor::advance(tick)` are the only
+sources the touch scroll physics sees, so a fling, bounce or stopped-finger
+rule is exact and repeatable (`test/ScrollPhysicsTest.cpp`,
+`test/UILayoutHarness.cpp`, `test/GameGUITouchHarness.cpp`). Events without a
+timestamp carry no velocity, which is why older synthetic gestures never coast.
 
 ## Python tests
 
@@ -261,6 +282,16 @@ To poke `cases[i].terrain` directly (`regenerateMap` is protected): grass < 16, 
 
 ## Real LAN session regression
 
+The direct transport/security checks use `scons release=1 transport-test`,
+`python3 test/run-network-transport-tests.py`,
+`build/darwin/client/release/src/lan-discovery-test` (substitute your platform),
+and `python3 -m unittest discover -s tests/transport -v`. Container lifecycle
+checks use `python3 -m unittest discover -s tests/deployment -v` after building
+the server image and browser assets. They run an isolated Compose project and
+verify persistence, backup restoration, router-loss readiness, state ownership,
+graceful draining, and forced deadline interruption. Keep capture output from
+`tests/transport/capture_container.py` under ignored `artifacts/`.
+
 From the repository root:
 
 ```sh
@@ -269,8 +300,8 @@ python3 test/run_lan_session_test.py build/native-tests/src/LANSessionHarness
 ```
 
 This runs separate host and joining client processes with real SDL lobby widgets,
-YOG anonymous LAN server, game router, and TCP connections. The joiner uses the
-actual `LANFindScreen` Connect path. It clicks Ready and Leave Game, then rejoins.
+YOG anonymous LAN server, game router, and paired WSS connections. The joiner uses the
+actual `LANFindScreen` Pair and connect path with the host session fingerprint. It clicks Ready and Leave Game, then rejoins.
 Both cycles force a map download and compare the downloaded `.gz` bytes against
 the fixture source (`maps/FourSquares1.map.gz`) byte for byte: the host's private
 copy is already gzip-compressed, so the transfer exercises sending a locally
@@ -284,24 +315,25 @@ absolute capture prefixes whose parent directories already exist:
 
 ```sh
 SDL_VIDEODRIVER=dummy ./build/native-tests/src/LANSessionHarness host 127.0.0.1 2 /tmp/lan-host
-SDL_VIDEODRIVER=dummy ./build/native-tests/src/LANSessionHarness join HOST_IP 2 /tmp/lan-guest
+SDL_VIDEODRIVER=dummy ./build/native-tests/src/LANSessionHarness join 'HOST_PAIRING_STRING' 2 /tmp/lan-guest
 ```
 
-Start the joiner after the host prints `HOST roster=1`. TCP ports 7489 and 7491
+Start the joiner after the host prints `HOST roster=1`, copying its full
+`PAIRING` string. TLS/WebSocket TCP ports 7489 and 7491
 must be reachable; this does not connect to the public YOG service. Omit
 `SDL_VIDEODRIVER=dummy` to show the real window. Normal game profiles are preserved;
 the harness uses `.glob2-lan-test-host` and `.glob2-lan-test-join` profiles containing
 only test data. Fixed input timers allow map transfer before leaving; the runner
 bounds startup, execution, and child cleanup. Logs and captures are written under
-`output/lan-session-test` by default (`--output` overrides it).
+`artifacts/lan-session-test` by default (`--output` overrides it).
 
 ## Aspect-ratio and screen-capture regression
 
 The `FullscreenAspect` suite (`test/FullscreenAspectHarness.cpp`) opens a real SDL
-window and checks presentation pixels, clipping, logical-resolution screen captures,
-and translated mouse motion/button events and polling at equal, wide, tall, odd, and
-downscaled window sizes. It exercises the same scaling path used by desktop
-fullscreen. The software case also checks every pixel in 24 opaque/translucent
+window and checks native presentation pixels, clipping, logical screen captures,
+and translated mouse motion/button events and polling at equal, wide, tall and odd
+window sizes, accepting actual OS constraints. Desktop fullscreen follows the same
+native display metrics. The software case also checks every pixel in 24 opaque/translucent
 rectangle intersections, including rectangles above the clip area and empty
 rectangles. It does not load a game profile or change saved display settings.
 
@@ -314,7 +346,9 @@ Linux without a `DISPLAY` and uses Mesa software OpenGL (`LIBGL_ALWAYS_SOFTWARE=
 in CI. The OpenGL case is skipped in `opengl=0` builds. The same goes for the
 `WindowResize` suite (`test/WindowResizeHarness.cpp`), which resizes the window
 through the cache, callbacks, reflow, context recreation and minimum-size paths and
-needs a desktop at least 1100x850 when run natively.
+checks live scale/fullscreen transitions, F11, preserved window dimensions and
+context identity. `TextRaster` checks glyph pixels against an independent native
+font raster in both OpenGL and software, including fractional output scaling.
 
 ## Wrapped building footprint regression
 
@@ -760,6 +794,20 @@ inputs/preferences are unchanged. PNGs, command logs and hashes are retained in
 and checks invalid settings and preferences.
 See [map CLI documentation](../docs/map-generators/CLI.md).
 
+### Flat map images
+
+`python3 test/test_map_image.py [client-binary]` tests the optional image importer
+and exporter without display or network access. It uses only the Python standard
+library and retains command logs and fixtures in `artifacts/map-image/`.
+Checks cover every resource type, bounded mature resource amounts, implicit terrain,
+offset wrap contours, legal resource-budget preservation and seam stitching,
+post-shore seam/corner agreement, protected seam-crossing start markers,
+resizing in both directions, deterministic initialization, four starting workers,
+save/load, dropped shoreline resources, invalid images and colony counts, and
+resolved gzip input/output collisions.
+
+Linux and Windows CI run the native conversion suite.
+
 ### Map JSON reports
 
 Build `scons release=1 server=0 map-report-test`, then run
@@ -909,7 +957,11 @@ controls, replay actions, setup/settings navigation and modal viewport changes.
 Build and run commands are in [Mobile development](../docs/mobile/development.md#verification).
 The `GameGUITouch` and `UIPresentation` cases need a windowing display (Xvfb on
 Linux), run in isolated profiles and copy their screenshots into their artifact
-directories. They complement
+directories. `UIPresentation` has one case per viewport, so CI shards distribute
+the full screen/presentation/inset sweep and each viewport gets its own timeout
+and failure report. Its offline lobby fixture renders the production screen
+without starting the public IRC connection, so layout checks do not wait for
+external network timeouts during teardown. They complement
 Android/iOS device playtesting; they do not establish device lifecycle,
 performance, keyboard or cross-platform simulation compatibility.
 
@@ -960,3 +1012,144 @@ worker counts under the same delayed schedule. `check_gradient_pipeline.py` also
 checks the one-worker/eight-tick defaults and save/resume at each of the eight
 deadline phases with zero, one and two workers. Pending fields, supersession and
 remaining deadlines are versioned save state; worker count is not.
+
+## Experimental features and guard-area balancing
+
+`ExperimentalFeatures` (`glob2-unit-tests`) covers the experiments registry and
+the set a game carries: stable keys, the preferences text form, binary and text
+stream round trips, unknown keys dropped, and the `GameHeader` forms with a
+version 123 header reading no experiment. `SettingsExperiments` and the
+`experiments` case of `CustomGameSetup` (`glob2-engine-tests`) cover the
+preferences round trip, the string tables and the baked-in rule: every
+registry entry's label and help are listed keys matching the English table, a new
+game takes Settings → Experiments, its save keeps that set after the setting is
+turned off, a fresh game then carries nothing, and a campaign mission never takes
+the set. `test/tournament_cli_integration.py` covers `--run-game --experiment`. The `Settings` display cases toggle the switch on the
+settings page. See [experimental features](../docs/features/experimental-features.md).
+
+`GuardAreaBalance` (`glob2-engine-tests`, `python3 test/run_tests.py --filter
+'GuardAreaBalance/*'`) runs the real engine on a blank 64x64 map with 24 warriors
+for the `guard-area-balancing` experiment: spawn, drain, patches, size, three
+areas, erase, settled-guard movement, a save/load continuation and the crowding
+box sum against brute force, plus a `[benchmark]` timing case. Its first case
+runs spawn and drain without the experiment, expects the old outcome, and compares
+the default game's per-100-tick checksums with
+`test/fixtures/guard-area/off-path-checksums.txt` (`[golden]`). Games start with the experiment through
+`glob2test::GameOptions::experiments`; `GameOptions::header` installs the
+one-local-player header and seed they need. Design and numbers:
+[guard-area balancing](../docs/features/guard-area-balancing.md).
+
+## JavaScript
+
+See the [scripting guide](../docs/development/javascript.md) and
+[API reference](../docs/development/javascript-api.md) for the public boundary.
+
+Current saves use format 125, preserving released format 124's experiment-header
+layout through version-gated loading. Formats 58–124 receive scripting identities
+on load; format 125 validates its stored identities and complete generation tables.
+The minimum save version remains 58, the network protocol is 48, and the replay
+minimum remains 123. Draft JavaScript fixtures use format 125; released historical
+fixtures remain unchanged.
+
+Build `unit-tests engine-tests` with SCons and run
+`python3 test/run_tests.py --build-dir build/darwin/client/release --filter 'JavaScript*/*'`
+(use the build directory for your platform).
+The runtime harness checks capability restrictions, deterministic work exhaustion,
+automatic global snapshots, aliases/cycles, reload/rejection rollback, serial
+worker migration and exact Math output bits.
+Raw global-number fixtures also compare the persisted snapshot boundary:
+NaNs have one canonical representation, while signed zero and infinity signs
+survive save/load. The integration harness checks AI
+visibility/ownership and transactional scenario effects and continuation. Run
+`python3 test/check_javascript.py /absolute/path/to/glob2 --output artifacts/js-check`
+with a fresh output directory for the frozen per-tick profile trace, worker
+equivalence and full-game saved continuation.
+
+
+`python3 test/run_tests.py --filter 'ScriptEditor/*'` checks the map editor's
+SGSL/USL/JavaScript language selection, draft compilation and cancellation,
+`.js` load/save, embedded map source/mode round trips, and dropdown interaction
+with captures on desktop and both phone orientations. It also exercises a real
+USL runtime resource failure during JavaScript-to-SGSL confirmation, verifies
+that both live programs survive the failure, and executes the committed SGSL
+program after its preparation objects are destroyed. SGSL exchange coverage
+checks story owner pointers in both resulting runtimes.
+
+The named `JavaScriptNumbers`, `JavaScriptTransactions`, `JavaScriptLifecycle`,
+`JavaScriptRealistic`, `JavaScriptPresentation`, `JavaScriptSession` and
+`JavaScriptSimulation` suites run alongside runtime/integration cases. The shared
+corpus includes real map-reading economic planners and a scenario survey with
+transcendental math, private RNG, returned data and executed orders. Browser and
+iOS harnesses link the same production objects and select these suites; Android
+uses the same native test registry.
+
+`python3 test/check_javascript_corpus.py --build-dir BUILD --output artifacts/js-corpus`
+retains numeric bits, serialized results, simulation traces, saves, replays, logs,
+JUnit results, source/fixture hashes and compiler metadata. Harnesses emit their
+build-time source revision and content hash; runners reject binaries built from
+a different source tree. The shared comparator also requires identical normalized
+Git source hashes across platforms. Git blob normalization accounts for checkout
+line endings and symlink representations; modified and untracked inputs still
+make development builds ineligible for the clean revision gate. Manifests retain
+the actual Git status entries, and CI records checkout status before and after
+compilation, so unexpected dirty inputs can be diagnosed without relaxing that
+gate. A clean runner checkout alone does not establish binary provenance.
+The native corpus runner requires a clean
+committed revision; `--allow-dirty` is for development evidence only. Use fresh
+output directories and compare identical final revisions across platforms.
+
+Android: build `android-tests` for API 24 and the selected ABI, then run
+`python3 mobile/android_device_tests.py --android-sdk SDK --serial SERIAL --arch ABI --suite 'JavaScript*' --output artifacts/js-android`.
+The runner uses disposable shell directories, retrieves artifacts even after
+failure and never accesses installed game data. Use a fresh Android output
+directory; failed artifact transfers fail the run and retain its remote evidence
+for recovery. iOS: build the separate app with
+`python3 mobile/ios.py build --environment simulator --release --script-tests`;
+for a device use `--environment device --team TEAM`. Its bundle identifier is
+`org.globulation2.glob2.script-tests`, and evidence is exported in its own
+Documents/ScriptingEvidence directory. Simulator evidence does not satisfy the
+physical-device gate. Browser: build `web-tests` and run the shared corpus case in
+`browser/tests/determinism.spec.js`; evidence is under
+`artifacts/browser-determinism/script-corpus/`.
+
+Cross-platform acceptance requires identical numeric/data results and complete
+per-tick traces, plus decoded save payloads. Exclude only documented MapHeader
+SHA1 metadata when save histories differ. Same-platform equal-history save and
+replay bytes must match. Build success and simulator-only runs are insufficient.
+CI retains evidence even when execution fails; unavailable devices/signing leave
+those platform gates incomplete. See the [fixture notes](fixtures/javascript/README.md)
+for the exact frozen worlds, seeds and intended draft profile corrections.
+CI executes the shared scripting corpus in Chromium, Firefox and WebKit and
+compares their numeric/data results, complete traces and decoded saves against
+the Linux and Windows corpus runs. The separate released replay comparison
+selects only its baseline traces, so scripting fixture traces cannot be mistaken
+for the released replay.
+
+`python3 test/check_javascript_evidence.py REFERENCE CANDIDATE --output artifacts/js-comparison.json`
+compares shared numeric/data values, complete traces and decoded save payloads,
+requiring the same artifact inventory. It excludes only MapHeader SHA1 from save
+payloads. Review each runner manifest to establish matching source revisions and
+successful execution before treating matching hashes as acceptance evidence.
+Use `mobile/ios_script_tests.py` with an explicit device identifier and, for a
+simulator, an owned `--simulator-set` to install, run and retrieve the separate app.
+
+To retain released simulation compatibility traces, replays, commands, and logs,
+pass `--output artifacts/released-compatibility` to
+`test/check_telemetry_simulation.py`. Fresh-load traces compare complete bytes;
+the legacy checkpoint comparison excludes the version-dependent aggregate and
+compares every stored team/entity record. The evidence manifest records this
+exception. CI retains these artifacts even when verification fails.
+
+The shared evidence comparator requires successful runs of the same clean source
+revision. `--allow-development` permits diagnostic comparisons while recording
+provenance failures; those comparisons do not satisfy the final acceptance gate.
+
+## Software renderer
+
+The opt-in `software-render-benchmark` tool profiles loaded games through the production
+software renderer. It is part of `glob2-tools`, not a CI timing threshold. See
+[Software rendering architecture and profiling](../docs/development/reference.md#software-rendering-architecture-and-profiling)
+for fixture capture, paired CPU measurements and diagnostic overrides. The
+`SoftwareRenderer` suite checks raster sampling, ordering, opacity revisions and
+terrain-cache correctness; `PortableRenderer`, `WindowResize`, `MapRenderResize` and
+`HighResolutionIntegration` cover the shared facade and window lifecycle.

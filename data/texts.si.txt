@@ -84,6 +84,10 @@ AIWarrush
 Spreten graditelj, ki uporablja izurjene napadalne sile.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Krmilnik, ki uporablja vgrajen modul izvorne kode JavaScript.
 [Alga]
 Alga
 [algae]
@@ -3068,8 +3072,6 @@ Mini zemljevid
 Hitro naprej
 [Hide keyboard]
 Skrij tipkovnico
-[Dialog text size]
-Velikost besedila pogovornih oken
 [Player slot]
 Mesto igralca
 [Team color]
@@ -3150,6 +3152,30 @@ Samodejno shrani igro približno vsako minuto.
 Računalniški nasprotniki
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Prostorna postavitev uporablja stransko ploščo, kadar je dovolj prostora. Strnjena uporablja orodno vrstico in izvlečne plošče.
+[settings One-finger zoom]
+Povečava z enim prstom
+[settings Double-tap the map, hold, then drag to zoom.]
+Dvakrat tapnite zemljevid, pridržite in povlecite za povečavo.
+[settings Platform default]
+Privzeto za sistem
+[settings Drag up zooms in]
+Vlečenje navzgor poveča
+[settings Drag down zooms in]
+Vlečenje navzdol poveča
+[settings Thumb side]
+Stran palca
+[settings Phone controls gather in this bottom corner.]
+Na telefonu se kontrolniki zberejo v tem spodnjem kotu.
+[settings Right]
+Desno
+[settings Left]
+Levo
+[Undo stroke]
+Razveljavi
+[No overlay]
+Brez plasti
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Dodeljeno %0 · Cilj %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Možnost zmage: %0 · Moč: %1
 Najnižja zahtevana stopnja %0
 [Confirm %0]
 Potrdi: %0
-[Dialog text size %0]
-Velikost besedila pogovornih oken: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Nadaljuj igro
 Igre
 [Add AI]
 Dodaj UI
+[settings Experiments]
+Poskusi
+[settings Try features we are still testing. They can change balance and pacing.]
+Preizkusite funkcije, ki jih še testiramo. Lahko spremenijo ravnovesje in tempo.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Poskusi veljajo za nove igre, ki jih začnete ali gostite, nikoli za misije kampanje. Shranjena igra obdrži tiste, s katerimi se je začela.
+[Experiments set by the host]
+Poskusi, ki jih je izbral gostitelj
+[settings No experiments in this build.]
+V tej različici ni poskusov.
+[Experiments]
+Poskusi
+[experiment guard-area-balancing]
+Uravnoteženje stražarskih območij
+[experiment guard-area-balancing help]
+Prosti bojevniki se porazdelijo med narisana stražarska območja, namesto da bi vsi šli v najbližje: večje območje jih dobi več, prenatrpano pa se postopoma prazni v druga.
+[settings Touch scrolling]
+Drsenje z dotikom
+[settings List momentum]
+Zagon seznamov
+[settings How far lists and panels keep scrolling after a flick.]
+Kako daleč se seznami in plošče še premikajo po hitrem potegu.
+[settings List bounce]
+Odboj seznamov
+[settings How much lists and panels stretch past their ends and spring back.]
+Koliko se seznami in plošče raztegnejo čez rob in odbijejo nazaj.
+[settings Map momentum]
+Zagon zemljevida
+[settings How far the map keeps panning after a flick.]
+Kako daleč se zemljevid še premika po hitrem potegu.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Občutek drsenja z dotikom. 0 izklopi učinek; 50 je privzeto.
+[List momentum]
+Zagon seznamov
+[List bounce]
+Odboj seznamov
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Zagon zemljevida

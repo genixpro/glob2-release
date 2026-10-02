@@ -3,6 +3,7 @@
 
 #include "GameGUIDialog.h"
 #include "FormatableString.h"
+#include "ScrollTuning.h"
 #include "GameGUI.h"
 #include "GlobalContainer.h"
 #include "Player.h"
@@ -85,7 +86,7 @@ Element InGameEndOfGameScreen::build(const Presentation &p)
 	if (!classic() && teamColor && globalContainer->unitmini)
 	{
 		const GAGCore::Color color = *teamColor;
-		const bool animate = won && !(globalContainer->settings.optionFlags & GlobalContainer::OPTION_LOW_SPEED_GFX) &&
+		const bool animate = won && globalContainer->settings.decorativeAnimations &&
 							 !(globalContainer->reducedMotion);
 		parts.push_back(fe::canvas("outcome/art", {p.pt(200), p.pt(72)},
 								   [color, animate, unit = p.unit](fe::Canvas &c, fe::Rect r, const fe::Frame &frame)
@@ -98,7 +99,7 @@ Element InGameEndOfGameScreen::build(const Presentation &p)
 										   const double bob = animate ? std::sin(frame.tick / 220.0 + i) * 3 * unit : 0;
 										   const int w = sprite->getW(i);
 										   c.transformed(2 * unit, {r.x + r.w / 2 + int((i - 1) * 44 * unit) - int(w * unit), r.y + int(12 * unit + bob)}, r,
-														 [&] { c.surface()->drawSprite(0, 0, sprite, i); });
+														 [&] { c.drawSprite({0, 0}, sprite, i); });
 									   }
 								   }));
 	}
@@ -462,20 +463,41 @@ Element InGameOptionScreen::build(const Presentation &p)
 								   [this](bool value)
 								   {
 									   globalContainer->reducedMotion = value;
+									   applyScrollTuning(globalContainer->settings, value);
 									   invalidate();
 								   }));
-		const int percent = settings.mobileDialogTextPercent;
+		// Touch scroll feel, tunable mid-game like volume: 0 is off, 50 the default.
+		struct ScrollSlider
+		{
+			const char *key, *caption;
+			int Settings::*field;
+		};
+		for (const auto &item : {ScrollSlider{"momentum", "[List momentum]", &Settings::touchScrollMomentum},
+								 ScrollSlider{"bounce", "[List bounce]", &Settings::touchScrollBounce},
+								 ScrollSlider{"mapmomentum", "[Map momentum]", &Settings::mapScrollMomentum}})
+		{
+			fe::SliderOptions options;
+			options.caption = fe::tr(item.caption);
+			options.valueText = std::to_string(settings.*item.field) + "%";
+			parts.push_back(fe::slider(item.key, settings.*item.field, 0, 100,
+									   [this, field = item.field](int value)
+									   {
+										   auto &s = globalContainer->settings;
+										   s.*field = std::clamp(value, 0, 100);
+										   applyScrollTuning(s, globalContainer->reducedMotion);
+										   invalidate();
+									   },
+									   options));
+		}
+		// The same preference as Settings > Display; every touch text surface follows it.
+		const int percent = settings.textSizePercent;
 		const int selected = percent >= 150 ? 2 : percent >= 125 ? 1 : 0;
 		std::vector<std::string> sizes;
 		for (int i = 0; i < 3; ++i)
-			sizes.push_back(GAGCore::FormattableString(fe::tr("[Dialog text size %0]")).arg(100 + i * 25));
-		parts.push_back(fe::label(fe::tr("[Dialog text size]"), {fe::FontRole::Support, true}));
+			sizes.push_back(std::to_string(100 + i * 25) + " %");
+		parts.push_back(fe::label(fe::tr("[settings Text size]"), {fe::FontRole::Support, true}));
 		parts.push_back(fe::segments("text-size", sizes, selected,
-									 [this](int index)
-									 {
-										 globalContainer->settings.mobileDialogTextPercent = 100 + index * 25;
-										 invalidate();
-									 }));
+									 [](int index) { globalContainer->settings.setTextSizePercent(100 + index * 25); }));
 	}
 	std::ostringstream oss;
 	oss << globalContainer->gfx->getW() << "x" << globalContainer->gfx->getH();
@@ -643,7 +665,9 @@ Element InGameTextInput::build(const Presentation &p)
 		return entry;
 	fe::ButtonOptions sendOptions;
 	sendOptions.primary = true;
-	auto send = fe::button("send", fe::tr("[Send]"), [this] { finish(0); }, sendOptions);
-	auto close = fe::button("close", fe::tr("[Close]"), [this] { finish(1); });
+	auto send = fe::compactButton(
+		"send", fe::tr("[Send]"), fe::UIIcon::Send, [this] { finish(0); }, p, sendOptions);
+	auto close =
+		fe::compactButton("close", fe::tr("[Close]"), fe::UIIcon::Close, [this] { finish(1); }, p);
 	return fe::row({fe::expanded(entry), send, close}, {p.pt(6), fe::CrossAlign::Center});
 }

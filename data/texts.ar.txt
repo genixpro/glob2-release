@@ -84,6 +84,10 @@ V: ﺇﺗﺎﺣﺔ ﺍﻟﺮﺅﻳﺔ ﻟﺠﻤﻴﻊ ﺍﻟﻤﺒﺎﻧﻲ
 بنّاء قوي ينشر قوات هجومية مدرّبة.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+وحدة تحكم تستخدم وحدة مصدر JavaScript مضمّنة.
 [Alga]
 ﻃﺤﺎﻟﺐ
 [algae]
@@ -3066,8 +3070,6 @@ Emoji
 تقديم سريع
 [Hide keyboard]
 إخفاء لوحة المفاتيح
-[Dialog text size]
-حجم نص الحوار
 [Player slot]
 خانة اللاعب
 [Team color]
@@ -3148,6 +3150,30 @@ Emoji
 خصوم آليون
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 يستخدم التخطيط الواسع لوحة جانبية عند توفر مساحة. يستخدم التخطيط المضغوط شريط أدوات ولوحات قابلة للفتح.
+[settings One-finger zoom]
+التكبير بإصبع واحدة
+[settings Double-tap the map, hold, then drag to zoom.]
+انقر نقرًا مزدوجًا على الخريطة، واستمر بالضغط، ثم اسحب للتكبير.
+[settings Platform default]
+افتراضي النظام
+[settings Drag up zooms in]
+السحب لأعلى يكبّر
+[settings Drag down zooms in]
+السحب لأسفل يكبّر
+[settings Thumb side]
+جهة الإبهام
+[settings Phone controls gather in this bottom corner.]
+تتجمع عناصر التحكم في الهاتف في هذه الزاوية السفلية.
+[settings Right]
+اليمين
+[settings Left]
+اليسار
+[Undo stroke]
+تراجع
+[No overlay]
+بلا طبقة
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 المعيّنون %0 · الهدف %1
 [Range: %0]
@@ -3382,8 +3408,6 @@ Emoji
 ﺍﻟﻤﺴﺘﻮﻯ ﺍﻷﺩﻧﻰ ﺍﻟﻤﻄﻠﻮﺏ: %0
 [Confirm %0]
 ﻧﻌﻢ: %0
-[Dialog text size %0]
-حجم نص الحوار: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3392,3 +3416,117 @@ Emoji
 الألعاب
 [Add AI]
 إضافة لاعب آلي
+[settings Experiments]
+التجارب
+[settings Try features we are still testing. They can change balance and pacing.]
+جرّب ميزات ما زلنا نختبرها. قد تغيّر التوازن والإيقاع.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+تنطبق التجارب على الألعاب الجديدة التي تبدأها أو تستضيفها، ولا تنطبق أبداً على مهام الحملة. تحتفظ اللعبة المحفوظة بالتجارب التي بدأت بها.
+[Experiments set by the host]
+تجارب اختارها المضيف
+[settings No experiments in this build.]
+لا توجد تجارب في هذا الإصدار.
+[Experiments]
+التجارب
+[experiment guard-area-balancing]
+موازنة مناطق الحراسة
+[experiment guard-area-balancing help]
+يتوزع المحاربون الأحرار بين مناطق الحراسة المرسومة بدلاً من التوجه جميعاً إلى الأقرب: تحصل المنطقة الأكبر على عدد أكبر منهم، والمنطقة المكتظة تتناقص لصالح المناطق الأخرى.
+[settings Touch scrolling]
+التمرير باللمس
+[settings List momentum]
+زخم القوائم
+[settings How far lists and panels keep scrolling after a flick.]
+إلى أي مدى تستمر القوائم واللوحات في التمرير بعد النقرة السريعة.
+[settings List bounce]
+ارتداد القوائم
+[settings How much lists and panels stretch past their ends and spring back.]
+مقدار تمدد القوائم واللوحات بعد أطرافها قبل أن تعود.
+[settings Map momentum]
+زخم الخريطة
+[settings How far the map keeps panning after a flick.]
+إلى أي مدى تستمر الخريطة في التحرك بعد النقرة السريعة.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+إحساس التمرير باللمس. 0 يعطل التأثير؛ 50 هو الافتراضي.
+[List momentum]
+زخم القوائم
+[List bounce]
+ارتداد القوائم
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+زخم الخريطة

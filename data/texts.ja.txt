@@ -92,6 +92,10 @@ Warrush
 建設に強く、訓練された攻撃部隊を送り出します。
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+埋め込まれた JavaScript ソースモジュールを使用するコントローラー。
 [Alga]
 藻
 [algae]
@@ -3064,8 +3068,6 @@ Emoji
 早送り
 [Hide keyboard]
 キーボードを隠す
-[Dialog text size]
-ダイアログの文字サイズ
 [Player slot]
 プレイヤー枠
 [Team color]
@@ -3146,6 +3148,30 @@ Emoji
 AI対戦相手
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 ゆったり配置は十分な空間があるときにサイドパネルを使います。コンパクト配置はツールバーと開閉式パネルを使います。
+[settings One-finger zoom]
+片手ズーム
+[settings Double-tap the map, hold, then drag to zoom.]
+マップをダブルタップしたまま、ドラッグしてズームします。
+[settings Platform default]
+システムの既定
+[settings Drag up zooms in]
+上にドラッグで拡大
+[settings Drag down zooms in]
+下にドラッグで拡大
+[settings Thumb side]
+親指の側
+[settings Phone controls gather in this bottom corner.]
+スマートフォンでは操作ボタンがこの下隅に集まります。
+[settings Right]
+右
+[settings Left]
+左
+[Undo stroke]
+元に戻す
+[No overlay]
+オーバーレイなし
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 割り当て %0 · 目標 %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ CPU %0%
 最低必要レベル： %0
 [Confirm %0]
 OK: %0
-[Dialog text size %0]
-ダイアログの文字サイズ: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ OK: %0
 ゲーム
 [Add AI]
 AIを追加
+[settings Experiments]
+実験機能
+[settings Try features we are still testing. They can change balance and pacing.]
+まだテスト中の機能を試せます。バランスやテンポが変わることがあります。
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+実験機能は自分で開始またはホストする新しいゲームに適用され、キャンペーンのミッションには適用されません。保存したゲームは開始時の実験機能を保持します。
+[Experiments set by the host]
+ホストが選んだ実験機能
+[settings No experiments in this build.]
+このビルドには実験機能がありません。
+[Experiments]
+実験機能
+[experiment guard-area-balancing]
+警備エリアの分散
+[experiment guard-area-balancing help]
+自由な戦士は最も近い警備エリアに全員集まるのではなく、塗られた警備エリアの間で分散します。大きなエリアほど多くの戦士を受け入れ、混みすぎたエリアからは他のエリアへ少しずつ移動します。
+[settings Touch scrolling]
+タッチスクロール
+[settings List momentum]
+リストの慣性
+[settings How far lists and panels keep scrolling after a flick.]
+フリック後にリストやパネルがどれだけスクロールし続けるか。
+[settings List bounce]
+リストのバウンス
+[settings How much lists and panels stretch past their ends and spring back.]
+リストやパネルが端を越えてどれだけ伸びて戻るか。
+[settings Map momentum]
+マップの慣性
+[settings How far the map keeps panning after a flick.]
+フリック後にマップがどれだけ動き続けるか。
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+タッチスクロールの感触。0 で効果をオフ、50 が既定値です。
+[List momentum]
+リストの慣性
+[List bounce]
+リストのバウンス
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+マップの慣性

@@ -3,6 +3,7 @@
 
 #include "MultiplayerGame.h"
 #include "Engine.h"
+#include "GlobalContainer.h"
 #include "Player.h"
 #include "YOGClientFileAssembler.h"
 #include "FileTransferMessages.h"
@@ -61,11 +62,7 @@ void MultiplayerGame::update()
 	
 	if(state == ConnectingToGameRouter)
 	{
-		//This is a special case, it means the router ip is the same as the yog ip
-		if(gameRouterIP == "YOGIP" || client->getIPAddress().rfind("wss://", 0) == 0)
-		{
-			gameRouterIP = 	client->getIPAddress();
-		}
+
 		if(!client->getGameConnection())
 		{
 			client->setGameConnection(std::shared_ptr<NetConnection>(new NetConnection(gameRouterIP, YOG_ROUTER_PORT)));
@@ -100,6 +97,11 @@ void MultiplayerGame::update()
 	
 			shared_ptr<NetSendMapHeader> message2(new NetSendMapHeader(mapHeader));
 			client->sendNetMessage(message2);
+
+			// The header carries the host's experiments: send it now so joiners
+			// see them in the lobby, not only once the game starts.
+			shared_ptr<NetSendGameHeader> message3(new NetSendGameHeader(gameHeader));
+			client->sendNetMessage(message3);
 			
 			state = ConnectingToGameRouter;
 		}
@@ -209,7 +211,22 @@ void MultiplayerGame::setMapHeader(MapHeader& nmapHeader)
 {
 	mapHeader = nmapHeader;
 
-	NetReteamingInformation info = constructReteamingInformation(mapHeader.getFileName());
+	const GameHeader fileHeader = Engine::loadGameHeader(mapHeader.getFileName());
+	// A hosted save keeps the experiments it was started with; a fresh map takes
+	// the host's settings. Joiners get the header from the server. Only the
+	// experiments are carried from a hosted save: its other custom rules are not
+	// (pre-existing), since Game::setGameHeader replaces the header wholesale.
+	if (mapHeader.getIsSavedGame())
+	{
+		if (fileHeader.getNumberOfPlayers() == 0)
+			std::cerr << "MultiplayerGame: cannot read the game header of " << mapHeader.getFileName()
+					  << "; hosting it without experiments" << std::endl;
+		gameHeader.setExperiments(fileHeader.getExperiments());
+	}
+	else
+		Engine::applyLocalExperiments(gameHeader, mapHeader);
+
+	NetReteamingInformation info = constructReteamingInformation(fileHeader);
 	playerManager.setNumberOfTeams(mapHeader.getNumberOfTeams());
 	playerManager.setReteamingInformation(info);
 	needToSendMapHeader=true;
@@ -651,10 +668,9 @@ void MultiplayerGame::sendToListeners(std::shared_ptr<MultiplayerGameEvent> even
 
 
 
-NetReteamingInformation MultiplayerGame::constructReteamingInformation(const std::string& file)
+NetReteamingInformation MultiplayerGame::constructReteamingInformation(const GameHeader& game)
 {
 	NetReteamingInformation info;
-	GameHeader game = Engine::loadGameHeader(file);
 	for(int i=0; i<Team::MAX_COUNT; ++i)
 	{
 		if(game.getBasePlayer(i).type == Player::P_IP)

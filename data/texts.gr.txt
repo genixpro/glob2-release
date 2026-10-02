@@ -84,6 +84,10 @@ AIWarrush
 Ισχυρός οικοδόμος που παρατάσσει εκπαιδευμένες επιθετικές δυνάμεις.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Ένας ελεγκτής που χρησιμοποιεί μια ενσωματωμένη μονάδα πηγαίου κώδικα JavaScript.
 [Alga]
 Φύκη
 [algae]
@@ -3138,8 +3142,6 @@ Emoji
 Γρήγορη προώθηση
 [Hide keyboard]
 Απόκρυψη πληκτρολογίου
-[Dialog text size]
-Μέγεθος κειμένου διαλόγων
 [Player slot]
 Θέση παίκτη
 [Team color]
@@ -3220,6 +3222,30 @@ Emoji
 Αντίπαλοι υπολογιστή
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Η ευρύχωρη διάταξη χρησιμοποιεί πλευρικό πίνακα όταν υπάρχει χώρος. Η συμπαγής χρησιμοποιεί γραμμή εργαλείων και αναπτυσσόμενους πίνακες.
+[settings One-finger zoom]
+Ζουμ με ένα δάχτυλο
+[settings Double-tap the map, hold, then drag to zoom.]
+Πατήστε δύο φορές στον χάρτη, κρατήστε και σύρετε για ζουμ.
+[settings Platform default]
+Προεπιλογή συστήματος
+[settings Drag up zooms in]
+Σύρσιμο πάνω μεγεθύνει
+[settings Drag down zooms in]
+Σύρσιμο κάτω μεγεθύνει
+[settings Thumb side]
+Πλευρά αντίχειρα
+[settings Phone controls gather in this bottom corner.]
+Τα χειριστήρια στο τηλέφωνο συγκεντρώνονται σε αυτή την κάτω γωνία.
+[settings Right]
+Δεξιά
+[settings Left]
+Αριστερά
+[Undo stroke]
+Αναίρεση
+[No overlay]
+Χωρίς επίστρωση
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Ανατεθειμένοι %0 · Στόχος %1
 [Range: %0]
@@ -3454,8 +3480,6 @@ CPU %0%
 Ελάχιστο απαιτούμενο επίπεδο: %0
 [Confirm %0]
 Εντάξει: %0
-[Dialog text size %0]
-Μέγεθος κειμένου διαλόγων: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3464,3 +3488,117 @@ CPU %0%
 Παιχνίδια
 [Add AI]
 Προσθήκη AI
+[settings Experiments]
+Πειράματα
+[settings Try features we are still testing. They can change balance and pacing.]
+Δοκιμάστε λειτουργίες που ακόμα δοκιμάζουμε. Μπορεί να αλλάξουν την ισορροπία και τον ρυθμό.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Τα πειράματα ισχύουν για νέα παιχνίδια που ξεκινάτε ή φιλοξενείτε, ποτέ για αποστολές εκστρατείας. Ένα αποθηκευμένο παιχνίδι κρατά όσα είχε όταν ξεκίνησε.
+[Experiments set by the host]
+Πειράματα που επέλεξε ο οικοδεσπότης
+[settings No experiments in this build.]
+Δεν υπάρχουν πειράματα σε αυτήν την έκδοση.
+[Experiments]
+Πειράματα
+[experiment guard-area-balancing]
+Εξισορρόπηση ζωνών φρούρησης
+[experiment guard-area-balancing help]
+Οι ελεύθεροι πολεμιστές μοιράζονται στις σχεδιασμένες ζώνες φρούρησης αντί να πηγαίνουν όλοι στην πλησιέστερη: μια μεγαλύτερη ζώνη παίρνει περισσότερους, και μια υπερπλήρης ζώνη αδειάζει σταδιακά προς τις άλλες.
+[settings Touch scrolling]
+Κύλιση με αφή
+[settings List momentum]
+Ορμή λιστών
+[settings How far lists and panels keep scrolling after a flick.]
+Πόσο συνεχίζουν να κυλούν οι λίστες και τα πάνελ μετά από ένα τίναγμα.
+[settings List bounce]
+Αναπήδηση λιστών
+[settings How much lists and panels stretch past their ends and spring back.]
+Πόσο τεντώνονται οι λίστες και τα πάνελ πέρα από τα άκρα τους πριν επιστρέψουν.
+[settings Map momentum]
+Ορμή χάρτη
+[settings How far the map keeps panning after a flick.]
+Πόσο συνεχίζει να κινείται ο χάρτης μετά από ένα τίναγμα.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Αίσθηση της κύλισης με αφή. Το 0 απενεργοποιεί ένα εφέ, το 50 είναι η προεπιλογή.
+[List momentum]
+Ορμή λιστών
+[List bounce]
+Αναπήδηση λιστών
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Ορμή χάρτη

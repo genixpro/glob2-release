@@ -10,6 +10,7 @@
 #include "GameGUIKeyActions.h"
 #include "KeyboardManager.h"
 #include "FileManager.h"
+#include <ScrollPhysics.h>
 #include <Toolkit.h>
 #include <StringTable.h>
 #include <SDL_net.h>
@@ -77,8 +78,8 @@ static void run(int width,int height,bool gl,bool expanded)
         FrontendTheme theme;
         FrontendScope frontend;
         NativeSettings screen;
-        for(int category=0;category<6;++category){
-            screen.selectCategory(SettingsScreen::Category(category));
+        for(auto category:screen.visibleCategories()){
+            screen.selectCategory(category);
             for(const auto& r:screen.rows()){
                 if(r.id.empty())continue;
                 if(!(r.control.w>0 && r.control.h>0)){std::cerr<<"row without bounds: "<<r.id<<"\n";
@@ -88,7 +89,7 @@ static void run(int width,int height,bool gl,bool expanded)
                 REQUIRE((r.control.x>=r.bounds.x && r.control.x+r.control.w<=r.bounds.x+r.bounds.w));
                 REQUIRE((r.control.y>=r.bounds.y && r.control.y+r.control.h<=r.bounds.y+r.bounds.h));
             }
-            screen.capture(output+"/category-"+std::to_string(category)+".bmp");
+            screen.capture(output+"/category-"+std::to_string(int(category))+".bmp");
         }
         screen.selectCategory(SettingsScreen::Category::Display);
         const auto windowMode=screen.row("display.mode").number;
@@ -96,9 +97,8 @@ static void run(int width,int height,bool gl,bool expanded)
         REQUIRE(screen.row("graphics.torus").kind==SettingsScreen::Kind::Toggle);
         screen.capture(output+"/window-mode-dropdown.bmp");
         screen.key(SDLK_DOWN);screen.key(SDLK_ESCAPE);
-        REQUIRE((screen.row("display.mode").number==windowMode && !screen.displayConfirmationPending()));
-        screen.activateSetting("display.resolution");
-        screen.capture(output+"/resolution-dropdown.bmp");screen.key(SDLK_ESCAPE);
+        REQUIRE((screen.row("display.mode").number==windowMode && !screen.restartRequired()));
+        for (const auto& row : screen.rows()) REQUIRE(row.id != "display.resolution");
         screen.selectCategory(SettingsScreen::Category::Gameplay);
         for(const auto& row:screen.rows())REQUIRE((row.id!="graphics.torus" && row.id!="gameplay.torus"));
         screen.selectCategory(SettingsScreen::Category::Buildings);
@@ -115,9 +115,36 @@ static void run(int width,int height,bool gl,bool expanded)
         screen.key(SDLK_TAB);screen.key(SDLK_RIGHT);screen.onTimer(SDL_GetTicks()+400);
         REQUIRE(screen.changeSetting("audio.music",123));
         screen.finishInteraction();Settings loaded;loaded.load();REQUIRE((loaded.musicVolume==123 && !loaded.mute));
+        screen.selectCategory(SettingsScreen::Category::Controls);
+        for(const char* id:{"controls.momentum","controls.bounce","controls.mapmomentum"}){
+            REQUIRE(screen.row(id).kind==SettingsScreen::Kind::Slider);REQUIRE(screen.row(id).value=="50%");REQUIRE(screen.row(id).maximum==100);
+        }
+        REQUIRE(screen.changeSetting("controls.momentum",0));REQUIRE(s.touchScrollMomentum==0);REQUIRE(!GAGCore::ScrollPresets::widget().momentum);
+        REQUIRE(screen.changeSetting("controls.bounce",80));REQUIRE(s.touchScrollBounce==80);REQUIRE(GAGCore::ScrollPresets::widget().rubberBandCoefficient>0.56);
+        REQUIRE(screen.changeSetting("controls.mapmomentum",10));REQUIRE(s.mapScrollMomentum==10);REQUIRE(GAGCore::ScrollPresets::mapViewport().decelerationRate<0.998);
+        REQUIRE(screen.row("controls.bounce").value=="80%");
+        screen.onTimer(SDL_GetTicks()+400);loaded.load();
+        REQUIRE((loaded.touchScrollMomentum==0 && loaded.touchScrollBounce==80 && loaded.mapScrollMomentum==10));
+        for(const char* id:{"controls.momentum","controls.bounce","controls.mapmomentum"})REQUIRE(screen.changeSetting(id,50));
+        screen.onTimer(SDL_GetTicks()+400);loaded.load();REQUIRE(loaded.touchScrollMomentum==50);
+        REQUIRE(GAGCore::ScrollPresets::widget().momentum);
         screen.selectCategory(SettingsScreen::Category::Display);
-        s.optionFlags|=0x80;REQUIRE(screen.changeSetting("graphics.detail",1));REQUIRE((s.optionFlags & 0x80));
-        REQUIRE(screen.changeSetting("graphics.detail",0));REQUIRE(s.optionFlags==0x80);
+        s.optionFlags |= 0x80;
+        for (const char* id : {"graphics.clouds", "graphics.shadows", "graphics.particles", "graphics.magic", "graphics.panels", "graphics.paths", "graphics.indicators", "graphics.animation"}) {
+            REQUIRE(screen.changeSetting(id,0)); REQUIRE(s.optionFlags==0x80);
+            REQUIRE(screen.changeSetting(id,1)); REQUIRE(s.optionFlags==0x80);
+        }
+        REQUIRE((s.clouds && s.cloudShadows && s.buildingParticles && s.fullMagicEffects));
+        REQUIRE(screen.changeSetting("graphics.clouds",0));
+        REQUIRE((!s.clouds && s.cloudShadows && s.highResolutionArtwork==originalArtwork));
+        Settings effectSaved; effectSaved.load(); REQUIRE((!effectSaved.clouds && effectSaved.cloudShadows));
+        for (int index : {1,2,0}) {
+            REQUIRE(screen.changeSetting("display.textsize",index));
+            Settings savedText; savedText.load(); REQUIRE(savedText.textSizePercent==100+25*index);
+            screen.paintFrame(SDL_GetTicks());
+            screen.host().scrollIntoView("display.textsize");
+            screen.capture(output+"/text-size-"+std::to_string(index)+".bmp");
+        }
         REQUIRE(screen.row("graphics.renderer").kind==SettingsScreen::Kind::Choice);
         screen.activateSetting("graphics.renderer");screen.key(SDLK_ESCAPE);
         screen.capture(output+"/graphics-renderer.bmp");
@@ -125,21 +152,22 @@ static void run(int width,int height,bool gl,bool expanded)
             REQUIRE(screen.changeSetting("graphics.renderer",0));REQUIRE(screen.restartRequired());
             loaded.load();REQUIRE(!(loaded.screenFlags & GraphicContext::USEGPU));
             REQUIRE(screen.changeSetting("graphics.renderer",1));REQUIRE(!screen.restartRequired());
-        }else{
-            int oldWidth=s.screenWidth;
-            auto resolution=screen.row("display.resolution");int index=-1;
-            for(size_t i=0;i<resolution.choices.size();++i)if(resolution.choices[i].rfind("800 × 600",0)==0)index=i;
-            REQUIRE(index>=0);
-            screen.failNextDisplay=true;REQUIRE(screen.changeSetting("display.resolution",index));
-            REQUIRE((!screen.displayConfirmationPending() && globalContainer->gfx->getW()==oldWidth));
-            REQUIRE(screen.changeSetting("display.resolution",index));
-            REQUIRE(screen.displayConfirmationPending());REQUIRE(s.screenWidth==oldWidth);
-            screen.capture(output+"/display-confirm.bmp");
-            screen.confirmDisplay(false);REQUIRE(globalContainer->gfx->getW()==oldWidth);
-            screen.changeSetting("display.resolution",index);screen.onTimer(SDL_GetTicks()+16000);
-            REQUIRE((!screen.displayConfirmationPending() && globalContainer->gfx->getW()==oldWidth));
-            screen.changeSetting("display.resolution",index);screen.confirmDisplay(true);loaded.load();REQUIRE(loaded.screenWidth==800);
         }
+        {
+            const auto previousFlags=s.screenFlags;
+            screen.failNextDisplay=true;
+            REQUIRE(screen.changeSetting("display.mode",1));
+            REQUIRE(s.screenFlags==previousFlags);
+            REQUIRE(screen.changeSetting("display.mode",1));
+            REQUIRE((globalContainer->gfx->getOptionFlags() & GraphicContext::FULLSCREEN));
+            REQUIRE((s.screenFlags & ~GraphicContext::FULLSCREEN)==(previousFlags & ~GraphicContext::FULLSCREEN));
+            loaded.load(); REQUIRE((loaded.screenFlags & GraphicContext::FULLSCREEN));
+            REQUIRE(!screen.restartRequired());
+            REQUIRE(screen.changeSetting("display.mode",0));
+            REQUIRE(!(globalContainer->gfx->getOptionFlags() & GraphicContext::FULLSCREEN));
+            loaded.load(); REQUIRE(!(loaded.screenFlags & GraphicContext::FULLSCREEN));
+        }
+
         {
             // The collapsed control shows the chosen entry, not the scale in use.
             auto scale=screen.row("display.uiscale");
@@ -148,8 +176,8 @@ static void run(int width,int height,bool gl,bool expanded)
             REQUIRE((index>=0 && screen.changeSetting("display.uiscale",index)));
             REQUIRE(screen.row("display.uiscale").value=="175 %");
             loaded.load();REQUIRE(loaded.uiScale==175);
-            // Software mode applies it in place; a GPU context waits for a restart.
-            REQUIRE(screen.restartRequired()==bool(s.screenFlags & GraphicContext::USEGPU));
+            // Both renderers change scale without a context restart.
+            REQUIRE(!screen.restartRequired());
             screen.capture(output+"/interface-scale.bmp");
             REQUIRE(screen.changeSetting("display.uiscale",0));
             REQUIRE((screen.row("display.uiscale").value.rfind("Match the desktop",0)==0 && !screen.restartRequired()));
@@ -158,6 +186,15 @@ static void run(int width,int height,bool gl,bool expanded)
         REQUIRE(screen.changeSetting("gameplay.speed",4-Settings::GAME_SPEED_MINIMUM));loaded.load();REQUIRE(loaded.gameSpeed==4);
         REQUIRE(s.autosaveGames);REQUIRE(screen.changeSetting("gameplay.autosave",0));loaded.load();REQUIRE(!loaded.autosaveGames);
         REQUIRE(screen.changeSetting("gameplay.autosave",1));loaded.load();REQUIRE(loaded.autosaveGames);
+        // Experiments: one toggle per registry entry, saved as its key.
+        screen.selectCategory(SettingsScreen::Category::Experiments);
+        REQUIRE(screen.row("experiments.guard-area-balancing").kind==SettingsScreen::Kind::Toggle);
+        REQUIRE(!s.experiments.has(ExperimentId::GuardAreaBalancing));
+        REQUIRE(screen.changeSetting("experiments.guard-area-balancing",1));loaded.load();REQUIRE(loaded.experiments.has(ExperimentId::GuardAreaBalancing));
+        REQUIRE(readFile(profile+"/preferences.txt").find("experiments=guard-area-balancing\n")!=std::string::npos);
+        screen.capture(output+"/experiments.bmp");
+        REQUIRE(screen.changeSetting("experiments.guard-area-balancing",0));loaded.load();REQUIRE(loaded.experiments.empty());
+        screen.selectCategory(SettingsScreen::Category::Gameplay);
         const auto before=readFile(profile+"/preferences.txt");
         const auto permissions=std::filesystem::status(profile+"/preferences.txt").permissions();
         const auto directoryTarget=profile+"/atomic-directory";
@@ -178,7 +215,7 @@ static void run(int width,int height,bool gl,bool expanded)
         loaded.load();REQUIRE(loaded.getUsername()=="New player");
         screen.activateSetting("player.name");screen.key(SDLK_BACKSPACE);screen.key(SDLK_ESCAPE);REQUIRE(s.getUsername()=="New player");
         screen.changeSetting("player.language",Toolkit::getStringTable()->getLangCode("fr"));
-        for(int c=0;c<6;++c){screen.selectCategory(SettingsScreen::Category(c));screen.capture(output+"/french-"+std::to_string(c)+".bmp");}
+        for(auto c:screen.visibleCategories()){screen.selectCategory(c);screen.capture(output+"/french-"+std::to_string(int(c))+".bmp");}
         screen.selectCategory(SettingsScreen::Category::Player);screen.changeSetting("player.language",Toolkit::getStringTable()->getLangCode("en"));
         screen.selectCategory(SettingsScreen::Category::Controls);
         screen.activateSetting("keys.add.0");screen.key(SDLK_F12);screen.activateSetting("binding.save");
@@ -209,12 +246,12 @@ static void run(int width,int height,bool gl,bool expanded)
         REQUIRE(s.highResolutionArtwork==originalArtwork);
         screen.selectCategory(SettingsScreen::Category::Display);
         screen.changeSetting("graphics.artwork",!originalArtwork);
-        Settings saved;saved.load();REQUIRE(saved.highResolutionArtwork==!originalArtwork);
+        Settings saved;saved.load();REQUIRE(saved.highResolutionArtwork==(gl ? !originalArtwork : originalArtwork));
         screen.changeSetting("graphics.artwork",originalArtwork);
         screen.selectCategory(SettingsScreen::Category::Display);
         const bool previousTorus=s.automaticTorus;
         screen.changeSetting("graphics.torus",!previousTorus);
-        saved.load();REQUIRE(saved.automaticTorus==!previousTorus);
+        saved.load();REQUIRE(saved.automaticTorus==(gl ? !previousTorus : previousTorus));
         screen.changeSetting("graphics.torus",previousTorus);
         for (const auto& [value,name] : std::vector<std::pair<int,std::string>>{{1,"compact"},{2,"spacious"},{0,"automatic"}}) {
             REQUIRE(screen.changeSetting("display.presentation",value));
@@ -238,10 +275,10 @@ static void run(int width,int height,bool gl,bool expanded)
 // sizes, one software renderer and the expanded English wording.
 TEST_SUITE("Settings")
 {
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, false); }
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization at 800x600 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(800, 600, true, false); }
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization at 1000x700 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, true, false); }
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization at 1280x900 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1280, 900, true, false); }
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization at 1000x700 in software rendering [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, false, false); }
-	TEST_CASE("layout; persistence; display confirmation; bindings and localization with expanded wording at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, true); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, false); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization at 800x600 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(800, 600, true, false); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1000x700 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, true, false); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1280x900 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1280, 900, true, false); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1000x700 in software rendering [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, false, false); }
+	TEST_CASE("layout; persistence; live display changes; bindings and localization with expanded wording at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, true); }
 }

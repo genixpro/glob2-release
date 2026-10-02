@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <ApplicationHost.h>
+#include <algorithm>
 #include <sstream>
 #include <typeinfo>
 #include <ui/Screen.h>
@@ -89,14 +90,14 @@ bool quitRequest(const SDL_Event &event)
 	return false;
 }
 
-void ensureMeasurer(std::unique_ptr<ToolkitTextMeasurer> &measurer, bool &touch, double &scale,
+void ensureMeasurer(std::unique_ptr<ToolkitTextMeasurer> &measurer, bool &touch, double &unit,
 					const Theme &theme, const Presentation &p, Host &host)
 {
-	if (measurer && touch == p.touch && scale == p.textScale)
+	if (measurer && touch == p.touch && unit == p.textUnit)
 		return;
 	touch = p.touch;
-	scale = p.textScale;
-	measurer = std::make_unique<ToolkitTextMeasurer>(theme, touch, scale);
+	unit = p.textUnit;
+	measurer = std::make_unique<ToolkitTextMeasurer>(theme, touch, unit);
 	host.setMeasurer(measurer.get());
 }
 } // namespace
@@ -124,9 +125,8 @@ void UIScreen::refreshPresentation()
 {
 	if (!gfx)
 		return;
-	auto p = resolvePresentation(*gfx);
-	p.textScale = textScale(p);
-	ensureMeasurer(measurer, measurerTouch, measurerScale, themeValue, p, hostValue);
+	const auto p = resolvePresentation(*gfx, themeValue.touchTextScale);
+	ensureMeasurer(measurer, measurerTouch, measurerUnit, themeValue, p, hostValue);
 	hostValue.setPresentation(p);
 }
 
@@ -164,6 +164,14 @@ void UIScreen::handleExecutionEvent(SDL_Event event)
 		return;
 	hostValue.event(event);
 	onEvent(event);
+}
+
+Uint32 UIScreen::executionDelay(Uint32 now, Uint32 fallback)
+{
+	if (!hostValue.animating())
+		return fallback;
+	const Uint32 elapsed = now - lastTick;
+	return std::min(fallback, elapsed < 16 ? 16 - elapsed : 0);
 }
 
 void UIScreen::viewportResized(int, int, int, int)
@@ -237,9 +245,8 @@ void UIDialog::refreshPresentation()
 {
 	if (!surface)
 		return;
-	auto p = resolvePresentation(*surface);
-	p.textScale = textScale(p);
-	ensureMeasurer(measurer, measurerTouch, measurerScale, themeValue, p, hostValue);
+	const auto p = resolvePresentation(*surface, themeValue.touchTextScale);
+	ensureMeasurer(measurer, measurerTouch, measurerUnit, themeValue, p, hostValue);
 	hostValue.setPresentation(p);
 }
 

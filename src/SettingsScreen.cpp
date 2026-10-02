@@ -9,6 +9,7 @@
 #include <Toolkit.h>
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 
 using namespace GAGCore;
 using namespace Glob2UI;
@@ -17,8 +18,6 @@ SettingsScreen::SettingsScreen() : gameKeys(GameGUIShortcuts), editorKeys(MapEdi
 
 SettingsScreen::~SettingsScreen()
 {
-	if (modal == Modal::Display)
-		confirmDisplay(false);
 	if (settingsDirty || keyboardDirty[0] || keyboardDirty[1])
 		persist();
 }
@@ -80,7 +79,7 @@ void SettingsScreen::resetScroll()
 
 std::string SettingsScreen::categoryName(Category category) const
 {
-	const char *names[] = {"Display & graphics", "Audio", "Gameplay", "Building defaults", "Controls", "Language & player"};
+	const char *names[] = {"Display & graphics", "Audio", "Gameplay", "Building defaults", "Controls", "Language & player", "Experiments"};
 	return tr(names[int(category)]);
 }
 
@@ -176,6 +175,7 @@ std::vector<SettingsScreen::Category> SettingsScreen::visibleCategories() const
 	if (!touchLayout)
 		result.push_back(Category::Controls);
 	result.push_back(Category::Player);
+	result.push_back(Category::Experiments);
 	return result;
 }
 
@@ -186,8 +186,6 @@ void SettingsScreen::selectCategory(Category category)
 		return;
 	host().closePopup();
 	selectedBuilding = -1;
-	if (modal == Modal::Display)
-		confirmDisplay(false);
 	host().endEditing();
 	finishInteraction();
 	current = category;
@@ -257,8 +255,6 @@ void SettingsScreen::finishInteraction()
 void SettingsScreen::done()
 {
 	host().closePopup();
-	if (modal == Modal::Display)
-		confirmDisplay(false);
 	host().endEditing();
 	// Always confirm durability on close, not just when something in this
 	// session is dirty: a prior browser storage-restore failure can leave
@@ -280,17 +276,13 @@ void SettingsScreen::abandon()
 	// failed: every change is already live and auto-saved as it's made, so
 	// there is nothing to discard.
 	host().closePopup();
-	if (modal == Modal::Display)
-		confirmDisplay(false);
 	host().endEditing();
 	endExecute(1);
 }
 
 void SettingsScreen::dismiss()
 {
-	if (modal == Modal::Display)
-		confirmDisplay(false);
-	else if (modal == Modal::Conflict)
+	if (modal == Modal::Conflict)
 	{
 		modal = Modal::Binding;
 		invalidate();
@@ -354,10 +346,6 @@ bool SettingsScreen::interceptEvent(const SDL_Event &event)
 void SettingsScreen::onTimer(Uint32 tick)
 {
 	lastTick = tick;
-	if (modal == Modal::Display && Sint32(tick - displayDeadline) >= 0)
-		confirmDisplay(false);
-	if (modal == Modal::Display)
-		invalidate(); // countdown text
 	if (saveAt && Sint32(tick - saveAt) >= 0)
 		persist();
 	if (persistence)
@@ -396,41 +384,33 @@ void SettingsScreen::onTimer(Uint32 tick)
 	}
 }
 
-bool SettingsScreen::displayConfirmationPending() const { return modal == Modal::Display; }
-
 bool SettingsScreen::restartRequired() const
 {
 #ifdef GLOB2_MOBILE
-	// The OS controls the mobile viewport; desktop display preferences are unused.
 	return false;
 #else
 	const auto &s = globalContainer->settings;
-	auto *g = globalContainer->gfx;
-	const Uint32 mask = GraphicContext::USEGPU | GraphicContext::FULLSCREEN | GraphicContext::CUSTOMCURSOR;
-	return (s.screenFlags & mask) != (g->getOptionFlags() & mask) || s.screenWidth != g->getRequestedW() ||
-		   s.screenHeight != g->getRequestedH() ||
-		   // The preference is resolved against the desktop, and the window floor may
-		   // have reduced the scale in use, so compare what setRes() was asked for.
-		   GraphicContext::effectiveUiScale(s.uiScale / 100.0f) != g->getWantedUiScale();
+	const Uint32 mask = GraphicContext::USEGPU | GraphicContext::CUSTOMCURSOR;
+	return (s.screenFlags & mask) != (globalContainer->gfx->getOptionFlags() & mask);
 #endif
 }
 
 void SettingsScreen::changeUiScale(int percent)
 {
 	auto &s = globalContainer->settings;
-	if (percent == s.uiScale)
-		return;
+	if (percent == s.uiScale) return;
+	displayError = false;
+	if (!globalContainer->gfx->setUiScale(percent / 100.0f))
+	{
+		displayError = true; invalidate(); return;
+	}
 	s.uiScale = percent;
 	commit();
-	GraphicContext::setRequestedUiScale(percent / 100.0f);
-	// A GPU context cannot be rebuilt in place; restartRequired() reports it instead.
-	if (!(globalContainer->gfx->getOptionFlags() & GraphicContext::USEGPU))
-		applyDisplayMode(s.screenWidth, s.screenHeight, s.screenFlags);
 }
 
 bool SettingsScreen::applyDisplayMode(int width, int height, Uint32 flags)
 {
-	return globalContainer->gfx->setRes(width, height, flags);
+	return globalContainer->gfx->setFullscreen(bool(flags & GraphicContext::FULLSCREEN));
 }
 
 void SettingsScreen::changeDisplay(std::function<void(Settings &)> change)
@@ -439,57 +419,15 @@ void SettingsScreen::changeDisplay(std::function<void(Settings &)> change)
 	Settings candidate = s;
 	change(candidate);
 	displayError = false;
-	if (candidate.screenWidth == s.screenWidth && candidate.screenHeight == s.screenHeight && candidate.screenFlags == s.screenFlags)
-		return;
-	// A GPU context cannot switch to a software surface in place.
-	if ((candidate.screenFlags | globalContainer->gfx->getOptionFlags()) & GraphicContext::USEGPU)
+	const bool fullscreenChanged = bool((candidate.screenFlags ^ globalContainer->gfx->getOptionFlags()) & GraphicContext::FULLSCREEN);
+	if (fullscreenChanged && !applyDisplayMode(candidate.screenWidth, candidate.screenHeight, candidate.screenFlags))
 	{
-		s = candidate;
-		commit();
-		return;
+		displayError = true; invalidate(); return;
 	}
-	previousDisplay = s;
-	if (!applyDisplayMode(candidate.screenWidth, candidate.screenHeight, candidate.screenFlags))
-	{
-		applyDisplayMode(s.screenWidth, s.screenHeight, s.screenFlags);
-		displayError = true;
-		invalidate();
-		return;
-	}
-	if (candidate.screenWidth == s.screenWidth && candidate.screenHeight == s.screenHeight &&
-		((candidate.screenFlags ^ s.screenFlags) & GraphicContext::FULLSCREEN) == 0)
-	{
-		s = candidate;
-		commit();
-		return;
-	}
-	// Keep the persisted preferences unchanged until the player accepts the mode.
-	picker.number = candidate.screenWidth;
-	picker.maximum = candidate.screenHeight;
-	picker.minimum = int(candidate.screenFlags);
-	modal = Modal::Display;
-	pendingFocus = "display.keep";
-	displayDeadline = SDL_GetTicks() + 15000;
-	invalidate();
-}
-
-void SettingsScreen::confirmDisplay(bool keep)
-{
-	if (modal != Modal::Display)
-		return;
-	auto &s = globalContainer->settings;
-	if (keep)
-	{
-		s.screenWidth = picker.number;
-		s.screenHeight = picker.maximum;
-		s.screenFlags = Uint32(picker.minimum);
-		commit();
-	}
-	else if (!applyDisplayMode(previousDisplay.screenWidth, previousDisplay.screenHeight, previousDisplay.screenFlags))
-		displayError = true;
-	modal = Modal::None;
-	host().focus("", false);
-	invalidate();
+	candidate.screenWidth = globalContainer->gfx->getRequestedW();
+	candidate.screenHeight = globalContainer->gfx->getRequestedH();
+	s = candidate;
+	commit();
 }
 
 // Layout ------------------------------------------------------------------
@@ -513,6 +451,12 @@ Element SettingsScreen::categoryNavigation(const Presentation &p, bool sidebar)
 			options.alignLeft = true;
 			options.selected = category == current && modal == Modal::None;
 			options.minHeight = 42;
+			// One icon per Category, in its order.
+			static constexpr UIIcon icons[] = {UIIcon::Display,   UIIcon::Audio,    UIIcon::Gameplay,
+											   UIIcon::Buildings, UIIcon::Controls, UIIcon::Player,
+											   UIIcon::Experiments};
+			static_assert(std::size(icons) == std::size_t(Category::Experiments) + 1, "an icon for every settings category");
+			options.icon = uiIcon(icons[int(category)]);
 			items.push_back(Glob2UI::button("nav." + std::to_string(int(category)), categoryName(category),
 											[this, category] { selectCategory(category); }, options));
 		}
@@ -714,15 +658,17 @@ Element SettingsScreen::build(const Presentation &p)
 	{
 		if (modal == Modal::None)
 			buttons.push_back({"cancel", tr(failed ? "continue" : "Cancel"), [this] { abandon(); }});
-		buttons.push_back({"done", tr(modal == Modal::None ? "Done" : modal == Modal::Display ? "Revert" : "Cancel"), [this] { dismiss(); }, true});
+		buttons.push_back({"done", tr(modal == Modal::None ? "Done" : "Cancel"), [this] { dismiss(); }, true});
 	}
 	auto footerRow = row({expanded(paragraph(status, {FontRole::Support, true})), actions(std::move(buttons), p, ActionStyle::Compact)}, {-1, CrossAlign::Center});
 
-	const bool sidebar = modal == Modal::None && !p.compact() && p.safe.w >= p.pt(760);
+	// The rail only when the body keeps its room beside it (760 points at 100% text).
+	const bool sidebar = modal == Modal::None && !p.compact() && p.safe.w >= p.pt(584) + p.textPt(176);
 	Element page;
 	if (sidebar)
 	{
-		auto rail = padding({0, 0, p.pt(8), 0}, width(p.pt(176), categoryNavigation(p, true)));
+		// Widens with larger text and scrolls when the categories outgrow the page.
+		auto rail = padding({0, 0, p.pt(8), 0}, width(p.textPt(176), scroll("nav", categoryNavigation(p, true))));
 		page = column({heading(tr("Settings")), expanded(row({rail, expanded(body)}, {-1, CrossAlign::Stretch})), divider(), footerRow}, {p.pt(10)});
 	}
 	else

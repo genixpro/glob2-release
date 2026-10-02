@@ -35,6 +35,11 @@ Settings::Settings()
 	screenHeight = 600;
 	uiScale = 0;
 	optionFlags = 0;
+#ifdef __EMSCRIPTEN__
+	setGraphicsDetail(false);
+#else
+	setGraphicsDetail(true);
+#endif
 	automaticTorus = false;
 	language = "en";
 	musicVolume = 190;
@@ -42,7 +47,9 @@ Settings::Settings()
 	mute = 0;
 	rememberUnit = 1;
 	gameSpeed = GAME_SPEED_NORMAL;
-    mobileDialogTextPercent = 100;
+    textSizePercent = 100;
+	oneFingerZoomDirection = ONE_FINGER_ZOOM_PLATFORM;
+	thumbSide = THUMB_RIGHT;
 	tempUnit = 1;
 	tempUnitFuture = 1;
 	version = 0;
@@ -78,13 +85,37 @@ Settings::Settings()
 }
 
 
+void Settings::setGraphicsDetail(bool full)
+{
+	clouds = full;
+	cloudShadows = full;
+	buildingParticles = full;
+	fullMagicEffects = full;
+	translucentPanels = full;
+	translucentPathLines = full;
+	smoothProgressIndicators = full;
+	decorativeAnimations = full;
+	optionFlags &= ~LEGACY_LOW_DETAIL;
+}
+
 std::string Settings::getUsername() { return username; }
 void Settings::setUsername(std::string s) { username.assign(s, 0, BasePlayer::MAX_NAME_LENGTH); }
+
+void Settings::setTextSizePercent(int percent)
+{
+	textSizePercent = std::clamp(percent, 100, 150);
+	GAGCore::userTextScale = textSizePercent / 100.0;
+}
 std::string Settings::getPasswd() { return password; }
 void Settings::setPasswd(std::string s) { password = s; }
 
 void Settings::load(std::string filename)
 {
+#ifdef __EMSCRIPTEN__
+	setGraphicsDetail(false);
+#else
+	setGraphicsDetail(true);
+#endif
     interfacePresentation="automatic";
 	std::map<std::string, std::string> parsed;
 
@@ -119,6 +150,18 @@ void Settings::load(std::string filename)
         READ_PARSED_STRING(interfacePresentation);
         interfacePresentation=presentationPreferenceName(parsePresentationPreference(interfacePresentation));
 		READ_PARSED_INT(optionFlags);
+		// Old profiles seed each missing effect; explicit choices win.
+		if (parsed.count("optionFlags"))
+			setGraphicsDetail(!(optionFlags & LEGACY_LOW_DETAIL));
+		READ_PARSED_INT(clouds);
+		READ_PARSED_INT(cloudShadows);
+		READ_PARSED_INT(buildingParticles);
+		READ_PARSED_INT(fullMagicEffects);
+		READ_PARSED_INT(translucentPanels);
+		READ_PARSED_INT(translucentPathLines);
+		READ_PARSED_INT(smoothProgressIndicators);
+		READ_PARSED_INT(decorativeAnimations);
+
 		READ_PARSED_INT(automaticTorus);
 		READ_PARSED_STRING(language);
 		READ_PARSED_INT(musicVolume);
@@ -128,9 +171,25 @@ void Settings::load(std::string filename)
 		READ_PARSED_INT(scrollWheelEnabled);
 		READ_PARSED_INT(highResolutionArtwork);
 		READ_PARSED_INT(autosaveGames);
+		// The file decides the set: absent or empty means nothing enabled, the
+		// default, rather than whatever this object held before.
+		experiments.clear();
+		if (parsed.find("experiments") != parsed.end())
+			experiments = ExperimentSet::fromText(parsed["experiments"]);
 		READ_PARSED_INT(gameSpeed);
-        READ_PARSED_INT(mobileDialogTextPercent);
-        mobileDialogTextPercent=std::clamp(mobileDialogTextPercent,100,150);
+        READ_PARSED_INT(textSizePercent);
+        setTextSizePercent(textSizePercent);
+        READ_PARSED_INT(touchScrollMomentum);
+        READ_PARSED_INT(touchScrollBounce);
+        READ_PARSED_INT(mapScrollMomentum);
+        touchScrollMomentum=std::clamp(touchScrollMomentum,0,100);
+        touchScrollBounce=std::clamp(touchScrollBounce,0,100);
+        mapScrollMomentum=std::clamp(mapScrollMomentum,0,100);
+		READ_PARSED_INT(oneFingerZoomDirection);
+		oneFingerZoomDirection = std::clamp(oneFingerZoomDirection,
+			int(ONE_FINGER_ZOOM_PLATFORM), int(ONE_FINGER_ZOOM_DOWN_IN));
+		READ_PARSED_INT(thumbSide);
+		thumbSide = std::clamp(thumbSide, int(THUMB_RIGHT), int(THUMB_LEFT));
 		gameSpeed=std::max(static_cast<int>(GAME_SPEED_MINIMUM),
 			std::min(static_cast<int>(GAME_SPEED_MAXIMUM), gameSpeed));
 #ifndef YOG_SERVER_ONLY
@@ -189,7 +248,7 @@ bool Settings::save(std::string filename)
 		Utilities::streamprintf(stream, "screenFlags=%d\n", screenFlags);
 		Utilities::streamprintf(stream, "uiScale=%d\n", uiScale);
         Utilities::streamprintf(stream, "interfacePresentation=%s\n", interfacePresentation.c_str());
-		Utilities::streamprintf(stream, "optionFlags=%d\n", optionFlags);
+		Utilities::streamprintf(stream, "optionFlags=%d\n", optionFlags & ~LEGACY_LOW_DETAIL);
 		Utilities::streamprintf(stream, "automaticTorus=%d\n", automaticTorus);
 		Utilities::streamprintf(stream, "language=%s\n", language.c_str());
 		Utilities::streamprintf(stream, "musicVolume=%d\n", musicVolume);
@@ -198,9 +257,23 @@ bool Settings::save(std::string filename)
 		Utilities::streamprintf(stream, "rememberUnit=%d\n", rememberUnit);
 		Utilities::streamprintf(stream, "scrollWheelEnabled=%d\n", scrollWheelEnabled);
 		Utilities::streamprintf(stream, "highResolutionArtwork=%d\n", highResolutionArtwork);
+		Utilities::streamprintf(stream, "clouds=%d\n", clouds);
+		Utilities::streamprintf(stream, "cloudShadows=%d\n", cloudShadows);
+		Utilities::streamprintf(stream, "buildingParticles=%d\n", buildingParticles);
+		Utilities::streamprintf(stream, "fullMagicEffects=%d\n", fullMagicEffects);
+		Utilities::streamprintf(stream, "translucentPanels=%d\n", translucentPanels);
+		Utilities::streamprintf(stream, "translucentPathLines=%d\n", translucentPathLines);
+		Utilities::streamprintf(stream, "smoothProgressIndicators=%d\n", smoothProgressIndicators);
+		Utilities::streamprintf(stream, "decorativeAnimations=%d\n", decorativeAnimations);
 		Utilities::streamprintf(stream, "autosaveGames=%d\n", autosaveGames);
+		Utilities::streamprintf(stream, "experiments=%s\n", experiments.toText().c_str());
 		Utilities::streamprintf(stream, "gameSpeed=%d\n", gameSpeed);
-        Utilities::streamprintf(stream,"mobileDialogTextPercent=%d\n",mobileDialogTextPercent);
+        Utilities::streamprintf(stream,"textSizePercent=%d\n",textSizePercent);
+        Utilities::streamprintf(stream,"touchScrollMomentum=%d\n",touchScrollMomentum);
+        Utilities::streamprintf(stream,"touchScrollBounce=%d\n",touchScrollBounce);
+        Utilities::streamprintf(stream,"mapScrollMomentum=%d\n",mapScrollMomentum);
+		Utilities::streamprintf(stream, "oneFingerZoomDirection=%d\n", oneFingerZoomDirection);
+		Utilities::streamprintf(stream, "thumbSide=%d\n", thumbSide);
 
 		for(int n=0; n<IntBuildingType::NB_BUILDING; ++n)
 		{
@@ -229,6 +302,19 @@ bool Settings::save(std::string filename)
 }
 
 
+
+bool Settings::dragUpZoomsIn(void) const
+{
+	if (oneFingerZoomDirection == ONE_FINGER_ZOOM_UP_IN)
+		return true;
+	if (oneFingerZoomDirection == ONE_FINGER_ZOOM_DOWN_IN)
+		return false;
+#ifdef __ANDROID__
+	return false;
+#else
+	return true;
+#endif
+}
 
 int Settings::getGameSpeedStepDuration(void) const
 {

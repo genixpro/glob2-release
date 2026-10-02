@@ -25,6 +25,13 @@ ENGINE_SUPPORT = [
 
 # glob2-engine-tests: every client object except the entry point, plus these.
 ENGINE_TESTS = [
+    ('ScriptCompatibilityTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    'ScriptIntegrationTest.cpp',
+    'ScriptPresentationTest.cpp',
+    'ScriptEditorTest.cpp',
+    'ScriptRealisticTest.cpp',
+    ('ScriptSessionTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('ScriptSimulationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     'BuildingExpelHarness.cpp',
     'BuildingGradientInvalidationHarness.cpp',
     'FetchApportionmentHarness.cpp',
@@ -71,8 +78,9 @@ ENGINE_TESTS = [
     ('EnteringUnitDrawHarness.cpp', dict(require={'opengl'})),
     ('FailingUnitMarkersHarness.cpp', dict(require={'opengl'})),
     'FullscreenAspectHarness.cpp',
-    ('HighResolutionIntegrationHarness.cpp', dict(require={'opengl'})),
+    'HighResolutionIntegrationHarness.cpp',
     'PortableRendererHarness.cpp',
+    'SoftwareRendererTest.cpp',
     ('RuntimePackCheck.cpp', dict(require={'opengl'})),
     ('TextRasterHarness.cpp', dict(require={'opengl'})),
     ('TorusRenderIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
@@ -81,8 +89,12 @@ ENGINE_TESTS = [
     ('UnitTeamShaderTest.cpp', dict(require={'opengl'})),
     'WindowResizeHarness.cpp',
     'SettingsScreenTest.cpp',
+    'SettingsGraphicsTest.cpp',
+    'SettingsExperimentsTest.cpp',
+    'GuardAreaBalanceTest.cpp',
     'GameSpeedTest.cpp',
     'UIPresentationHarness.cpp',
+    'UIIconsTest.cpp',
     'GameGUITouchHarness.cpp',
     # Command-line harnesses whose modes became cases.
     'CustomGameSetupHarness.cpp',
@@ -92,10 +104,17 @@ ENGINE_TESTS = [
 
 # glob2-unit-tests: libgag, libusl, the production sources below and stubs.
 UNIT_TESTS = [
+    'ScriptRuntimeTest.cpp',
+    'ScriptNumericTest.cpp',
+    ('UnitDrawBatchTest.cpp', dict(require={'opengl'})),
+    ('MapGeometryCacheTest.cpp', dict(require={'opengl'})),
+    ('SpriteDrawBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('OpaqueRectangleBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
     # Former CppUnit suite (TestsRunner).
     'AllyTeamWidgetIndexTest.cpp',
     'BitArrayTest.cpp',
     'BrushAccumulatorTest.cpp',
+    'BrushCoverageTest.cpp',
     'BrushToolHitTest.cpp',
     'BuildingFailureDisplayTest.cpp',
     'CortexUpgradeTest.cpp',
@@ -127,6 +146,7 @@ UNIT_TESTS = [
     'BaseTeamSaveLoadTest.cpp',
     'BulletSaveLoadTest.cpp',
     'CloudFieldTest.cpp',
+    'ExperimentalFeaturesTest.cpp',
     'GameHeaderDefaultAlliancesTest.cpp',
     'GameHeaderTextSaveLoadTest.cpp',
     'GameHintsTest.cpp',
@@ -160,6 +180,7 @@ UNIT_TESTS = [
     ('MobileTemporaryFilesHarness.cpp', dict(require={'not-mingw'})),
     'PerformanceTelemetryHarness.cpp',
     'ScreenExecutionHarness.cpp',
+    'ScrollPhysicsTest.cpp',
     'SoundMixerTrackSelectionHarness.cpp',
     'UILayoutHarness.cpp',
     'GlobalGradientHarness.cpp',
@@ -179,8 +200,11 @@ UNIT_TESTS = [
 # Production sources the unit binary links. Plain entries reuse the client build's
 # object; entries with `defines` are compiled again for the unit binary only.
 UNIT_PRODUCTION_SOURCES = [
+    '#src/script/ScriptValue.cpp',
+    '#src/script/ScriptRuntime.cpp',
     '#src/BitArray.cpp',
     '#src/Brush.cpp',
+    '#src/BrushCoverage.cpp',
     '#src/OverlayFill.cpp',
     '#src/PlayerVoice.cpp',
     '#src/Utilities.cpp',
@@ -210,6 +234,7 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/BasePlayer.cpp',
     '#src/BaseTeam.cpp',
     '#src/Bullet.cpp',
+    '#src/ExperimentalFeatures.cpp',
     '#src/GameHeader.cpp',
     '#src/GameHints.cpp',
     '#src/GameObjectives.cpp',
@@ -249,6 +274,7 @@ PROGRAMS = [
     ('MapReportHarness', 'MapReportHarness.cpp', 'map-report-test', 'test'),
     ('MaximaStrategyDump', 'maxima/MaximaStrategyDump.cpp', 'maxima-strategy-dump', 'tools'),
     ('MenuColonyHarness', '#tools/MenuColonyHarness.cpp', 'menu-colony-harness', 'test'),
+    ('SoftwareRenderBenchmark', 'SoftwareRenderBenchmark.cpp', 'software-render-benchmark', 'tools'),
     ('torus-render-benchmark', 'TorusRenderBenchmark.cpp', 'torus-render-benchmark', 'tools'),
 ]
 
@@ -320,3 +346,17 @@ LEGACY_ALIASES = {
     'screen-test': 'glob2-unit-tests',
     'ui-layout-test': 'glob2-unit-tests',
 }
+
+
+def scripting_entries():
+    """Shared in-process corpus for browser and the standalone iOS test app.
+
+    TeamStatsSaveHarness owns the production conversion fixture and lifecycle
+    cases. Its unrelated registered cases are excluded by the JavaScript* suite
+    filter. Both desktop binaries and Android use the full registry above.
+    """
+    selected = {'ScriptCompatibilityTest.cpp', 'ScriptIntegrationTest.cpp', 'ScriptPresentationTest.cpp',
+                'ScriptRealisticTest.cpp', 'ScriptSessionTest.cpp', 'ScriptSimulationTest.cpp',
+                'TeamStatsSaveHarness.cpp', 'ScriptRuntimeTest.cpp', 'ScriptNumericTest.cpp'}
+    return [entry for entry in ENGINE_TESTS + UNIT_TESTS
+            if (entry if isinstance(entry, str) else entry[0]) in selected]

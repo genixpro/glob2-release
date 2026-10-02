@@ -86,6 +86,10 @@ Warrush
 A strong builder that fields trained attacking forces.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+A controller using an embedded JavaScript source module.
 [Alga]
 Algae
 [algae]
@@ -3066,8 +3070,6 @@ Minimap
 Fast forward
 [Hide keyboard]
 Hide keyboard
-[Dialog text size]
-Dialog text size
 [Player slot]
 Player slot
 [Team color]
@@ -3118,6 +3120,30 @@ Compact
 Spacious
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.
+[settings One-finger zoom]
+One-finger zoom
+[settings Double-tap the map, hold, then drag to zoom.]
+Double-tap the map, hold, then drag to zoom.
+[settings Platform default]
+Platform default
+[settings Drag up zooms in]
+Drag up zooms in
+[settings Drag down zooms in]
+Drag down zooms in
+[settings Thumb side]
+Thumb side
+[settings Phone controls gather in this bottom corner.]
+Phone controls gather in this bottom corner.
+[settings Right]
+Right
+[settings Left]
+Left
+[Undo stroke]
+Undo
+[No overlay]
+No overlay
+[zoom factor %0]
+%0×
 [More]
 More
 [No items]
@@ -3382,8 +3408,6 @@ Win chance: %0 · Fitness: %1
 Minimum required level: %0
 [Confirm %0]
 Ok: %0
-[Dialog text size %0]
-Dialog text size: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3392,3 +3416,117 @@ Resume game
 Games
 [Add AI]
 Add AI
+[settings Experiments]
+Experiments
+[settings Try features we are still testing. They can change balance and pacing.]
+Try features we are still testing. They can change balance and pacing.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.
+[Experiments set by the host]
+Experiments set by the host
+[settings No experiments in this build.]
+No experiments in this build.
+[Experiments]
+Experiments
+[experiment guard-area-balancing]
+Guard-area balancing
+[experiment guard-area-balancing help]
+Free warriors spread between painted guard areas instead of all taking the nearest one: a bigger area gets more of them, and an over-full area thins out into the others.
+[settings Touch scrolling]
+Touch scrolling
+[settings List momentum]
+List momentum
+[settings How far lists and panels keep scrolling after a flick.]
+How far lists and panels keep scrolling after a flick.
+[settings List bounce]
+List bounce
+[settings How much lists and panels stretch past their ends and spring back.]
+How much lists and panels stretch past their ends and spring back.
+[settings Map momentum]
+Map momentum
+[settings How far the map keeps panning after a flick.]
+How far the map keeps panning after a flick.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Touch scrolling feel. 0 turns an effect off; 50 is the default.
+[List momentum]
+List momentum
+[List bounce]
+List bounce
+[Map momentum]
+Map momentum
+[settings Artwork]
+Artwork
+[settings Original]
+Original
+[settings High resolution]
+High resolution
+[settings Clouds]
+Clouds
+[settings Show cloud cover above the map.]
+Show cloud cover above the map.
+[settings Cloud shadows]
+Cloud shadows
+[settings Show cloud shadows on the ground independently of cloud cover.]
+Show cloud shadows on the ground independently of cloud cover.
+[settings Building particles]
+Building particles
+[settings Show smoke and other building particles.]
+Show smoke and other building particles.
+[settings Magic effects]
+Magic effects
+[settings Choose animated magic effects or a simple visible effect.]
+Choose animated magic effects or a simple visible effect.
+[settings Simple]
+Simple
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+Requires the OpenGL renderer. Your saved choice is retained.
+[settings Interface appearance]
+Interface appearance
+[settings Panels]
+Panels
+[settings Choose translucent or opaque interface panels.]
+Choose translucent or opaque interface panels.
+[settings Opaque]
+Opaque
+[settings Translucent]
+Translucent
+[settings Advanced graphics]
+Advanced graphics
+[settings Path lines]
+Path lines
+[settings Choose translucent or opaque unit path lines.]
+Choose translucent or opaque unit path lines.
+[settings Smooth progress indicators]
+Smooth progress indicators
+[settings Smooth the moving edges of progress indicators.]
+Smooth the moving edges of progress indicators.
+[settings Decorative interface animation]
+Decorative interface animation
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+Animate victory artwork. Reduced motion also disables this animation.
+[settings Text size]
+Text size
+[settings Enlarge interface text without changing the map scale.]
+Enlarge interface text without changing the map scale.
+[lan pairing field]
+Host pairing string (or trusted WSS URL)
+[lan pairing connect]
+Pair and connect
+[lan discovery instructions]
+Select a host, then paste its pairing string to verify its identity.
+[lan discovery unavailable]
+LAN discovery is unavailable. Check local network permission or paste a host pairing string.
+[lan discovered host %0]
+Discovered host %0 — pair to view games
+[lan share pairing]
+Share this pairing string with guests to verify this LAN session:
+[lan copy pairing]
+Copy pairing string
+[lan connection unavailable]
+Unable to reach the LAN host. Check local network permission and the host pairing string.
+[lan connection verification failed %0]
+Unable to verify or connect to the LAN host: %0
+[network start refused]
+The server refused to start this game. Check player readiness or reconnect after the server update.
+[lan lobby endpoint required]
+Use the host lobby endpoint

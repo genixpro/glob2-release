@@ -21,6 +21,7 @@
 #include "DatasetWriter.h"
 #include "ReplayReader.h"
 #include "ReplayWriter.h"
+#include "ScrollTuning.h"
 #endif  // !YOG_SERVER_ONLY
 
 #include "YOGConsts.h"
@@ -51,13 +52,13 @@ GlobalContainer::GlobalContainer(const char *profileName)
 
 #ifdef __EMSCRIPTEN__
 	// Start browser profiles quietly and without clouds. Saved preferences win.
-	settings.optionFlags |= OPTION_LOW_SPEED_GFX;
 	settings.mute = 1;
 #endif
 	// load user preference
 	settings.load();
 
 #ifndef YOG_SERVER_ONLY
+	applyScrollTuning(settings, reducedMotion);
 	runNoX = false;
 	hostServer = false;
 #else
@@ -163,6 +164,19 @@ void GlobalContainer::loadClient(void)
 		// create graphic context
 		GraphicContext::setRequestedUiScale(settings.uiScale / 100.0f);
 		gfx = Toolkit::initGraphic(settings.screenWidth, settings.screenHeight, settings.screenFlags, "Globulation 2", "glob 2");
+#if !defined(GLOB2_MOBILE) && !defined(__EMSCRIPTEN__)
+		gfx->setDisplayPreferenceCallback([this](int w, int h, bool fullscreen)
+		{
+			const bool changed = bool(settings.screenFlags & GraphicContext::FULLSCREEN) != fullscreen;
+			settings.screenWidth=w; settings.screenHeight=h;
+			if (gfx->getOptionFlags() & GraphicContext::RESIZABLE) settings.screenFlags |= GraphicContext::RESIZABLE;
+			if (fullscreen) settings.screenFlags |= GraphicContext::FULLSCREEN;
+			else settings.screenFlags &= ~GraphicContext::FULLSCREEN;
+			// Resizes are kept in memory and saved by the normal settings/shutdown flow.
+			// F11 is a preference change and persists immediately.
+			if (changed && !settings.save()) std::cerr << "Could not save display preferences." << std::endl;
+		});
+#endif
 		gfx->setCompactWindowAllowed(true);
         gfx->refreshPresentation();
 		gfx->setMinRes(640, 480);

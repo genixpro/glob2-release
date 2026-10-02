@@ -92,6 +92,10 @@ Warrush
 Сильний будівельник, що виставляє навчені ударні сили.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Контролер, що використовує вбудований модуль вихідного коду JavaScript.
 [Alga]
 Водорості
 [algae]
@@ -3064,8 +3068,6 @@ Emoji
 Перемотування вперед
 [Hide keyboard]
 Сховати клавіатуру
-[Dialog text size]
-Розмір тексту діалогів
 [Player slot]
 Місце гравця
 [Team color]
@@ -3146,6 +3148,30 @@ Emoji
 Комп’ютерні суперники
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Просторе компонування використовує бічну панель, якщо вистачає місця. Компактне — панель інструментів і висувні панелі.
+[settings One-finger zoom]
+Масштаб одним пальцем
+[settings Double-tap the map, hold, then drag to zoom.]
+Двічі торкніться мапи, утримуйте й перетягніть, щоб змінити масштаб.
+[settings Platform default]
+Як у системі
+[settings Drag up zooms in]
+Угору — наблизити
+[settings Drag down zooms in]
+Униз — наблизити
+[settings Thumb side]
+Бік великого пальця
+[settings Phone controls gather in this bottom corner.]
+На телефоні елементи керування збираються в цьому нижньому куті.
+[settings Right]
+Праворуч
+[settings Left]
+Ліворуч
+[Undo stroke]
+Скасувати
+[No overlay]
+Без шару
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Призначено %0 · Ціль %1
 [Range: %0]
@@ -3380,8 +3406,6 @@ Emoji
 Мін. рівень: %0
 [Confirm %0]
 Гаразд: %0
-[Dialog text size %0]
-Розмір тексту діалогів: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3390,3 +3414,117 @@ Emoji
 Ігри
 [Add AI]
 Додати ШІ
+[settings Experiments]
+Експерименти
+[settings Try features we are still testing. They can change balance and pacing.]
+Спробуйте функції, які ми ще тестуємо. Вони можуть змінити баланс і темп.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Експерименти діють у нових іграх, які ви починаєте або розміщуєте, але ніколи в місіях кампанії. Збережена гра зберігає ті, з якими почалася.
+[Experiments set by the host]
+Експерименти, обрані хостом
+[settings No experiments in this build.]
+У цій збірці немає експериментів.
+[Experiments]
+Експерименти
+[experiment guard-area-balancing]
+Балансування зон охорони
+[experiment guard-area-balancing help]
+Вільні воїни розподіляються між намальованими зонами охорони, а не йдуть усі до найближчої: більша зона отримує більше воїнів, а переповнена поступово перетікає в інші.
+[settings Touch scrolling]
+Сенсорне прокручування
+[settings List momentum]
+Інерція списків
+[settings How far lists and panels keep scrolling after a flick.]
+Як далеко списки й панелі прокручуються після свайпу.
+[settings List bounce]
+Відскок списків
+[settings How much lists and panels stretch past their ends and spring back.]
+Наскільки списки й панелі розтягуються за край і повертаються.
+[settings Map momentum]
+Інерція мапи
+[settings How far the map keeps panning after a flick.]
+Як далеко мапа рухається після свайпу.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Відчуття сенсорного прокручування. 0 вимикає ефект; 50 — типове значення.
+[List momentum]
+Інерція списків
+[List bounce]
+Відскок списків
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Інерція мапи

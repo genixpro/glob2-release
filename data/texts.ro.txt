@@ -84,6 +84,10 @@ AIWarrush
 Un constructor puternic, care trimite forțe de atac instruite.
 [AICabino]
 Cabino
+[AIJavaScript]
+JavaScript
+[AIJavaScript-Description]
+Un controler care folosește un modul de cod JavaScript încorporat.
 [Alga]
 Alge
 [algae]
@@ -3068,8 +3072,6 @@ Minihartă
 Derulare rapidă
 [Hide keyboard]
 Ascunde tastatura
-[Dialog text size]
-Dimensiunea textului din dialoguri
 [Player slot]
 Loc de jucător
 [Team color]
@@ -3150,6 +3152,30 @@ Salvează automat jocul aproximativ o dată pe minut.
 Adversari IA
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Aranjarea spațioasă folosește un panou lateral când există loc. Cea compactă folosește o bară de instrumente și panouri extensibile.
+[settings One-finger zoom]
+Zoom cu un deget
+[settings Double-tap the map, hold, then drag to zoom.]
+Atinge harta de două ori, ține apăsat și trage pentru zoom.
+[settings Platform default]
+Implicit sistem
+[settings Drag up zooms in]
+Tragerea în sus mărește
+[settings Drag down zooms in]
+Tragerea în jos mărește
+[settings Thumb side]
+Partea degetului mare
+[settings Phone controls gather in this bottom corner.]
+Pe telefon, comenzile se grupează în acest colț de jos.
+[settings Right]
+Dreapta
+[settings Left]
+Stânga
+[Undo stroke]
+Anulează
+[No overlay]
+Fără strat
+[zoom factor %0]
+%0×
 [Assigned %0 · Target %1]
 Alocați %0 · Țintă %1
 [Range: %0]
@@ -3384,8 +3410,6 @@ Colonie %0
 Nivel minim necesar: %0
 [Confirm %0]
 Acceptă: %0
-[Dialog text size %0]
-Dimensiunea textului din dialoguri: %0%
 [%0 %1]
 %0 %1
 [resume game]
@@ -3394,3 +3418,117 @@ Reia jocul
 Jocuri
 [Add AI]
 Adaugă IA
+[settings Experiments]
+Experimente
+[settings Try features we are still testing. They can change balance and pacing.]
+Încearcă funcții pe care încă le testăm. Pot schimba echilibrul și ritmul.
+[settings Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with.]
+Experimentele se aplică jocurilor noi pe care le începi sau le găzduiești, niciodată misiunilor de campanie. Un joc salvat le păstrează pe cele cu care a început.
+[Experiments set by the host]
+Experimente alese de gazdă
+[settings No experiments in this build.]
+Nu există experimente în această versiune.
+[Experiments]
+Experimente
+[experiment guard-area-balancing]
+Echilibrarea zonelor de gardă
+[experiment guard-area-balancing help]
+Războinicii liberi se împart între zonele de gardă desenate în loc să meargă toți la cea mai apropiată: o zonă mai mare primește mai mulți, iar o zonă supraaglomerată se golește treptat spre celelalte.
+[settings Touch scrolling]
+Derulare tactilă
+[settings List momentum]
+Inerția listelor
+[settings How far lists and panels keep scrolling after a flick.]
+Cât de departe continuă listele și panourile să deruleze după o glisare.
+[settings List bounce]
+Reculul listelor
+[settings How much lists and panels stretch past their ends and spring back.]
+Cât de mult se întind listele și panourile dincolo de margini înainte de a reveni.
+[settings Map momentum]
+Inerția hărții
+[settings How far the map keeps panning after a flick.]
+Cât de departe continuă harta să se miște după o glisare.
+[settings Touch scrolling feel. 0 turns an effect off; 50 is the default.]
+Senzația derulării tactile. 0 dezactivează un efect; 50 este valoarea implicită.
+[List momentum]
+Inerția listelor
+[List bounce]
+Reculul listelor
+[lan pairing field]
+
+[lan pairing connect]
+
+[lan discovery instructions]
+
+[lan discovery unavailable]
+
+[lan discovered host %0]
+
+[lan share pairing]
+
+[lan copy pairing]
+
+[lan connection unavailable]
+
+[lan connection verification failed %0]
+
+[network start refused]
+
+[lan lobby endpoint required]
+
+[settings Artwork]
+
+[settings Original]
+
+[settings High resolution]
+
+[settings Clouds]
+
+[settings Show cloud cover above the map.]
+
+[settings Cloud shadows]
+
+[settings Show cloud shadows on the ground independently of cloud cover.]
+
+[settings Building particles]
+
+[settings Show smoke and other building particles.]
+
+[settings Magic effects]
+
+[settings Choose animated magic effects or a simple visible effect.]
+
+[settings Simple]
+
+[settings Requires the OpenGL renderer. Your saved choice is retained.]
+
+[settings Interface appearance]
+
+[settings Panels]
+
+[settings Choose translucent or opaque interface panels.]
+
+[settings Opaque]
+
+[settings Translucent]
+
+[settings Advanced graphics]
+
+[settings Path lines]
+
+[settings Choose translucent or opaque unit path lines.]
+
+[settings Smooth progress indicators]
+
+[settings Smooth the moving edges of progress indicators.]
+
+[settings Decorative interface animation]
+
+[settings Animate victory artwork. Reduced motion also disables this animation.]
+
+[settings Text size]
+
+[settings Enlarge interface text without changing the map scale.]
+
+[Map momentum]
+Inerția hărții
