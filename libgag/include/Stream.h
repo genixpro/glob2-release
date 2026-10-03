@@ -6,6 +6,7 @@
 // For U/SintNN
 #include "Types.h"
 #include <string>
+#include <stdexcept>
 
 namespace GAGCore
 {
@@ -36,6 +37,13 @@ namespace GAGCore
 		virtual void writeUint16(const Uint16 v, const std::string name) = 0;
 		virtual void writeSint32(const Sint32 v, const std::string name) = 0;
 		virtual void writeUint32(const Uint32 v, const std::string name) = 0;
+		//! A byte offset into this stream. Deferred encoders relocate the target
+		//! after expanding placeholders; ordinary binary/text streams write it
+		//! exactly as a uint32. Field names never determine relocation behavior.
+		virtual void writeOffset32(const Uint32 value, const std::string name)
+		{
+			writeUint32(value, name);
+		}
 		virtual void writeFloat(const float v, const std::string name) = 0;
 		virtual void writeDouble(const double v, const std::string name) = 0;
 		virtual void writeText(const std::string &v, const std::string name) = 0;
@@ -62,8 +70,34 @@ namespace GAGCore
 	//! The stream that can be read from
 	class InputStream : public Stream
 	{
+		unsigned nestingDepth = 0;
 	public:
 		virtual ~InputStream() { }
+
+		// Bound file-controlled counts BEFORE allocating or resizing. The default
+		// is a backstop: pass the smallest domain limit available at each call.
+		Uint32 readCount(const std::string& name, Uint32 maximum = 1048576)
+		{
+			const Uint32 count = readUint32(name);
+			if (count > maximum) throw std::runtime_error("Oversized collection: " + name);
+			return count;
+		}
+		// Per-stream recursion budget for nested factory graphs; this does not
+		// bound aggregate memory or total parsing/execution time.
+		class NestedRead
+		{
+			InputStream& stream;
+		public:
+			explicit NestedRead(InputStream& input) : stream(input)
+			{
+				if (stream.nestingDepth >= 64) throw std::runtime_error("Saved object nesting limit exceeded");
+				++stream.nestingDepth;
+			}
+			~NestedRead() { --stream.nestingDepth; }
+			NestedRead(const NestedRead&) = delete;
+			NestedRead& operator=(const NestedRead&) = delete;
+		};
+
 	
 		virtual void read(void *data, size_t size, const std::string name) = 0;
 		virtual Sint8 readSint8(const std::string name) = 0;

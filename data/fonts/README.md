@@ -20,6 +20,10 @@ The appended Droid outlines use Apache License 2.0; copyright and full license
 are in `LICENSE-Droid.txt`. The combined font is renamed Glob2 Sans and records
 the modification in its embedded metadata.
 
+The browser client starts with `browser/assets/sans-core.ttf`, this font without
+the appended CJK outlines, and downloads the full font later
+(`browser/derive_assets.py`). Regenerate that copy whenever this font changes.
+
 ## Rebuild
 
 Normal game builds use the checked-in font and need no Python font packages.
@@ -38,7 +42,7 @@ python3 data/fonts/build_chinese_font.py /tmp/glob2-base.ttf /tmp/DroidSansFallb
 python3 test/test_font_coverage.py
 ```
 
-The coverage test uses the same SDL2_ttf library as the game and fails if any
+The coverage test uses the same SDL3_ttf library as the game and fails if any
 catalog character cannot be displayed. Font rebuilds should also be checked
 visually at the game's 10, 13 and 20 pixel sizes, with layout measurements and
 an original-glyph regression comparison.

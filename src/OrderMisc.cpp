@@ -57,7 +57,9 @@ Uint8 *MessageOrder::getData(void)
 
 bool MessageOrder::setData(const Uint8 *data, int dataLength, Uint32 versionMinor)
 {
-	if (dataLength<9)
+	// Header and at least the text's terminator (the constructor always writes one).
+	// With only the header, the text check below would read past the buffer.
+	if (dataLength<10)
 		return false;
 	this->length=dataLength;
 	this->recipientsMask=getUint32(data, 0);
@@ -112,7 +114,9 @@ Uint8 *OrderVoiceData::getData(void)
 
 bool OrderVoiceData::setData(const Uint8 *data, int dataLength, Uint32 versionMinor)
 {
-	if (dataLength<5)
+	// Validate both allocation size and decoding work before copying input.
+	if (dataLength < 5 || size_t(dataLength - 5) > MAX_ENCODED_BYTES ||
+		getUint8(data, 4) > MAX_FRAMES)
 		return false;
 
 	this->framesDataLength = (size_t)dataLength - 5;

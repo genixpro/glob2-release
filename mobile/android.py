@@ -5,16 +5,33 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'scons'))
 from build_layout import build_identity, default_directory, BuildLock, PACKAGE_VERSION
+import official_instance
 from mobile_toolchain import ROOT, LOCK, discover
 from mobile_artifacts import verify_android_shared_library, verify_android_symbols, verify_android_archive_symbols
 import developer_apk
 from dev_paths import android_sdk, mobile_tools, gradle_home, dependency_prefix
-from asset_bundle import include_asset, restore_gzip_assets, verify_apk_assets
+from asset_bundle import restore_gzip_assets, verify_apk_assets
+
+
+# Intent filters that open invite links (glob2://join and the official App Link),
+# with the comment above each. Editions without online play leave them out.
+INVITE_LINK_FILTER=re.compile(r'(?:[ \t]*<!--(?:(?!-->).)*-->\s*)?[ \t]*<intent-filter[^>]*>'
+                              r'(?:(?!</intent-filter>).)*?android\.intent\.action\.VIEW'
+                              r'(?:(?!</intent-filter>).)*</intent-filter>\n',re.S)
+
+
+def without_invite_links(manifest):
+    """The manifest without invite-link intent filters (Amazon and China editions)."""
+    stripped=INVITE_LINK_FILTER.sub('',manifest)
+    if 'android.intent.action.VIEW' in stripped or 'android.intent.category.LAUNCHER' not in stripped:
+        raise ValueError('Unexpected AndroidManifest.xml layout while removing invite links')
+    return stripped
 
 
 def main():
@@ -129,12 +146,10 @@ def main():
             staged = project/source_tree
             if staged.exists(): shutil.rmtree(staged)
         shutil.copytree(ROOT/'mobile/android',project,dirs_exist_ok=True)
-        if args.amazon_apk:
-            manifest=project/'app/src/main/AndroidManifest.xml'
-            contents=manifest.read_text()
-            opening='<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
-            if contents.count(opening)!=1: raise ValueError('Unexpected Android manifest root')
-            manifest.write_text(contents.replace(opening,opening+'\n    <uses-permission android:name="android.permission.INTERNET" />',1))
+        if args.amazon_apk or args.china:
+            # These editions build without online play, so they claim no invite links.
+            staged_manifest=project/'app/src/main/AndroidManifest.xml'
+            staged_manifest.write_text(without_invite_links(staged_manifest.read_text()))
         shutil.copy2(LOCK,project/'glob2-toolchain.json')
         native_command=[sys.executable,str(ROOT/'mobile/android.py'),'configure','--arch',args.arch,
             '--android-sdk',str(sdk),'--jobs',str(args.jobs),'--version-code',str(args.version_code)]
@@ -145,7 +160,8 @@ def main():
         if args.fdroid: native_command.append('--fdroid')
         (project/'glob2-build.json').write_text(json.dumps({'root':str(ROOT),'command':native_command,
             'release':args.release,'version_code':args.version_code,
-            'version_name':version_name,'arch':args.arch,'package_name':package_name},indent=2)+'\n')
+            'version_name':version_name,'arch':args.arch,'package_name':package_name,
+            'official_instance_host':official_instance.host(official_instance.origin())},indent=2)+'\n')
         generated=project/'app/generated'
         if generated.exists(): shutil.rmtree(generated)
         generated.mkdir(parents=True)
@@ -170,14 +186,19 @@ def main():
         validate_bundle(prefixes[args.arch], build_identity(dict(base_options,arch=args.arch)), discover(build_identity(dict(base_options,arch=args.arch)), {'android_sdk':str(sdk)})['fingerprint'])
         if not java.is_dir(): raise ValueError('Dependency bundle lacks pinned SDL Java sources; rebuild dependencies')
         shutil.copytree(java,generated/'java')
-        assets=generated/'assets/glob2-bundle';assets.mkdir(parents=True)
+        sys.path.insert(0, str(ROOT))
+        from tools.package_assets import export_assets
+        exported = output/'runtime-assets'
+        export_assets(ROOT, exported, platform='android', optimized=args.release)
+        assets=generated/'assets/glob2-bundle'
+        if assets.exists(): shutil.rmtree(assets)
+        assets.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(exported, assets)
         digest=hashlib.sha256();names=[]
-        for directory in ('data','maps','campaigns','scripts'):
-            for source in sorted((ROOT/directory).rglob('*')):
-                if source.is_file() and include_asset(source.relative_to(ROOT).as_posix()):
-                    relative=source.relative_to(ROOT);names.append(relative.as_posix())
-                    digest.update(relative.as_posix().encode()+b'\0'+hashlib.sha256(source.read_bytes()).digest())
-                    target=assets/relative;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(source,target)
+        for source in sorted(assets.rglob('*')):
+            if source.is_file():
+                relative=source.relative_to(assets);names.append(relative.as_posix())
+                digest.update(relative.as_posix().encode()+b'\0'+hashlib.sha256(source.read_bytes()).digest())
         (assets/'index.list').write_text(digest.hexdigest()+'\n'+'\n'.join(names)+'\n')
         (project/'local.properties').write_text('sdk.dir='+str(sdk).replace('\\','\\\\').replace(':','\\:')+'\n')
         print('Android Studio project:',project)

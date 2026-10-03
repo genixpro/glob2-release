@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "CustomGameSetup.h"
+#include "ai/ScriptLibrary.h"
 #include "MapHeader.h"
 #include "StartQuality.h"
 #include "ui/FrontendUI.h"
@@ -59,6 +60,12 @@ class CustomGameScreen : public Glob2UI::Screen
 		invalidate();
 	}
 	int selectedSpeed() const { return setup.speed; }
+	// Room setup (RoomScreen): edit an online room's map and rules with this screen.
+	// Start becomes "Use in room" and ends with OK without generating or launching;
+	// the room's server generates the map.
+	void useForRoom(const CustomGameSetup &draft, int tab);
+	bool roomMode() const { return forRoom; }
+	const CustomGameSetup &draft() const { return setup; }
 	// Semantic entry points shared with the harnesses.
 	void selectTab(int tab);
 	int tab() const { return currentTab; }
@@ -77,6 +84,14 @@ class CustomGameScreen : public Glob2UI::Screen
 	MapHeader mapHeader;
 	GameHeader gameHeader;
 	std::string username, source, message;
+	std::unique_ptr<Online::OnlineStorage> aiStorage;
+	std::unique_ptr<Script::Library> aiLibrary;
+	std::map<std::string, std::string> frozenAIs;
+	std::vector<std::string> aiChoices() const;
+	int aiSelection(int colony) const;
+	void selectAI(int colony, int selection);
+	std::string aiLabel(int colony) const;
+	void freezeAIs();
 	// Serialized bytes of the last successfully generated map (see generateMap()), read
 	// directly by the loader instead of round-tripping through a temporary file.
 	std::shared_ptr<std::string> generatedSnapshot;
@@ -110,6 +125,7 @@ class CustomGameScreen : public Glob2UI::Screen
 	int landscapeSortOrder = 0;
 	bool separateMapLibraries = true;
 	int currentTab = 0;
+	bool forRoom = false;
 	std::unique_ptr<LobbyMapPreview> preview;
 	std::vector<std::string> mapPaths, mapNames;
 	std::string librarySelection[2];

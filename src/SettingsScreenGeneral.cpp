@@ -61,7 +61,7 @@ void SettingsScreen::buildGeneral()
 				if (selected >= int(std::size(percents)))
 					selected = 0;
 				choice("display.uiscale", "Interface scale",
-					   "Enlarge menus, text and the sidebar on a high-resolution screen.", selected,
+					   "Multiply the operating system display scale for menus, text and the sidebar.", selected,
 					   labels,
 					   [this](int v)
 					   {
@@ -159,6 +159,8 @@ void SettingsScreen::buildGeneral()
 		appearance("graphics.paths", "Path lines", "Choose translucent or opaque unit path lines.", &Settings::translucentPathLines, "Opaque", "Translucent");
 		effect("graphics.indicators", "Smooth progress indicators", "Smooth the moving edges of progress indicators.", &Settings::smoothProgressIndicators);
 		effect("graphics.animation", "Decorative interface animation", "Animate victory artwork. Reduced motion also disables this animation.", &Settings::decorativeAnimations);
+		effect("graphics.zoomdetail", "Adaptive zoom detail", "Simplify bars, zones, terrain and units as the map zooms out, and keep them small zoomed in.", &Settings::adaptiveZoomDetail);
+		effect("graphics.unitmotion", "Smooth unit motion", "Experimental: move and animate units between game ticks.", &Settings::unitInterpolation);
 #ifndef GLOB2_MOBILE
 		if (!touchLayout || globalContainer->gfx->isNativeDesktop())
 		{

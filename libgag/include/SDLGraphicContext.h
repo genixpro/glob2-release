@@ -20,7 +20,7 @@
 #include <list>
 #include <unordered_map>
 
-#include <SDLCompat.h>
+#include <SDL3/SDL.h>
 
 
 namespace GAGCore
@@ -344,6 +344,8 @@ namespace GAGCore
 			RESIZABLE = 8,
 			CUSTOMCURSOR = 16,
 			PORTABLEGPU = 32,
+            //! Opt out of high-density backing pixels for fixed-pixel profiling.
+            LOWPIXELDENSITY = 64,
 		};
 		
 	protected:
@@ -391,6 +393,7 @@ namespace GAGCore
 		bool mapTransformActive=false;
         bool periodicCopy=false;
 		float mapScale=1, mapTranslateX=0, mapTranslateY=0;
+		void drawMapSnappedRect(int x1, int y1, int x2, int y2, const Color& color, bool stroked, float maxStrokePoints);
 		float overlayScale=1;
         float mapCopyTranslateX=0, mapCopyTranslateY=0;
 		unsigned long drawCalls=0;
@@ -408,7 +411,7 @@ namespace GAGCore
 		SDL_Window *window = nullptr;
 		unsigned glContextGeneration = 0;
 		SDL_GLContext context = nullptr;
-		SDL_threadID eventThread = 0;
+		SDL_ThreadID eventThread = 0;
 		bool pollingEvents = false;
 		bool presenting = false;
 		bool watchingEvents = false;
@@ -445,7 +448,7 @@ namespace GAGCore
 		void destroyUnitShader();
 		// Central presentation boundary, also used by render-validation contexts.
 		virtual void swapBuffers();
-		static int SDLCALL watchWindow(void *userdata, SDL_Event *event);
+		static bool SDLCALL watchWindow(void *userdata, SDL_Event *event);
 		std::unique_ptr<RenderBackend> portableRenderer;
         RenderBackend* renderer = nullptr; // Borrowed active backend; ownership stays in the two unique_ptrs.
         // Rasterizes transformed passes into the existing software framebuffer.
@@ -495,6 +498,8 @@ namespace GAGCore
 		int getRequestedH(void) const { return requestedH; }
 		//! interface scale to apply on the next setRes(); 0 follows the desktop
 		static void setRequestedUiScale(float scale) { requestedUiScale = scale; }
+		//! the interface scale the player chose; 0 follows the desktop
+		static float getRequestedUiScale(void) { return requestedUiScale; }
 		//! the interface scale in use
 		float getUiScale(void) const { return uiScale; }
 		//! the scale the last setRes() was asked for, before the window floor reduced it
@@ -521,17 +526,35 @@ namespace GAGCore
 		void endMapTransform();
         //! Axis-aligned world boundary, snapped to target pixels with a minimum one-pixel stroke.
         //! Unlike ordinary UI lines, this remains visible when the map is zoomed out.
-        void drawMapBoundary(int x1, int y1, int x2, int y2, const Color& color);
+        //! maxStrokePoints, when positive, stops the stroke thickening past that many screen points.
+        void drawMapBoundary(int x1, int y1, int x2, int y2, const Color& color, float maxStrokePoints = 0);
+        //! Axis-aligned world rectangle with edges snapped to target pixels, so
+        //! translucent neighbours tile without seams or doubled edges at any zoom.
+        void drawMapFill(int x1, int y1, int x2, int y2, const Color& color);
+        //! A whole-tile fill that must meet neighbouring sprites exactly. The
+        //! software rasteriser truncates coordinates, so there it snaps like
+        //! drawMapFill; accelerated renderers place sprites at exact fractions,
+        //! and a snapped fill beside them would leave a hairline seam.
+        void drawMapTileFill(int x1, int y1, int x2, int y2, const Color& color);
+        //! A sprite frame covering the `size`-pixel map square at (x, y), meeting
+        //! its neighbours and drawMapTileFill exactly. In the software rasteriser
+        //! its edges snap to the same pixels as theirs; elsewhere it is drawSprite.
+        void drawMapTileSprite(int x, int y, int size, Sprite *sprite, unsigned index);
         // Repeat a presentation-only pass. Its primary invocation advances visual
         // state once; subsequent invocations must only draw.
         void drawMapCopies(int periodW,int periodH,int viewW,int viewH,const std::function<void()> &draw);
         bool isPeriodicCopy() const {return periodicCopy;}
 		void beginScreenOverlay(int &x,int &y,int &sx,int &sy,int &sw,int &sh);
+		//! Scale of the active map transform; 1 outside a map pass.
+		float mapTransformScale() const { return mapTransformActive ? mapScale : 1.f; }
+		//! Where a map pixel lands in the screen overlay's logical units,
+		//! including the periodic copy being drawn.
+		void mapToScreen(int x, int y, float &screenX, float &screenY) const;
 		void endScreenOverlay();
 		unsigned long getDrawCallCount() const {return drawCalls;}
 		void resetDrawCallCount(){drawCalls=0;}
 		//! convert window pixel coordinates (as delivered by SDL) to logical coordinates
-		void windowToLogical(Sint32 &x, Sint32 &y);
+		void windowToLogical(float &x, float &y);
 		//! set a GL line width in logical pixels; GL rasterises lines in window pixels, which the viewport does not scale
 		void setScaledLineWidth(float width);
 		//! declare that drawing now goes to an offscreen target with this many of its pixels per logical pixel; 0 restores the window
@@ -540,6 +563,7 @@ namespace GAGCore
 		float getRasterScale(void) {return rasterScale();}
 		//! translate SDL_GetMouseState coordinates through the active context's scaling
 		static void translateMouseCoordinates(int &x, int &y);
+        static void translateMouseCoordinates(float &x, float &y);
 		//! rewrite a polled event's mouse coordinates from window pixels to logical coordinates
 		static void translateMouseEvent(SDL_Event *event);
 		//! Pump events at a frame boundary; modal expose callbacks only present a cached frame.
@@ -712,7 +736,7 @@ namespace GAGCore
 		friend class DrawableSurface;
 		// Support functions
 		//! Load a frame from two file pointers
-		void loadFrame(SDL_RWops *frameStream, SDL_RWops *rotatedStream);
+		void loadFrame(SDL_IOStream *frameStream, SDL_IOStream *rotatedStream);
 		//! Check if index is within bound and return true, assert false and return false otherwise
 		bool checkBound(int index);
 		//! Return a rotated drawable surface for actColor, create it if necessary

@@ -48,7 +48,7 @@ namespace GAGCore
                     vertices.reserve(quads.size() * 6);
                     for (const auto &quad : quads)
                     {
-                        const SDL_Color color{quad.color.r, quad.color.g, quad.color.b, 255};
+                        const SDL_FColor color{quad.color.r / 255.0f, quad.color.g / 255.0f, quad.color.b / 255.0f, 1.0f};
                         const SDL_Vertex a{{quad.x, quad.y}, color, {}},
                                          b{{quad.x + quad.w, quad.y}, color, {}},
                                          c{{quad.x + quad.w, quad.y + quad.h}, color, {}},
@@ -195,10 +195,47 @@ namespace GAGCore
 #endif
     }
 
-    void GraphicContext::drawMapBoundary(int x1, int y1, int x2, int y2, const Color& color)
+    void GraphicContext::drawMapBoundary(int x1, int y1, int x2, int y2, const Color& color, float maxStrokePoints)
+    {
+        assert(x1 == x2 || y1 == y2);
+        drawMapSnappedRect(x1, y1, x2, y2, color, true, maxStrokePoints);
+    }
+
+    void GraphicContext::drawMapFill(int x1, int y1, int x2, int y2, const Color& color)
+    {
+        drawMapSnappedRect(x1, y1, x2, y2, color, false, 0);
+    }
+
+    void GraphicContext::drawMapTileFill(int x1, int y1, int x2, int y2, const Color& color)
+    {
+        if (softwareTransform || !mapTransformActive)
+            drawMapSnappedRect(x1, y1, x2, y2, color, false, 0);
+        else
+            drawFilledRect(float(x1), float(y1), float(x2 - x1), float(y2 - y1), color);
+    }
+
+    void GraphicContext::drawMapTileSprite(int x, int y, int size, Sprite *sprite, unsigned index)
+    {
+        if (!softwareTransform || !mapTransformActive)
+        {
+            drawSprite(x, y, sprite, index);
+            return;
+        }
+        // The same snapping as drawMapSnappedRect, with one logical unit a pixel.
+        const float offsetX = mapTranslateX + mapCopyTranslateX, offsetY = mapTranslateY + mapCopyTranslateY;
+        const float left = std::round(x * mapScale + offsetX), top = std::round(y * mapScale + offsetY);
+        const float right = std::round((x + size) * mapScale + offsetX), bottom = std::round((y + size) * mapScale + offsetY);
+        if (right <= left || bottom <= top)
+            return;
+        // Back to map coordinates, a quarter pixel inside each snapped edge so
+        // the rasteriser's truncation lands on it rather than one short.
+        drawSprite((left + 0.25f - offsetX) / mapScale, (top + 0.25f - offsetY) / mapScale,
+                   (right - left) / mapScale, (bottom - top) / mapScale, sprite, index);
+    }
+
+    void GraphicContext::drawMapSnappedRect(int x1, int y1, int x2, int y2, const Color& color, bool stroked, float maxStrokePoints)
     {
 		if (renderer) prepareDraw();
-        assert(x1 == x2 || y1 == y2);
         // Snap in the actual raster target, then return to world coordinates.
         // Include periodic-copy translation: wrapped maps need the same pixel
         // alignment as the primary pass, even at fractional zoom and DPI.
@@ -211,7 +248,12 @@ namespace GAGCore
         const float top = std::round(std::min(y1, y2) * pixelsPerWorld + offsetY);
         const float right = std::round(std::max(x1, x2) * pixelsPerWorld + offsetX);
         const float bottom = std::round(std::max(y1, y2) * pixelsPerWorld + offsetY);
-        const float stroke = std::max(1.f, std::round(pixelsPerWorld));
+        // A boundary's stroke follows the map but never vanishes, and stops
+        // thickening at its cap. A fill has none: its far edges are exclusive,
+        // so neighbouring fills meet on the same snapped pixel without overlap.
+        float stroke = stroked ? std::max(1.f, std::round(pixelsPerWorld)) : 0.f;
+        if (stroked && maxStrokePoints > 0)
+            stroke = std::min(stroke, std::max(1.f, std::round(maxStrokePoints * raster * float(logicalUnitsPerPoint()))));
         // SDL's software geometry rasterizer truncates transformed coordinates.
         // Avoid a world->screen->world round trip there: tiny float errors can
         // otherwise move a snapped edge back across a pixel boundary.
@@ -219,7 +261,7 @@ namespace GAGCore
         {
             const float x=left/raster, y=top/raster;
             const float rightEdge=(right+stroke)/raster, bottomEdge=(bottom+stroke)/raster;
-            const SDL_Color ink{color.r,color.g,color.b,color.a};
+            const SDL_FColor ink{(color.r) / 255.0f, (color.g) / 255.0f, (color.b) / 255.0f, (color.a) / 255.0f};
             const SDL_Vertex a{{x,y},ink,{}}, b{{rightEdge,y},ink,{}},
                              c{{rightEdge,bottomEdge},ink,{}}, d{{x,bottomEdge},ink,{}};
             const SDL_Vertex vertices[]{a,b,c,a,c,d};
@@ -230,6 +272,14 @@ namespace GAGCore
         drawFilledRect((left-offsetX)/pixelsPerWorld, (top-offsetY)/pixelsPerWorld,
                        (right-left+stroke)/pixelsPerWorld,
                        (bottom-top+stroke)/pixelsPerWorld, color);
+    }
+
+    void GraphicContext::mapToScreen(int x, int y, float &screenX, float &screenY) const
+    {
+        screenX = float(x); screenY = float(y);
+        if (!mapTransformActive) return;
+        screenX = x*mapScale + mapTranslateX + mapCopyTranslateX;
+        screenY = y*mapScale + mapTranslateY + mapCopyTranslateY;
     }
 
     void GraphicContext::beginScreenOverlay(int &x,int &y,int &sx,int &sy,int &sw,int &sh)
@@ -284,13 +334,13 @@ namespace GAGCore
         if (uiTransformActive && !renderer && (optionFlags & USEGPU)) {
             SDL_Rect transformed{int(std::floor(x*uiTransformScale+uiTransformX)),int(std::floor(y*uiTransformScale+uiTransformY)),
                 int(std::ceil(w*uiTransformScale)),int(std::ceil(h*uiTransformScale))};
-            SDL_Rect clipped{}; SDL_IntersectRect(&transformed,&uiBounds,&clipped);
+            SDL_Rect clipped{}; SDL_GetRectIntersection(&transformed,&uiBounds,&clipped);
             x=clipped.x;y=clipped.y;w=clipped.w;h=clipped.h;
         }
 #endif
 		if(mapTransformActive){x=mapClipX;y=mapClipY;w=mapClipW;h=mapClipH;}
 		DrawableSurface::setClipRect(x, y, w, h);
-		if (nativeSoftware) SDL_SetClipRect(sdlsurface, nullptr);
+		if (nativeSoftware) SDL_SetSurfaceClipRect(sdlsurface, nullptr);
         if (renderer) renderer->clip(mapTransformActive ? nullptr : &clipRect);
 		#ifdef HAVE_OPENGL
 		if (_gc->optionFlags & GraphicContext::USEGPU)
@@ -531,7 +581,7 @@ namespace GAGCore
             float dx=x2-x1, dy=y2-y1, length=std::hypot(dx,dy);
             if (length == 0) { drawPixel(x1,y1,color); return; }
             float nx=-dy/(2*length), ny=dx/(2*length);
-            SDL_Color c{color.r,color.g,color.b,color.a};
+            SDL_FColor c{(color.r) / 255.0f, (color.g) / 255.0f, (color.b) / 255.0f, (color.a) / 255.0f};
             SDL_Vertex a{{x1+nx,y1+ny},c,{0,0}}, b{{x2+nx,y2+ny},c,{0,0}}, d{{x1-nx,y1-ny},c,{0,0}}, e{{x2-nx,y2-ny},c,{0,0}};
             const SDL_Vertex vertices[] = {a,b,e,a,e,d};
             renderer->triangles(vertices); return;

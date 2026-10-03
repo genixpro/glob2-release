@@ -15,11 +15,11 @@ alone is not a safe job limit. The commands below leave concurrency unspecified.
 
 ```sh
 scons                        # default client: debug information, no optimization
-scons release=1 server=0       # optimized client, including headless runs
-scons release=1 server=1       # server with the correct stripped library
+scons release=1                # optimized client, including headless runs
+scons role=relay release=1 relay # the match relay and its tests (docs/multiplayer/relay.md)
 scons release=1 package        # macOS signed app bundle and DMG
 scons release=1 bundle         # macOS app bundle without the DMG
-scons release=1 server=0 tests # glob2-engine-tests and glob2-unit-tests
+scons release=1 tests          # glob2-engine-tests and glob2-unit-tests
 python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
 ```
 
@@ -30,8 +30,10 @@ python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
 - Options are explicit on each invocation; there is no cross-invocation
   `options.py`. Outputs and generated configuration are isolated under
   `build/<toolchain>/<role>/<mode>`: `darwin`, `linux`, or `mingw` for native
-  toolchains; `client`, `server`, or `router` for the role. Use `server=1`
-  to enable `YOG_SERVER_ONLY`. Use `release=1` for headless
+  toolchains; `client` or `relay` for the role. The YOG lobby `server` and
+  `router` roles were removed at the M9 cutover: `role=server`, `role=router` and
+  `server=1` are refused, and `server=0` is accepted as a no-op so existing client
+  commands keep working. Use `release=1` for headless
   measurements: the unoptimized build can be substantially slower. Use `release=0`
   for debugging. `scons -c` cleans; `--build=/tmp/out` selects an out-of-source
   build directory; `BINDIR=/path/bin INSTALLDIR=/path/share` selects installation
@@ -40,7 +42,10 @@ python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
   are in `vcpkg.json` and CI. Check the affected platform jobs rather than assuming
   a successful local build covers another compiler or operating system.
 - The **Steam Windows package** workflow runs manually, as a reusable workflow, or
-  when its packaging files change in a pull request. It builds the MinGW release
+  from the release workflows; it never runs on pull requests or master pushes, because
+  packaging checks are only needed when releasing. The same rule applies to the Mac App
+  Store build and to Android release-contract, store-listing and APK checks (pull
+  requests only build and smoke-test Android). It builds the MinGW release
   client and stages `glob2.exe`, its runtime DLL dependency closure, game assets,
   license, and attribution in one depot folder. A separate Windows job downloads
   that artifact and runs a short headless game without the build toolchain. Download
@@ -70,9 +75,16 @@ python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
   setting a build live.
 - `scons target=web release=1` builds the WebAssembly browser client; see
   `docs/browser/adr-001-build-isolation.md` for the toolchain isolation this relies on.
-- Dependencies include SDL2/net/ttf/image, Vorbis/Ogg, Speex, OpenGL/GLU, libepoxy,
-  zlib, fribidi and pcre; PortAudio is optional. All native multiplayer builds (client, server, and router) require OpenSSL and the header-only
-  Boost.Beast and Boost.Asio; nothing else uses Boost.
+- Dependencies include pinned SDL3/SDL3_net/SDL3_ttf/SDL3_image (see `scons/sdl3-versions.json`) and WebP 1.6.0 for optimized packaged artwork, Vorbis/Ogg, Speex, OpenGL/GLU, libepoxy,
+  zlib, fribidi and pcre; PortAudio is optional. All native multiplayer builds (client and relay) require OpenSSL and the header-only
+  Boost.Beast and Boost.Asio; nothing else uses Boost. `role=relay` builds only
+  `glob2-relay` and its tests and links no SDL library (it still needs SDL3's headers);
+  see [the relay guide](../multiplayer/relay.md).
+  The source helper and vcpkg overlay apply the same reviewed SDL3 X11 patches:
+  an [upstream reparenting fix](https://github.com/libsdl-org/SDL/commit/25f4af8fcf7d1a9a06be8d89694b1c612158f41f)
+  backported to 3.4.16, and a mapping wait that accepts confirmed window state
+  when its notification is missing. Patch hashes are recorded in the SDK manifest
+  and invalidate cached builds. Use this patched SDK for the pinned X11 build.
 - `CCACHE=1` opts into the shared compiler cache. Unset it when generating
   `compile_commands.json`; do not add `CCACHE_SLOPPINESS` settings that weaken
   content or time-macro validation (`include_file_mtime`, `include_file_ctime`,
@@ -97,7 +109,7 @@ python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
   release mirror supplies the Mac distribution identities and provisioning
   profile, then makes a signed `.pkg` beside the app. The existing `package`
   target remains the direct distribution DMG path. Test saves, map import, LAN
-  hosting and YOG connections in the sandboxed app before upload; local testing
+  hosting and online play in the sandboxed app before upload; local testing
   alone does not establish App Store acceptance. See the
   [Mac App Store release process](mac-app-store.md) for the mirror-only manual
   workflow and required signing credentials.
@@ -110,10 +122,31 @@ python3 test/run_tests.py      # run them; --list, --filter, --tag, --shard
   `test/run_tests.py` already isolates and aggregates the native test cases. Artifact uploads run after failed checks
   so reviewers can inspect the available evidence. The Linux client builds once
   per supported toolchain, then distributes its built programs to four parallel
-  test shards per toolchain. The original `linux (...)` checks require every
-  build and shard to pass, preserving their merge-blocking status. PRs compare
-  with their base commit, and master pushes compare with the pre-push commit;
-  unknown paths or unavailable diffs select full CI.
+  test shards per toolchain. Linux compiler builds share
+  `.github/workflows/ci-linux-build.yml`; the GCC artifact builds and Clang
+  compatibility check run separately, so runtime shards do not wait for Clang.
+  Primary GCC 13 programs are published before CLI regressions and consumed by
+  both native shards and browser transport checks. Each selected GCC toolchain
+  starts its own runtime shards without waiting for Clang. The stable
+  `Relevant checks passed` gate requires every selected check to succeed.
+  Draft PRs defer expensive verification; `ready_for_review` or `ci:run` starts it.
+  The [risk policy and rollout](#tiered-pull-request-coverage-rollout) controls
+  secondary platforms and cumulative master validation. Unknown inputs select full
+  development coverage. Steam/store release packaging runs only for releases or
+  explicit dispatches, including when its helper files change.
+- CI run cancellation: superseded PR revisions cancel through server-side
+  concurrency. Master runs finish once started and only the newest pending push
+  remains; nightly and manual runs have separate groups. Call-only workflows
+  inherit their caller's cancellation. Other callable workflows use a literal
+  prefix distinct from their caller to prevent deadlocks. The trusted
+  `cancel-superseded.yml` workflow uses `pull_request_target`, checks out only
+  default-branch code, and cancels allowlisted event-triggered validation left
+  behind by updates or closed/merged PRs, including forks. Legacy Steam/App Store
+  PR runs from older workflow definitions are retired even at the current PR head. It never executes PR
+  code or cancels manual releases. Its sweep can clear obsolete pending master
+  pushes but protects master once any job has begun (including between jobs),
+  even when the workflow API reports it as queued, and protects scheduled runs. Closed-PR caches and old
+  master cache generations are reclaimed on closure and in a daily sweep.
 
 For headless games, use the client binary's `--nox <game-file> <steps> <runs>`
 option. `-test-games-nox` runs random AI games indefinitely unless bounded as
@@ -229,6 +262,124 @@ GDK. A future MSIXVC2 migration needs its own Partner Center package branch.
 See Microsoft's [PC packaging guide](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/packaging/overviews/packaging-getting-started-for-pc),
 [MakePkg reference](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/common/packaging/deployment/makepkg),
 and [Package Uploader setup](https://github.com/microsoft/PackageUploader).
+
+## Release asset and bundle sizes
+
+Release packagers share `tools/package_assets.py`. Original artwork stays in
+`data/` and `datasrc/`; generated runtime trees and per-image caches stay under
+`build/`. The exporter retains the smallest of original PNG, optimized PNG and
+pixel-exact lossless WebP. It preserves RGB beneath transparent pixels, dimensions,
+team-color masks and HD frame geometry. Normal source/debug builds use the
+originals. Image lookup searches directories in their existing order, checking a
+logical PNG first and its WebP alternative second within each directory; an
+original PNG override therefore retains precedence.
+
+Packaging bootstraps a private Pillow 12.2.0/libwebp 1.6.0 encoder environment
+when the current Python lacks the pinned encoder. This is a build dependency,
+never application content. It requires network access on first setup; subsequent
+exports reuse cached verified conversions. Flatpak supplies checksum-pinned
+encoder sources and build dependencies for its offline sandbox. RPM uses
+`tools/build_asset_encoder.py` with checksum-pinned Source archives; the helper
+builds a private encoder with pip's `--no-index --no-build-isolation` options.
+Fetch sources before entering an offline build with
+`python3 tools/build_asset_encoder.py fetch --sources <source-directory>`.
+Distro installs can request `optimized_assets=1` independently of `release=0`,
+preserving distro compiler flags and debug information. `optimized_assets=0`
+retains original asset bytes for a measurement baseline; `auto` follows `release`.
+Windows CI uses standard CPython for encoding and MinGW Python for building;
+`GLOB2_ASSET_ENCODER_PYTHON` selects a validated, already prepared interpreter.
+Python tests can use the same environment:
+
+```sh
+"$(python3 tools/package_assets.py --encoder-python)" -m unittest discover -s tests/build_system -v
+python3 tools/package_assets.py --platform linux --output build/runtime-assets
+```
+
+The export audit is beside the generated tree, outside shipped assets. Build
+helpers and the HD source provenance manifest are omitted, while `frames.txt`,
+font coverage, notices, music and all HD images are retained. Store screenshots
+remain in Linux packages where metainfo requires them. Android's installed asset
+index hashes the exported bytes. Run source `dist` and release `install` as
+separate SCons invocations; the latter installs the exported runtime tree.
+Release installs retain a compact compressed ownership index to remove obsolete
+managed files on upgrades. Unrelated files and modified obsolete files are kept.
+On the first upgrade from an install without that index, PNGs at current shipped
+image paths are replaced when WebP is selected, including artwork from older
+releases. Keep custom image overrides in the user profile so they retain priority.
+
+Windows distributions stage assets and recursively imported DLLs through
+`tools/release/windows_runtime.py`. ZIP, Steam, Epic, Store and NSIS use this
+shared policy; missing non-system imports fail packaging. `scons release=1
+mingw=1 lean_images=1 windows-installer` builds the x64 NSIS installer from that
+same staged tree. It retains the machine installation/shortcuts and legacy
+installation directory lookup, uses solid LZMA, and inventories installed files
+for upgrades and uninstall. Unrelated files and saved games are preserved.
+Compile an existing portable stage with `tools/release/package_nsis.py --stage
+<stage> --version <version> --output <setup.exe>`.
+
+Self-contained Linux/MinGW package builds use `lean_images=1` for a private,
+checksum-pinned PNG/JPEG/WebP SDL_image. Its cache identity includes compilers,
+CMake, codec options, dependency versions and selected library hashes. Linux
+installs its canonical decoder under `lib/glob2` with soname symlinks and an
+executable-relative search path. Windows staging automatically prioritizes the
+private runtime recorded beside its build binary. These builds use a separate
+`lean-images` build directory; ordinary builds and RPM retain system libraries.
+Snap stages the required JPEG/PNG/WebP runtimes; Flatpak builds the same codec
+allowlist directly. PNG/JPEG saving remains enabled for screenshots and maps.
+
+Mac `bundle`/`package` additionally builds a checksum-pinned SDL_image 2.8.12
+with PNG/JPEG/WebP loading and PNG/JPEG saving. The cache identity includes
+compiler, SDK, codec configuration, dependency versions and the actual libraries
+reported by pkg-config. Shared real files are hashed once; unrelated Homebrew
+libraries do not invalidate this cache. Missing or changed required libraries
+fail packaging rather than falling back to another decoder. The bundle stores
+one canonical copy per dylib, preserving required runtime aliases as symlinks.
+Its executable is stripped only after a matching dSYM has been retained in the
+build's `symbols/` directory, and before dependency rewriting and signing.
+Preserve that dSYM with release evidence for crash symbolication.
+
+The opaque `menu-colony.png` illustration uses visually reviewed quality-85
+lossy WebP in release exports. Use `--lossless-background` for an exact-artwork
+comparison export. Wordmarks, icons, sprites, masks and atlases remain lossless. No save,
+replay, network or simulation format changes are involved. Measure complete
+packages and startup separately: smaller compressed assets need not decode
+faster or use less GPU memory.
+
+`tools/release/package_sizes.py report --staged-root <root> --archive <package>
+--output <report.json>` records payload categories, file hashes, archive sizes,
+source revision, architecture and compiler. Its `compare` command rejects
+reports from different sources, platforms, compilers or measurement scopes.
+Use `--scope asset-only` for an export without a binary/runtime; it must not be
+reported as a complete application download. Candidate release CI retains
+same-source original/optimized reports for Linux tarballs and Windows ZIPs.
+Installed sizes exclude symlink targets counted elsewhere; download size is the
+actual archive byte count. Shared system runtimes are outside these artifacts.
+
+GCC/MinGW release experiments use `size_optimization=gc|lto|size`: section
+collection, section collection plus LTO, and those options with `-Os`, respectively.
+The default `none` keeps current flags. Each experiment has its own
+`size-<profile>` build directory and identity, including a separate directory
+when combined with `lean_images=1`. They are restricted to native Linux/MinGW
+release builds; mobile, browser and Mac builds retain their existing settings.
+
+The candidate release workflow's `benchmark_profiles` input builds all three
+experiments. `tools/release/benchmark_profiles.py` compares complete archive
+sizes and retains two batches of seven alternating simulation/process-launch
+pairs after warmups. It verifies exact per-tick traces, replay orders and saves
+from the same two frozen initial states. Adoption needs at least 1 MiB or 1%
+archive savings, no credible repeatable simulation slowdown, image/renderer
+checks, and a separate actual application-startup measurement within 10%.
+`--version` timing is labelled process launch and does not prove GUI startup.
+The tool never changes defaults or declares an experiment ready to adopt.
+`benchmark_decoder.py` compares stock/private decoders against identical exported
+images in separate processes; its scope excludes GPU upload and rendering.
+
+`tools/release/archives.py` compares ZIP levels 6/9 using one stage and keeps the
+smaller archive (level 6 on ties). Linux retains gzip and additionally emits xz
+only when it saves at least 1 MiB or 5%; xz level 9 must save a further 1 MiB over
+level 6. Tar metadata is normalized using `SOURCE_DATE_EPOCH` (zero by default).
+These are build-time compression settings; decompressed application content is
+unchanged. Compression reports remain review evidence outside package payloads.
 
 ## Renderer stress measurements
 
@@ -381,9 +532,43 @@ For timing and scheduling, start with `src/Game_sync.cpp` and `src/EngineRun.cpp
   order, but does not make their shared map and caches safe for concurrent access.
   A controller must still have at most one `getOrder()` in flight; its stream
   and decision state are mutable.
-- The non-AI `syncRand()` generator is `thread_local`: the simulation normally uses
-  one thread, while background map generation seeds its own stream. A new thread
-  starts from the default seed; seed it before relying on its sequence.
+- Each `Game` owns its synchronized stream (`Game::syncRandom`), saved and restored
+  with the game. `Game::syncStep`, `Game::executeOrder`, load and save bind it with
+  `SyncRandScope`, so the simulation draws from the game it advances on whichever
+  thread runs it. Other code that advances a game's simulation must bind it with
+  `Game::bindRandom()`. Outside a bound scope, `syncRand()` uses a `thread_local`
+  default stream that map generation and other tools seed for themselves; a new
+  thread starts from the default seed. During an engine session an unbound draw is
+  a determinism bug: it is counted (`unboundSyncRandDraws()`), and
+  `GLOB2_SYNC_RAND_STRICT=1` aborts on it.
+- Keep rendering, particles, animation and other presentation-only randomness off
+  `syncRand()`. Use a presentation-owned generator such as `GameGUI::effectsRandom`,
+  so visual effects can change, run at any frame rate or move to another thread
+  without consuming simulation draws.
+- Simulation/client boundary (`src/sim/`). Simulation code must not call `GameGUI`;
+  it talks to the client through three channels, which `GameGUI` owns and `Game`
+  points to (all null without a GUI):
+  - `ClientEvents`: lossless queue of notices the simulation publishes (team
+    `GameEvent`s, chat, voice, marks, pause, ghost removal, building removal, unit
+    conversion, executed orders) plus a per-tick latest-value pulse
+    (`Team::wasRecentEvent` for every team). `Game::executeOrderAndNotify` publishes
+    the order effects; `GameGUI::consumeClientEvents` applies them after each order,
+    after each engine tick, and at the start of `step` and `drawAll`.
+  - `ClientCommandSink`: the presentation commands map scripts issue (building and
+    flag choices, GUI elements, highlights, Space swallowing, script text). SGSL,
+    USL and JavaScript map scripts call it instead of `GameGUI`. Its two read
+    methods are legacy USL queries; do not add more.
+  - `ClientRequests`: a latest-value `ClientView` (viewport, observed building,
+    overlay, debug layers) and a lossless command queue (the SGSL Space
+    acknowledgement). `Game::applyClientRequests` applies them at the start of
+    `Game::syncStep`; only the observed building records
+    `Building::unitsFailingByReason`.
+
+  Client code holds entities as `BuildingRef`/`UnitRef` (gid plus `scriptIdentity`)
+  and resolves them through `Game::resolveBuilding`/`resolveUnit` at each use; do not
+  keep `Building*`/`Unit*` across ticks in client code. The channels are
+  single-threaded for now. Making them thread-safe only changes `LosslessQueue` and
+  the latest-value accessors.
 - For behavior-preserving refactors and optimizations, compare base and changed
   builds using identical saves/maps, seeds, settings and orders. Compare per-tick
   state/checksums as well as replay bytes: matching orders alone do not prove that
@@ -396,10 +581,28 @@ For timing and scheduling, start with `src/Game_sync.cpp` and `src/EngineRun.cpp
   Treat save-format, replay and network compatibility as separate questions. If
   simulation rules change, assess replay acceptance and protocol/version gates even
   when the saved byte layout is unchanged.
+- Team capacity is `Team::MAX_COUNT` (16), shared by colonies and controller slots.
+  `MAX_COUNT_ON_DISK` (32) is the fixed GameHeader player/alliance layout, not a
+  selectable match size. Team masks are 32-bit; packed growth coverage requires
+  three masks to fit a 64-bit word (at most 21 teams in that representation).
+  Unit/building identifiers must also fit below the 16-bit empty-entity sentinel.
+  Team iterators must use the live match count; a full array has no null end slot.
+  Format 127 counts Maxima opponent records and script-generation team slots;
+  older formats retain their historical 12-slot layouts. Text header alliances use
+  indexed slots from format 127; binary header bytes stay unchanged. Custom-game
+  preferences version 4 counts colony records and still reads the twelve records
+  written by versions 1–3. The building-generation
+  plane must be remapped when loading old saves. Never substitute a live capacity
+  for a historical serialized length. Save floor 58 remains unchanged.
+  Warrush probes one capacity slot every two ticks (32 ticks for sixteen slots).
+  Empty slots fall through to normal decisions, preserving smaller-match timing.
+  Replay floor 127 gates the new capacity; network protocol 51 additionally
+  requires the format-128 compact save reader. Older saves load into the current
+  simulation.
 - Versioning rule: when the save format changes, bump `VERSION_MINOR` and preserve
   older saves through version-gated loading, or explicitly document an approved
   compatibility break. When simulation changes invalidate old replays or mixed-client
-  games, update replay acceptance and `NET_PROTOCOL_VERSION`/YOG minimums as needed.
+  games, update replay acceptance, `NET_PROTOCOL_VERSION` and `SIM_REVISION` as needed.
   Test acceptance/rejection at the version boundaries; unchanged saved bytes do not
   establish replay or network compatibility.
 - `.map`/`.game` files are gzip level 6 by default (`FileManager::writeGzipAtomic`/
@@ -413,9 +616,8 @@ For timing and scheduling, start with `src/Game_sync.cpp` and `src/EngineRun.cpp
   file with no `.gz` sibling still loads unchanged. `glob2PreferGzipReadPath`/
   `glob2GzipWritePath`/`glob2ListMapOrSaveFiles` (`src/map/io/MapHeader.cpp`) are
   the read/write path-resolution helpers most call sites should use rather than
-  hand-rolling the `.gz` suffix logic. Replays and YOG/network protocol gates are
-  unaffected; the YOG map-transfer wire payload was already a single gzip layer
-  and now skips re-gzipping a locally-compressed map.
+  hand-rolling the `.gz` suffix logic. Replays and network protocol gates are
+  unaffected.
 - Intentional bug fixes or gameplay changes may change old outcomes. Explain the
   difference and test the intended behavior rather than claiming old/new equivalence.
 - Before parallelizing gradients, inspect scratch ownership and input lifetimes in
@@ -423,12 +625,42 @@ For timing and scheduling, start with `src/Game_sync.cpp` and `src/EngineRun.cpp
   publication are relevant checks.
 - Gradient field seeding lives in the area, building and resource source files.
   `MapGradientPropagation.cpp` starts eager fields through the private
-  `kernel/GradientPropagation.h` core; `BuildingGradientSearch.cpp` resumes
-  building fields. Both use `kernel/GradientRelaxation.h`. Keep their cell-cost
+  `src/field/GradientPropagation.h` core; `BuildingGradientSearch.cpp` resumes
+  building fields. Both use `src/field/GradientRelaxation.h`. Keep their cell-cost
   and queue ordering contracts shared when tuning architecture-specific kernels.
-  `GradientConstants.h` owns the field encoding; `Map` keeps its pipeline and
+  `src/field/GradientConstants.h` owns the field encoding; `Map` keeps its pipeline and
   per-executor scratch in an opaque `GradientRuntime`. Save/load reaches pending
   work through snapshot views, not the pipeline's mutable jobs.
+- `src/field/` is the Map-independent field library. Weighted paths retain
+  bucket queues and scalar/SSE2/NEON relaxation; uniform four/eight-neighbour
+  fields use an ordered FIFO with caller-owned payloads and admission rules.
+  Seed and neighbour order matter for first-discovery payloads and early stopping,
+  including Cortex wheat depth and Maxima food claims. Keep those searches ordered.
+  Callers own seeding, field encodings, transient scratch, cache ages and publication.
+  Sharing a solver does not make fields with different predicates interchangeable.
+- Choose the smallest field operation that preserves the caller's contract:
+
+  | Operation | Entry point | Caller responsibility |
+  | --- | --- | --- |
+  | Weighted path field | `gradient_kernel::propagateField` | Encode seeds/obstacles, supply stable terrain and a `GradientWorkspace`. |
+  | Resumable weighted paths | `gradient_kernel::expandBucket` | Preserve pending buckets and settle whole cost layers before pausing. |
+  | Uniform distance field | `field::expandDistances` | Seed equal distances, choose the unvisited sentinel and ordered stencil. |
+  | Ordered FIFO with payloads | `field::traverse` | Admit and enqueue neighbours; retain first-discovery payloads and stopping rules. |
+  | Domain heap search | `field::traversePriority` | Own costs, comparator, stale-entry checks and parent ties, including zero-cost edges. |
+  | Component stack/queue | `field::depthFirst` / `field::breadthFirst` | Own discovery and push order. |
+
+  `Grid::neighbors` supplies raw coordinates for bounds checks before wrapping;
+  `Grid::neighborIndices` supplies wrapped indices. Both retain stencil order and
+  aliases on thin grids. The vector FIFO keeps discovery history; `Frontier`
+  consumes entries and retains storage for the largest pending frontier. Clear
+  and seed either workspace at the owning caller. An early stop preserves writes
+  already made; grid traversal finishes the current neighbour stencil before
+  visiting the next entry. Use `breadthFirst` for stops during expansion.
+- Influence has two distinct contracts in `src/field/Influence.h`: convergent
+  maximum-contribution propagation and four directional sweeps. Castor requires
+  the latter's staggered scan order and byte arithmetic; replacing it with
+  convergence changes AI decisions. Map retains the cooperative checkpoints
+  around convergent rows. No solver depends on Map, AI, threading or serialization.
 - In `src/map/gradient/MapGradientChamfer.cpp` the chamfer distance transform's
   convergence-pass cap is bounded by the Uint8 value range (256), not by the
   Borgefors 1-pass result. Borgefors holds only on an obstacle-free grid; with
@@ -452,16 +684,14 @@ For timing and scheduling, start with `src/Game_sync.cpp` and `src/EngineRun.cpp
   separate program (two processes, a golden-table tool) gets a `PROGRAMS` entry
   and one step that only runs it: a separate `scons` call per step re-reads the
   whole build and compiles one file at a time. Builds that need other options
-  (`server=1`, `opengl=0`) belong in
+  (`role=relay`, `opengl=0`) belong in
   the `linux variants` job, and long CPU-bound checks in a job of their own, as the
   golden-map sweep does; its four sweep shards are split between two jobs per
   toolchain, alongside a job for telemetry and generator defaults. These jobs reuse
   the main Linux build artifacts when native checks are selected; map-only diffs
   build the required programs themselves. Tests run in parallel after the shared
-  build. The Linux variants matrix owns the YOG server build on both supported
-  toolchains; the main
-  Linux jobs do not repeat that build. On Windows the `windows server` job owns it
-  for the same reason.
+  build. The Linux variants matrix owns the relay build; the main Linux jobs do
+  not repeat it.
   Browser checks follow the same rule: build once per job, pass outputs to the
   test jobs as artifacts, and shard long suites rather than lengthening one job.
 - A map generator's `revision` is enforced by `MapGeneratorGoldenTest`: a seed's map changing
@@ -579,14 +809,180 @@ never infers that extracted tool directories are trustworthy from a version
 string alone. Windows inventory/seeding is supported; duplicate removal requires
 a supported open-file checker and is conservatively skipped there.
 
+## Scene renderer
+
+Drawing reads an immutable `Scene` (`src/scene/`), never live simulation objects, so it
+runs while the simulation advances on another thread.
+
+- `SceneExtractor::extract(game, request, scene)` (`src/scene/SceneExtract.cpp`) is the
+  only place presentation code reads the game. `GameGUI::drawAll` extracts
+  `frameScene` once per frame and publishes it in `Game::ViewState::scene`; `drawMap`
+  callers without a published scene (menu colony, editor, torus without a GUI, tests)
+  get one extracted into `ViewState::render.ownScene`. `ViewState::drawnScene()`
+  returns whichever was drawn.
+- `SceneMap` copies the per-tile layers whole (terrain, resources, occupancy, discovery
+  and fog, displayed areas); its queries match `Map`'s. `SceneEntities` holds
+  presentation copies of units, buildings and flags with lookup by gid (field names
+  follow `Unit`/`Building`; `team` indexes `SceneEntities::teams`), per-sector
+  bullets and animations, and the selected building's map-view data. Static
+  definitions (`BuildingType`, `Race`) are referenced, not copied.
+- The overlay map is computed during extraction and shared as an immutable snapshot;
+  it refreshes when the requested type or team changes and once per 25-tick window.
+- Adding something drawn on the map: extract what the drawing needs in
+  `SceneExtract.cpp` and read it from the `Scene` in the render pass. Never read
+  `Game`, `Map`, `Team`, `Unit` or `Building` state from drawing code.
+  `tests/build_system/test_scene_boundary.py` rejects live entity reads in the render
+  passes, the minimap and `GameGUIDraw*`, and simulation includes in `src/scene/` headers.
+- Selection panels, the HUD, the top bar, statistics pages, the minimap and the building
+  tool's placement preview also draw from the Scene (`ScenePanels`, `SceneMap`). Input
+  handlers still act on the game, and validate against it before issuing an order.
+
+### Simulation thread
+
+Interactive sessions run the simulation on its own thread (`src/sim/SimulationRunner`)
+on native platforms; there is no setting. Both browser runtimes, and any platform where
+creating the simulation thread fails, run the same session serially (`Engine::stepSession`), which
+also remains the headless default and the equivalence reference.
+
+- The simulation thread paces itself with the speed presets and runs ticks
+  (`Engine::simulationStep`: orders, network, `Game::syncStep`). After a tick, if the main
+  thread has taken the previous Scene, it extracts the next one into a `SceneBuffer`
+  (lock-free triple buffer), so fast-forward extracts at most once per drawn frame.
+- The main thread draws the newest Scene every frame. Work that reads or writes the game —
+  input, `GameGUI::step`, consuming `ClientEvents`, checking the selection, script
+  highlights — runs in `SimulationRunner::withGame`, which parks the simulation between
+  ticks (immediately when it is sleeping between ticks).
+- Only state both threads use is shared: `ClientRequests`' view is locked; `gamePaused`,
+  `hardPause`, `isRunning` and the CPU-load history are atomics. A pause order or the local
+  player leaving takes effect on the simulation thread in the same tick, as in serial
+  execution. GUI state extraction reads (selection, local team) changes only while the
+  simulation is parked.
+- The synchronized RNG belongs to the game, so results do not depend on the thread.
+  `GLOB2_SIM_THREAD=1` runs headless sessions on the simulation thread for
+  `check_sim_thread.py --candidate-env GLOB2_SIM_THREAD=1`; `GLOB2_SIM_THREAD=0` keeps
+  any session serial, for tests that count frames against a scripted host clock.
+- The simulation thread paces on the host's clock (`Engine::sessionClock`): the clock the
+  host last passed in, advanced by real time. Time the application spent in the
+  background is therefore not caught up after resuming, as in serial execution.
+  GUI updates use `SDL_GetTicks()` instead: touch event timestamps and momentum
+  must share the SDL clock, including after the session clock has been suspended.
+- Values the client sets while drawing and extraction reads (viewport, drawn map size,
+  overlay, observed building) go through `ClientRequests`, never through `Game` or `Map`
+  fields. To check for races, build with `CXXFLAGS="-g -fsanitize=thread"
+  LINKFLAGS="-fsanitize=thread"` and run a windowed `-test-games` session or a headless
+  `--run-game` with `GLOB2_SIM_THREAD=1`. Build against the pinned SDL3 prefix
+  with `GLOB2_SDL3_PREFIX`; sanitizer builds use the same native SDL3 dependency set.
+  `.github/workflows/thread-sanitizer.yml` runs both games under ThreadSanitizer nightly,
+  through the main build workflow and on demand. The risk selector includes it
+  for code shared by threads; add boundaries in `.github/scripts/ci_policy.py`
+  when new code becomes shared between them. Drafts defer it. It does not report thread leaks, because SDL3
+  leaves its own startup threads unjoined at exit, and uses the dummy audio driver, because
+  PulseAudio's uninstrumented mainloop thread reports races inside libpulse. Narrow, explained suppressions for
+  library shutdown races live in `test/tsan.supp`; never suppress game code there.
+  Draft PRs skip it.
+- `SceneBuffer<T>` (`src/scene/SceneBuffer.h`) hands Scenes between the threads without
+  either waiting for the other.
+
+### Smooth unit motion
+
+The experimental **Smooth unit motion** graphics setting (`Settings::unitInterpolation`,
+off by default) draws units between ticks, so threaded play at display rate uses all
+32 animation frames per direction instead of repeating one pose per tick.
+
+- A unit's drawn position and animation frame follow `delta`, which the simulation
+  advances by `SceneUnit::stepSpeed` each tick. Each frame, `GameGUI::drawAll` sets
+  `MapRenderState::unitMotion` to the elapsed fraction of the tick interval since the
+  Scene's tick (`Scene::tickTime`, `Scene::tickInterval`; `src/render/UnitMotion.h`).
+  Unit drawing, path lines, off-screen markers and worker circles add that fraction of
+  `stepSpeed` to `delta`, stopping at the end of the current action.
+- Motion is 0 when the setting is off, when the game is paused, and when the simulation
+  runs uncapped. At 0, drawing is identical to drawing the ticked state; keep it that way
+  so captures with the setting off stay comparable.
+- A unit that turns or stops at the next tick can jump back by at most one tick of motion.
+  Serial execution draws right after each tick, so the setting has almost no effect there.
+
+## Adaptive zoom detail
+
+The map zooms from the fitted whole map up to 500% (`MapCamera::MAX_ZOOM`). With the
+`adaptiveZoomDetail` graphics setting (default on), map elements change
+representation with the zoom instead of scaling uniformly. Presentation only: none of
+it is saved, checksummed or read by the simulation.
+
+- `ZoomDetail::forView` (`src/render/ZoomDetail.h`) is the single source of the
+  curves. Its input is the size of one tile in screen points
+  (`32 * zoom / logicalUnitsPerPoint()`), so thresholds mean the same on a phone, a
+  high-density display and a desktop. Every threshold is a named constant there; each
+  ramp is a smoothstep between two tile sizes, so representations cross-fade.
+  `Game::drawMap` computes it once per frame into `MapRenderState::detail`.
+  A small map cannot zoom out far enough to reach the strategic view by tile size,
+  so the view's owner sets `MapRenderState::minimumZoom` and `ZoomDetail::rampTile`
+  compresses the far range: fully zoomed out is the full strategic view on a map of
+  any size, and from twice that tile size (at least 20 points) in nothing changes. A
+  map still at 20 points or more per tile when fully zoomed out is left detailed.
+  Overlay sizes always follow the true zoom. Disabled,
+  it returns the values of uniform scaling and the passes take their original paths.
+- `MapOverlayQueue` (`src/render/MapOverlayQueue.h`) holds overlays of constant screen
+  size. Passes queue them at a map position while the map transform is active;
+  `drawMap` flushes once after the air units (under clouds and fog) and once on
+  return (flags), inside one `beginScreenOverlay` scope. Bars therefore draw above
+  every unit and building rather than interleaved with them. `Game::anchorBars` names
+  the map point a bar keeps fixed while its size changes.
+- Bars hold their 100% size from 48 down to 20 points per tile and change slowly
+  outside that. Below 20 points only bars reporting a problem remain (a starving unit
+  or one at 60% health or less; a damaged building, one with under half its workers,
+  an inn without food, a tower without ammunition), then a status pip, then nothing.
+- Zones cross-fade from pattern sprites with an outline to a flat translucent tint
+  without one: an area keeps its shape at any scale where a one-pixel line cannot.
+  `GraphicContext::drawMapFill` snaps fill edges to target pixels so translucent
+  neighbours tile without seams. The fog-of-war shade draws one fill per horizontal
+  run of whole squares with `drawMapTileFill` and its edge sprites with
+  `drawMapTileSprite`. Both snap to pixels only in the software rasteriser, where
+  truncated coordinates otherwise leave one-pixel gaps between tiles; accelerated
+  renderers place sprites at exact fractions, and a snapped fill beside them
+  leaves hairline seams.
+  The outline stroke stops thickening at two points.
+- Below 12 points per tile `Game::drawMapOverview` fades in one flat colour per tile
+  (terrain, or the resource's minimap colour over it); at 5 points it replaces the
+  water, terrain and resource passes. It is one image, a pixel per visible tile,
+  stretched over the map in a single draw: as per-tile translucent fills it cost
+  more than the terrain it covered during the cross-fade.
+- Units cross-fade to team-coloured markers (dot worker, triangle warrior, diamond
+  explorer). Bullets, explosions, death animations, the magic effect and the
+  level-up number go with the unit sprites. Below 8 points per tile building sprites cross-fade to chips in the
+  team's colour carrying a white icon of the building's purpose, with a pip per
+  upgrade level and a paler chip for a construction site; flags become discs of
+  constant size; walls become plain team-coloured tiles. Chips are 15 to 26 points
+  and placed in priority order (damaged, flags, towers, hives, the rest); one that a
+  placed chip would cover by more than 15% is left out. The icons are
+  `data/gfx/mapicon*.png`, rasterised at seven pixel sizes from the SVGs in
+  `datasrc/icons/map/` by `python3 tools/icons/export_map_icons.py` (needs
+  `rsvg-convert`); the renderer draws the largest frame that fits, pixel for pixel.
+  Frame order is shared between that script and `MapOverlayQueue.cpp`.
+- In the strategic view (below 6 points per tile) `Game::drawMapTerritory` washes
+  the land around each team's visible buildings in its colour, and an under-attack
+  event raises the same pulsing mark as a player's ping.
+
+When tuning, capture the same save across zooms with `SoftwareRenderBenchmark`
+(`PROFILE_ZOOM`, `PROFILE_CAPTURE`); `PROFILE_ADAPTIVE_ZOOM=0` draws uniform scaling
+from the same build for a before/after pair. Set it explicitly on every run: the
+benchmark saves preferences, so the last value otherwise carries into the next run.
+`torus-render-benchmark` takes `GLOB2_BENCH_ZOOM`, `GLOB2_BENCH_PAN_X`/`_Y` (the
+camera's top-left tile), `GLOB2_BENCH_AREAS=1` (zones), `GLOB2_BENCH_FOG=1`,
+`GLOB2_BENCH_FRACTION` (a camera offset in map pixels, which seams need to show) and
+`GLOB2_BENCH_ADAPTIVE_ZOOM=0|1` for the same comparison on OpenGL. Sprites stay
+opaque while markers and chips fade in over them, since a translucent sprite leaves
+its batch; check draw calls as well as time when changing a cross-fade.
+
 ## Software rendering architecture and profiling
 
 `GraphicContext` remains the drawing facade and retains existing capability queries.
 It owns the accelerated backend and software backend independently; transformed passes
 borrow them through scoped transform/clip state (`RenderStateScope.h`). The CPU backend
-in `SoftwareRenderBackend.cpp` implements sprite blits and rectangle fills directly on
-its borrowed framebuffer. It creates SDL's software renderer only when general triangle
-geometry is needed, and flushes that queue before direct writes or target replacement.
+in `SoftwareRenderBackend.cpp` implements verified same-format opaque sprite blits and
+opaque rectangle fills directly on its borrowed framebuffer. Translucent draws and
+mixed pixel formats retain SDL geometry rasterization so platform-specific blending
+rounding and source modulation match the reference. General triangles use that same
+lazy SDL renderer; its queue flushes before direct writes or target replacement.
 Large existing images expanded past 512 pixels, including water, retain SDL geometry
 rasterization because its fixed-point overflow behavior is visible at some transformed
 sizes. Borrowed terrain run views use direct rasterization: they replace small tiles and must not acquire that
@@ -614,8 +1010,12 @@ content revision. Code that edits pixels through `getSDLSurface()` must call
 `markPixelsChanged()` afterward. This includes raw SDL copies and external rasterizers.
 
 `GameRenderFrame` groups the viewport, assets, visibility and draw options inside the
-existing game rendering entry point. `Game::softwareTerrainCache` is transient presentation
-state: 16×16 tile chunks, at most 32 MiB of pixel storage, least-recently-used eviction.
+existing game rendering entry point. Presentation state a view keeps between frames —
+animation phases, the cloud field, the overlay scratch buffer and the software terrain
+cache — lives in `MapRenderState`, owned by `Game::ViewState`, never on `Game` or `Map`;
+the simulation neither reads nor writes it and each view animates independently. The
+terrain cache is transient presentation state: 16×16 tile chunks, at most 32 MiB of pixel
+storage, least-recently-used eviction.
 The cache is used during transformed software passes. Ordinary native drawing keeps
 its per-tile opaque copies, avoiding full-chunk blending of mixed alpha. Within a
 transformed chunk, adjacent opaque tiles become borrowed surface views over the raw
@@ -623,7 +1023,7 @@ chunk pixels. Coastlines retain individual source blits, avoiding repeated alpha
 over transparent chunk holes. Views are destroyed before their backing chunk.
 Each chunk validates exact terrain IDs, the existing discovery decisions and source
 content revisions. It stores raw color/alpha, so coastlines blend over animated water
-once. Map replacement clears the cache; editor terrain changes and visible-team changes
+once. Map replacement (a new `Map::identity()`) clears the cache; editor terrain changes and visible-team changes
 are detected during preparation. Resources, actors, fog and overlays keep their existing
 passes. Water coverage subtracts only verified opaque terrain rectangles, including discovery
 boundaries. A complete animated water tile is omitted only when all of it is covered;
@@ -655,12 +1055,16 @@ PROFILE_SAVE=artifacts/software-renderer/initial.game.gz PROFILE_ZOOM=0.5 \
 
 Use the appropriate `linux`/`mingw` build directory or an explicit `--build=DIR`.
 Resolution is the existing `-s WxH` argument, measured in framebuffer pixels.
-The benchmark disables HiDPI by default so the workload does not change with the
-monitor density. `PROFILE_NATIVE_DISPLAY=1` retains native Retina/HiDPI presentation. `PROFILE_OFFSET_X/Y` add logical-pixel camera
+The benchmark creates its SDL3 window without high-density backing pixels by default,
+so the workload does not change with monitor density. `PROFILE_NATIVE_DISPLAY=1` retains native Retina/HiDPI presentation. `PROFILE_OFFSET_X/Y` add logical-pixel camera
 offsets; `PROFILE_FRACTION=1` adds a half-pixel horizontal offset. `PROFILE_VISIBLE=1`
 shows the window; omit `PROFILE_NO_PRESENT` to include presentation. `PROFILE_CAPTURE`
 names an output BMP. `PROFILE_TERRAIN_CACHE=0` isolates primitive performance without
-adding a user graphics setting. The harness reports population, wall-time mean/median/p95,
+adding a user graphics setting. `PROFILE_SELECT=building|flag|unit` selects the local
+team's first such entity, so frames include its selection panel and map markers;
+`PROFILE_TOOL=<building type>` (for example `inn`) activates the building tool with the
+cursor over the middle of the map view, so frames include the placement preview. Use them
+with `PROFILE_MODE=gui` for Scene parity captures against another revision. The harness reports population, wall-time mean/median/p95,
 process CPU time, optional thread CPU stage costs, backend operation counts, cache memory
 and cache hit/rebuild counts. It also checks that drawing preserves the simulation checksum.
 Run captured fixtures from early, mid and late games; keep generated saves and profiles
@@ -702,3 +1106,273 @@ opt-in executable. Timing thresholds are review criteria, not CI assertions. Run
 `SoftwareRenderer`, `PortableRenderer`, `WindowResize`, `MapRenderResize` and
 `HighResolutionIntegration` suites on supported SDL/platform builds, retain before/after
 captures, and report unavailable platform and maintainer-playtesting coverage explicitly.
+
+### CI timing and retained revisions
+
+Ready pull requests cancel superseded revisions. Master finishes active verification
+and keeps the newest pending push. With tiers enabled, the selector compares its
+checkout to the latest successful ancestor checkpoint with matching policy evidence;
+this includes all changes whose intermediate pending runs were replaced. An absent,
+expired, divergent or invalid checkpoint selects full coverage. Nightly verification
+runs at 06:00 UTC in a separate concurrency group without publication operations.
+Release packaging first runs the full development matrix on the exact candidate
+revision through `build.yml`'s `revision` workflow-call input.
+
+CI measurements batch completed runs hourly using trusted default-branch code and
+inert artifacts. Cancellations do not create measurement workflows, and draft-only
+observations are excluded. Batches retain attempt identities to avoid remeasuring
+completed runs and attempt at most ten new measurements per batch. `feedback.json` reports p90 after ten successful matching-inventory
+PR samples, with explicit gaps when there are fewer samples. Metrics report queue delay, active execution time, idle
+gaps, aggregate runner minutes, feedback time and cache observations separately.
+Per-job queue timestamps are estimates, not proof of runner saturation. Overlapping
+jobs count once in wall execution time and separately in runner minutes.
+Compare ten successful runs with matching event and exact coverage inventory using
+`python3 .github/scripts/ci_run_metrics.py --before before.json --after after.json`.
+Report workload reductions separately from execution savings. The initial service
+objective is p90 ordinary-PR feedback below 15 minutes and queue delay below two
+minutes; full compatibility changes and releases may take longer. Missing samples
+and missing inventories cannot establish improvements.
+
+### Linux execution dependencies
+
+GCC 13 builds its client and applicable transport programs once. Runtime consumers
+reuse same-run artifacts with matching source/configuration provenance. Compiler
+build jobs publish programs before separate CLI/scripting regressions; native and
+browser consumers can start without waiting for those regressions. Golden-only
+changes build once per selected platform and distribute programs to sweep consumers.
+Primary generator sweeps are complete; secondary platforms retain golden rows and
+telemetry equivalence under enabled tiers. Native inventory audits require every
+selected engine case to belong to exactly one shard.
+
+ELF dependency collection records runtime package owners and rejects unresolved or
+unowned libraries. Generator, CLI and browser consumers install runtime libraries
+rather than compiler/header environments. Enable `CI_RUNTIME_PACKAGES_ENABLED=true`
+for ordinary engine shards only after `Validate clean Linux runtime images` passes
+both Ubuntu container images. Until then engine shards retain their prior package
+installation; the clean-image dispatch also exercises CLI/scripting consumers.
+
+Pinned SDL3, WebAssembly and Android dependency prefixes are cached independently
+from application objects. Restored prefixes require matching inputs and complete
+file hashes; invalid content rebuilds. Android tooling and Playwright installations
+use pinned tool/package identities. Default-branch jobs publish shared caches;
+ordinary PRs restore them. The cleanup sweep removes closed-PR caches and retains
+three generations per master compiler/object family. Cache timings and quota
+pressure must be measured before expanding retained cache data.
+
+### Reviewed native shard timing profiles
+
+Native runners optionally accept `--timing-profile` and `--auxiliary-jobs`.
+Nonempty profiles assign jobs longest first to the least-loaded shard, with label
+and shard-number tie breaks; unknown cases use the median recorded duration.
+Empty or omitted profiles preserve alphabetical slicing and existing auxiliary
+ownership. Unit tests and auxiliary groups participate in the same load plan,
+retaining their original commands, flags and timeouts. Every selected engine job
+runs exactly once. Auxiliary artifacts follow their assigned group.
+
+Successful job durations are retained alongside JUnit results. To propose updated
+weights, gather observations and run
+`python3 test/build_ci_timing_profile.py observations --family ubuntu-24.04 --output test/ci-timings/ubuntu-24.04.json`.
+Only platform-matched jobs with ten successful samples enter a profile. Review the
+resulting diff before shipping it; weights never change during a run. Profiles
+remain empty until measurements are available, rather than using invented data.
+
+### Tiered pull-request coverage rollout
+
+`.github/scripts/ci_policy.py` records proposed and effective selection, reasons,
+changed paths, checkpoint, policy identity and selected command inventory in
+`ci-selection.json`. Native runners additionally retain exact eligible/assigned
+case inventories. Primary Linux keeps the complete applicable native suite.
+Simulation/save/AI changes add older-GCC and Windows compatibility cases plus
+complete native/browser per-tick and scripting comparisons. Presentation changes
+retain software/WebGL and Firefox/WebKit coverage. Network changes retain real
+transport/server/deployment checks. Android changes retain arm64 builds and x86_64
+emulator smoke. Shared headers, dependency/build configuration and unknown paths
+select the full development matrix. Native coverage is selected nightly/full or
+when its infrastructure changes. `test/ci-compatibility.json` owns repeated native
+compatibility cases; add suites there when introducing a new portability boundary.
+
+Drafts run contracts only. `ci:run` requests normal affected checks while still
+in draft. `ci:full`, `ci:windows`, `ci:android` and `ci:browsers` expand the minimum;
+use `ci:run` as well to execute an expansion while draft. Ready transitions and
+label changes re-evaluate selection. The aggregate gate rejects missing, failed,
+cancelled and unexpectedly skipped required jobs; draft summaries clearly state
+that expensive verification was deferred.
+
+Reductions start disabled. First validate scheduling and reuse changes with the
+full hosted master/nightly matrix. Then set `CI_TIERED_COVERAGE_ENABLED=true` after
+reviewing shadow-selection evidence. The selector discovers successful full master
+runs with matching source/policy identity and unexpired evidence automatically;
+`CI_TIER_BASELINE_RUN_ID` can specify a preferred baseline. Old-policy evidence
+cannot activate a new selector. Unavailable evidence falls back to conservative
+coverage. Set the flag false to roll back reductions while keeping scheduling and
+reuse improvements. Full nightly and release verification remains mandatory.
+
+## Untrusted maps, saved games and replays
+
+Treat serialized fields as untrusted before using them as indices, allocation
+sizes or runtime state. Map/save game and GUI decoding use checked binary reads;
+a short field raises an error instead of supplying partial or zero-filled state.
+Keep these scopes around the entire load, including legacy fields. Callers must
+handle both a false result and a decoding exception, and must not run a partially
+loaded game. Map headers validate their team records, and entity loaders validate
+types, identities, levels and cross-references before using them. Map sector
+dimensions must match the dimensions derived from the terrain grid.
+
+Names from headers are converted to a single portable filename component before
+download/save paths are built: separators, controls (including NUL), Windows
+reserved characters and device basenames cannot redirect writes outside the
+selected directory.
+
+Gzip file loaders limit compressed input to 256 MiB and expanded output to 2 GiB.
+The separate expansion limit permits the existing late-game snapshots (roughly
+1 GiB uncompressed) while still bounding hostile compressed streams.
+Scenario objectives, hints and legacy areas are limited to 65,536 records;
+building/unit reference lists are bounded by the corresponding entity capacity.
+AI and history collection reads are limited to 1,048,576 entries per collection,
+with Maxima continuation retaining its explicit 16,777,216-entry bound for
+large saved geometry tables. Nested AI condition graphs are limited to 64
+factory calls. Unknown AI implementations,
+object tags, invalid module indices and malformed queued orders are rejected.
+These are reader limits, not a new disk format. Files exceeding these limits are
+rejected. Ordinary valid saves retain their format versions and continuation
+semantics.
+
+Replays must contain a complete, valid order stream ending in a null order.
+Truncated recordings are rejected, including recordings with a valid prefix;
+playback no longer tries to recover a prefix from a malformed stream. Both scanning
+and playback check short reads, and the scan rejects overflowing step totals.
+Execution checks player/team references before indexing game state. This is not
+an authentication mechanism for multiplayer commands. Voice orders additionally
+limit encoded audio to 4,096 bytes and 121 frames before copying or decoding.
+The recorder flushes after crossing 2,048 bytes or 120 frames, so the receive
+limits retain headroom for its final frame and existing recordings.
+
+Embedded legacy USL has no `load` file capability. The application still loads its
+own runtime libraries through the host API. Native type errors stop the map script
+instead of asserting or dereferencing an invalid value. USL also rejects integer
+overflow, limits source to 1 MiB and 65,536 tokens, bounds parser nesting (128)
+and expression chains (256), and checks runtime frames (1,024), frame operands
+(65,536) and heap values (262,144) at instruction boundaries. Garbage marking
+uses an iterative traversal to avoid overflowing the native stack. Legacy SGSL saved program
+counters must match parser-derived statement boundaries or the integer suspension
+point of `wait(N)`.
+
+These checks do not establish a hostile-script sandbox. Script interpreters and
+native simulation code still share the game process. Per-collection and
+instruction-boundary limits are not an aggregate byte or execution-time budget.
+Keep dependency review, sanitizer fuzzing of the complete load-and-step path,
+and platform replay/checksum comparisons separate from targeted rejection tests.
+See [JavaScript scripting](javascript.md) for that interpreter's capability and
+resource boundaries.
+
+
+## Native simulation memory and CPU comparisons
+
+Build the client itself with `scons release=1 server=0`; the `tests` target alone
+can leave an older game executable in place. Preserve a baseline with the same
+benchmark instrumentation, build options and dependencies before rebuilding.
+The structured runner accepts `--benchmark-warmup N` when loading a saved game.
+It reports process CPU nanoseconds for setup/loading, execution after the warmup,
+and the final save in `result.json`. The measured execution includes pending
+pipeline completion; save compression is measured separately. `--ticks` remains
+an absolute game tick, and the warmup must leave a nonempty measured window.
+
+```sh
+python3 tools/memory_benchmark.py \
+  --baseline artifacts/memory/baseline/glob2 \
+  --candidate build/darwin/client/release/src/glob2 \
+  --fixture 0=artifacts/memory/initial.game.gz \
+  --fixture 15000=artifacts/memory/checkpoint-15000.game.gz \
+  --fixture 45000=artifacts/memory/checkpoint-45000.game.gz \
+  --output artifacts/memory/comparison
+```
+
+Use the appropriate platform build directory. The runner alternates seven pairs,
+checks identical final simulation checksums and compressed save bytes, and extends
+to at most 21 pairs if the one-sided 95% paired bootstrap upper bound exceeds the
+2% CPU regression limit. It retains binary/fixture hashes, commands, raw logs,
+timings and one final save per variant and fixture. Keep other heavy work off the
+machine. CPU comparisons explicitly disable malloc logging; collect heap profiles
+in separate runs using the same fixtures. Record actual capture ticks, distinguish
+live allocation totals from resident memory and allocator retention, and report
+platforms whose execution could not be checked.
+
+On POSIX, `--interleave-seconds 0.1` alternates the two processes with
+`SIGSTOP`/`SIGCONT` within each pair. Process CPU clocks exclude the pauses; this
+reduces drift from changing background load without changing the measured tick
+window. Both games remain resident, so this is a separate scheduling condition,
+not a peak-memory measurement. Retain sequential results too, and identify the
+measurement condition when reporting the gate.
+Use `--resume` with the same arguments to continue completed pairs after an
+interruption. Binary hashes, fixture hashes and measurement settings must match;
+the unfinished pair is rerun.
+
+Memory-only representation changes must preserve legacy serialized widths and
+sentinels. Maxima's obstacle-free distance fields use 16-bit storage with an
+internal 65535 infinity, translated to the existing signed 32-bit `INT_MAX` on
+save/load. Route distances retain their wider representation. Food source masks
+retain their legacy 64-bit encoding. Wrapped nine-cell geometry tables share
+immutable storage by map dimensions; loaded noncanonical tables retain their
+original content. Weighted gradient searches share an immutable water snapshot;
+water-classification changes invalidate the map's current snapshot while ongoing
+searches retain their frozen version. Growth overlap counters use 16-bit storage;
+removal precedes addition so both generations cannot temporarily exceed the bound.
+
+Game-file persistence uses move-only snapshots in uninitialized 1 MiB blocks.
+Growing the block table does not copy the saved bytes; allocated byte capacity is
+at most the snapshot length plus one block (with a separate small pointer table).
+Gzip loading reads compressed input in 64 KiB batches and inflates directly into
+these blocks. CRC/truncation/trailing-data validation completes before loading
+headers or simulation state. Filename-based custom and campaign initialization
+reuse one validated input for both headers and the body, then release it before
+replay/network setup. Standalone header readers retain their existing interfaces.
+
+Interactive saves capture owned literals and bounded array/history batches at a
+consistent game boundary. A lightweight fixed integer representation bounds the
+capture memory; final array encoding and history transposition run on the worker.
+Final output uses chunked storage, with relocated header offsets and SHA1 ranges;
+headless callers can still serialize synchronously without changing saved bytes.
+A captured `DeferredStream::Snapshot` is consumed once: finalization releases its
+owned inputs as their output is produced. Append deferred fields in stream order;
+seeks may only backpatch fixed-size literals. Serialize stream positions with
+`OutputStream::writeOffset32`, which explicitly registers relocation on deferred
+streams and writes an ordinary uint32 on binary/text streams. Field names do not
+control relocation. SHA1 still covers the original header followed by the final
+body, preserving the existing pre-backpatch hash contract.
+
+Worker gzip compression uses bounded 256 KiB output buffers; cooperative gzip
+uses 64 KiB input/output steps. Neither flushes at input-block boundaries.
+Optional level-zero compression retains the legacy whole-buffer path to preserve
+zlib's stored-block byte layout; it is outside the normal-save memory bound.
+Background finalization does not add a wire-format change beyond compact format
+128 (save floor 58, replay floor 127, network protocol 51).
+
+For the 45,000-tick large-map fixture, the native macOS arm64 comparison measured
+1.93 GiB peak RSS for combined loading and saving, down from 3.96 GiB in the
+previous optimized build. The acceptance limit is 2.5 GiB for that fixture with
+default compression. This is a fixture-specific measurement, not a bound for
+arbitrary games or other platforms; preserve the commands, fixture hashes and
+raw measurements under ignored `artifacts/` when repeating it.
+
+Autosave defers capture while a previous writer is busy, then captures the current
+tick when the writer becomes idle. It never queues a second owned snapshot or
+waits for compression during a game tick. Manual game and editor saves keep their
+dialog pending while waiting for the worker, writing the file, and persisting
+browser storage; names and editor dirty state change only after success. Editor
+mutation is disabled while saving. A pending save dialog cannot be replaced by
+another panel. Normal session exit stops simulation and keeps presenting frames
+and polling the dialog through queued capture, file writing and browser storage
+completion. A failed save remains actionable for retry/export or cancellation;
+exiting does not silently discard that dialog.
+
+Native and threaded-browser jobs finalize arrays, transpose histories, hash,
+compress and replace files on the worker. Threadless builds advance bounded
+encoding and compression steps with a two-millisecond polling budget (individual
+steps can exceed the budget); snapshot capture still occurs synchronously.
+Worker-start failures fail the save rather than running encoding synchronously.
+Allocation, serialization and worker-finalization failures retain the previous
+file and allow subsequent writes. Browser persistence occurs after local atomic
+replacement: if it fails, the new local file remains available for export while
+the previously persisted browser copy remains intact. A retry creates a new save
+operation; each operation's terminal state is sticky and its success callback
+runs once. Other background string writers still keep the newest queued snapshot.

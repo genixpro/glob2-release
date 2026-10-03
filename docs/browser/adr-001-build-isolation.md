@@ -23,7 +23,7 @@ directory; different identities can build concurrently.
 
 Options are explicit on each command. The emitted options record is not loaded
 by another invocation. Existing native selectors remain available, including
-`server=1`, `mingw=1`, `mingwcross=1`, and `--build=PATH`. Their default output
+`role=relay`, `mingw=1`, `mingwcross=1`, and `--build=PATH`. Their default output
 paths move under the identity directory. macOS packaging is an explicit
 `package` target rather than a side effect of compiling release objects.
 
@@ -39,3 +39,10 @@ object and artifact contents, timestamps, and tracked source files remain
 unchanged. Running that full native build again in the browser job would
 duplicate the Linux lanes without improving routine pull-request coverage.
 These checks do not replace platform-specific runtime and determinism tests.
+
+SDL3, SDL3_image, SDL3_ttf and SDL3_net are built into the selected browser
+output directory using the shared checksum-verified dependency helper. SDL2
+Emscripten ports are not used. The FreeType source dependency is separately
+pinned in `scons/sdl3-vendored.json`; other existing Emscripten ports retain their
+SDK pins. Browser transport uses WebSockets and does not initialize SDL_net's
+native resolver threads or LAN discovery.

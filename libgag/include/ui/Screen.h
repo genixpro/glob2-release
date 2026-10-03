@@ -39,6 +39,9 @@ class UIScreen : public Screen
 	virtual Rect available(const Presentation &presentation, const Metrics &metrics);
 	virtual Rect place(Size measured, Rect available) { return available; }
 	virtual void onEscape() {}
+	// Last word on the frame's presentation (for instance a larger reading size on
+	// big desktop windows); the default keeps what the context resolved.
+	virtual void adjustPresentation(Presentation &) {}
 	// Hooks around each frame for themes with per-frame work.
 	virtual void beforePaint() {}
 	virtual void afterPaint(Canvas &) {}
@@ -65,7 +68,10 @@ class UIDialog
 	virtual ~UIDialog();
 	virtual Element build(const Presentation &presentation) = 0;
 	void attach(GAGCore::DrawableSurface &surface);
+	//! Mouse coordinates must already be in the owning surface's logical space.
 	bool event(const SDL_Event &event);
+	// Gameplay has already mapped window coordinates to the logical surface.
+	bool eventLogical(const SDL_Event &event);
 	void update(Uint32 tick);
 	void draw(Uint32 tick);
 	void cancelInput();

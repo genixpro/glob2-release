@@ -6,7 +6,7 @@
 #include <mutex>
 #include "Map.h"
 #include "MapInternal.h"
-#include "kernel/GradientRelaxation.h"
+#include "field/GradientRelaxation.h"
 
 using gradient_kernel::BUCKETS;
 using gradient_kernel::COST_LIMIT;
@@ -23,22 +23,13 @@ void BuildingGradientSearch::begin(const Map &map, std::uint16_t *seeded, int sw
 	cells = std::size_t(map.getW()) * map.getH();
 	widthMask = map.getMaskW();
 	heightMask = map.getMaskH();
-	widthShift = map.getShiftW();
 	swimClass = swim;
 	currentCost = 0;
 	popped = 0;
 	pending = 0;
 	for (auto &bucket : buckets) bucket.clear();
 	const bool weighted = weightedClass(swim);
-	const bool splitWater = weighted && map.computeEnabled(Map::ComputeInitialize) && cells >= 16384;
-	if (weighted) water.resize(cells);
-	else water.clear();
-	if (splitWater)
-	{
-		map.initializeGradientCells([&](size_t begin, size_t end) {
-			for (size_t i = begin; i < end; ++i) water[i] = map.isWater(static_cast<unsigned>(i));
-		});
-	}
+	water = weighted ? map.frozenWaterSnapshot() : nullptr;
 	// Building fields have only zero-cost seeds, so no deferred seeds are needed.
 	for (std::size_t i = 0; i < cells; ++i)
 	{
@@ -48,7 +39,6 @@ void BuildingGradientSearch::begin(const Map &map, std::uint16_t *seeded, int sw
 			buckets[0].push(static_cast<Uint32>(i));
 			++pending;
 		}
-		if (weighted && !splitWater) water[i] = map.isWater(static_cast<unsigned>(i));
 	}
 }
 
@@ -72,22 +62,23 @@ void BuildingGradientSearch::resolve(std::size_t target)
 			assert(currentCost <= COST_LIMIT);
 			popped += buckets[currentCost % BUCKETS].size;
 			expandBucket<decltype(weighted)::value>(gradient, buckets.data(), pending, currentCost, COST_LIMIT,
-				widthMask, heightMask, widthShift, waterSteps, waterAt);
+				{widthMask+1, heightMask+1}, waterSteps, waterAt);
 			++currentCost;
 		}
 	};
-	if (water.empty())
+	if (!water)
 		sweep(std::false_type(), LAND_STEPS, [](size_t) { return false; });
 	else
 	{
-		const std::uint8_t *const waterCells = water.data();
+		const std::uint8_t *const waterCells = water->data();
 		sweep(std::true_type(), entrySteps(WATER_STEP[swimClass]), [waterCells](size_t i) { return waterCells[i] != 0; });
 	}
+	if (complete()) water.reset();
 }
 
 std::size_t BuildingGradientSearch::retainedBytes() const
 {
-	std::size_t bytes = sizeof(*this) + water.capacity() * sizeof(water[0]);
+	std::size_t bytes = sizeof(*this);
 	for (const auto &bucket : buckets)
 		bytes += bucket.cells.capacity() * sizeof(bucket.cells[0]);
 	return bytes;
@@ -97,7 +88,7 @@ void BuildingGradientSearch::clearForReuse()
 {
 	gradient = nullptr;
 	cells = pending = 0;
-	water.clear();
+	water.reset();
 	for (auto &bucket : buckets) bucket.clear();
 }
 

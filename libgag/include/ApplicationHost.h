@@ -2,7 +2,7 @@
 #pragma once
 #include <cstdint>
 #include <string>
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <functional>
 #include <memory>
 #include <vector>
@@ -25,6 +25,9 @@ void run(std::unique_ptr<Loop> loop, std::function<void()> complete);
 // use scheduled screens or cooperative tasks; the browser implementation rejects it.
 void wait(std::uint32_t milliseconds);
 
+// Initialize host compatibility state after a new OpenGL context is current.
+void initializeOpenGLContext();
+
 // Consume the newest host viewport request at an application frame boundary.
 bool takeViewportSize(int &width, int &height);
 // Read current host points, safe areas, keyboard occlusion and input capabilities.
@@ -43,6 +46,8 @@ struct SelectedFile
 {
 	std::string name;
 	std::vector<unsigned char> bytes;
+	// Desktop only; browser/mobile imports deliberately expose no external path.
+	std::string externalPath;
 };
 class FileSelection
 {
@@ -55,6 +60,14 @@ bool canImportFiles();
 std::unique_ptr<FileSelection> selectFile(const std::string &extension);
 
 bool storageRestoreFailed();
+
+// Staged game data. The browser host installs some data packages (game sprites,
+// the CJK font, menu music) after the main menu is up; see scons/web_assets.py.
+// Hosts that ship all data with the application answer true for every package
+// and never report an installation.
+bool assetPackageReady(const char *name);
+// Packages installed since the previous call, oldest first.
+std::vector<std::string> takeInstalledAssetPackages();
 bool canExportFiles();
 bool exportLocalFile(const std::string &path);
 bool exportFile(const std::string &name, const std::vector<unsigned char> &bytes);
@@ -73,6 +86,16 @@ class Persistence
 	virtual PersistenceState state() const = 0;
 };
 std::unique_ptr<Persistence> persistStorage();
+
+// Opens an http(s) URL in the system browser (a new tab on the web). Returns
+// false when the host cannot, or a popup blocker refused it; browsers allow it
+// reliably only while handling a click.
+bool openUrl(const std::string &url);
+// Puts text on the system clipboard. In the browser this is the asynchronous
+// Clipboard API (with a fallback for browsers without it), which needs the
+// transient activation of a recent click; SDL's own clipboard does not reach
+// the page there. Returns false when the host certainly could not copy.
+bool copyText(const std::string &text);
 
 // Read-only diagnostics; hosts decide whether and how to publish them.
 void screenChanged(const char *name);

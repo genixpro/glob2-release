@@ -2,6 +2,7 @@
 // Renders every declarative screen at phone, tablet and desktop viewports with
 // platform gutters and text scales, checking the framework invariants and saving
 // captures for review. Run with SDL_VIDEODRIVER=dummy and a disposable profile.
+#include <Environment.h>
 #include "EngineFixtures.h"
 #include "UIRecordingCanvas.h"
 #include <InterfacePresentation.h>
@@ -10,6 +11,7 @@
 #include <memory>
 #include <utility>
 #include <cstdlib>
+#include <cmath>
 #include <exception>
 #include "GlobalContainer.h"
 #include "CampaignEditor.h"
@@ -22,6 +24,7 @@
 #include "EditorMainMenu.h"
 #include "Engine.h"
 #include "LANFindScreen.h"
+#include "LanRoom.h"
 #include "LANMenuScreen.h"
 #include "MainMenuScreen.h"
 #include "MessageScreen.h"
@@ -33,22 +36,14 @@
 #include "AINames.h"
 #include "GeneratorRegistry.h"
 #include "GenerationRequest.h"
-#include "YOGClient.h"
-#include "YOGClientMapUploadScreen.h"
-#include "YOGClientLobbyScreen.h"
-#include "YOGClientMapDownloadScreen.h"
-#include "YOGClientOptionsScreen.h"
-#include "MultiplayerGame.h"
-#include "MultiplayerGameScreen.h"
-#include "SessionTabsScreen.h"
-#include "YOGLoginScreen.h"
-#include "YOGRegisterScreen.h"
 #include "FrontendTheme.h"
+#include "test/OnlineUIFixtures.h"
 #include <ui/Screen.h>
 #include <HostViewport.h>
 #include <ScreenStack.h>
 #include <StringTable.h>
 #include <Toolkit.h>
+#include <SDL3_net/SDL_net.h>
 #include <cstdio>
 #include <functional>
 #include <set>
@@ -81,53 +76,18 @@ struct Fixture
 	bool navigable = true;
 };
 
-// A network session hosting one tab the harness owns.
-template <class Tab> class SessionFixture final : public SessionTabsScreen
+// A LAN room as its host sees it, offline (no listener): the host, one AI and the
+// open seats, through the real LanRoom backend in the Room screen.
+std::unique_ptr<GAGGUI::Screen> lanRoom(GAGGUI::ScreenStack &s)
 {
-	std::shared_ptr<YOGClient> client;
-	std::shared_ptr<MultiplayerGame> game;
-	std::unique_ptr<Tab> tab;
-	// Offline, a session tab's timer notices the missing server and leaves or
-	// pushes a "connection lost" message over the fixture; the fixture shows
-	// the tab as it looks while connected instead.
-	bool timers;
-
-  public:
-	SessionFixture(std::shared_ptr<YOGClient> client, std::shared_ptr<MultiplayerGame> game, std::unique_ptr<Tab> tab, bool timers = true)
-		: client(std::move(client)), game(std::move(game)), tab(std::move(tab)), timers(timers)
-	{
-		addTab(this->tab.get(), true);
-	}
-	~SessionFixture() override { removeTab(tab.get()); }
-	void onTimer(Uint32 tick) override
-	{
-		if (timers)
-			SessionTabsScreen::onTimer(tick);
-	}
-};
-template <class Tab, class... Args> std::unique_ptr<GAGGUI::Screen> session(Args &&...args)
-{
-	auto client = std::make_shared<YOGClient>();
-	return std::make_unique<SessionFixture<Tab>>(client, nullptr, std::make_unique<Tab>(std::forward<Args>(args)..., client), false);
-}
-
-// Like offline session tabs above, show the connected upload form without an
-// unrelated connection-loss child covering it before its first layout. The real
-// form, controls and preview still render and receive navigation events.
-class MapUploadFixture final : public YOGClientMapUploadScreen
-{
-  public:
-	using YOGClientMapUploadScreen::YOGClientMapUploadScreen;
-	void onTimer(Uint32) override {}
-};
-std::unique_ptr<GAGGUI::Screen> gameRoom(GAGGUI::ScreenStack &s)
-{
-	auto client = std::make_shared<YOGClient>();
-	auto game = std::make_shared<MultiplayerGame>(client);
-	game->createNewGame("Harness game");
-	static MapHeader mapHeader = Engine().loadMapHeader("maps/balanced.map");
-	game->setMapHeader(mapHeader);
-	return std::make_unique<SessionFixture<MultiplayerGameScreen>>(client, game, std::make_unique<MultiplayerGameScreen>(s, game, client), false);
+	Lan::LanHost::Options options;
+	options.hostName = "Harness host";
+	options.map = Engine().loadMapHeader("maps/balanced.map");
+	options.network = false;
+	auto room = Lan::LanRoom::host(std::move(options));
+	room->addAI(AI::NICOWAR);
+	room->update();
+	return std::make_unique<RoomScreen>(s, room);
 }
 
 std::vector<Fixture> fixtures()
@@ -210,18 +170,82 @@ std::vector<Fixture> fixtures()
 		{"load-map", [](GAGGUI::ScreenStack &) { return std::make_unique<ChooseMapScreen>("maps", "map", true); }},
 		{"load-game", [](GAGGUI::ScreenStack &) { return std::make_unique<ChooseMapScreen>("games", "game", true, "replays", "replay", true); }},
 		{"lan-find", [](GAGGUI::ScreenStack &s) { return std::make_unique<LANFindScreen>(s); }},
-		{"online-login", [](GAGGUI::ScreenStack &s) { return std::make_unique<YOGLoginScreen>(s, std::make_shared<YOGClient>()); }},
-		{"online-register", [](GAGGUI::ScreenStack &) { return std::make_unique<YOGRegisterScreen>(std::make_shared<YOGClient>()); }},
-		{"map-upload", [](GAGGUI::ScreenStack &s) { return std::make_unique<MapUploadFixture>(s, std::make_shared<YOGClient>(), "maps/balanced.map"); }},
-		{"game-room", gameRoom},
-		{"online-lobby", [](GAGGUI::ScreenStack &s)
+		{"lan-room", lanRoom},
+		{"online-hub", [](GAGGUI::ScreenStack &s) { return OnlineUIFixtures::hubFixture(s); }},
+		{"online-hub-signin", [](GAGGUI::ScreenStack &s)
 		 {
-			 auto client = std::make_shared<YOGClient>();
-			 return std::make_unique<SessionFixture<YOGClientLobbyScreen>>(
-				 client, nullptr, std::make_unique<YOGClientLobbyScreen>(s, client, false), false);
+			 return OnlineUIFixtures::hubFixture(s, [](OnlineHubScreen::Model &m)
+												 {
+													 m.signIn = OnlineHubScreen::Model::SignIn::Waiting;
+													 m.confirmationCode = "KXQ742";
+												 });
 		 }},
-		{"online-maps", [](GAGGUI::ScreenStack &s) { return session<YOGClientMapDownloadScreen>(s); }},
-		{"online-options", [](GAGGUI::ScreenStack &) { return session<YOGClientOptionsScreen>(); }},
+		{"online-hub-offline", [](GAGGUI::ScreenStack &s)
+		 {
+			 return OnlineUIFixtures::hubFixture(s, [](OnlineHubScreen::Model &m)
+												 {
+													 m.link = OnlineHubScreen::Model::Link::Offline;
+													 m.retryInSeconds = 8;
+													 m.displayName = "Bradley";
+													 m.accountKind = "registered";
+													 m.rooms = Online::Json::array();
+												 });
+		 }},
+		{"online-hub-trust", [](GAGGUI::ScreenStack &s)
+		 {
+			 auto hub = OnlineUIFixtures::hubFixture(s);
+			 static_cast<OnlineHubScreen &>(*hub).acceptInvite("https://play.lanparty.net", "7HD21QABCD");
+			 return hub;
+		 }},
+		{"room-host", [](GAGGUI::ScreenStack &s)
+		 {
+			 return std::make_unique<RoomScreen>(s, Online::PlatformRoom::preview(OnlineUIFixtures::roomState(), OnlineUIFixtures::HOST_ID, OnlineUIFixtures::roomChat()));
+		 }},
+		{"room-guest-map", [](GAGGUI::ScreenStack &s)
+		 {
+			 auto room = std::make_unique<RoomScreen>(s, Online::PlatformRoom::preview(OnlineUIFixtures::roomState(), OnlineUIFixtures::GUEST_ID, OnlineUIFixtures::roomChat()));
+			 room->selectTab(RoomScreen::MapTab);
+			 return room;
+		 }},
+		{"room-rules", [](GAGGUI::ScreenStack &s)
+		 {
+			 auto room = std::make_unique<RoomScreen>(s, Online::PlatformRoom::preview(OnlineUIFixtures::roomState(), OnlineUIFixtures::HOST_ID, OnlineUIFixtures::roomChat()));
+			 room->selectTab(RoomScreen::RulesTab);
+			 return room;
+		 }},
+		{"room-lan", [](GAGGUI::ScreenStack &s) { return std::make_unique<RoomScreen>(s, std::make_shared<OnlineUIFixtures::LanRoomFixture>()); }},
+		// A member who joined a full room: listed as not seated, Ready disabled with why.
+		{"room-unseated", [](GAGGUI::ScreenStack &s)
+		 {
+			 return std::make_unique<RoomScreen>(s, Online::PlatformRoom::preview(OnlineUIFixtures::fullRoomState(), OnlineUIFixtures::LATE_ID, OnlineUIFixtures::roomChat()));
+		 }},
+		// A premade map uploaded for the room, named by the server's mapTitle.
+		{"room-premade-map", [](GAGGUI::ScreenStack &s)
+		 {
+			 auto room = std::make_unique<RoomScreen>(s, Online::PlatformRoom::preview(OnlineUIFixtures::premadeRoomState(), OnlineUIFixtures::HOST_ID, OnlineUIFixtures::roomChat()));
+			 room->selectTab(RoomScreen::MapTab);
+			 return room;
+		 }},
+		{"match-starting", [](GAGGUI::ScreenStack &s) { return std::make_unique<MatchStartScreen>(s, OnlineUIFixtures::startingMatch()); }},
+		{"settings-online", [](GAGGUI::ScreenStack &)
+		 {
+			 auto settings = std::make_unique<SettingsScreen>();
+			 settings->selectCategory(SettingsScreen::Category::Online);
+			 return settings;
+		 }},
+		// Online screens (quick match, profile, maps) on canned data.
+		{"quick-match", [](GAGGUI::ScreenStack &s) { return OnlineUIFixtures::quickMatch(s, false); }},
+		{"quick-match-searching", [](GAGGUI::ScreenStack &s) { return OnlineUIFixtures::quickMatch(s, true); }},
+		{"match-found", [](GAGGUI::ScreenStack &) { return OnlineUIFixtures::matchFound(true); }},
+		{"match-found-ai", [](GAGGUI::ScreenStack &) { return OnlineUIFixtures::matchFound(false); }},
+		{"online-profile", [](GAGGUI::ScreenStack &s) { return OnlineUIFixtures::profile(s); }},
+		{"online-maps", [](GAGGUI::ScreenStack &s)
+		 { return OnlineUIFixtures::maps(s, OnlineMapsScreen::Tab::Browse, glob2test::sourceRoot().string() + "/"); }},
+		{"online-my-maps", [](GAGGUI::ScreenStack &s)
+		 { return OnlineUIFixtures::maps(s, OnlineMapsScreen::Tab::Mine, glob2test::sourceRoot().string() + "/"); }},
+		{"map-share", [](GAGGUI::ScreenStack &) { return OnlineUIFixtures::share(0); }},
+		{"map-share-checking", [](GAGGUI::ScreenStack &) { return OnlineUIFixtures::share(1); }},
+		{"map-share-rejected", [](GAGGUI::ScreenStack &) { return OnlineUIFixtures::share(2); }},
 		{"setup-options", [](GAGGUI::ScreenStack &)
 		 {
 			 static MapHeader mapHeader = Engine().loadMapHeader("maps/balanced.map");
@@ -234,11 +258,35 @@ std::vector<Fixture> fixtures()
 void resize(int width, int height)
 {
 	auto *gfx = globalContainer->gfx;
-	SDL_SetWindowSize(SDL_GetWindowFromID(gfx->windowID()), width, height);
+	auto *window = SDL_GetWindowFromID(gfx->windowID());
+	int actualWidth = 0, actualHeight = 0;
+	REQUIRE(SDL_GetWindowSize(window, &actualWidth, &actualHeight));
+	if (actualWidth != width || actualHeight != height)
+		REQUIRE(SDL_SetWindowSize(window, width, height));
+	// X11 synchronization also waits for window position and can time out even
+	// when a repeated resize already has the requested dimensions.
+	const auto deadline = SDL_GetTicks() + 3000;
+	do
+	{
+		SDL_PumpEvents();
+		REQUIRE(SDL_GetWindowSize(window, &actualWidth, &actualHeight));
+		if (actualWidth == width && actualHeight == height)
+			break;
+		SDL_Delay(10);
+	} while (SDL_GetTicks() < deadline);
+	int minWidth = 0, minHeight = 0, maxWidth = 0, maxHeight = 0;
+	SDL_GetWindowMinimumSize(window, &minWidth, &minHeight);
+	SDL_GetWindowMaximumSize(window, &maxWidth, &maxHeight);
+	INFO("Requested " << width << "x" << height << "; actual " << actualWidth << "x" << actualHeight
+		 << "; minimum " << minWidth << "x" << minHeight << "; maximum " << maxWidth << "x" << maxHeight
+		 << "; flags " << SDL_GetWindowFlags(window) << "; SDL error: " << SDL_GetError());
+	REQUIRE(actualWidth == width);
+	REQUIRE(actualHeight == height);
 	SDL_Event event{};
-	event.type = SDL_WINDOWEVENT;
-	event.window.event = SDL_WINDOWEVENT_SIZE_CHANGED;
+	event.type = SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
 	GAGCore::GraphicContext::translateMouseEvent(&event);
+	REQUIRE(gfx->getW() == int(std::lround(width / gfx->getUiScale())));
+	REQUIRE(gfx->getH() == int(std::lround(height / gfx->getUiScale())));
 }
 
 // The part of a node that clipping ancestors leave visible.
@@ -283,7 +331,7 @@ void verifyOrDump(UIScreen &screen, const std::string &label)
 	}
 	catch (...)
 	{
-		if (SDL_getenv("GLOB2_UI_DUMP"))
+		if (SDL_getenv_unsafe("GLOB2_UI_DUMP"))
 			dump(*screen.host().root(), 0);
 		throw;
 	}
@@ -367,12 +415,19 @@ void verify(UIScreen &screen, const std::string &label)
 }
 void run(const Viewport &viewport)
 {
-	if (const char *only = SDL_getenv("GLOB2_UI_VIEWPORT");
+	if (const char *only = SDL_getenv_unsafe("GLOB2_UI_VIEWPORT");
 		only && *only && std::string(only) != viewport.name)
 		return;
 	glob2test::GlobalsOptions options{.display = true, .loadStrings = true, .width = 800, .height = 600,
 	                                  .screenFlags = GAGCore::GraphicContext::PORTABLEGPU | GAGCore::GraphicContext::RESIZABLE};
 	glob2test::HeadlessGlobals globals(options);
+	// This sweep constructs LAN discovery screens, just as Glob2::run does
+	// after network initialization. SDL3_net resolvers require initialized
+	// synchronization even when no connection is made by the fixture.
+	struct NetworkScope {
+		NetworkScope() { REQUIRE(NET_Init()); }
+		~NetworkScope() { NET_Quit(); }
+	} network;
 	auto theme = std::make_unique<FrontendTheme>();
 	int checked = 0;
 	const bool capture = true;
@@ -380,13 +435,13 @@ void run(const Viewport &viewport)
 	const std::string capturePath = glob2test::artifactDirFromWorkingDirectory();
 	for (const char *presentation : {"0", "1"})
 	{
-		SDL_setenv("GLOB2_MOBILE_UI", presentation, 1);
+		GAGCore::setProcessEnvironment("GLOB2_MOBILE_UI", presentation, 1);
 		if (presentation[0] == '0' && viewport.width < 600)
 			continue;
 		resize(viewport.width, viewport.height);
 		for (const auto &fixture : fixtures())
 		{
-			if (const char *only = SDL_getenv("GLOB2_UI_ONLY"); only && *only && std::string(only) != fixture.name)
+			if (const char *only = SDL_getenv_unsafe("GLOB2_UI_ONLY"); only && *only && std::string(only) != fixture.name)
 				continue;
 			// Keep generated previews while the same viewport changes safe insets.
 			// Separate viewport cases remain independently shardable in CI.
@@ -421,7 +476,8 @@ void run(const Viewport &viewport)
 				const std::string label = std::string(fixture.name) + " " + viewport.name +
 										  " touch=" + presentation + " text=" + std::to_string(percent) +
 										  " bottom=" + std::to_string(int(insets.bottom));
-				if (const char *reveal = SDL_getenv("GLOB2_UI_REVEAL"); reveal && *reveal)
+				if (const char *reveal = SDL_getenv_unsafe("GLOB2_UI_REVEAL"); reveal && *reveal)
+
 				{
 					screen->host().scrollIntoView(reveal);
 					frame();
@@ -447,8 +503,8 @@ void run(const Viewport &viewport)
 				for (std::size_t i = 0; fixture.navigable && i < screen->host().focusOrder().size(); ++i)
 				{
 					SDL_Event tab{};
-					tab.type = SDL_KEYDOWN;
-					tab.key.keysym.sym = SDLK_TAB;
+					tab.type = SDL_EVENT_KEY_DOWN;
+					tab.key.key = SDLK_TAB;
 					frame({tab});
 				}
 				if (fixture.navigable && screen->host().focused().empty())
@@ -458,6 +514,10 @@ void run(const Viewport &viewport)
 						order += key + " ";
 					require(false, label + ": tab never focused a control (order: " + order + ", editing: " + screen->host().editing() + ")");
 				}
+				// The focused control's tooltip is an overlay that may cover its
+				// neighbours (Leave's covers the room's tab bar on a small phone); the
+				// next pass checks the layout, so dismiss it as Escape or a tap would.
+				screen->host().dismissTooltip(screen->host().focused());
 				++checked;
 			}
 			screen->endExecute(0);
@@ -467,7 +527,7 @@ void run(const Viewport &viewport)
 	GAGCore::mobileSafeInsetsForTesting.reset();
 	GAGCore::userTextScale = 1;
 	theme.reset();
-	SDL_setenv("GLOB2_MOBILE_UI", "0", 1);
+	GAGCore::setProcessEnvironment("GLOB2_MOBILE_UI", "0", 1);
 	std::printf("PASS ui presentation: %d screen/viewport combinations verified\n", checked);
 }
 } // namespace
@@ -494,7 +554,7 @@ TEST_SUITE("UIPresentation")
 	{
 		run(viewports[4]);
 	}
-	TEST_CASE("every screen lays out; navigates and captures at fullhd across presentations and insets [display:1600x1400][artifacts][slow]")
+	TEST_CASE("every screen lays out; navigates and captures at fullhd across presentations and insets [display:2200x1400][artifacts][slow]")
 	{
 		run(viewports[5]);
 	}

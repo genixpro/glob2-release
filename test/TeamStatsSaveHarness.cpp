@@ -9,7 +9,7 @@
 #include "MapEditKeyActions.h"
 #include "FileManager.h"
 #include "Version.h"
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include <fstream>
 #include <string>
 #include <utility>
@@ -22,6 +22,8 @@
 #include "Sector.h"
 #include "EndGameScreen.h"
 #include "ReplayReader.h"
+#include "ReplayTelemetry.h"
+#include "FileFormatVersions.h"
 #include "OrderMessages.h"
 #include "Order.h"
 #include "Player.h"
@@ -30,7 +32,7 @@
 #include <set>
 #include "Toolkit.h"
 #include "StringTable.h"
-#include <SDL_image.h>
+#include <SDL3_image/SDL_image.h>
 #include <filesystem>
 #include "BinaryStream.h"
 #include "StreamBackend.h"
@@ -63,6 +65,7 @@ struct TeamStatsMeasurementFixture
 
 	GameGUI gui;
 	Game &game = gui.game;
+	glob2test::BoundGameRandom random{game};
 	TeamStatsMeasurementFixture()
 	{
         if (glob2test::currentTestSuite() == "JavaScriptLifecycle")
@@ -372,6 +375,34 @@ static void measurementScenarios()
 		w.game.map.rebuildGrowthCoverage();
 		require((w.game.map.growthCoverage[tile] & 1) == 0,
 			"removing the last anchor clears coverage");
+	}
+	for (int heightShift : {4,5})
+	{
+		TeamStatsMeasurementFixture w;
+		w.game.map.setSize(4,heightShift,GRASS); w.game.map.setGame(&w.game);
+		auto &stats=w.game.teams[0]->stats;
+		stats.coverageBuildings.assign(Building::MAX_COUNT,{8,8,32,32});
+		++stats.coverageBuildingGeneration; w.game.map.rebuildGrowthCoverage();
+		for (int replacement=0;replacement<3;++replacement)
+		{
+			stats.coverageBuildings.assign(Building::MAX_COUNT,{replacement,0,32,32});
+			++stats.coverageBuildingGeneration; w.game.map.rebuildGrowthCoverage();
+			// Independent wide-counter oracle, including repeated toroidal visits.
+			for (int band=0;band<3;++band)
+			{
+				const int radius=8<<band, width=16, height=1<<heightShift;
+				std::vector<uint32_t> expected(width*height,0);
+				for (int y=-32;y<64;++y) for (int x=replacement-32;x<replacement+64;++x)
+				{
+					const int dx=std::max({replacement-x,0,x-(replacement+31)});
+					const int dy=std::max({-y,0,y-31});
+					if(std::max(dx,dy)<=radius) expected[(y&(height-1))*width+(x&15)]+=Building::MAX_COUNT;
+				}
+				for(size_t i=0;i<expected.size();++i) require(w.game.map.growthCoverageCounts[band][i]==expected[i],"compact coverage matches wide wrapped oracle");
+			}
+		}
+		stats.coverageBuildings.clear(); ++stats.coverageBuildingGeneration; w.game.map.rebuildGrowthCoverage();
+		for(auto mask:w.game.map.growthCoverage) require(mask==0,"final coverage removal clears all wrapped cells");
 	}
 	{
 		TeamStatsMeasurementFixture w;
@@ -785,9 +816,9 @@ static void measurementAttributionFields()
 static void measurementReplayBoundaries()
 {
 	// Format 124 introduced experiments; format 125 adds JavaScript identities.
-	// Protocol 49 adds WSS; default replay floor stays 123.
-	require(REPLAY_MINIMUM_VERSION_MINOR == 123 && NET_PROTOCOL_VERSION == 49 &&
-				YOG_MIN_CLIENT_NET_PROTOCOL_VERSION == 49,
+	// Format 128 changes save encoding, retaining the format-127 replay floor.
+	// Protocol 51 prevents peers that cannot read compact map snapshots.
+	require(REPLAY_MINIMUM_VERSION_MINOR == 127 && NET_PROTOCOL_VERSION == 51,
 			"integrated simulation uses current replay and network gates");
 	for (int version : {98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 115, 119, 120, 121, 122, 123, 124, VERSION_MINOR, VERSION_MINOR+1})
 	{
@@ -798,6 +829,8 @@ static void measurementReplayBoundaries()
 		writer.writeUint32(0, "replayStepCounter");
 		NetSendOrder message(std::make_shared<NullOrder>());
 		message.encodeData(&writer);
+		if (version >= FILE_FORMAT_VERSION_CUSTOM_AI)
+			ReplayTelemetry::Stream().write(&writer);
 		auto *copy = new GAGCore::MemoryStreamBackend(*bytes);
 		copy->seekFromStart(0);
 		ReplayReader reader;
@@ -850,17 +883,7 @@ static void aiTelemetryContinuation(const char *path)
 	GAGCore::BinaryInputStream input(new GAGCore::FileStreamBackend(file));
 	GameGUI gui;
 	require(gui.game.load(&input), "all-AI initial state loads");
-	auto step = [](Game &g)
-	{
-		for (int p = 0; p < g.gameHeader.getNumberOfPlayers(); ++p)
-			if (g.players[p] && g.players[p]->ai)
-			{
-				auto order = g.players[p]->ai->getOrder(false);
-				order->sender = p;
-				g.executeOrder(order, p);
-			}
-		g.syncStep(0);
-	};
+	auto step = glob2test::stepAI;
 	auto checks = [](Game &g)
 	{
 		std::vector<Uint32> c, b, u;
@@ -876,7 +899,8 @@ static void aiTelemetryContinuation(const char *path)
 	// Legacy controllers deliberately rebuild/reset some unsaved internal state.
     // Compare two continuations of the same saved state, not different AI states.
     auto reference = roundTrip(gui.game);
-    const auto random = syncRandEngine();
+    // Each game restores its own saved stream; the continuations start equal.
+    REQUIRE(loaded->game.syncRandom == reference->game.syncRandom);
 	std::vector<std::vector<Uint32>> expected;
 	std::vector<std::vector<AITelemetry::Sample>> samples;
 	for (int t = 0; t < 700; ++t)
@@ -889,7 +913,6 @@ static void aiTelemetryContinuation(const char *path)
 				row.push_back(reference->game.players[p]->ai->telemetrySeries->current);
 		samples.push_back(std::move(row));
 	}
-	syncRandEngine() = random;
 	for (int t = 0; t < 700; ++t)
 	{
 		step(loaded->game);
@@ -1043,7 +1066,7 @@ static void aiTelemetryScenarios()
 		bool rejected = false;
 		try
 		{
-			load(&reader, copy);
+			load(&reader, copy, VERSION_MINOR);
 		}
 		catch (const std::runtime_error &)
 		{
@@ -1118,7 +1141,7 @@ static void measurementScreenshots(const std::string &directory)
 				screen.paintFrame(0);
 				require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(),
 									(directory + "/graphs-" + std::to_string(page) + "-" + suffix)
-										.c_str()) == 0,
+										.c_str()),
 						"save graph screenshot");
 			}
 		}
@@ -1127,14 +1150,14 @@ static void measurementScreenshots(const std::string &directory)
 										 Toolkit::getStringTable()->getString("[Stats page two]"));
 		game.teams[0]->stats.drawMeasurements(size.first - 144, 211);
 		require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(),
-							(directory + "/live-" + suffix).c_str()) == 0,
+							(directory + "/live-" + suffix).c_str()),
 			"save live panel screenshot");
 		globalContainer->gfx->drawFilledRect(0, 0, size.first, size.second, 0, 0, 32);
 		globalContainer->gfx->drawString(size.first - 140, 195, globalContainer->littleFont,
 									 Toolkit::getStringTable()->getString("[Stats page three]"));
 		game.teams[0]->stats.drawExpandedMeasurements(size.first - 144, 211);
 		require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(),
-							(directory + "/live-expanded-" + suffix).c_str()) == 0,
+							(directory + "/live-expanded-" + suffix).c_str()),
 			"save expanded live panel screenshot");
 	}
 }
@@ -1298,7 +1321,7 @@ TEST_CASE("Scripting identity survives conversion and save load" * doctest::test
  u->needToRecheckMedical=true;
  TeamStatsMeasurementFixture::activity(u);
  REQUIRE(u->owner==w.game.teams[1]);
- REQUIRE(w.game.scriptGenerations[1024+Unit::GIDtoID(u->gid)]==u->scriptIdentity);
+ REQUIRE(w.game.scriptGenerations[Game::scriptGenerationIndex(false, 1, Unit::GIDtoID(u->gid))]==u->scriptIdentity);
  auto loaded=roundTrip(w.game);
  REQUIRE(loaded->game.teams[1]->myUnits[Unit::GIDtoID(u->gid)]->scriptIdentity==u->scriptIdentity);
  CHECK(loaded->game.scriptGenerations==w.game.scriptGenerations);
@@ -1439,4 +1462,109 @@ TEST_CASE("Scripting normal death invalidates lookup before cleanup and slot reu
  auto loaded=roundTrip(world.game);
  Script::Observations restored(loaded->game,-1);
  CHECK(restored.query("unit",{reference}).kind==Script::Value::Null);
+}
+
+TEST_CASE("Compact telemetry retains every sample across chunk boundaries" * doctest::test_suite("TeamStatsSave"))
+{
+    using namespace AITelemetry;
+    auto series=std::make_shared<Series>();
+    series->fields=schema(0);
+    series->playerName="history fixture";
+    series->fields.push_back({"float_bits","bits","exact bit patterns",Real,Gauge});
+    for(unsigned n=0;n<513;++n)
+    {
+        Sample sample; sample.tick=n*512; sample.available=(n%3)!=0;
+        sample.values.resize(series->fields.size());
+        for(size_t f=0;f<sample.values.size();++f)
+        {
+            auto& v=sample.values[f];
+            v.bits=f%3==0?UINT64_MAX-n:f%3==1?Uint64(n)*0x123456789abcdefULL:0x8000000000000000ULL;
+            v.updated=n?n*512-1:0;v.valid=(f+n)%2;
+        }
+        series->history.push_back(std::move(sample));
+    }
+    series->current=series->history.back();
+    for(bool text:{false,true})
+    {
+        auto* memory=new GAGCore::MemoryStreamBackend;
+        std::unique_ptr<GAGCore::OutputStream> out(text?static_cast<GAGCore::OutputStream*>(new GAGCore::TextOutputStream(memory)):static_cast<GAGCore::OutputStream*>(new GAGCore::BinaryOutputStream(memory)));
+        save(out.get(),{series});
+        auto bytes=memory->takeContents();
+        auto* source=new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size());source->seekFromStart(0);
+        std::unique_ptr<GAGCore::InputStream> in(text?static_cast<GAGCore::InputStream*>(new GAGCore::TextInputStream(source)):static_cast<GAGCore::InputStream*>(new GAGCore::BinaryInputStream(source)));
+        std::vector<std::shared_ptr<Series>> restored;
+        load(in.get(),restored,VERSION_MINOR);
+        REQUIRE(restored.size()==1);
+        CHECK(restored[0]->fields==series->fields);
+        CHECK(restored[0]->current==series->current);
+        CHECK(restored[0]->history==series->history);
+    }
+}
+
+TEST_CASE("Compact identity tables preserve unused slots and reject invalid entries" * doctest::test_suite("JavaScriptCompatibility"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::GameOptions options; options.header=true;
+    glob2test::HeadlessGame world(options);
+    REQUIRE(world.game.sgslScript.compileScript(&world.game,"").type==ErrorReport::ET_OK);
+    world.game.scriptGenerations[7]=42;
+    world.game.scriptGenerations.back()=UINT32_MAX;
+    class IdentityFields : public GAGCore::BinaryOutputStream
+    {
+    public:
+        using BinaryOutputStream::BinaryOutputStream;
+        std::vector<size_t> indices,values;
+        bool identities=false;
+        void writeUint32(const Uint32 v,const std::string name) override
+        {
+            if(name=="nonzero") identities=true;
+            if(identities && name=="index") indices.push_back(getPosition());
+            if(identities && name=="value") values.push_back(getPosition());
+            BinaryOutputStream::writeUint32(v,name);
+        }
+    };
+    auto* memory=new GAGCore::MemoryStreamBackend;
+    IdentityFields out(memory);world.game.save(&out,false,"sparse identities");
+    const auto bytes=memory->takeContents();
+    REQUIRE(out.indices.size()==2);
+    const auto loadBytes=[&](const std::string& data) {
+        GAGCore::BinaryInputStream in(new GAGCore::MemoryStreamBackend(data.data(),data.size()));in.seekFromStart(0);
+        GameGUI restored;
+        REQUIRE(restored.game.load(&in));
+        CHECK(restored.game.scriptGenerations==world.game.scriptGenerations);
+    };
+    loadBytes(bytes);
+    for(int variant=0;variant<3;++variant)
+    {
+        auto bad=bytes;
+        const size_t offset=variant==2?out.values[0]:out.indices[1];
+        const Uint32 value=variant==0?7:variant==1?UINT32_MAX:0;
+        for(int b=0;b<4;++b) bad[offset+b]=char(value>>(24-8*b));
+        CHECK_THROWS(loadBytes(bad));
+    }
+}
+
+TEST_CASE("Compact team histories preserve samples across two batch boundaries" * doctest::test_suite("TeamStatsSave"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::GameOptions options; options.header = true;
+    glob2test::HeadlessGame world(options);
+    REQUIRE(world.game.sgslScript.compileScript(&world.game, "").type == ErrorReport::ET_OK);
+    auto& stats = world.team->stats;
+    // Drive the public sampling path, so the private end-game history is populated
+    // exactly as in play. Distinct counters catch misplaced rows and columns.
+    for (unsigned n = 0; n < 513; ++n)
+    {
+        world.game.stepCounter = n * 512;
+        world.team->prestige = n * 7;
+        stats.measurements.births[0] = Uint64(n) * 0x100000001ULL;
+        stats.measurements.deaths[1][GameplayMeasurements::COMBAT] = UINT64_MAX - n;
+        stats.step(world.team);
+    }
+    REQUIRE(stats.getEndOfGameStats().size() == 513);
+    REQUIRE(stats.measurementHistory.size() == 513);
+    // Exercise the compact binary format. Scalar text coverage stays in
+    // textRoundTrip; its legacy end-game labels are not valid text identifiers.
+    auto restored = roundTrip(world.game);
+    compare(stats, restored->game.teams[0]->stats);
 }

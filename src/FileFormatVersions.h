@@ -169,3 +169,12 @@ static constexpr int FILE_FORMAT_VERSION_EXPERIMENTS = 124;
 //! JavaScript AI/map state and per-entity identities with generation counters.
 //! Version 124 remains the released experiments layout without these fields.
 static constexpr int FILE_FORMAT_VERSION_JAVASCRIPT = 125;
+
+//! Counted team-dependent state: Maxima opponents and JavaScript generation planes.
+static constexpr int FILE_FORMAT_VERSION_COUNTED_TEAM_STATE = 127;
+
+//! Lossless packed arrays and histories; existing save readers remain supported.
+static constexpr int FILE_FORMAT_VERSION_COMPACT_STATE = 128;
+
+//! Custom AI profile 2, named telemetry and replay diagnostic trailers.
+static constexpr int FILE_FORMAT_VERSION_CUSTOM_AI = 129;

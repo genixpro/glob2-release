@@ -2,24 +2,18 @@
 // Copyright (C) 2007 Bradley Arsenault
 
 #include "NetEngine.h"
-#include "OrderMessages.h"
+#include "Team.h"
+#include <stdexcept>
 
 
-NetEngine::NetEngine(int numberOfPlayers, int localPlayer, int networkOrderRate, std::shared_ptr<NetConnection> router)
-	: numberOfPlayers(numberOfPlayers), localPlayer(localPlayer), router(router), networkOrderRate(networkOrderRate)
+NetEngine::NetEngine(int numberOfPlayers, int localPlayer)
+	: numberOfPlayers(numberOfPlayers), localPlayer(localPlayer)
 {
+	if (numberOfPlayers < 1 || numberOfPlayers > Team::MAX_COUNT || localPlayer < 0 || localPlayer >= numberOfPlayers)
+		throw std::runtime_error("Invalid network game configuration");
 	step=0;
 	orders.resize(numberOfPlayers);
-	localOrderSendCountdown = 0;
 	currentLatency = 0;
-}
-
-
-
-void NetEngine::setNetworkInfo(int nnetworkOrderRate, std::shared_ptr<NetConnection> nrouter)
-{
-	networkOrderRate = nnetworkOrderRate;
-	router = nrouter;
 }
 
 
@@ -27,44 +21,31 @@ void NetEngine::setNetworkInfo(int nnetworkOrderRate, std::shared_ptr<NetConnect
 void NetEngine::advanceStep(Uint32 checksum)
 {
 	step+=1;
-	if(localOrderSendCountdown == 0)
+	std::shared_ptr<Order> localOrder;
+
+	if(outgoing.empty())
 	{
-		std::shared_ptr<Order> localOrder;
-
-		if(outgoing.empty())
-		{
-			localOrder = shared_ptr<Order>(new NullOrder);
-		}
-		else
-		{
-			localOrder = outgoing.front();
-			outgoing.pop();
-		}
-
-		localOrder->gameCheckSum = checksum;
-		if(router)
-		{
-			localOrder->sender = localPlayer;
-			shared_ptr<NetSendOrder> message(new NetSendOrder(localOrder));
-			router->sendMessage(message);
-		}
-		pushOrder(localOrder, localPlayer, false);
-		localOrderSendCountdown = networkOrderRate - 1;
+		localOrder = std::shared_ptr<Order>(new NullOrder);
 	}
 	else
 	{
-		localOrderSendCountdown -= 1;
+		localOrder = outgoing.front();
+		outgoing.pop();
 	}
+
+	localOrder->gameCheckSum = checksum;
+	pushOrder(localOrder, localPlayer, false);
 }
 
 
 
 void NetEngine::clearTopOrders()
 {
+	if (!allOrdersReceived()) return;
 	for(int p=0; p<numberOfPlayers; ++p)
 	{
 		std::shared_ptr<Order> o = orders[p].front();
-		///Handle latency adjustment order
+		///Old replays of YOG games carry latency adjustment orders: replay them
 		if(o->getOrderType() == ORDER_ADJUST_LATENCY)
 		{
 			std::shared_ptr<AdjustLatency> al = std::static_pointer_cast<AdjustLatency>(o);
@@ -89,29 +70,19 @@ void NetEngine::clearTopOrders()
 
 
 
-void NetEngine::pushOrder(std::shared_ptr<Order> order, int playerNumber, bool isAI)
+void NetEngine::pushOrder(std::shared_ptr<Order> order, int playerNumber, bool)
 {
-	assert(playerNumber>=0);
+	if (!order || playerNumber < 0 || playerNumber >= numberOfPlayers) return;
 	order->sender=playerNumber;
 	orders[playerNumber].push_back(order); 
-
-	///The local player and network players all have padding around their order
-	if(! isAI)
-	{
-		for(int i=0; i<(networkOrderRate - 1); ++i)
-		{
-			shared_ptr<Order> norder(new NullOrder);
-			norder->sender=playerNumber;
-			orders[playerNumber].push_back(norder);
-		}
-	}
 }
 
 
 
 std::shared_ptr<Order> NetEngine::retrieveOrder(int playerNumber)
 {
-  return *orders[playerNumber].begin();
+  if (playerNumber < 0 || playerNumber >= numberOfPlayers || orders[playerNumber].empty()) return {};
+  return orders[playerNumber].front();
 }
 
 
@@ -155,27 +126,7 @@ void NetEngine::flushAllOrders()
 		localOrder = outgoing.front();
 		outgoing.pop();
 		localOrder->gameCheckSum = ORDER_CHECKSUM_NONE;
-
-		if(router)
-		{
-			localOrder->sender = localPlayer;
-			shared_ptr<NetSendOrder> message(new NetSendOrder(localOrder));
-			router->sendMessage(message);
-		}
 		pushOrder(localOrder, localPlayer, false);
-
-	}
-	localOrderSendCountdown = networkOrderRate - 1;
-}
-
-
-
-void NetEngine::prepareForLatency(int playerNumber, int latency)
-{
-	currentLatency = latency;
-	for(int s=0; s<latency; ++s)
-	{
-		pushOrder(std::shared_ptr<Order>(new NullOrder), playerNumber, true);
 	}
 }
 
@@ -183,6 +134,7 @@ void NetEngine::prepareForLatency(int playerNumber, int latency)
 
 bool NetEngine::orderReceived(int playerNumber)
 {
+	if (playerNumber < 0 || playerNumber >= numberOfPlayers) return false;
 	if(orders[playerNumber].empty())
 		return false;
 	return true;
@@ -197,7 +149,7 @@ Uint32 NetEngine::getWaitingOnMask()
 	{
 		if(orders[p].empty())
 		{
-			mask |= (1<<p);
+			mask |= Team::teamNumberToMask(p);
 		}
 	}
 	return mask;
@@ -225,14 +177,6 @@ bool NetEngine::matchCheckSums()
 		}
 	}
 	return true;
-}
-
-
-
-void NetEngine::increaseLatencyAdjustment()
-{
-	std::shared_ptr<AdjustLatency> latency(new AdjustLatency(currentLatency+1));
-	addLocalOrder(latency);
 }
 
 

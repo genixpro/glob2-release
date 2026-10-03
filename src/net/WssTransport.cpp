@@ -1,11 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "NetTransport.h"
-#ifdef HAVE_CONFIG_H
-#include <glob2/BuildConfig.h>
-#endif
-#if defined(GLOB2_MOBILE) || defined(__APPLE__) || defined(_WIN32)
-#include "mobile/CertificateTrust.h"
-#endif
+#include "TlsSetup.h"
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
 #include <boost/beast/core.hpp>
@@ -26,6 +21,12 @@ namespace beast = boost::beast;
 namespace ws = beast::websocket;
 using tcp = asio::ip::tcp;
 using Error = boost::system::error_code;
+std::string canonicalAddress(const asio::ip::address &address)
+{
+    if (address.is_v6() && address.to_v6().is_v4_mapped())
+        return asio::ip::make_address_v4(asio::ip::v4_mapped, address.to_v6()).to_string();
+    return address.to_string();
+}
 
 // The same application thread that owns NetConnection pumps asynchronous I/O.
 // No blocking connect, TLS handshake, read, or write runs on that thread.
@@ -44,43 +45,16 @@ class WssTransport final : public NetTransport
 		size_t incomingBytes = 0, outgoingBytes = 0;
 		std::string host, authority, service, route, fingerprint, failure, peer;
 		beast::http::request_parser<beast::http::empty_body> request;
-		bool writing = false;
+		bool writing = false, readPaused = false;
+		// The last poll() ran its whole handler budget: more completions may be queued.
+		bool saturated = false;
+		// Accepted by a listener (rather than opened by this side).
+		bool accepted = false;
+		// Unread messages kept before reading pauses (with queueLimit bytes): about
+		// three minutes of relay bundles at 25 per second.
+		static constexpr size_t incomingMessageLimit = 4096;
+		NetMessageMode mode = NetMessageMode::Binary;
 
-		static void configure(ssl::context &context, const NetTlsConfig &config,
-							  bool loadTrust = true)
-		{
-			if (!SSL_CTX_set_min_proto_version(context.native_handle(), TLS1_2_VERSION))
-				throw std::runtime_error("TLS minimum version could not be configured");
-			if (!config.certificatePem.empty())
-			{
-				context.use_certificate_chain(asio::buffer(config.certificatePem));
-				context.use_private_key(asio::buffer(config.keyPem), ssl::context::pem);
-			}
-			else if (!config.certificateFile.empty())
-			{
-				context.use_certificate_chain_file(config.certificateFile);
-				context.use_private_key_file(config.keyFile, ssl::context::pem);
-			}
-			if ((!config.certificatePem.empty() || !config.certificateFile.empty()) &&
-				!SSL_CTX_check_private_key(context.native_handle()))
-				throw std::runtime_error("TLS key does not match certificate");
-			if (loadTrust)
-			{
-				if (!config.caPem.empty())
-					context.add_certificate_authority(asio::buffer(config.caPem));
-				else if (!config.caFile.empty())
-					context.load_verify_file(config.caFile);
-				else
-					context.set_default_verify_paths();
-			}
-		}
-		static std::shared_ptr<ssl::context>
-		contextFor(ssl::context::method method, const NetTlsConfig &config, bool loadTrust = true)
-		{
-			auto context = std::make_shared<ssl::context>(method);
-			configure(*context, config, loadTrust);
-			return context;
-		}
 		static int verifyPin(X509_STORE_CTX *store, void *data)
 		{
 			auto &self = *static_cast<Session *>(data);
@@ -104,9 +78,10 @@ class WssTransport final : public NetTransport
 					: X509_check_host(cert, self.host.c_str(), self.host.size(), 0, nullptr) == 1;
 			return identity && CRYPTO_memcmp(actual.data(), self.fingerprint.data(), 64) == 0;
 		}
-		Session(const std::string &address, const NetTlsConfig &config)
-			: tls(contextFor(ssl::context::tls_client, config,
-							 NetEndpoint::parse(address).fingerprint.empty()))
+		Session(const std::string &address, const NetTlsConfig &config, NetMessageMode messageMode)
+			: tls(NetTls::contextFor(ssl::context::tls_client, config,
+							 NetEndpoint::parse(address).fingerprint.empty())),
+			  mode(messageMode)
 		{
 			const auto endpoint = NetEndpoint::parse(address);
 			host = endpoint.host;
@@ -120,17 +95,8 @@ class WssTransport final : public NetTransport
 				SSL_CTX_set_cert_verify_callback(tls->native_handle(), verifyPin, this);
 			}
 			else
-			{
-#if defined(GLOB2_MOBILE) || defined(__APPLE__) || defined(_WIN32)
-				if (config.caFile.empty() && config.caPem.empty())
-					SSL_CTX_set_cert_verify_callback(tls->native_handle(),
-													 MobileCertificateTrust::verify, &host);
-				else
-#endif
-					socket.next_layer().set_verify_callback(ssl::host_name_verification(host));
-			}
-			if (!SSL_set_tlsext_host_name(socket.next_layer().native_handle(), host.c_str()))
-				throw std::runtime_error("Could not set TLS server name");
+				NetTls::verifyServer(socket.next_layer(), *tls, host, config);
+			NetTls::serverName(socket.next_layer(), host);
 			setup();
 			resolver.async_resolve(
 				host, service,
@@ -144,7 +110,7 @@ class WssTransport final : public NetTransport
 						{
 							if (!active(error))
 								return;
-							peer = endpoint.address().to_string();
+							peer = canonicalAddress(endpoint.address());
 							socket.next_layer().async_handshake(
 								ssl::stream_base::client,
 								[this](Error error)
@@ -167,9 +133,10 @@ class WssTransport final : public NetTransport
 		// Transfer an accepted socket to this session's own I/O context.
 		Session(tcp::socket accepted, const NetListenConfig &config,
 				std::shared_ptr<ssl::context> serverContext)
-			: tls(std::move(serverContext))
+			: tls(std::move(serverContext)), mode(config.messageMode)
 		{
-			peer = accepted.remote_endpoint().address().to_string();
+			this->accepted = true;
+			peer = canonicalAddress(accepted.remote_endpoint().address());
 			const auto protocol = accepted.local_endpoint().protocol();
 			beast::get_lowest_layer(socket).socket().assign(protocol, accepted.release());
 			if (config.tls.requireClientCertificate)
@@ -222,7 +189,7 @@ class WssTransport final : public NetTransport
 										cancel();
 										return;
 									}
-									peer = address.to_string();
+									peer = canonicalAddress(address);
 								}
 							}
 							socket.set_option(ws::stream_base::timeout{
@@ -246,8 +213,11 @@ class WssTransport final : public NetTransport
 
 		void setup()
 		{
-			socket.read_message_max(64 * 1024);
-			socket.binary(true);
+			const bool binary = mode == NetMessageMode::Binary;
+			socket.read_message_max(binary ? 64 * 1024 : textMessageLimit);
+			if (!binary)
+				buffer.max_size(textMessageLimit);
+			socket.binary(binary);
 			connectDeadline.expires_after(std::chrono::seconds(10));
 			connectDeadline.async_wait(
 				[this](Error error)
@@ -287,9 +257,40 @@ class WssTransport final : public NetTransport
 		void poll()
 		{
 			io.restart();
-			for (unsigned i = 0; i < 16 && io.poll_one(); ++i)
-			{
-			}
+			unsigned i = 0;
+			while (i < 16 && io.poll_one())
+				++i;
+			saturated = i == 16;
+		}
+		NetWaitStatus waitHandles(std::vector<NetWaitHandle> &out)
+		{
+#ifdef _WIN32
+			// Sockets complete through the I/O completion port, which a readiness
+			// poll does not see.
+			(void)out;
+			return NetWaitStatus::Unsupported;
+#else
+			poll();
+			if (status == State::Closed)
+				return NetWaitStatus::Idle;
+			if (saturated || !incoming.empty())
+				return NetWaitStatus::Ready;
+			// An outgoing connection resolves on asio's resolver thread and then
+			// waits for its own connect and handshake: poll it on a timer.
+			if (status == State::Connecting && !accepted)
+				return NetWaitStatus::Unsupported;
+			auto &lowest = beast::get_lowest_layer(socket).socket();
+			if (!lowest.is_open())
+				return NetWaitStatus::Idle;
+			NetWaitHandle handle;
+			handle.socket = static_cast<std::intptr_t>(lowest.native_handle());
+			// A handshaking server connection waits for the client's next message.
+			handle.read = status == State::Connecting || !readPaused;
+			handle.write = writing;
+			if (handle.read || handle.write)
+				out.push_back(handle);
+			return NetWaitStatus::Idle;
+#endif
 		}
 		void read()
 		{
@@ -298,16 +299,19 @@ class WssTransport final : public NetTransport
 							  {
 								  if (!active(error))
 									  return;
-								  if (!socket.got_binary() || size > queueLimit - incomingBytes ||
-									  incoming.size() >= 256)
+								  const bool binary = mode == NetMessageMode::Binary;
+								  if (socket.got_binary() != binary || size > queueLimit)
 								  {
-									  failure = !socket.got_binary()
-													? "Text WebSocket messages are not allowed"
-													: "Network input queue overflow";
+									  failure = socket.got_binary() != binary
+													? (binary ? "Text WebSocket messages are not allowed"
+															  : "Binary WebSocket messages are not "
+																"allowed in text mode")
+													: "Network message too large";
 									  cancel();
 									  return;
 								  }
-								  if (!size)
+								  // An empty text message is still a message.
+								  if (!size && binary)
 								  {
 									  read();
 									  return;
@@ -317,8 +321,27 @@ class WssTransport final : public NetTransport
 								  buffer.consume(size);
 								  incomingBytes += size;
 								  incoming.push_back(std::move(bytes));
-								  read();
+								  // A reader that falls behind (a backgrounded phone, a long
+								  // reload) is not dropped: reading pauses, TCP flow control
+								  // holds the rest at the sender, and takeMessage() resumes
+								  // reading once the queue has drained below its bounds.
+								  if (incomingFull())
+									  readPaused = true;
+								  else
+									  read();
 							  });
+		}
+		bool incomingFull() const
+		{
+			return incomingBytes >= queueLimit || incoming.size() >= incomingMessageLimit;
+		}
+		void resumeReading()
+		{
+			if (readPaused && status == State::Connected && !incomingFull())
+			{
+				readPaused = false;
+				read();
+			}
 		}
 		void write()
 		{
@@ -351,10 +374,28 @@ class WssTransport final : public NetTransport
 	std::shared_ptr<Session> session;
 	NetTlsConfig config;
 	std::string failure;
+	NetMessageMode mode = NetMessageMode::Binary;
+
+	bool takeMessage(std::vector<uint8_t> &bytes)
+	{
+		if (!session)
+			return false;
+		session->poll();
+		if (session->incoming.empty())
+			return false;
+		bytes = std::move(session->incoming.front());
+		session->incoming.pop_front();
+		session->incomingBytes -= bytes.size();
+		session->resumeReading();
+		return true;
+	}
 
   public:
-	explicit WssTransport(const NetTlsConfig &config) : config(config) {}
-	explicit WssTransport(std::shared_ptr<Session> session) : session(std::move(session)) {}
+	WssTransport(const NetTlsConfig &config, NetMessageMode mode) : config(config), mode(mode) {}
+	explicit WssTransport(std::shared_ptr<Session> session)
+		: session(std::move(session)), mode(this->session->mode)
+	{
+	}
 	std::string error() const override
 	{
 		return session ? session->failure : failure;
@@ -369,7 +410,7 @@ class WssTransport final : public NetTransport
 		try
 		{
 			failure.clear();
-			session = std::make_shared<Session>(address, config);
+			session = std::make_shared<Session>(address, config, mode);
 		}
 		catch (const std::exception &error)
 		{
@@ -394,9 +435,16 @@ class WssTransport final : public NetTransport
 		session->poll();
 		return session->status;
 	}
+	size_t pendingOutgoing() const override
+	{
+		if (!session)
+			return 0;
+		session->poll();
+		return session->status == State::Connected ? session->outgoingBytes : 0;
+	}
 	bool send(std::vector<uint8_t> bytes) override
 	{
-		if (state() != State::Connected)
+		if (mode != NetMessageMode::Binary || state() != State::Connected)
 			return false;
 		if (bytes.size() > queueLimit - session->outgoingBytes)
 		{
@@ -412,17 +460,36 @@ class WssTransport final : public NetTransport
 		session->write();
 		return true;
 	}
+	bool sendText(std::string text) override
+	{
+		if (mode != NetMessageMode::Text || text.size() > textMessageLimit ||
+			text.find('\0') != std::string::npos || state() != State::Connected)
+			return false;
+		if (text.size() > queueLimit - session->outgoingBytes)
+		{
+			session->failure = "Network output queue overflow";
+			return false;
+		}
+		session->outgoingBytes += text.size();
+		session->outgoing.emplace_back(text.begin(), text.end());
+		session->write();
+		return true;
+	}
+	bool receiveText(std::string &text) override
+	{
+		std::vector<uint8_t> message;
+		if (mode != NetMessageMode::Text || !takeMessage(message))
+			return false;
+		text.assign(message.begin(), message.end());
+		return true;
+	}
 	bool receive(std::vector<uint8_t> &bytes) override
 	{
-		if (!session)
-			return false;
-		session->poll();
-		if (session->incoming.empty())
-			return false;
-		bytes = std::move(session->incoming.front());
-		session->incoming.pop_front();
-		session->incomingBytes -= bytes.size();
-		return true;
+		return mode == NetMessageMode::Binary && takeMessage(bytes);
+	}
+	NetWaitStatus waitHandles(std::vector<NetWaitHandle> &out) const override
+	{
+		return session ? session->waitHandles(out) : NetWaitStatus::Idle;
 	}
 	class Listener final : public NetTransportListener
 	{
@@ -436,18 +503,19 @@ class WssTransport final : public NetTransport
 
 	  public:
 		explicit Listener(const NetListenConfig &c)
-			: config(c), tls(Session::contextFor(ssl::context::tls_server, c.tls))
+			: config(c), tls(NetTls::contextFor(ssl::context::tls_server, c.tls))
 		{
 			// Fail startup even when no clients have attempted a handshake yet.
 			if (c.tls.certificatePem.empty() && c.tls.certificateFile.empty())
 				throw std::invalid_argument("A TLS server identity is required");
 			if (!c.connectionLimit)
 				throw std::invalid_argument("Connection limit must be positive");
-			for (const auto &proxy : c.trustedProxyAddresses)
-				asio::ip::make_address(proxy);
+			for (auto &proxy : config.trustedProxyAddresses)
+                proxy = canonicalAddress(asio::ip::make_address(proxy));
 			tcp::endpoint endpoint(asio::ip::make_address(c.bindAddress), c.port);
 			acceptor.open(endpoint.protocol());
 			acceptor.set_option(asio::socket_base::reuse_address(true));
+            if (endpoint.protocol() == tcp::v6()) acceptor.set_option(asio::ip::v6_only(false));
 			acceptor.bind(endpoint);
 			acceptor.listen();
 			acceptor.non_blocking(true);
@@ -510,15 +578,48 @@ class WssTransport final : public NetTransport
 		{
 			return acceptor.is_open();
 		}
+		NetWaitStatus waitHandles(std::vector<NetWaitHandle> &out) const override
+		{
+#ifdef _WIN32
+			(void)out;
+			return NetWaitStatus::Unsupported;
+#else
+			NetWaitStatus result = NetWaitStatus::Idle;
+			size_t live = 0;
+			for (const auto &weak : activeSessions)
+			{
+				auto session = weak.lock();
+				if (session && session->status != State::Closed)
+					++live;
+			}
+			// At the connection limit, waiting connections stay in the backlog
+			// until accept() has room: do not wake for them.
+			if (acceptor.is_open() && live < config.connectionLimit)
+			{
+				NetWaitHandle handle;
+				handle.socket = static_cast<std::intptr_t>(
+					const_cast<tcp::acceptor &>(acceptor).native_handle());
+				handle.read = true;
+				out.push_back(handle);
+			}
+			for (const auto &session : pending)
+			{
+				if (session->waitHandles(out) != NetWaitStatus::Idle ||
+					session->status == State::Connected)
+					result = NetWaitStatus::Ready;
+			}
+			return result;
+#endif
+		}
 	};
 };
 } // namespace
-std::unique_ptr<NetTransport> makeWssTransport(const NetTlsConfig &config)
+std::unique_ptr<NetTransport> makeWssTransport(const NetTlsConfig &config, NetMessageMode mode)
 {
-	return std::make_unique<WssTransport>(config);
+	return std::make_unique<WssTransport>(config, mode);
 }
 
-std::unique_ptr<NetTransportListener> makeNetTransportListener(const NetListenConfig &config)
+std::unique_ptr<NetTransportListener> makeWssTransportListener(const NetListenConfig &config)
 {
 	return std::make_unique<WssTransport::Listener>(config);
 }

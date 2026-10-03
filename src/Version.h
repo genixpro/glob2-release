@@ -6,7 +6,12 @@
 // This is the version of map and savegame format, and all of the recorded data on the server
 #define VERSION_MAJOR 0
 #define MINIMUM_VERSION_MINOR 58
-#define VERSION_MINOR 125
+#define VERSION_MINOR 129
+// version 129 adds profile-2 AI services and named/replay AI diagnostics.
+// version 128 losslessly packs map, routing, statistics and Maxima save state.
+// version 127 supports 16 teams and counts Maxima opponents and script generation planes.
+// Older saves remain loadable; Warrush probes all sixteen slots within 32 ticks.
+// version 126 preserves Castor boot progress, projects and decision caches on save/load.
 // version 125 adds optional deterministic JavaScript scripts and entity identities.
 // version 124 adds the experiments list to GameHeader (Settings > Experiments), baked into
 //             every new game. The default simulation is unchanged, so replays from 123 still play.
@@ -153,11 +158,13 @@
 // version 104 adds the custom-game sudden-death timer win condition (a new winning-condition
 //             type in the existing list; no new GameHeader field)
 
-//This must be updated when there are changes to YOG, MapHeader, GameHeader, BasePlayer, BaseTeam,
-//NetMessage, and the likes, in parallel to change of the VERSION_MINOR above
-#define NET_PROTOCOL_VERSION 49
-//Clients with older versions than this will be rejected
-#define YOG_MIN_CLIENT_NET_PROTOCOL_VERSION 49
+//This must be updated when there are changes to MapHeader, GameHeader, BasePlayer, BaseTeam,
+//NetMessage, and the likes, in parallel to change of the VERSION_MINOR above. It is part of
+//the simulation version (src/online/SimVersion.cpp). The YOG lobby that also checked it
+//(YOG_MIN_CLIENT_NET_PROTOCOL_VERSION) was removed at protocol 51.
+#define NET_PROTOCOL_VERSION 51
+// version 51 requires readers of compact version-128 map snapshots.
+// version 50 requires clients that understand all sixteen team/controller slots.
 // version 49 requires native WSS endpoints and versioned mutual-TLS router registration.
 // Transport-only: save and replay version gates follow the existing simulation formats.
 // version 48 adds JavaScript controllers, map scripts and serialized entity identities.

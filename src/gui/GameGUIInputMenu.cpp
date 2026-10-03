@@ -5,12 +5,14 @@
 #include <stdio.h>
 
 #include <BinaryStream.h>
+#include <FormatableString.h>
 #include <FileManager.h>
 #include <Stream.h>
 #include <StringTable.h>
 #include <Toolkit.h>
 
 #include "Game.h"
+#include "SaveSnapshot.h"
 #include "GameGUI.h"
 #include "GameGUIDialog.h"
 #include "GameGUITouch.h"
@@ -35,6 +37,9 @@ Glob2UI::InGameDialog *GameGUI::activeDialog() const
 
 void GameGUI::openDialog(InGameMenu menu, std::unique_ptr<Glob2UI::InGameDialog> dialog)
 {
+    // Panel icons must not destroy an operation before durable persistence ends.
+    if (inGameMenu == IGM_SAVE && gameMenuScreen &&
+        static_cast<LoadSaveDialog*>(gameMenuScreen.get())->isPersisting()) return;
 	if (touch)
 		touch->cancel(true);
 	inGameMenu = menu;
@@ -45,13 +50,44 @@ void GameGUI::openDialog(InGameMenu menu, std::unique_ptr<Glob2UI::InGameDialog>
 
 void GameGUI::closeDialog()
 {
+    if (inGameMenu == IGM_SAVE && gameMenuScreen &&
+        static_cast<LoadSaveDialog*>(gameMenuScreen.get())->isPersisting()) return;
 	inGameMenu = IGM_NONE;
 	gameMenuScreen.reset();
 }
 
 void GameGUI::openMainMenu()
 {
-	openDialog(IGM_MAIN, std::make_unique<InGameMainScreen>(globalContainer->replaying, !globalContainer->isViewingGame(), gamePaused));
+	auto menu = std::make_unique<InGameMainScreen>(globalContainer->replaying, !globalContainer->isViewingGame(), gamePaused);
+	menu->setNetworked(networkMatch.active);
+	if (networkMatch.active)
+	{
+		auto &strings = *Toolkit::getStringTable();
+		const PauseState state = pauseState ? pauseState() : PauseState();
+		std::string label;
+		if (gamePaused)
+			label = strings.getString("[resume game]");
+		else if (!state.limited)
+			label = strings.getString("[pause game]");
+		else if (pauseAvailable())
+			label = GAGCore::FormattableString(strings.getString("[pause game left %0]")).arg(state.pausesLeft);
+		else
+			label = strings.getString("[pause none left]");
+		menu->setPauseOffer(label, pauseAvailable());
+	}
+	openDialog(IGM_MAIN, std::move(menu));
+}
+
+std::unique_ptr<Glob2UI::InGameDialog> GameGUI::makeLeaveConfirmation() const
+{
+	auto &strings = *Toolkit::getStringTable();
+	const char *body = !networkMatch.online   ? "[leave lan body]"
+					   : networkMatch.rated   ? "[leave rated body]"
+					   : networkMatch.fromRoom ? "[leave room body]"
+											   : "[leave casual body]";
+	return std::make_unique<InGameConfirmScreen>(strings.getString(networkMatch.online ? "[leave match title]" : "[leave lan title]"),
+												 strings.getString(body), strings.getString("[leave match confirm]"),
+												 strings.getString("[keep playing]"));
 }
 
 void GameGUI::openChat()
@@ -86,17 +122,12 @@ void GameGUI::toggleHistory()
 
 void GameGUI::saveGameTo(LoadSaveDialog &dialog)
 {
-	waitForAutosave();
-	const std::string locationName = dialog.getFileName();
-	const std::string name = dialog.getName();
-	if (!Toolkit::getFileManager()->writeGzipAtomically(glob2GzipWritePath(locationName), [&](OutputStream &stream) { save(&stream, name); }))
-	{
-		std::cerr << "GGU: Save failed; previous file retained: " << locationName << std::endl;
-		dialog.showSaveFailure();
-		return;
-	}
-	defaultGameSaveName = name;
-	dialog.beginPersistence(GAGCore::ApplicationHost::persistStorage());
+    const std::string locationName=glob2GzipWritePath(dialog.getFileName());
+    const std::string name=dialog.getName();
+    if(!autosaveWriter) autosaveWriter=std::make_unique<BackgroundFileWriter>(Toolkit::getFileManager());
+    dialog.beginPersistence(std::make_unique<SaveOperation>(*autosaveWriter,locationName,
+        [this,name]{return captureSave([&](OutputStream* stream,DeferredGameSHA1* sha){save(stream,name,sha);});},
+        [this,name]{defaultGameSaveName=name;}));
 }
 
 // Feed the event to the open dialog and act on its result. Returns true when
@@ -106,8 +137,8 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 	if (!gameMenuScreen)
 		return false;
 	bool consumed = false;
-	if (event && event->type != SDL_USEREVENT)
-		consumed = gameMenuScreen->event(*event);
+	if (event && event->type != SDL_EVENT_USER)
+		consumed = gameMenuScreen->eventLogical(*event);
 	if (!gameMenuScreen->finished())
 		return consumed;
 	const int result = gameMenuScreen->result();
@@ -130,6 +161,10 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 					openDialog(IGM_SAVE, std::make_unique<LoadSaveDialog>("games", "game", false, Toolkit::getStringTable()->getString("[save game]"), defaultGameSaveName.c_str(), glob2FilenameToName, glob2NameToFilename));
 					return true;
 				}
+				case InGameMainScreen::AI_TELEMETRY:
+					openDialog(IGM_TELEMETRY, std::make_unique<InGameAITelemetryScreen>(this));
+					return true;
+
 				case InGameMainScreen::OPTIONS:
 				{
 					openDialog(IGM_OPTION, std::make_unique<InGameOptionScreen>(this));
@@ -141,7 +176,7 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 					if (globalContainer->replaying)
 						gamePaused = !gamePaused;
 					else if (!globalContainer->isViewingGame())
-						orderQueue.push_back(std::make_shared<PauseGameOrder>(!gamePaused));
+						requestPause(!gamePaused);
 					return true;
 				}
 				case InGameMainScreen::RETURN_GAME:
@@ -151,6 +186,12 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 				}
 				case InGameMainScreen::QUIT_GAME:
 				{
+					// Leaving a networked match costs the match: say so first.
+					if (networkMatch.active)
+					{
+						openDialog(IGM_CONFIRM_LEAVE, makeLeaveConfirmation());
+						return true;
+					}
 					closeDialog();
 					orderQueue.push_back(shared_ptr<Order>(new PlayerQuitsGameOrder(localPlayer)));
 					flushOutgoingAndExit=true;
@@ -159,6 +200,19 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 				default:
 				return false;
 			}
+		}
+
+		case IGM_CONFIRM_LEAVE:
+		{
+			closeDialog();
+			if (result == InGameConfirmScreen::CONFIRM)
+			{
+				orderQueue.push_back(shared_ptr<Order>(new PlayerQuitsGameOrder(localPlayer)));
+				flushOutgoingAndExit = true;
+			}
+			else
+				openMainMenu();
+			return true;
 		}
 
 		case IGM_ALLIANCE:
@@ -184,7 +238,7 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 					if (playerMask[mi]&(1<<pi))
 					{
 						// player is set, set team
-						teamMask[mi]|=(1<<otherTeam);
+						teamMask[mi]|=(Team::teamNumberToMask(otherTeam));
 					}
 				}
 			}
@@ -201,6 +255,10 @@ bool GameGUI::processGameMenu(SDL_Event *event)
 			closeDialog();
 			return true;
 		}
+
+		case IGM_TELEMETRY:
+			closeDialog();
+			return true;
 
 		case IGM_OPTION:
 		{

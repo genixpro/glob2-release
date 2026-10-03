@@ -10,13 +10,9 @@
 #include "NetMessageType.h"
 #include "Order.h"
 
-/// Maximum byte length of the payload inside a NetSendOrder envelope. The
-/// largest legitimate Order is OrderVoiceData (capped at 2048 bytes by
-/// VoiceRecorder); every other Order is tens of bytes. 1 MiB mirrors the
-/// string-length cap in BinaryInputStream::readText and leaves three orders
-/// of magnitude of headroom against future order growth, while keeping any
-/// pre-allocation under control. Used by NetSendOrder::decodeData to reject
-/// attacker-supplied envelope sizes before they reach `new Uint8[size]`.
+/// Bound the envelope before allocation, independently of transport framing.
+/// Replay streams have no network frame limit. Individual order decoders must
+/// still enforce their own size/work limits; this cap is only a backstop.
 constexpr Uint32 MAX_NET_SEND_ORDER_SIZE = 1u << 20;
 
 /// Wraps an Order for transmission across the network. The simulation engine
@@ -45,10 +41,10 @@ public:
 	Uint8 getMessageType() const;
 	void encodeData(GAGCore::OutputStream* stream) const;
 	/// Wire format: Uint32 size | size bytes payload | Uint8 sender | Uint32 checksum.
-	/// Throws std::ios_base::failure if size > MAX_NET_SEND_ORDER_SIZE or if
-	/// Order::getOrder cannot interpret the payload. All callers
-	/// (ReplayReader::loadReplay, retrieveOrder, NetMessage::getNetMessage)
-	/// already treat ios_base::failure as a clean "drop this message" signal.
+	/// Throws std::ios_base::failure for an oversized or invalid order payload.
+	/// ReplayReader rejects the replay; NetConnection catches decode exceptions
+	/// at the receive boundary and closes the malformed peer. The generic
+	/// NetMessage dispatcher propagates exceptions to its caller.
 	void decodeData(GAGCore::InputStream* stream);
 	std::string format() const;
 	bool operator==(const NetMessage& rhs) const;
@@ -56,49 +52,4 @@ private:
 	std::shared_ptr<Order> order;
 
 	Uint32 decodeVersionMinor;
-};
-
-/// Latency probe sent periodically to measure round-trip time.
-class NetPing : public NetMessage
-{
-public:
-	NetPing();
-
-	Uint8 getMessageType() const;
-	void encodeData(GAGCore::OutputStream* stream) const;
-	void decodeData(GAGCore::InputStream* stream);
-	std::string format() const;
-	bool operator==(const NetMessage& rhs) const;
-};
-
-/// Reply to NetPing.
-class NetPingReply : public NetMessage
-{
-public:
-	NetPingReply();
-
-	Uint8 getMessageType() const;
-	void encodeData(GAGCore::OutputStream* stream) const;
-	void decodeData(GAGCore::InputStream* stream);
-	std::string format() const;
-	bool operator==(const NetMessage& rhs) const;
-};
-
-/// Server -> all clients: change the order-pipeline latency adjustment, used
-/// to keep all clients deterministically in sync under variable network conditions.
-class NetSetLatencyMode : public NetMessage
-{
-public:
-	NetSetLatencyMode();
-	NetSetLatencyMode(Uint8 latencyAdjustment);
-
-	Uint8 getMessageType() const;
-	void encodeData(GAGCore::OutputStream* stream) const;
-	void decodeData(GAGCore::InputStream* stream);
-	std::string format() const;
-	bool operator==(const NetMessage& rhs) const;
-
-	Uint8 getLatencyAdjustment() const;
-private:
-	Uint8 latencyAdjustment;
 };

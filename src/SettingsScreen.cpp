@@ -16,6 +16,12 @@ using namespace Glob2UI;
 
 SettingsScreen::SettingsScreen() : gameKeys(GameGUIShortcuts), editorKeys(MapEditShortcuts) {}
 
+void SettingsScreen::custom(const std::string &id, std::function<Element(const Presentation &)> render)
+{
+	auto &r = add(id, Kind::Custom, "");
+	r.render = std::move(render);
+}
+
 SettingsScreen::~SettingsScreen()
 {
 	if (settingsDirty || keyboardDirty[0] || keyboardDirty[1])
@@ -79,7 +85,9 @@ void SettingsScreen::resetScroll()
 
 std::string SettingsScreen::categoryName(Category category) const
 {
-	const char *names[] = {"Display & graphics", "Audio", "Gameplay", "Building defaults", "Controls", "Language & player", "Experiments"};
+	const char *names[] = {
+		"Display & graphics", "Audio",  "Gameplay",    "Building defaults", "Controls",
+		"Language & player",  "Online", "Experiments", "Custom AIs"};
 	return tr(names[int(category)]);
 }
 
@@ -92,6 +100,10 @@ void SettingsScreen::buildRows()
 		buildBuildings();
 	else if (current == Category::Controls)
 		buildKeyboard();
+	else if (current == Category::Online)
+		buildOnline();
+	else if (current == Category::CustomAIs)
+		buildCustomAIs();
 	else
 		buildGeneral();
 	if (current == Category::Buildings && touchLayout)
@@ -112,7 +124,7 @@ void SettingsScreen::measureRows()
 				return;
 			if (auto *node = host().find(key))
 				target = {node->bounds.x, node->bounds.y, node->bounds.w, node->bounds.h};
-			else if (SDL_getenv("GLOB2_UI_DEBUG"))
+			else if (SDL_getenv_unsafe("GLOB2_UI_DEBUG"))
 				std::fprintf(stderr, "settings: no element for row %s\n", key.c_str());
 		};
 		assign(row.id, row.control);
@@ -175,7 +187,11 @@ std::vector<SettingsScreen::Category> SettingsScreen::visibleCategories() const
 	if (!touchLayout)
 		result.push_back(Category::Controls);
 	result.push_back(Category::Player);
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE)
+	result.push_back(Category::Online);
+#endif
 	result.push_back(Category::Experiments);
+	result.push_back(Category::CustomAIs);
 	return result;
 }
 
@@ -254,6 +270,8 @@ void SettingsScreen::finishInteraction()
 
 void SettingsScreen::done()
 {
+	if (customAIBusy())
+		return;
 	host().closePopup();
 	host().endEditing();
 	// Always confirm durability on close, not just when something in this
@@ -272,6 +290,8 @@ void SettingsScreen::done()
 
 void SettingsScreen::abandon()
 {
+	if (customAIBusy())
+		return;
 	// Always closes in one click, whether or not anything is dirty or
 	// failed: every change is already live and auto-saved as it's made, so
 	// there is nothing to discard.
@@ -319,15 +339,15 @@ void SettingsScreen::onEscape()
 // Shortcut capture must see raw keys before the framework interprets them.
 bool SettingsScreen::interceptEvent(const SDL_Event &event)
 {
-	if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+	if ((event.type >= SDL_EVENT_WINDOW_FIRST && event.type <= SDL_EVENT_WINDOW_LAST) && event.type == SDL_EVENT_WINDOW_FOCUS_LOST)
 	{
 		finishInteraction();
 		captureKey = -1;
 		return false;
 	}
-	if (modal != Modal::Binding || captureKey < 0 || event.type != SDL_KEYDOWN)
+	if (modal != Modal::Binding || captureKey < 0 || event.type != SDL_EVENT_KEY_DOWN)
 		return false;
-	const SDL_Keycode key = event.key.keysym.sym;
+	const SDL_Keycode key = event.key.key;
 	if (key == SDLK_ESCAPE)
 	{
 		captureKey = -1;
@@ -337,7 +357,7 @@ bool SettingsScreen::interceptEvent(const SDL_Event &event)
 	if (key == SDLK_LSHIFT || key == SDLK_RSHIFT || key == SDLK_LCTRL || key == SDLK_RCTRL || key == SDLK_LALT ||
 		key == SDLK_RALT || key == SDLK_LGUI || key == SDLK_RGUI)
 		return true;
-	bindingKeys[std::size_t(captureKey)] = KeyPress(event.key.keysym, bindingKeys[std::size_t(captureKey)].getPressed());
+	bindingKeys[std::size_t(captureKey)] = KeyPress(event.key, bindingKeys[std::size_t(captureKey)].getPressed());
 	captureKey = -1;
 	invalidate();
 	return true;
@@ -346,6 +366,9 @@ bool SettingsScreen::interceptEvent(const SDL_Event &event)
 void SettingsScreen::onTimer(Uint32 tick)
 {
 	lastTick = tick;
+	pollCustomAIs();
+	if (current == Category::Online)
+		pollOnline();
 	if (saveAt && Sint32(tick - saveAt) >= 0)
 		persist();
 	if (persistence)
@@ -452,10 +475,12 @@ Element SettingsScreen::categoryNavigation(const Presentation &p, bool sidebar)
 			options.selected = category == current && modal == Modal::None;
 			options.minHeight = 42;
 			// One icon per Category, in its order.
-			static constexpr UIIcon icons[] = {UIIcon::Display,   UIIcon::Audio,    UIIcon::Gameplay,
-											   UIIcon::Buildings, UIIcon::Controls, UIIcon::Player,
-											   UIIcon::Experiments};
-			static_assert(std::size(icons) == std::size_t(Category::Experiments) + 1, "an icon for every settings category");
+			static constexpr UIIcon icons[] = {
+				UIIcon::Display,   UIIcon::Audio,       UIIcon::Gameplay,
+				UIIcon::Buildings, UIIcon::Controls,    UIIcon::Player,
+				UIIcon::Online,    UIIcon::Experiments, UIIcon::Gameplay};
+			static_assert(std::size(icons) == std::size_t(Category::CustomAIs) + 1,
+						  "an icon for every settings category");
 			options.icon = uiIcon(icons[int(category)]);
 			items.push_back(Glob2UI::button("nav." + std::to_string(int(category)), categoryName(category),
 											[this, category] { selectCategory(category); }, options));
@@ -569,6 +594,8 @@ Element SettingsScreen::rowElement(const Row &r, const Presentation &p)
 			return control;
 		return row({sized({p.pt(56), p.pt(56)}, sprite(artwork, frame, Size{p.pt(56), p.pt(56)})), expanded(control)}, {-1, CrossAlign::Center});
 	}
+	case Kind::Custom:
+		return r.render ? r.render(p) : empty();
 	case Kind::Binding:
 	{
 		ButtonOptions options;
@@ -646,7 +673,8 @@ Element SettingsScreen::build(const Presentation &p)
 	const std::string scrollKey = modal != Modal::None ? "settings/modal" : "settings/" + std::to_string(int(current));
 	auto body = scroll(scrollKey, column(std::move(content), {p.pt(10)}));
 
-	std::string status = failed ? tr("Could not save") : settingsDirty ? tr("Saving…") : restartRequired() ? tr("Saved — restart required") : tr("Changes saved automatically");
+	const bool cannotSave = failed || GAGCore::ApplicationHost::storageRestoreFailed();
+	std::string status = cannotSave ? tr("Could not save") : settingsDirty ? tr("Saving…") : restartRequired() ? tr("Saved — restart required") : tr("Changes saved automatically");
 	std::vector<MenuAction> buttons;
 	if (phonePage())
 	{
@@ -656,8 +684,12 @@ Element SettingsScreen::build(const Presentation &p)
 	}
 	else
 	{
-		if (modal == Modal::None)
-			buttons.push_back({"cancel", tr(failed ? "continue" : "Cancel"), [this] { abandon(); }});
+		// Every change applies and saves as it is made ("Changes saved
+		// automatically"), so there is nothing for a Cancel to undo: Done closes.
+		// Only when saving fails (or cannot last: the browser's storage did not
+		// restore) is there a way to leave without trying again.
+		if (modal == Modal::None && cannotSave)
+			buttons.push_back({"cancel", tr("continue"), [this] { abandon(); }});
 		buttons.push_back({"done", tr(modal == Modal::None ? "Done" : "Cancel"), [this] { dismiss(); }, true});
 	}
 	auto footerRow = row({expanded(paragraph(status, {FontRole::Support, true})), actions(std::move(buttons), p, ActionStyle::Compact)}, {-1, CrossAlign::Center});

@@ -33,7 +33,19 @@ NetEndpoint NetEndpoint::parse(const std::string &url)
 		throw std::invalid_argument("WebSocket URL requires an explicit route");
 	e.authority = rest.substr(0, slash);
 	e.route = rest.substr(slash);
-	if (e.route != "/yog" && e.route != "/router" && e.route != "/register")
+	// A relay's public URL is /relay/<relay id> behind the instance's proxy, or
+	// /relay when a client connects to the relay directly.
+	const auto relayRoute = [](const std::string &route) {
+		if (route == "/relay")
+			return true;
+		if (route.rfind("/relay/", 0) != 0)
+			return false;
+		const auto id = route.substr(7);
+		return !id.empty() && id.size() <= 63 && id.front() != '-' &&
+			   id.find_first_not_of("abcdefghijklmnopqrstuvwxyz0123456789-") == std::string::npos;
+	};
+	if (e.route != "/yog" && e.route != "/router" && e.route != "/register" &&
+		e.route != "/realtime" && !relayRoute(e.route))
 		throw std::invalid_argument("Unknown WebSocket route");
 	e.service = "443";
 	if (!e.authority.empty() && e.authority.front() == '[')
@@ -136,7 +148,7 @@ NetworkConfig makeNetworkConfig(bool lan, bool routerRole)
 	for (auto *listener : {&c.lobby, &c.router, &c.registration})
 	{
 		listener->tls = tls;
-		listener->bindAddress = setting("GLOB2_BIND_ADDRESS", "0.0.0.0");
+		listener->bindAddress = setting("GLOB2_BIND_ADDRESS", "::");
 		listener->connectionLimit = number("GLOB2_CONNECTION_LIMIT", 256, 65535);
 		listener->allowedOrigins = origins;
 	}

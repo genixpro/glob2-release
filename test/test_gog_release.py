@@ -86,10 +86,11 @@ class GOGReleaseTests(unittest.TestCase):
         self.assertFalse((self.root / "outside").exists())
 
     def test_public_tag_source_diff_blocks_release(self):
+        tag = "v0.9.5.0"
         with patch("gog_release.command", side_effect=["a" * 40, "b" * 40, "SConstruct"]), \
-             patch("gog_release.subprocess.run"):
+             patch("gog_release.subprocess.run"), patch("gog_release.version", return_value=tag[1:]):
             with self.assertRaisesRegex(ValueError, "differs from public tag"):
-                preflight("v0.9.5.0", "refs/gog-upstream/v0.9.5.0")
+                preflight(tag, f"refs/gog-upstream/{tag}")
 
 
 if __name__ == "__main__":

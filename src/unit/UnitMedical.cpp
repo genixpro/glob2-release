@@ -10,9 +10,7 @@
 #include "Building.h"
 
 #include "Utilities.h"
-#ifndef YOG_SERVER_ONLY
 #include "render/GameAnimations.h"
-#endif  // !YOG_SERVER_ONLY
 #include <set>
 
 void Unit::selectPreferredMovement(void)
@@ -135,7 +133,7 @@ void Unit::handleMagic(void)
 					{
 						Sint32 targetTeam = Unit::GIDtoTeam(targetGUID);
 						Uint16 targetID = Unit::GIDtoID(targetGUID);
-						Uint32 targetTeamMask = 1<<targetTeam;
+						Uint32 targetTeamMask = Team::teamNumberToMask(targetTeam);
 						if (owner->attackableTeams() & targetTeamMask)
 						{
 							Unit *enemyUnit = teams[targetTeam]->myUnits[targetID];

@@ -17,6 +17,10 @@
 #include "Player.h"
 #include "ReplayReader.h"
 #include "ReplayWriter.h"
+#include "OrderValidation.h"
+#include "TurnLockstep.h"
+#include "gui/ConnectionOverlay.h"
+#include "gui/TurnMatchPresenter.h"
 
 #include <cerrno>
 #include <cstdlib>
@@ -41,14 +45,16 @@ GAGCore::CooperativeTask Engine::initCampaignTask(std::string filename, Campaign
 {
     initializationDiagnostic.clear();
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
-    auto map = loadMapHeader(filename);
-    auto players = loadGameHeader(filename);
+    MapHeader map;
+    GameHeader players;
+    auto stream = openGameInput(filename, map, players);
+    if (!stream) co_return false;
     if (players.getNumberOfPlayers() == 0) players = prepareCampaign(map, gui.localPlayer, gui.localTeamNo);
     else { gui.localPlayer = 0; gui.localTeamNo = players.getBasePlayer(0).teamNumber; }
     if (campaign) players.getBasePlayer(0).name = campaign->getPlayerName();
     // Missions and the tutorial play as authored: never with experiments.
     if (!map.getIsSavedGame()) players.getExperiments().clear();
-    const bool loaded = co_await initGameTask(map, players);
+    const bool loaded = co_await initGameFromStreamTask(map, players, std::move(stream), false);
     if (loaded && campaign) gui.setCampaignGame(*campaign, mission);
     co_return loaded;
 }
@@ -91,51 +97,143 @@ GAGCore::CooperativeTask Engine::initCustomTask(std::string filename)
 {
     initializationDiagnostic.clear();
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
-    auto map = loadMapHeader(filename);
-    auto players = loadGameHeader(filename);
+    MapHeader map;
+    GameHeader players;
+    auto stream = openGameInput(filename, map, players);
+    if (!stream) co_return false;
     for (int p = 0; p < players.getNumberOfPlayers(); ++p)
         if (players.getBasePlayer(p).type == BasePlayer::P_IP) players.getBasePlayer(p).makeItAI(AI::toggleAI);
     applyLocalExperiments(players, map);
-    co_return co_await initGameTask(map, players, true, false, true, filename);
+    if (players.getNumberOfPlayers() == 0) co_return false;
+    co_return co_await initGameFromStreamTask(map, players, std::move(stream), true);
 }
 
 
-int Engine::initMultiplayer(std::shared_ptr<MultiplayerGame> multiplayerGame, std::shared_ptr<YOGClient> client, int localPlayer)
+int Engine::initTurnMatch(TurnMatchStart start)
 {
-    const bool loaded = initMultiplayerTask(multiplayerGame, client, localPlayer).run();
+    const bool loaded = initTurnMatchTask(std::move(start)).run();
     if (!loaded) showMapLoadError();
     return loaded ? EE_NO_ERROR : EE_CANT_LOAD_MAP;
 }
 
-GAGCore::CooperativeTask Engine::initMultiplayerTask(std::shared_ptr<MultiplayerGame> multiplayerGame, std::shared_ptr<YOGClient> client, int localPlayer)
+GAGCore::CooperativeTask Engine::initTurnMatchTask(TurnMatchStart start)
 {
     initializationDiagnostic.clear();
-    if (localPlayer < 0 || localPlayer >= multiplayerGame->getGameHeader().getNumberOfPlayers()) co_return false;
-	gui.localPlayer = localPlayer;
-	gui.localTeamNo = multiplayerGame->getGameHeader().getBasePlayer(localPlayer).teamNumber;
+    if (!start.transport) co_return false;
+    co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
+    TurnMatchState state;
+    state.mapFile = start.mapFile;
+    state.localSeat = start.localSeat;
+    state.simVersion = start.setup.simVersion.key();
+    state.networkKind = start.networkKind;
+    state.relayId = start.relayId;
+    state.relayRegion = start.relayRegion;
+    state.map = loadMapHeader(start.mapFile);
+    try { state.header = start.setup.toGameHeader(state.map); }
+    catch (const Online::MatchSetupError& error)
+    {
+        initializationDiagnostic = error.what();
+        co_return false;
+    }
+    const int players = state.header.getNumberOfPlayers();
+    if (start.localSeat >= players) co_return false;
+    int viewSeat = start.localSeat;
+    if (viewSeat < 0)
+    {
+        viewSeat = 0;
+        for (const auto& seat : start.setup.seats)
+            if (seat.human) { viewSeat = seat.seat; break; }
+    }
+    state.localPlayer = viewSeat;
+    state.localTeam = state.header.getBasePlayer(viewSeat).teamNumber;
+    gui.localPlayer = state.localPlayer;
+    gui.localTeamNo = state.localTeam;
 
-	// On failure, initGame has not created `net`; propagate the error before
-	// touching it, and leave `multiplayer` unset so the engine is not left
-	// half-initialised (mirrors the clean state teardownSession leaves).
-	const bool loaded = co_await initGameTask(multiplayerGame->getMapHeader(), multiplayerGame->getGameHeader(), true, true);
-	if (!loaded) co_return false;
+    // ignoreGUIData: a saved game's own local player and viewport do not apply.
+    const bool loaded = co_await initGameTask(state.map, state.header, true, true, false, state.mapFile);
+    if (!loaded) co_return false;
+    // A match without human seats would otherwise start as a live-spectated
+    // offline game, whose local AI orders would be submitted as human orders.
+    globalContainer->liveSpectating = false;
+    gui.localPlayer = state.localPlayer;
+    gui.localTeamNo = state.localTeam;
 
-	multiplayer = multiplayerGame;
-	multiplayer->setNetEngine(net.get());
-
-	for (int p=0; p<multiplayerGame->getGameHeader().getNumberOfPlayers(); p++)
-	{
-		if (multiplayerGame->getGameHeader().getBasePlayer(p).type==BasePlayer::P_IP)
-		{
-			net->prepareForLatency(p, multiplayerGame->getGameHeader().getGameLatency());
-		}
-	}
-
-	net->setNetworkInfo(multiplayerGame->getGameHeader().getOrderRate(), client->getGameConnection());
-
-	co_return true;
+    // Replaces the NetEngine finishGameInit created; nothing has used it yet.
+    auto session = std::make_unique<Turn::TurnLockstepSession>(players, start.transport, start.config);
+    // Every human order is checked against this game before it executes, on every
+    // client and in the verifier alike (OrderValidation.h).
+    session->validator = [this](int player, Order& order) { return OrderValidation::validate(gui.game, player, order); };
+    session->onLocalQuit = [this] { leaveTurnMatch(); };
+    if (start.setup.pauseLimit)
+        session->setPauseLimit({static_cast<std::uint32_t>(start.setup.pauseLimit->pauses),
+                                static_cast<std::uint32_t>(start.setup.pauseLimit->seconds)});
+    session->onPauseNotice = [this](Turn::PauseNotice notice, int seat) {
+        auto& strings = *Toolkit::getStringTable();
+        if (notice == Turn::PauseNotice::Refused)
+        {
+            if (seat == gui.localPlayer)
+                gui.addNotice(strings.getString("[turn no pauses left]"));
+        }
+        else if (seat >= 0 && seat < gui.game.gameHeader.getNumberOfPlayers() && gui.game.players[seat])
+            gui.addNotice(GAGCore::FormattableString(strings.getString("[turn pause time used %0]"))
+                              .arg(gui.game.players[seat]->name));
+    };
+    turn = session.get();
+    // What the menus and the Paused label show of the pause limit.
+    gui.pauseState = [this] {
+        GameGUI::PauseState state;
+        if (!turn)
+            return state;
+        const auto period = std::max<std::uint64_t>(1, turn->turn().tickPeriodMicros());
+        const auto secondsLeft = [&](int seat) {
+            const std::uint64_t budget = std::uint64_t(turn->currentPauseLimit()->seconds) * 1000000;
+            const std::uint64_t used = std::uint64_t(turn->pauseTicksUsed(seat)) * period;
+            return int((budget > used ? budget - used : 0) / 1000000);
+        };
+        state.pausedBy = turn->pausedBy();
+        if (const auto& limit = turn->currentPauseLimit())
+        {
+            state.limited = true;
+            const int seat = gui.localPlayer;
+            state.pausesLeft = int(limit->pauses > turn->pausesUsed(seat) ? limit->pauses - turn->pausesUsed(seat) : 0);
+            state.secondsLeft = secondsLeft(seat);
+            if (state.pausedBy >= 0)
+                state.pauserSecondsLeft = secondsLeft(state.pausedBy);
+        }
+        return state;
+    };
+    net = std::move(session);
+    const char* envReplayPath = getenv("GLOB2_REPLAY_PATH");
+    state.replayPath = envReplayPath ? envReplayPath : "replays/last_game.replay";
+    turnMatch = std::move(state);
+    // The connection HUD replaces the "waiting for players" notice.
+    gui.networkMatch.active = true;
+    gui.connectionOverlay = std::make_unique<ConnectionOverlay>();
+    turnPresenter = std::make_unique<TurnMatchPresenter>();
+    gui.connectionOverlay->source = [this] {
+        return turn ? turnPresenter->snapshot(turn->turn(), gui.game, turnNowMicros) : ConnectionSnapshot();
+    };
+    gui.connectionOverlay->leave = [this] { gui.isRunning = false; };
+    gui.connectionOverlay->notice = [this](const std::string& line) { gui.addNotice(line); };
+    gui.connectionNotice = [this] {
+        return turn ? TurnMatchPresenter::notice(turn->turn(), gui.game) : std::vector<std::string>();
+    };
+    co_return true;
 }
 
+
+Turn::TurnSession* Engine::turnSession()
+{
+    return turn ? &turn->turn() : nullptr;
+}
+
+bool Engine::turnFastForwarding()
+{
+    if (!turn || !session || !gui.isRunning)
+        return false;
+    const Turn::TurnSession& s = turn->turn();
+    return s.state() == Turn::TurnSession::State::Running && s.catchingUp() && !s.needsReload() && s.bufferedTicks() > 0;
+}
 
 
 namespace
@@ -377,6 +475,23 @@ GAGCore::CooperativeTask Engine::initGameTask(MapHeader mapHeader, GameHeader ga
 	}
 	finishGameInit();
 	co_return true;
+}
+
+GAGCore::CooperativeTask Engine::initGameFromStreamTask(MapHeader map, GameHeader players, std::unique_ptr<InputStream> stream, bool saveAI)
+{
+    bool loaded = false;
+    try
+    {
+        loaded = co_await gui.loadFromStreamTask(map, players, true, false, saveAI, stream.get());
+    }
+    catch (const std::exception& error)
+    {
+        initializationDiagnostic = error.what();
+        std::cerr << "Failed to load the map: " << initializationDiagnostic << std::endl;
+    }
+    stream.reset(); // release the snapshot before replay/network setup
+    if (loaded) finishGameInit();
+    co_return loaded;
 }
 
 void Engine::finishGameInit()

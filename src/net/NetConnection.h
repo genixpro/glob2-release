@@ -2,8 +2,9 @@
 // Copyright (C) 2007 Bradley Arsenault
 
 #pragma once
+#include "NetFrame.h"
 #include "NetTransport.h"
-#include <SDL_stdinc.h>
+#include <SDL3/SDL_stdinc.h>
 #include <queue>
 
 using std::shared_ptr;
@@ -45,7 +46,7 @@ protected:
 private:
     std::unique_ptr<NetTransport> transport;
     std::queue<std::shared_ptr<NetMessage>> received;
-    std::vector<uint8_t> pending;
+    NetFrame::Reader reader;
     std::string address;
     std::queue<std::vector<uint8_t>> outgoing;
     size_t outgoingBytes = 0;

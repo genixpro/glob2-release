@@ -26,11 +26,13 @@
 #include "Unit.h"
 #include "UnitDrawGeometry.h"
 #include "UnitAnimation.h"
+#include "UnitMotion.h"
 #include <algorithm>
 #include "UnitSkin.h"
+#include "scene/Scene.h"
 #include "Utilities.h"
 #include "GameGUI.h"
-#include "SDLCompat.h"
+#include <SDL3/SDL.h>
 
 
 #include "Brush.h"
@@ -42,11 +44,11 @@
 // Unit rendering. Split from Game_render.cpp.
 
 
-void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view)
+void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene)
 {
-	int id=Unit::GIDtoID(gid);
-	int team=Unit::GIDtoTeam(gid);
-	Unit *unit=teams[team]->myUnits[id];
+	const SceneEntities &entities = scene.entities;
+	const SceneMap &map = scene.map; // the extracted map, not Game::map
+	const SceneUnit *unit = entities.unit(gid);
 	assert(unit);
 	if (!unit)
 	{
@@ -56,7 +58,7 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	int dx=unit->dx;
 	int dy=unit->dy;
 
-	Uint32 visibleTeams = teams[localTeam]->me;
+	Uint32 visibleTeams = entities.teams[localTeam].me;
 	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
 
 	if ((drawOptions & DRAW_WHOLE_MAP) == 0)
@@ -74,7 +76,9 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	// behind the position (see UnitDrawGeometry.h).
 	int px = unitDrawTile(x, viewportX, unit->posX, map.getW()) * Map::TILE_PX;
 	int py = unitDrawTile(y, viewportY, unit->posY, map.getH()) * Map::TILE_PX;
-	int deltaLeft=255-unit->delta;
+	// Smooth unit motion may draw the unit part of the way to its next tick.
+	const int delta=drawnUnitDelta(*unit, view.render.unitMotion);
+	int deltaLeft=255-delta;
 	if (unit->action<BUILD)
 	{
 		px-=(unit->dx*deltaLeft)>>3;
@@ -86,7 +90,6 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	}
 
 	int dir=unit->direction;
-	int delta=unit->delta;
 	assert(dir>=0);
 	assert(dir<9);
 	assert(delta>=0);
@@ -95,22 +98,39 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 
 	// draw unit
 	Sprite *unitSprite = skin.sprite;
-	unitSprite->setBaseColor(teams[team]->color);
+	unitSprite->setBaseColor(entities.owner(*unit).color);
 	int decX = (unitSprite->getW(imgid)-32)>>1;
 	int decY = (unitSprite->getH(imgid)-32)>>1;
-	globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid);
+	// Too far out to make a unit out, it becomes a marker of constant size:
+	// a dot for a worker, a triangle for a warrior, a diamond for an explorer.
+	// Worker dots shrink further out, so a crowd reads as density.
+	const ZoomDetail &detail = view.render.detail;
+	// The sprite stays opaque under the marker fading in over it, and goes once
+	// the marker is solid: a translucent sprite would leave the unit batch.
+	if (detail.unitSprite > 0)
+		globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid);
+	if (detail.unitMarker > 0)
+	{
+		const GAGCore::Color &color = entities.owner(*unit).color;
+		const bool warrior = unit->typeNum==WARRIOR, explorer = unit->typeNum==EXPLORER;
+		view.render.overlays.marker(*globalContainer->gfx, px+16, py+16,
+			warrior ? MapOverlayQueue::Triangle : explorer ? MapOverlayQueue::Diamond : MapOverlayQueue::Dot,
+			warrior ? 6.f : explorer ? 5.f : 3.f + 2.25f*detail.workerMarkerScale,
+			color.r, color.g, color.b, detail.unitMarker);
+	}
 
 	// Units the selected building could not hire wear the badge, the same one
 	// shown next to the tally in the building panel. The panel asks the same
 	// gate, so a unit never wears a badge the panel has no row to explain.
-	if (view.selectedBuilding && view.selectedBuilding->recordFailingUnits && unit->owner->teamNumber==localTeam
-		&& shouldShowFailingUnitMarkers(view.selectedBuilding->unitsFailingRequirements,
+	const SceneSelectedBuilding &selected = entities.selectedBuilding;
+	if (selected.recordFailingUnits && entities.owner(*unit).teamNumber==localTeam
+		&& shouldShowFailingUnitMarkers(selected.unitsFailingRequirements.data(),
 			Building::UnitCantWorkReasonSize, Building::UnitNotAvailable,
-			(int)view.selectedBuilding->unitsWorking.size(), view.selectedBuilding->desiredMaxUnitWorking))
+			(int)selected.unitsWorking.size(), selected.desiredMaxUnitWorking))
 	{
 		for (int reason=0; reason<Building::UnitCantWorkReasonSize; ++reason)
 		{
-			const std::vector<Uint16>& failing=view.selectedBuilding->unitsFailingByReason[reason];
+			const std::vector<Uint16>& failing=selected.unitsFailingByReason[reason];
 			if (std::find(failing.begin(), failing.end(), unit->gid)!=failing.end())
 				// Fist-size, in the tile's top-right corner: a badge, not a ring around the unit.
 				drawFailureShape(globalContainer->gfx, px+26, py+6, 4, static_cast<Building::UnitCantWorkReason>(reason), failureShapeColor());
@@ -118,19 +138,20 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	}
 
 	// draw selection
-	if (unit==view.selectedUnit)
+	if (entities.isSelected(*unit))
 	{
 		globalContainer->gfx->drawCircle(px+16, py+16, 16, 0, 0, 255);
-		if (unit->owner->teamNumber == localTeam)
+		if (entities.owner(*unit).teamNumber == localTeam)
 			globalContainer->gfx->drawCircle(px+16, py+16, 16, 0, 0, 190);
-		else if ((teams[localTeam]->allies) & (unit->owner->me))
+		else if ((entities.teams[localTeam].allies) & (entities.owner(*unit).me))
 			globalContainer->gfx->drawCircle(px+16, py+16, 16, 255, 196, 0);
 		else
 			globalContainer->gfx->drawCircle(px+16, py+16, 16, 190, 0, 0);
 	}
 
-	// draw xp animation
-	if (unit->levelUpAnimation)
+	// draw xp animation. It and the magic effect belong to the sprite, and go
+	// with it once the unit is only a marker.
+	if (unit->levelUpAnimation && detail.unitSprite > 0)
 	{
 		std::ostringstream oss;
 		oss << unit->experienceLevel;
@@ -140,7 +161,7 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	}
 
 	// draw magic animation
-	if (unit->magicActionAnimation)
+	if (unit->magicActionAnimation && detail.unitSprite > 0)
 	{
 		if (!globalContainer->settings.fullMagicEffects)
 		{
@@ -163,24 +184,36 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	}
 
 	if ((px<view.mouseX)&&((px+32)>view.mouseX)&&(py<view.mouseY)&&((py+32)>view.mouseY)&&(((drawOptions & DRAW_WHOLE_MAP) != 0) ||(map.isFOWDiscovered(x+viewportX, y+viewportY, visibleTeams))||(Unit::GIDtoTeam(gid)==localTeam)))
-		view.mouseUnit=unit;
+		view.mouseUnit=UnitRef{unit->gid, unit->generation};
 
 	if ((drawOptions & DRAW_HEALTH_FOOD_BAR) != 0 )
 	{
-		drawPointBar(px+1, py+25, LEFT_TO_RIGHT, 10, (unit->hungry*10)/Unit::HUNGRY_MAX, 80, 179, 223);
+		// A hungry or hurt unit keeps its bar further out than a healthy one.
+		const int food=(unit->hungry*10)/Unit::HUNGRY_MAX;
+		const bool hungry=food<=1;
+		const bool hurt=unit->hp*10<=unit->performance[HP]*6;
+		anchorBars(px+16, py+25, hungry);
+		drawPointBar(px+1, py+25, LEFT_TO_RIGHT, 10, food, 80, 179, 223);
 
+		// At or below the ratio where the health bar stops being green.
 		float hpRatio=(float)unit->hp/(float)unit->performance[HP];
+		anchorBars(px+16, py+25, hurt);
 		drawHealthBar(px+1, py+25+3, 10, 1+(int)(9*hpRatio), hpRatio);
+		if (hurt)
+			drawStatusPip(px+16, py+28, 255, 0, 0);
+		else if (hungry)
+			drawStatusPip(px+16, py+28, 80, 179, 223);
 
-		if ((unit->performance[HARVEST]) && (unit->carriedResource>=0))
-			globalContainer->gfx->drawSprite(px+24, py, globalContainer->resourceMini, unit->carriedResource);
+		const int carriedAlpha=int(view.render.detail.barAll*255);
+		if ((unit->performance[HARVEST]) && (unit->carriedResource>=0) && carriedAlpha>0)
+			globalContainer->gfx->drawSprite(px+24, py, globalContainer->resourceMini, unit->carriedResource, carriedAlpha);
 		globalContainer->gfx->finishDrawingSprite(globalContainer->resourceMini, 255);
 	}
 
 	if (drawOptions & DRAW_ACCESSIBILITY)
 	{
 		std::ostringstream oss;
-		oss << unit->owner->teamNumber;
+		oss << entities.owner(*unit).teamNumber;
 		int accessW = globalContainer->littleFont->getStringWidth(oss.str().c_str());
 		int accessH = globalContainer->littleFont->getStringHeight(oss.str().c_str());
 		int accessX = px+((32-accessW)>>1);
@@ -189,71 +222,71 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 		globalContainer->gfx->drawRect(accessX-4, accessY, accessW+8, accessH, Color(255, 255, 255, 127));
 		globalContainer->gfx->drawString(accessX, accessY, globalContainer->littleFont, oss.str());
 	}
-	if(highlightUnitType & (1<<unit->typeNum))
+	if(entities.highlightUnitType & (1<<unit->typeNum))
 	{
 		globalContainer->gfx->drawSprite(px, py-decY-32, globalContainer->gamegui, 36);
 	}
 }
 
 
-void Game::drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view)
+void Game::drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene)
 {
 	PERF_SCOPE_TIME(GroundUnits);
     GAGCore::UnitDrawBatch unitBatch(globalContainer->gfx);
 	//Reset the mouse unit to NULL, as this time around there may not be a unit
 	//under the mouse pointer
-	view.mouseUnit=NULL;
+	view.mouseUnit=UnitRef();
 	for (int y=top-1; y<=bot; y++)
 		for (int x=left-1; x<=right; x++)
 		{
-			Uint16 gid=map.getGroundUnit(x+viewportX, y+viewportY);
+			Uint16 gid=scene.map.getGroundUnit(x+viewportX, y+viewportY);
 			if (gid!=NOGUID)
-				drawUnit(x, y, gid, viewportX, viewportY, (sw>>5), (sh>>5), localTeam, drawOptions, view);
+				drawUnit(x, y, gid, viewportX, viewportY, (sw>>5), (sh>>5), localTeam, drawOptions, view, scene);
 		}
 }
 
 
-void Game::drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view)
+void Game::drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene)
 {
 	PERF_SCOPE_TIME(AirUnits);
     GAGCore::UnitDrawBatch unitBatch(globalContainer->gfx);
 	for (int y=top-1; y<=bot; y++)
 		for (int x=left-1; x<=right; x++)
 		{
-			Uint16 gid=map.getAirUnit(x+viewportX, y+viewportY);
+			Uint16 gid=scene.map.getAirUnit(x+viewportX, y+viewportY);
 			if (gid!=NOGUID)
-				drawUnit(x, y, gid, viewportX, viewportY, (sw>>5), (sh>>5), localTeam, drawOptions, view);
+				drawUnit(x, y, gid, viewportX, viewportY, (sw>>5), (sh>>5), localTeam, drawOptions, view, scene);
 		}
 }
 
 
-void Game::drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view)
+void Game::drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene)
 {
+	const SceneEntities &entities = scene.entities;
 	if ((drawOptions & DRAW_PATH_LINE) != 0)
 	{
-		for(int i=0; i<Unit::MAX_COUNT; ++i)
-		{
-			Unit *unit=teams[localTeam]->myUnits[i];
-			if (unit)
-			{
-				drawUnitPathLine(left, top, right, bot, sw, sh, viewportX, viewportY, localTeam, drawOptions, unit);
-			}
-		}
+		// Units are extracted team by team in slot order, as the old loop visited them.
+		for (const SceneUnit &unit : entities.units)
+			if (unit.team == localTeam)
+				drawUnitPathLine(left, top, right, bot, sw, sh, viewportX, viewportY, localTeam, drawOptions, unit, scene, view.render.unitMotion);
 	}
-	if(view.selectedUnit != NULL)
+	const SceneUnit *selected = entities.unit(entities.selectedUnit.gid);
+	if (selected && entities.isSelected(*selected))
 	{
-		drawUnitPathLine(left, top, right, bot, sw, sh, viewportX, viewportY, localTeam, drawOptions, view.selectedUnit);
+		drawUnitPathLine(left, top, right, bot, sw, sh, viewportX, viewportY, localTeam, drawOptions, *selected, scene, view.render.unitMotion);
 	}
 }
 
 
 
-void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, Unit* unit)
+void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneUnit& sceneUnit, const Scene& scene, float unitMotion)
 {
-	Uint32 visibleTeams = teams[localTeam]->me;
+	const SceneMap &map = scene.map; // the extracted map, not Game::map
+	const SceneUnit *unit = &sceneUnit;
+	Uint32 visibleTeams = scene.entities.teams[localTeam].me;
 	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
 
-	if(unit->owner->sharedVisionOther & visibleTeams)
+	if(scene.entities.owner(*unit).sharedVisionOther & visibleTeams)
 	{
 		if (unit->validTarget)
 		{
@@ -267,8 +300,9 @@ void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int s
 			const int targetY = py + dy*32 + 16;
 			if (unit->action < BUILD)
 			{
-				px -= (unit->dx*(255-unit->delta)) >> 3;
-				py -= (unit->dy*(255-unit->delta)) >> 3;
+				const int delta = drawnUnitDelta(*unit, unitMotion);
+				px -= (unit->dx*(255-delta)) >> 3;
+				py -= (unit->dy*(255-delta)) >> 3;
 			}
 			px += 16;
 			py += 16;
@@ -283,12 +317,14 @@ void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int s
 
 
 
-void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, Unit* unit, Uint32 drawOptions)
+void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SceneUnit& sceneUnit, Uint32 drawOptions, const Scene& scene, float unitMotion)
 {
+	const SceneMap &map = scene.map; // the extracted map, not Game::map
+	const SceneUnit *unit = &sceneUnit;
 	// Get the direction to the unit
 	int px, py;
 	map.mapCaseToDisplayableVector(unit->posX, unit->posY, &px, &py, viewportX, viewportY, sw, sh);
-	int deltaLeft=255-unit->delta;
+	int deltaLeft=255-drawnUnitDelta(*unit, unitMotion);
 	if (unit->action<BUILD)
 	{
 		px-=(unit->dx*deltaLeft)>>3;
@@ -353,7 +389,7 @@ void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int 
 	imgid=ut->startImage[unit->action];
 
 	int dir=unit->direction;
-	int delta=unit->delta;
+	int delta=drawnUnitDelta(*unit, unitMotion);
 	assert(dir>=0);
 	assert(dir<9);
 	assert(delta>=0);
@@ -361,7 +397,7 @@ void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int 
 	imgid=unitAnimationFrame(imgid, dir, delta);
 
 	Sprite *unitSprite=globalContainer->units;
-	unitSprite->setBaseColor(unit->owner->color);
+	unitSprite->setBaseColor(scene.entities.owner(*unit).color);
 	int decX = (32-unitSprite->getW(imgid))>>1;
 	int decY = (32-unitSprite->getH(imgid))>>1;
 

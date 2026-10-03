@@ -10,6 +10,12 @@
 #include <StringTable.h>
 #include <stdexcept>
 
+namespace
+{
+// Milliseconds of extra ticks a frame may run while a turn game catches up.
+constexpr Uint64 CATCH_UP_FRAME_BUDGET_MS = 30;
+} // namespace
+
 GameSessionScreen::GameSessionScreen(GAGGUI::ScreenStack &stack, std::unique_ptr<Engine> engine)
 	: stack(stack), engine(std::move(engine))
 {
@@ -56,6 +62,10 @@ void GameSessionScreen::updateExecutionImpl(Uint32 tick)
 		engine->beginSession(clock);
 		nextTick = clock;
 		started = true;
+		finishingSession = false;
+		// The simulation runs on its own thread where threads exist; otherwise
+		// (the browser build, thread creation failure) this host steps it serially.
+		engine->startSimulationThread(clock);
 	}
 	else
 	{
@@ -68,11 +78,54 @@ void GameSessionScreen::updateExecutionImpl(Uint32 tick)
 		clock += static_cast<Uint32>(tick - lastTick);
 		lastTick = tick;
 	}
-	if (clock < nextTick)
-		return;
-	const bool running = engine->stepSession(clock, input);
-	input.clear();
-	nextTick = clock + engine->sessionDelay(clock);
+	bool running = false;
+	if (finishingSession)
+	{
+		frameStarted = tick;
+		const bool pending = engine->advancePendingSave(input.events());
+		input.clear();
+		if (pending) return;
+	}
+	else if (engine->simulationThreaded())
+	{
+		// Input and GUI logic every frame, with the simulation parked between ticks;
+		// the simulation thread paces itself.
+		frameStarted = tick;
+		engine->resumeSimulation(clock);
+		try { running = engine->threadedClientFrame(clock, input.events()); }
+		catch (...) { engine->abortSession(); throw; }
+		input.clear();
+	}
+	else
+	{
+		if (clock < nextTick)
+		{
+			// A turn game reads its relay connection between steps.
+			engine->pollTurnSession(clock);
+			return;
+		}
+		running = engine->stepSession(clock, input.events());
+		input.clear();
+		// Catching up in a turn game: the host calls this once per frame, so one tick per
+		// call caps the replay at the frame rate (in the browser, below real time on slow
+		// devices: the client falls further behind). Run more ticks within a frame
+		// budget; none of them is drawn (the catch-up draw ratio) and the frame still
+		// returns to the host in time for input and the card.
+		if (running && engine->turnFastForwarding())
+		{
+			const Uint64 deadline = SDL_GetTicks() + CATCH_UP_FRAME_BUDGET_MS;
+			while (running && engine->turnFastForwarding() && SDL_GetTicks() < deadline)
+				running = engine->stepSession(clock, {});
+		}
+		nextTick = clock + engine->sessionDelay(clock);
+	}
+	// Disk completion is only one stage: retain the dialog for queued capture,
+	// browser persistence, and retry/export after a persistence failure.
+	if (!running && !finishingSession)
+	{
+		finishingSession = true;
+		if (engine->advancePendingSave({})) return;
+	}
 	if (!running)
 	{
 		if (auto request = engine->finishSessionForHost())
@@ -145,7 +198,21 @@ Uint32 GameSessionScreen::executionDelay(Uint32 now, Uint32 fallback)
 {
 	if (!started || finished)
 		return 0;
-	return engine->sessionDelay(clock + static_cast<Uint32>(now - lastTick));
+	// Threaded: draw at display rate (presentation paces with vsync where enabled);
+	// cap at about 120 frames per second otherwise, counting the frame's own time.
+	if (engine->simulationThreaded())
+		return Engine::threadedFrameWait(now - frameStarted);
+	return engine->sessionPollDelay(clock + static_cast<Uint32>(now - lastTick));
+}
+
+GAGGUI::Screen::ExecutionWait GameSessionScreen::executionWait() const
+{
+	if (!started || finished || !engine)
+		return ExecutionWait::Untimed;
+	// The simulation thread owns the session state; its frame waits are pacing.
+	if (engine->simulationThreaded())
+		return ExecutionWait::Pacing;
+	return engine->waitingOnNetwork() ? ExecutionWait::Network : ExecutionWait::Pacing;
 }
 
 void GameSessionScreen::viewportResized(int oldWidth, int oldHeight, int width, int height)
@@ -159,7 +226,12 @@ void GameSessionScreen::viewportResized(int oldWidth, int oldHeight, int width, 
 void GameSessionScreen::suspendExecution()
 {
 	if (engine)
+	{
 		engine->suspendInput();
+		// No frames run in the background; the simulation thread waits too, as the
+		// serial loop did. updateExecution resumes it.
+		engine->suspendSimulation();
+	}
 	input.clear();
 	resetClock = true;
 }

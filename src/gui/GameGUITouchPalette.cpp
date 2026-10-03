@@ -64,12 +64,12 @@ ViewRect GameGUITouch::paletteItemRect(size_t index) const
 	const int columns = paletteColumns(ui);
 	if (paletteRail(ui))
 	{
-		// Row-major from the thumb corner: the first item sits nearest the thumb.
+		// Row-major from the toolbox corner, opposite the selected thumb.
 		const double cell = InGameTouchTheme::paletteCell * unit,
 					 stride = (InGameTouchTheme::paletteCell + InGameTouchTheme::gap) * unit,
 					 gap = InGameTouchTheme::gap * unit;
 		const int row = int(index) / columns, column = int(index) % columns;
-		const double x = ThumbSide::left() ? content.x + gap + column * stride
+		const double x = ThumbSide::toolboxLeft() ? content.x + gap + column * stride
 										   : content.x + content.w - gap - cell - column * stride;
 		const double y = content.y + content.h - gap - cell - row * stride + panelScroll * unit;
 		return {x, y, cell, cell};
@@ -122,7 +122,7 @@ void GameGUITouch::drawBuildPalette()
 			auto *sprite = type->miniSpriteImage >= 0 ? type->miniSpritePtr : type->gameSpritePtr;
 			const int frame =
 				type->miniSpriteImage >= 0 ? type->miniSpriteImage : type->gameSpriteImage;
-			sprite->setBaseColor(gui.localTeam->color);
+			sprite->setBaseColor(gui.drawnScene().panels.local.color);
 			const double factor = std::min({unit, (rect.w - 8 * unit) / sprite->getW(frame),
 											(rect.h - 8 * unit) / sprite->getH(frame)});
 			gfx->setUITransform(factor, rect.x + (rect.w - sprite->getW(frame) * factor) / 2,

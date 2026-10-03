@@ -2,6 +2,7 @@
 #pragma once
 #include <ViewportTransform.h>
 #include <optional>
+#include <array>
 #include <string>
 #include <vector>
 #include <utility>
@@ -12,7 +13,7 @@
 // through GameGUIToolManager. Cancelling a session cannot emit game orders.
 struct TouchPlacementSession
 {
-	using Pointer = std::pair<std::int64_t, std::int64_t>;
+	using Pointer = std::pair<std::uint64_t, std::uint64_t>;
 	Pointer pointer;
 	GAGCore::ViewPoint origin;
 	std::string building;
@@ -57,10 +58,15 @@ struct TouchAllocationSession
 	TouchPlacementSession::Pointer pointer;
 	GAGCore::ViewRect track;
 	int building = -1, team = -1, requested = 0;
-	// Dial sliders: which value (workers, a unit ratio or a flag range), the
+	// Dial sliders: which value (workers, production or a flag range), the
 	// sweep the value spans, and the contact for the readout above the finger.
 	int kind = 6, value = 0, maximum = 0, ring = 0;
 	bool polar = false;
+	// Two dividers share a fixed production budget; only release sends an order.
+	int divider = -1;
+	std::array<int, 3> ratios{}, initialRatios{};
+	GAGCore::ViewPoint start;
+	bool moved = false;
 	double sweepFrom = 0, sweepTo = 0;
 	GAGCore::ViewPoint position;
 };

@@ -10,9 +10,13 @@
 #include "BrushCoverage.h"
 #include "GameGUI.h"
 #include "GameGUIInternal.h"
+#include "GameUtilities.h"
 #include "GlobalContainer.h"
 #include "BuildingType.h"
 #include "TeamStat.h"
+#include "Unit.h"
+#include "UnitDisplayNames.h"
+#include "TeamDisplay.h"
 #include "render/Minimap.h"
 #include <TouchText.h>
 #include <Toolkit.h>
@@ -106,7 +110,7 @@ void GameGUITouch::drawPanel()
 		return;
 	auto *gfx = globalContainer->gfx;
 	gfx->setClipRect();
-	if (inspectedBuilding() && usesDial())
+	if (inspecting() && usesDial())
 	{
 		drawDial();
 		drawAllocation();
@@ -124,7 +128,7 @@ void GameGUITouch::drawPanel()
 		drawBuildPalette();
 		return;
 	}
-	if (inspectedBuilding())
+	if (inspecting())
 	{
 		drawBuildingActions();
 		drawAllocation();
@@ -138,7 +142,15 @@ void GameGUITouch::drawPanel()
 			.75);
 		return;
 	}
-	drawTacticalPanel();
+	if (inspectingResource())
+	{
+		drawResourceInfo();
+		return;
+	}
+	if (gui.selectionMode == GameGUI::UNIT_SELECTION)
+		drawUnitPanel();
+	else
+		drawTacticalPanel();
 }
 
 void GameGUITouch::drawKeyboardFocus()
@@ -196,8 +208,7 @@ void GameGUITouch::drawHUD()
 		}
 		gfx->setClipRect();
 	}
-	const double available =
-		std::min(ui.world.x + ui.world.w, minimapRect().x - 4 * unit) - ui.world.x;
+	const auto hud = hudLayout(ui);
 	struct Stat
 	{
 		std::string text;
@@ -215,28 +226,20 @@ void GameGUITouch::drawHUD()
 	}
 	stats.push_back(
 		{GAGCore::FormattableString(GAGCore::Toolkit::getStringTable()->getString("[P %0/%1/%2]"))
-			 .arg(gui.localTeam->prestige)
-			 .arg(gui.game.totalPrestige)
-			 .arg(gui.game.prestigeToReach)});
-	stats.push_back({"+" + std::to_string(gui.localTeam->unitConversionGained) + " / −" +
-					 std::to_string(gui.localTeam->unitConversionLost)});
-	int cpu = 0;
-	for (auto value : gui.smoothedCPULoad)
-		cpu += value;
-	cpu /= GameGUI::SMOOTHED_CPU_SIZE;
-	stats.push_back(
-		{GAGCore::FormattableString(GAGCore::Toolkit::getStringTable()->getString("[CPU load %0]"))
-			 .arg(cpu),
-		 -1, cpu >= 75});
-	const int columns = available / unit >= 600 ? 6 : 3;
-	const double cell = std::min(120 * unit, available / columns);
-	const double start = ui.world.x + (available - columns * cell) / 2;
+			 .arg(gui.drawnScene().panels.local.prestige)
+			 .arg(gui.drawnScene().panels.hud.totalPrestige)
+			 .arg(gui.drawnScene().panels.hud.prestigeToReach)});
+	stats.push_back({"+" + std::to_string(gui.drawnScene().panels.local.unitConversionGained) + " / −" +
+					 std::to_string(gui.drawnScene().panels.local.unitConversionLost)});
+	// The last cell holds the speed chevrons and the simulation tick rate; where
+	// the speed is fixed (network games) the rate has the cell to itself.
+	const auto rate = gui.tickRate.rate();
+	const bool chevrons = gui.canChangeGameSpeed();
+	stats.push_back({rate ? TickRateMeter::format(*rate) : "-", -1, gui.tickRateShortfall() == 2});
 	for (size_t i = 0; i < stats.size(); ++i)
 	{
 		const auto &stat = stats[i];
-		const ViewRect r{start + (i % columns) * cell,
-						 ui.safe.y + 4 * unit + (i / columns) * 28 * unit, cell - 3 * unit,
-						 24 * unit};
+		const ViewRect r = statRect(hud, int(i));
 		gfx->drawFilledRect(int(r.x), int(r.y), int(r.w), int(r.h), InGameTouchTheme::paper);
 		if (stat.warning)
 			gfx->drawRect(int(r.x), int(r.y), int(r.w), int(r.h), Color(230, 100, 95));
@@ -245,11 +248,28 @@ void GameGUITouch::drawHUD()
 		{
 			SDL_Rect clip{int(r.x), int(r.y), int(r.w), int(r.h)};
 			gfx->setUITransform(unit, r.x + 2 * unit, r.y + 3 * unit, &clip);
-			globalContainer->unitmini->setBaseColor(gui.localTeam->color);
+			globalContainer->unitmini->setBaseColor(gui.drawnScene().panels.local.color);
 			gfx->drawSprite(0, 0, globalContainer->unitmini, stat.icon);
 			gfx->setUITransform();
 			gfx->setClipRect();
 			inset = 20 * unit;
+		}
+		if (chevrons && i + 1 == stats.size())
+		{
+			const int lit = gui.litSpeedChevrons();
+			const double middle = r.y + r.h / 2;
+			for (int c = 0; c < GameSpeedControl::CHEVRONS; ++c)
+			{
+				const Color color = c < lit ? Color(120, 230, 120) : Color(110, 95, 125);
+				// Half-pixel steps fill a stroke two points thick.
+				for (double stroke = 0; stroke < 2 * unit; stroke += .5)
+				{
+					const float x = float(r.x + (4 + c * 7.5) * unit + stroke);
+					gfx->drawLine(x, float(middle - 5 * unit), float(x + 4.5 * unit), float(middle), color);
+					gfx->drawLine(float(x + 4.5 * unit), float(middle), x, float(middle + 5 * unit), color);
+				}
+			}
+			inset = 42 * unit;
 		}
 		drawPointLabel({r.x + inset, r.y, r.w - inset, r.h}, stat.text, .72);
 	}
@@ -323,7 +343,7 @@ ViewRect GameGUITouch::tutorialRect() const
 }
 void GameGUITouch::prepareTutorial()
 {
-	std::string text = gui.game.legacyScriptActive() && gui.game.sgslScript.isTextShown ? gui.game.sgslScript.textShown : "";
+	std::string text = gui.drawnScene().panels.hud.legacyScriptText;
 	if (!gui.scriptText.empty())
 	{
 		if (!text.empty())
@@ -432,30 +452,35 @@ void GameGUITouch::drawTutorial()
 	}
 }
 
-Building *GameGUITouch::allocationBuilding() const
+const SceneBuildingPanel *GameGUITouch::allocationBuilding() const
 {
 	if (gui.selectionMode != GameGUI::BUILDING_SELECTION || globalContainer->isViewingGame())
 		return nullptr;
-	auto *building = gui.selectionBuilding();
-	return building && building->owner->teamNumber == gui.localTeamNo &&
+	auto *building = inspectedBuilding();
+	return building && building->owner.teamNumber == gui.localTeamNo &&
 				   building->type->maxUnitWorking && building->buildingState == Building::ALIVE
 			   ? building
 			   : nullptr;
 }
 ViewRect GameGUITouch::allocationRect() const
 {
-	auto rect = layout().panel;
-	if (!inspectedBuilding() || rect.h <= 0)
+	const auto ui = layout();
+	auto rect = ui.panel;
+	if (!inspecting() || rect.h <= 0)
 		return {};
-	if (usesDial())
-		return dialLayout(layout()).header;
+	// Compact identity stays in the HUD even when its controls need row fallback.
+	if (!ui.persistentPanel)
+		return hudLayout(ui).identity;
 	rect.h = InGameTouchTheme::inspectorHeader * globalContainer->gfx->logicalUnitsPerPoint();
 	return rect;
 }
 ViewRect GameGUITouch::panelContent() const
 {
-	auto rect = layout().panel;
-	const double header = allocationRect().h;
+	const auto ui = layout();
+	auto rect = ui.panel;
+	const double header = gui.selectionMode == GameGUI::UNIT_SELECTION
+		? 48 * globalContainer->gfx->logicalUnitsPerPoint()
+		: inspecting() && !ui.persistentPanel ? 0 : allocationRect().h;
 	rect.y += header;
 	rect.h = std::max(0.0, rect.h - header);
 	return rect;
@@ -512,14 +537,19 @@ void GameGUITouch::drawAllocation()
 	auto *sprite = type->miniSpriteImage >= 0 ? type->miniSpritePtr : type->gameSpritePtr;
 	const int frame = type->miniSpriteImage >= 0 ? type->miniSpriteImage : type->gameSpriteImage;
 	SDL_Rect clip{int(rect.x), int(rect.y), int(rect.w), int(rect.h)};
-	sprite->setBaseColor(building->owner->color);
-	gfx->setUITransform(unit, rect.x + 4 * unit, rect.y + 4 * unit, &clip);
+	sprite->setBaseColor(building->owner.color);
+	const bool compact = !layout().persistentPanel;
+	const double factor = compact ? std::min({unit, 32 * unit / sprite->getW(frame),
+		(rect.h - 8 * unit) / sprite->getH(frame)}) : unit;
+	const double iconY = compact ? (rect.h - sprite->getH(frame) * factor) / 2 : 4 * unit;
+	gfx->setUITransform(factor, rect.x + 4 * unit, rect.y + iconY, &clip);
 	gfx->drawSprite(0, 0, sprite, frame);
 	gfx->setUITransform();
 	gfx->setClipRect();
 	const std::string name = Toolkit::getStringTable()->getString("[" + type->type + "]");
 	drawPointLabel(
-		{rect.x + 60 * unit, rect.y, std::max(0.0, rect.w - 108 * unit), rect.h},
+		{rect.x + (compact ? 40 : 60) * unit, rect.y,
+		 std::max(0.0, rect.w - (compact ? 88 : 108) * unit), rect.h},
 		GAGCore::FormattableString(Toolkit::getStringTable()->getString("[%0 · %1]"))
 				.arg(name)
 				.arg(type->level + 1) +
@@ -528,22 +558,60 @@ void GameGUITouch::drawAllocation()
 				GAGCore::Toolkit::getStringTable()->getString("[%0 / %1 HP · %2]"))
 				.arg(building->hp)
 				.arg(type->hpMax)
-				.arg(building->owner == gui.localTeam
+				.arg(building->owner.teamNumber == gui.drawnScene().panels.local.teamNumber
 						 ? std::string(
 							   GAGCore::Toolkit::getStringTable()->getString("[Your colony]"))
 						 : GAGCore::FormattableString(
 							   GAGCore::Toolkit::getStringTable()->getString("[Team %0]"))
-							   .arg(building->owner->teamNumber + 1)),
-		.85);
+							   .arg(building->owner.teamNumber + 1)),
+		compact ? .8 : .85);
 	drawPointLabel({rect.x + rect.w - 48 * unit, rect.y, 48 * unit, rect.h}, "×", 1.2);
+}
+
+GameGUITouch::HudLayout GameGUITouch::hudLayout(const MobileLayout &ui) const
+{
+	const auto safe = ui.safe;
+	const double unit = globalContainer->gfx->logicalUnitsPerPoint();
+	// Two stat rows need 56 points, then a 40-point identity bar and a gap.
+	// Reserve it for compact building inspection; other tools keep their usual
+	// minimap size. Wide landscapes have enough room for a single stat row.
+	const bool identity = inspecting() && !ui.persistentPanel;
+	const double side = (safe.h / unit < 400 && (!identity || safe.w / unit >= 680) ? 72 : 96) * unit;
+	HudLayout hud;
+	hud.minimap = {safe.x + safe.w - side - 4 * unit, safe.y + 4 * unit, side, side};
+	const double available = std::max(0.0, hud.minimap.x - 4 * unit - ui.world.x);
+	hud.columns = available / unit >= 600 ? 6 : 3;
+	const double cell = std::min(120 * unit, available / hud.columns);
+	hud.stats = {ui.world.x + (available - hud.columns * cell) / 2, safe.y + 4 * unit,
+				 std::max(0.0, hud.columns * cell - 3 * unit), (6 / hud.columns * 28 - 4) * unit};
+	const double header = InGameTouchTheme::inspectorHeader * unit;
+	hud.identity = {hud.stats.x, hud.minimap.y + hud.minimap.h - header, hud.stats.w, header};
+	return hud;
+}
+
+ViewRect GameGUITouch::statRect(const HudLayout &hud, int index) const
+{
+	const double unit = globalContainer->gfx->logicalUnitsPerPoint();
+	const double cell = (hud.stats.w + 3 * unit) / hud.columns;
+	return {hud.stats.x + (index % hud.columns) * cell,
+			hud.stats.y + (index / hud.columns) * 28 * unit, cell - 3 * unit, 24 * unit};
+}
+
+ViewRect GameGUITouch::speedRect() const
+{
+	if (!gui.canChangeGameSpeed())
+		return {};
+	const auto hud = hudLayout(layout());
+	auto rect = statRect(hud, 5);
+	// A thumb-sized target reaches below the cell unless the identity bar sits there.
+	if (!(inspecting() && !layout().persistentPanel))
+		rect.h = InGameTouchTheme::target * globalContainer->gfx->logicalUnitsPerPoint();
+	return rect;
 }
 
 ViewRect GameGUITouch::minimapRect() const
 {
-	const auto safe = layout().safe;
-	const double unit = globalContainer->gfx->logicalUnitsPerPoint();
-	const double side = (safe.h / unit < 400 ? 72 : 96) * unit;
-	return {safe.x + safe.w - side - 4 * unit, safe.y + 4 * unit, side, side};
+	return hudLayout(layout()).minimap;
 }
 void GameGUITouch::drawMinimap()
 {
@@ -554,7 +622,7 @@ void GameGUITouch::drawMinimap()
 	hudMinimap->setMinimapMode(globalContainer->replaying && !globalContainer->replayShowFog
 								   ? Minimap::HideFOW
 								   : Minimap::ShowFOW);
-	hudMinimap->draw(gui.localTeamNo, gui.viewportX, gui.viewportY,
+	hudMinimap->draw(gui.view.drawnScene(), gui.localTeamNo, gui.viewportX, gui.viewportY,
 					 int(std::ceil(gui.camera.visibleW() / 32)),
 					 int(std::ceil(gui.camera.visibleH() / 32)));
 	gfx->setUITransform();
@@ -642,7 +710,7 @@ std::vector<std::pair<std::string, int>> GameGUITouch::tacticalActions() const
 			{toggle(GAGCore::Toolkit::getStringTable()->getString("[show flags]"),
 					globalContainer->replayShowFlags),
 			 34}};
-		for (int i = 0; i < gui.game.teamsCount(); ++i)
+		for (int i = 0; i < gui.drawnScene().entities.teamCount; ++i)
 			playback.push_back(
 				{toggle((GAGCore::FormattableString(
 							 GAGCore::Toolkit::getStringTable()->getString("[View team %0]"))
@@ -655,6 +723,59 @@ std::vector<std::pair<std::string, int>> GameGUITouch::tacticalActions() const
 	}
 	return result;
 }
+bool GameGUITouch::inspectingResource() const
+{
+	return gui.selectionMode == GameGUI::RESOURCE_SELECTION;
+}
+
+std::optional<GameGUITouch::ResourceInfo> GameGUITouch::resourceInfo() const
+{
+	if (!inspectingResource()) return {};
+	const auto &r = gui.drawnScene().map.getResource(size_t(gui.selectionResource()));
+	if (r.type == NO_RES_TYPE) return {};
+	const auto *type = globalContainer->resourcesTypes.get(r.type);
+	ResourceInfo info;
+	info.name = getResourceName(r.type);
+	info.sprite = type->gfxId + r.variety * type->sizesCount + r.amount - (type->eternal ? 0 : 1);
+	if (type->granular)
+		info.amount = std::to_string(r.amount) + "/" + std::to_string(type->sizesCount);
+	return info;
+}
+
+bool GameGUITouch::inspectingReadOnly() const
+{
+	return inspectingResource() || gui.selectionMode == GameGUI::UNIT_SELECTION;
+}
+
+ViewRect GameGUITouch::readOnlyCloseRect() const
+{
+	const auto panel = layout().panel;
+	const double target = 48 * globalContainer->gfx->logicalUnitsPerPoint();
+	return {panel.x + panel.w - target, panel.y, target, target};
+}
+
+void GameGUITouch::drawResourceInfo()
+{
+	const auto info = resourceInfo();
+	if (!info) return;
+	auto *gfx = globalContainer->gfx;
+	const double unit = gfx->logicalUnitsPerPoint();
+	const auto panel = layout().panel;
+	drawPointLabel({panel.x + 8 * unit, panel.y, panel.w - 56 * unit, 48 * unit}, info->name, .9);
+	drawPointLabel(readOnlyCloseRect(), "×");
+	const ViewRect icon{panel.x + 16 * unit, panel.y + 52 * unit, 48 * unit, 48 * unit};
+	auto *sprite = globalContainer->resources;
+	const double factor = std::min(icon.w / sprite->getW(info->sprite), icon.h / sprite->getH(info->sprite));
+	SDL_Rect clip{int(panel.x), int(panel.y), int(panel.w), int(panel.h)};
+	gfx->setUITransform(factor, icon.x + (icon.w - sprite->getW(info->sprite) * factor) / 2,
+		icon.y + (icon.h - sprite->getH(info->sprite) * factor) / 2, &clip);
+	gfx->drawSprite(0, 0, sprite, info->sprite);
+	gfx->setUITransform();
+	gfx->setClipRect();
+	if (!info->amount.empty())
+		drawPointLabel({icon.x + icon.w + 8 * unit, icon.y, panel.w - 88 * unit, icon.h}, info->amount);
+}
+
 void GameGUITouch::drawTacticalPanel()
 {
 	auto *gfx = globalContainer->gfx;
@@ -672,4 +793,53 @@ void GameGUITouch::drawTacticalPanel()
 	}
 	labelClip.reset();
 	gfx->setClipRect();
+}
+
+std::vector<std::string> GameGUITouch::unitInfoRows() const
+{
+	const auto &u = gui.drawnScene().panels.unit;
+	if (!u.valid) return {};
+	auto *strings = Toolkit::getStringTable();
+	std::vector<std::string> rows{displayPlayerName(u.owner.firstPlayerName)};
+	auto value = [&](const char *key, std::string text) {
+		rows.push_back(std::string(strings->getString(key)) + ": " + text);
+	};
+	value("[hp]", std::to_string(u.hp) + " / " + std::to_string(u.performance[HP]));
+	value("[food]", std::to_string(u.hungry * 100 / Unit::HUNGRY_MAX) + "% (" + std::to_string(u.fruitCount) + ")");
+	value("[current speed]", std::to_string(u.speed));
+	if (u.performance[ARMOR]) value("[armor]", std::to_string(u.realArmor));
+	if (u.performance[HARVEST]) {
+		if (u.carriedResource < 0) rows.push_back(strings->getString("[don't carry anything]"));
+		else value("[carry]", getResourceName(u.carriedResource));
+	}
+	const std::pair<int, const char *> abilities[] = {{WALK,"[Walk]"}, {SWIM,"[Swim]"}, {BUILD,"[Build]"},
+		{HARVEST,"[Harvest]"}, {ATTACK_SPEED,"[At. speed]"}, {ATTACK_STRENGTH,"[At. strength]"},
+		{MAGIC_ATTACK_AIR,"[Magic At. Air]"}, {MAGIC_ATTACK_GROUND,"[Magic At. Ground]"}};
+	for (const auto &[ability,key] : abilities)
+		if (u.performance[ability]) {
+			const bool attack = ability == ATTACK_STRENGTH || ability == MAGIC_ATTACK_AIR || ability == MAGIC_ATTACK_GROUND;
+			const int strength = (u.performance[ability] + (attack ? u.experienceLevel : 0)) *
+				(ability == ATTACK_STRENGTH ? u.glassCannonScale : 1);
+			value(key, "(" + std::to_string(u.level[ability] + (ability == SWIM ? 0 : 1)) + ") " + std::to_string(strength));
+		}
+	if (u.performance[ATTACK_STRENGTH] || u.performance[MAGIC_ATTACK_AIR] || u.performance[MAGIC_ATTACK_GROUND])
+		rows.push_back("XP: " + std::to_string(u.experience) + " / " + std::to_string(u.nextLevelThreshold));
+	return rows;
+}
+
+void GameGUITouch::drawUnitPanel()
+{
+	const auto panel = layout().panel;
+	const double unit = globalContainer->gfx->logicalUnitsPerPoint();
+	const double row = 48 * unit * InGameTouchTheme::textGrowth();
+	const auto rows = unitInfoRows();
+	labelClip = panelContent();
+	globalContainer->gfx->setClipRect(int(labelClip->x), int(labelClip->y), int(labelClip->w), int(labelClip->h));
+	for (size_t i = 0; i < rows.size(); ++i)
+		drawPointLabel({panel.x, panel.y + 48 * unit + i * row - panelScroll * unit, panel.w, row}, rows[i], .9, true);
+	labelClip.reset();
+	globalContainer->gfx->setClipRect();
+	if (gui.drawnScene().panels.unit.valid)
+		drawPointLabel({panel.x, panel.y, panel.w - 48 * unit, 48 * unit}, getUnitName(gui.drawnScene().panels.unit.typeNum), 1.0, true);
+	drawPointLabel(readOnlyCloseRect(), "×", 1.2);
 }

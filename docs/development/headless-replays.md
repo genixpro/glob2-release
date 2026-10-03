@@ -9,7 +9,7 @@ Run AI games without a GUI to generate `.replay` files for cross-codebase fideli
 Version 121 gives each AI controller an independent saved random stream. Version
 122 also gives each Econo and Nicowar controller a private gradient cache. AI
 orders and game trajectories can differ from earlier versions for the same
-seed. Replays recorded before version 123 are refused; older saved games still
+seed. Replays recorded before version 127 are refused; older saved games still
 load, with shared gradient cache state copied into each controller. Network
 protocol version 46 rejects clients that still share these caches.
 
@@ -148,6 +148,61 @@ expected. Only the matchup AIs issue orders.
 ### `-test-games`
 
 Same as `-test-games-nox` but **with GUI** — useful for visually verifying AI behavior.
+
+## Verifying a match record
+
+```sh
+glob2 --verify-match <record.g2mr> --map <map-file> --out <dir> [--profile <name>]
+glob2 --sim-version
+```
+
+`--verify-match` replays a relay match record (the format is in the
+[turn protocol](../multiplayer/turn-protocol.md#match-record)) headlessly and judges the
+checksums the live clients reported. Pass absolute paths: a macOS build changes its
+working directory at startup. `--output-dir` is accepted for `--out`.
+
+It reads the record, parses its MatchSetup JSON and checks that the record's map hash
+and human seats agree with the setup. The map file must hash (SHA-256 of its
+decompressed bytes) to the setup's `map.hash`. It then builds the `GameHeader` from the
+setup with every human seat `P_IP`, as live clients do, and runs the match through
+`Engine::initTurnMatch` with the record standing in for the relay. Recorded human
+orders execute at their ticks and AI orders are computed locally. The end-of-replay GUI
+path is never involved, and a seat's quit order does not stop the run. The verifier
+takes the state checksum before every tick from 0 to the record's `endTick`, where a
+live client takes it, and compares every recorded report with it.
+
+Outputs in `<dir>`:
+
+| File | Contents |
+| --- | --- |
+| `verdict.json` | `{"verdict": "verified" \| "diverged" \| "unverifiable", "seats": [...], "reason": "..."}`; `seats` only when diverged, `reason` only when unverifiable. It also carries the protocol package's `VerifyVerdict` members: `clients` (the same seats) and, unless unverifiable, `outcome` (`finalTick`, per-team `outcome`, `prestige` and `eliminatedTick`, and the SHA-256 of `result.json` and `match.replay`). `orderRejections` lists each human seat that sequenced orders the engine refused: `seat`, `rejected`, `stale`, per-reason counts and `firstRejectedTick` (see order validation in `docs/multiplayer/turn-protocol.md`). |
+| `result.json` | The `--run-game` result format (`players`, `teams` with outcomes, `standard_statistics` and the 512-tick `history`, `winning_teams`) with `"job_type": "verify_match"`, the match id, both sim versions, the record flags, and a `verification` object (verdict, compared reports, first divergent tick per seat, and `order_checks`: per human seat, the orders accepted, stale and rejected, with reasons). It has no wall-clock fields, so a record verifies to the same bytes everywhere. |
+| `checksums.txt` | One `tick checksum` line (hexadecimal) for every tick from 0 to `endTick`. |
+| `match.replay` | A standard replay of the verified match, written by `ReplayWriter`. |
+| `artifacts.json` | The file manifest, as for `--run-game`. |
+
+The verdict is **verified** when every seat that reported matched at every tick it
+reported; **diverged** when some seats differ and at least one matched, with the
+differing seats listed; and **unverifiable** when no seat matched (engine
+nondeterminism or a corrupt record), when no report could be compared, or when the
+setup's sim version is not this build's (the run still completes and writes its trace).
+
+The exit code is 0 for any verdict. It is 2 for a bad request (unreadable or corrupt
+record, invalid setup, a map whose hash or team count does not match) and 3 for an
+engine or I/O failure; both write a `result.json` with `status` and `diagnostic`.
+
+`--sim-version` prints this build's simulation version as JSON,
+`{"versionMinor": ..., "netProtocol": ..., "dataHash": "<64 hex>"}`. Engine agents
+partition verification jobs by it; the definition of the data hash is in the
+[turn protocol](../multiplayer/turn-protocol.md#simulation-version).
+
+CI verifies `test/fixtures/multiplayer/FourSquares1.g2mr` on Linux, Windows and in
+three browsers (`test/run-browser-determinism.py` and `browser/tests/determinism.spec.js`)
+and requires the six `checksums.txt` traces to be identical. The committed
+`FourSquares1.verify-trace.txt` is the expected trace, and CI fails when the platforms
+agree on a different one; the engine test that checks it also regenerates both files
+under `--update-fixtures`. A change that moves the trace changed the simulation and
+must bump `SIM_REVISION` ([simulation version](../multiplayer/turn-protocol.md#simulation-version)).
 
 ## AI-Trainer Dataset Output
 
@@ -318,7 +373,12 @@ pending fields and their remaining deadlines without publishing them early;
 older saves remain loadable and start with an empty queue. The save compatibility
 floor remains 58. Version 123 narrows forbidden-zone invalidations to affected
 fields and gives escape fields an independent bounded refresh schedule. Replay
-versions before 123 are rejected because their routing schedule differs. Network
-protocol 46 rejects older and newer clients. Worker
-availability affects wall time only: the serial fallback publishes on the same
-ticks. Headless `--gradient-workers 0` is the deterministic serial control.
+versions before 123 used a different routing schedule. The current replay floor is
+127: the sixteen-team capacity changes Warrush's opening window from 24 to 32 ticks.
+Format 127 also counts Maxima opponents and script-generation team slots while
+keeping old saves loadable. Format 128 losslessly packs save data without changing
+that replay floor. Network protocol 51 requires compact-map readers and rejects
+older and newer clients. Background save finalization owns a captured state and
+does not advance simulation; continuation checks must still compare the same
+captured tick, seed and orders. Routing worker availability affects wall time only:
+the serial fallback publishes on the same ticks. Headless `--gradient-workers 0` is the deterministic serial control.

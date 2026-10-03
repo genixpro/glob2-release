@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
-#include <SDL_stdinc.h>
+#include <SDL3/SDL_stdinc.h>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -17,6 +17,9 @@ class Order;
 // Numeric diagnostic storage only. Never read by a gameplay decision.
 namespace AITelemetry
 {
+// Recorded replay rows contain presentation values, not a live controller schema.
+constexpr Uint32 ReplayPresentationSchema = 0x52504c31;
+constexpr unsigned MaximumPresentationValues = 4096 + 132;
 enum Type : Uint32
 {
 	Signed,
@@ -51,6 +54,12 @@ struct Sample
 	std::vector<Value> values;
 	bool operator==(const Sample &) const = default;
 };
+struct NamedValue
+{
+	std::string name, value, unit, meaning;
+	Uint32 updated = 0;
+	bool operator==(const NamedValue &) const = default;
+};
 struct Series
 {
 	int player = 0, implementation = 0;
@@ -59,6 +68,7 @@ struct Series
 	bool active = true;
 	bool schemaPrinted = false; // output state only; not saved
 	std::vector<Field> fields;
+	std::vector<NamedValue> named;
 	Sample current;
 	std::vector<Sample> history;
 };
@@ -112,8 +122,9 @@ class Sink
 		}
 	}
 };
+std::string displayValue(const Field &, const Value &);
 void capture(Team *team, bool retain, bool output, bool final = false);
 void save(GAGCore::OutputStream *stream, const std::vector<std::shared_ptr<Series>> &series);
-void load(GAGCore::InputStream *stream, std::vector<std::shared_ptr<Series>> &series);
+void load(GAGCore::InputStream *stream, std::vector<std::shared_ptr<Series>> &series, int versionMinor);
 void emit(Series &series, int team, bool final, bool describe = true);
 } // namespace AITelemetry

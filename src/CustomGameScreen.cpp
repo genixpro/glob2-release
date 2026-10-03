@@ -34,7 +34,10 @@ namespace
 {
 std::string tr(const std::string &s)
 {
-	return Toolkit::getStringTable()->getString("[" + s + "]");
+	const std::string text = Toolkit::getStringTable()->getString("[" + s + "]");
+	if (s == "Shared control needs a free controller slot (maximum %0).")
+		return FormattableString(text).arg(Team::MAX_COUNT);
+	return text;
 }
 std::vector<std::string> localized(std::vector<std::string> v)
 {
@@ -153,19 +156,44 @@ void CustomGameScreen::selectTab(int tab)
 
 bool CustomGameScreen::interceptEvent(const SDL_Event &event)
 {
-	if (event.type == SDL_KEYDOWN && (event.key.keysym.mod & KMOD_CTRL) && event.key.keysym.sym >= SDLK_1 &&
-		event.key.keysym.sym <= SDLK_3)
+	if (event.type == SDL_EVENT_KEY_DOWN && (event.key.mod & SDL_KMOD_CTRL) && event.key.key >= SDLK_1 &&
+		event.key.key <= SDLK_3)
 	{
-		selectTab(event.key.keysym.sym - SDLK_1);
+		selectTab(event.key.key - SDLK_1);
 		return true;
 	}
 	return false;
+}
+
+void CustomGameScreen::useForRoom(const CustomGameSetup &draft, int tab)
+{
+	forRoom = true;
+	setup = draft;
+	for (auto &colony : setup.colonies)
+		if (colony.ai == AI::JAVASCRIPT)
+		{
+			colony.ai = AI::NUMBI;
+			colony.aiLibraryId.clear();
+		}
+	// The editor opens on the room's generated map. A premade or own map chosen here
+	// is uploaded by the room (PlatformRoom::usePremadeMap); a random one is generated
+	// by the platform for everyone.
+	setup.random = true;
+	invalidatePreview();
+	selectTab(tab);
 }
 
 void CustomGameScreen::launch()
 {
 	if (!setup.validation().empty())
 		return;
+	if (forRoom)
+	{
+		if (!setup.random && !validMap)
+			return;
+		endExecute(OK);
+		return;
+	}
 	// A random map still resolving in the background: the disabled Start button
 	// and its "Generating preview..." note explain why, instead of blocking here
 	// on finishPreview()'s busy-wait with no visible feedback.
@@ -181,6 +209,16 @@ void CustomGameScreen::launch()
 		}
 	if (validMap)
 	{
+		try
+		{
+			freezeAIs();
+		}
+		catch (const std::exception &e)
+		{
+			message = e.what();
+			invalidate();
+			return;
+		}
 		savePreferences();
 		endExecute(OK);
 	}
@@ -220,14 +258,27 @@ std::string colorName(Color c)
 GameHeader &CustomGameScreen::getGameHeader()
 {
 	setup.writeHeader(gameHeader, username);
+	for (int i = 0; i < gameHeader.getNumberOfPlayers(); ++i)
+	{
+		gameHeader.setAIConfig(i, "");
+		auto &player = gameHeader.getBasePlayer(i);
+		if (player.type != BasePlayer::P_LOCAL &&
+			BasePlayer::implementationIdFromPlayerType(player.type) == AI::JAVASCRIPT)
+		{
+			const auto &id = setup.colonies[player.teamNumber].aiLibraryId;
+			auto source = frozenAIs.find(id);
+			if (source == frozenAIs.end())
+				throw std::runtime_error("Custom AI source was not frozen before launch");
+			gameHeader.setAIConfig(i, source->second);
+		}
+	}
 	gameHeader.getExperiments().clear();
 	Engine::applyLocalExperiments(gameHeader, mapHeader);
 	for (int i = 0; i < gameHeader.getNumberOfPlayers(); ++i)
 	{
 		auto &player = gameHeader.getBasePlayer(i);
 		if (player.type != BasePlayer::P_LOCAL)
-			player.name = AINames::getAIText(setup.colonies[player.teamNumber].ai) + " / " +
-						  colonyLabel(player.teamNumber);
+			player.name = aiLabel(player.teamNumber) + " / " + colonyLabel(player.teamNumber);
 	}
 	return gameHeader;
 }
@@ -746,6 +797,24 @@ void CustomGameScreen::setMapMode(bool random)
 
 void CustomGameScreen::showAIProfile(int colony)
 {
+	if (setup.colonies[colony].ai == AI::JAVASCRIPT)
+	{
+		message = aiLabel(colony);
+		if (aiLibrary)
+		{
+			try
+			{
+				message +=
+					"\n" + aiLibrary->get(setup.colonies[colony].aiLibraryId).metadata.description;
+			}
+			catch (const std::exception &e)
+			{
+				message = e.what();
+			}
+		}
+		invalidate();
+		return;
+	}
 	std::vector<std::string> labels;
 	for (int i : AINames::selectionOrder())
 		labels.push_back(AINames::getAISelectorText(i));
@@ -766,6 +835,18 @@ void CustomGameScreen::showAIProfile(int colony)
 
 Element CustomGameScreen::build(const Presentation &p)
 {
+	if (!forRoom && !aiLibrary)
+	{
+		try
+		{
+			aiStorage = Online::makeUserDirectoryStorage();
+			aiLibrary = std::make_unique<Script::Library>(*aiStorage);
+		}
+		catch (const std::exception &e)
+		{
+			message = e.what();
+		}
+	}
 	GAGCore::ApplicationHost::customGameReady(validMap && !previewBusy() && setup.validation().empty());
 	const bool narrow = p.compact() || p.safe.w < p.pt(720);
 	auto speed = globalContainer->settings;
@@ -796,9 +877,13 @@ Element CustomGameScreen::build(const Presentation &p)
 	const std::string summary = tr(setup.format) + "  /  " + std::to_string(setup.activeColonies()) + " " + tr("colonies") + "  /  " +
 								tr(setup.ruleset) + "  /  " + speed.getGameSpeedText();
 	const std::string note = error.empty() ? message : tr(error);
-	const bool ready = error.empty() && (!narrow || (validMap && !previewBusy() && (!setup.random || previewRevision == setup.mapRevision)));
-	const std::string startLabel = !setup.humanColony() ? tr(setup.random && !validMap ? "Generate & watch" : "Watch game")
-													  : tr(setup.random ? (validMap ? "Play this map" : "Generate & play") : "Start game");
+	bool ready = error.empty() && (!narrow || (validMap && !previewBusy() && (!setup.random || previewRevision == setup.mapRevision)));
+	if (forRoom)
+		ready = setup.validation().empty() && (setup.random || validMap);
+	std::string startLabel = !setup.humanColony() ? tr(setup.random && !validMap ? "Generate & watch" : "Watch game")
+												: tr(setup.random ? (validMap ? "Play this map" : "Generate & play") : "Start game");
+	if (forRoom)
+		startLabel = tr("Use in room");
 	std::vector<fe::MenuAction> footerActions;
 	if (phoneFlow)
 	{
@@ -1066,7 +1151,7 @@ CustomGameScreen::ColonyFields CustomGameScreen::colonyFields(int i, const Prese
 	}
 	fe::ChoiceOptions controllerOptions;
 	controllerOptions.enabled = enabled;
-	controllerOptions.help = tr("Shared control needs a free controller slot (maximum 12).");
+	controllerOptions.help = tr("Shared control needs a free controller slot (maximum %0).");
 	auto controller = fe::choice(id + "/controller", controllerNames, c.controller,
 								 [this, i](int value) { setup.setController(i, (CustomGameSetup::Controller)value); }, controllerOptions);
 	std::vector<std::string> teams;
@@ -1082,16 +1167,15 @@ CustomGameScreen::ColonyFields CustomGameScreen::colonyFields(int i, const Prese
 	Element aiControls;
 	if (hasAI)
 	{
-		std::vector<std::string> names;
-		for (int j : AINames::selectionOrder())
-			names.push_back(AINames::getAISelectorText(j));
-		const int selectedAI = AINames::selectionIndex(c.ai);
+		const auto names = aiChoices();
+		const int selectedAI = aiSelection(i);
 		// The choice and its strategy button share a line only when both fit.
 		aiControls = fe::adaptive(
-			[this, i, id, names, selectedAI, p](const fe::LayoutContext &, fe::Size available) -> Element
+			[this, i, id, names, selectedAI, p](const fe::LayoutContext &,
+												fe::Size available) -> Element
 			{
 				auto ai = fe::choice(id + "/ai", names, selectedAI,
-									 [this, i](int value) { setup.colonies[i].ai = (AI::ImplementationID)AINames::selectionOrder()[std::size_t(value)]; });
+									 [this, i](int value) { selectAI(i, value); });
 				auto info = fe::button(id + "/info", tr("AI strategy"), [this, i] { showAIProfile(i); });
 				if (available.w < p.textPt(300))
 					return fe::column({ai, info}, {p.pt(6)});
@@ -1111,13 +1195,15 @@ Element CustomGameScreen::playersTab(const Presentation &p, bool narrow)
 	const int selectedFormat = setup.format == "FFA" ? 0 : setup.format == "2 vs 2" ? 1 : setup.format == "You vs all" ? 2 : -1;
 	parts.push_back(fe::segments("format", localized({"FFA", "2 vs 2", "You vs all"}), selectedFormat, [this](int i) { setup.presetTeams(i); },
 								 {true, setup.activeColonies() == 4, bool(setup.humanColony()) && setup.activeColonies() > 1}));
-	parts.push_back(fe::caption(std::to_string(setup.controllerCount()) + " / 12 " + tr("controllers")));
+	parts.push_back(fe::caption(std::to_string(setup.controllerCount()) + " / " + std::to_string(Team::MAX_COUNT) + " " + tr("controllers")));
 	for (int i = 0; i < setup.capacity; ++i)
 	{
 		auto &c = setup.colonies[i];
-		const std::string summary = c.controller == CustomGameSetup::Human ? username
-									: c.controller == CustomGameSetup::Closed ? tr("This colony will not join the match.")
-																			  : AINames::getAISummary(c.ai);
+		const std::string summary =
+			c.controller == CustomGameSetup::Human ? username
+			: c.controller == CustomGameSetup::Closed
+				? tr("This colony will not join the match.")
+				: (c.ai == AI::JAVASCRIPT ? aiLabel(i) : AINames::getAISummary(c.ai));
 		// Side by side when the offered width holds the columns at the current
 		// text size (the desktop page is narrower than the window), else stacked.
 		auto layout = [this, i, p](bool stacked) -> Element
@@ -1140,6 +1226,8 @@ Element CustomGameScreen::playersTab(const Presentation &p, bool narrow)
 		cardOptions.padding = p.pt(10);
 		parts.push_back(fe::card(fe::column(std::move(body), {p.pt(6)}), cardOptions));
 	}
+	if (!forRoom)
+		parts.push_back(fe::caption(tr("Add JavaScript AIs in Settings → Custom AIs. They appear in each colony’s AI selector.")));
 	return fe::scroll("lobby/players", fe::column(std::move(parts), {p.pt(8)}));
 }
 
@@ -1348,4 +1436,88 @@ Element CustomGameScreen::rulesTab(const Presentation &p, bool narrow)
 							 fe::expanded(fe::caption(tr("* Changed from standard.")))},
 							{p.pt(12), fe::CrossAlign::Center}));
 	return fe::scroll("lobby/rules", fe::column(std::move(parts), {p.pt(8)}));
+}
+
+std::vector<std::string> CustomGameScreen::aiChoices() const
+{
+	std::vector<std::string> names;
+	for (int id : AINames::selectionOrder())
+		names.push_back(AINames::getAISelectorText(id));
+	if (!forRoom && aiLibrary)
+		for (const auto &entry : aiLibrary->entries())
+			names.push_back(entry.metadata.name + " · JavaScript #" + entry.id);
+	return names;
+}
+int CustomGameScreen::aiSelection(int colony) const
+{
+	const auto &c = setup.colonies[colony];
+	if (c.ai != AI::JAVASCRIPT)
+		return AINames::selectionIndex(c.ai);
+	if (!forRoom && aiLibrary)
+		for (std::size_t i = 0; i < aiLibrary->entries().size(); ++i)
+			if (aiLibrary->entries()[i].id == c.aiLibraryId)
+				return int(AINames::selectionOrder().size() + i);
+	return -1;
+}
+void CustomGameScreen::selectAI(int colony, int selection)
+{
+	if (selection < 0)
+		return;
+	auto &c = setup.colonies[colony];
+	const auto builtin = AINames::selectionOrder().size();
+	if (std::size_t(selection) < builtin)
+	{
+		c.ai = AI::ImplementationID(AINames::selectionOrder()[selection]);
+		c.aiLibraryId.clear();
+	}
+	else if (!forRoom && aiLibrary &&
+			 std::size_t(selection) - builtin < aiLibrary->entries().size())
+	{
+		c.ai = AI::JAVASCRIPT;
+		c.aiLibraryId = aiLibrary->entries()[selection - builtin].id;
+	}
+	frozenAIs.clear();
+}
+std::string CustomGameScreen::aiLabel(int colony) const
+{
+	const auto &c = setup.colonies[colony];
+	if (c.ai != AI::JAVASCRIPT)
+		return AINames::getAIText(c.ai);
+	try
+	{
+		if (aiLibrary)
+			return aiLibrary->get(c.aiLibraryId).metadata.name;
+	}
+	catch (...)
+	{
+	}
+	return tr("Missing custom AI");
+}
+void CustomGameScreen::freezeAIs()
+{
+	bool selected = false;
+	for (int i = 0; i < setup.capacity; ++i)
+		selected |= (setup.colonies[i].controller == CustomGameSetup::Computer ||
+			setup.colonies[i].controller == CustomGameSetup::Shared) &&
+			setup.colonies[i].ai == AI::JAVASCRIPT;
+	if (!selected)
+	{
+		frozenAIs.clear();
+		return;
+	}
+	if (!aiLibrary)
+	{
+		aiStorage = Online::makeUserDirectoryStorage();
+		aiLibrary = std::make_unique<Script::Library>(*aiStorage);
+	}
+	std::map<std::string, std::string> sources;
+	for (int i = 0; i < setup.capacity; ++i)
+	{
+		const auto &c = setup.colonies[i];
+		if ((c.controller == CustomGameSetup::Computer ||
+			 c.controller == CustomGameSetup::Shared) &&
+			c.ai == AI::JAVASCRIPT && !sources.contains(c.aiLibraryId))
+			sources.emplace(c.aiLibraryId, aiLibrary->configuration(c.aiLibraryId));
+	}
+	frozenAIs = std::move(sources);
 }

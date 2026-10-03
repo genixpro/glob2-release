@@ -21,18 +21,20 @@
 #include <BinaryStream.h>
 #include <TextStream.h>
 #include <StreamBackend.h>
+#include <ChunkedStreamBackend.h>
 
 #include "BuildingType.h"
 #include "DatasetWriter.h"
 #include "FileFormatVersions.h"
 #include "Game.h"
+#include <DeferredStream.h>
 #include "GameUtilities.h"
 #include "GlobalContainer.h"
 #include "Order.h"
 #include "Unit.h"
 #include "Integrity.h"
 #include "Utilities.h"
-#include "SDLCompat.h"
+#include <SDL3/SDL.h>
 
 
 #include "Brush.h"
@@ -154,6 +156,7 @@ bool Game::load(GAGCore::InputStream *stream)
 GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 {
 	assert(stream);
+	GAGCore::BinaryInputStream::CheckedReads checkedInput(stream);
     co_await GAGCore::CooperativeTask::checkpoint("[Loading headers]");
 
 	ReadSectionGuard gameSection(stream, "Game");
@@ -213,6 +216,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		teams[i]=new Team(this);
         if (!(co_await teams[i]->loadTask(stream, &globalContainer->buildingsTypes, versionMinor)))
             co_return false;
+		if (teams[i]->teamNumber != i) co_return false;
 		stream->readLeaveSection();
 	}
 	stream->readLeaveSection();
@@ -325,8 +329,36 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		GAGCore::BinaryInputStream::CheckedReads checked(stream);
 		stream->readEnterSection("scriptGenerations");
 		const bool text = dynamic_cast<GAGCore::TextInputStream *>(stream) != nullptr;
-		for (unsigned i = 0; i < scriptGenerations.size(); ++i)
+		// Formats 125/126 wrote two uncounted planes of twelve teams. Never use
+		// the current capacity to infer those historical lengths or plane offsets.
+		constexpr unsigned legacyTeamSlots = 12;
+		const unsigned savedTeamSlots = versionMinor >= FILE_FORMAT_VERSION_COUNTED_TEAM_STATE
+			? stream->readUint32("teamSlots") : legacyTeamSlots;
+		if (savedTeamSlots == 0 || savedTeamSlots < unsigned(mapHeader.getNumberOfTeams()) || savedTeamSlots > Team::MAX_COUNT)
+			throw std::runtime_error("Invalid script generation team-slot count");
+		const unsigned savedPlaneSize = savedTeamSlots * SCRIPT_ENTITY_SLOTS_PER_TEAM;
+		scriptGenerations.fill(0);
+        if(versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE && !text)
+        {
+            const auto count=stream->readCount("nonzero",SCRIPT_ENTITY_KINDS*savedPlaneSize);
+            Uint32 previous=0;
+            for(Uint32 n=0;n<count;++n)
+            {
+                const auto i=stream->readUint32("index");
+                const auto value=stream->readUint32("value");
+                if(i>=SCRIPT_ENTITY_KINDS*savedPlaneSize || (n && i<=previous) || !value)
+                    throw std::runtime_error("Invalid sparse script generations");
+                previous=i;
+                const unsigned inPlane=i%savedPlaneSize;
+                scriptGenerations[scriptGenerationIndex(i>=savedPlaneSize,
+                    inPlane/SCRIPT_ENTITY_SLOTS_PER_TEAM,inPlane%SCRIPT_ENTITY_SLOTS_PER_TEAM)]=value;
+            }
+        }
+        else for (unsigned i = 0; i < SCRIPT_ENTITY_KINDS * savedPlaneSize; ++i)
 		{
+			const unsigned inPlane = i % savedPlaneSize;
+			const unsigned destination = scriptGenerationIndex(i >= savedPlaneSize,
+				inPlane / SCRIPT_ENTITY_SLOTS_PER_TEAM, inPlane % SCRIPT_ENTITY_SLOTS_PER_TEAM);
 			stream->readEnterSection(i);
 			if (text)
 			{
@@ -335,18 +367,24 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 				const auto parsed = std::from_chars(encoded.data(), encoded.data() + encoded.size(), generation);
 				if (parsed.ec != std::errc{} || parsed.ptr != encoded.data() + encoded.size())
 					throw std::runtime_error("Invalid or missing script generation counter");
-				scriptGenerations[i] = generation;
+				scriptGenerations[destination] = generation;
 			}
-			else scriptGenerations[i] = stream->readUint32("value");
+			else scriptGenerations[destination] = stream->readUint32("value");
 			stream->readLeaveSection();
 		}
 		stream->readLeaveSection();
-        for(int t=0;t<mapHeader.getNumberOfTeams();++t)for(int i=0;i<1024;++i)
-        {
-            auto* u=teams[t]->myUnits[i];auto* b=teams[t]->myBuildings[i];
-            if(u && (!u->scriptIdentity || u->scriptIdentity!=scriptGenerations[t*1024+i]))throw std::runtime_error("Invalid unit script identity");
-            if(b && (!b->scriptIdentity || b->scriptIdentity!=scriptGenerations[Team::MAX_COUNT*1024+t*1024+i]))throw std::runtime_error("Invalid building script identity");
-        }
+		for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
+			for (int slot = 0; slot < SCRIPT_ENTITY_SLOTS_PER_TEAM; ++slot)
+			{
+				const auto *unit = teams[t]->myUnits[slot];
+				const auto *building = teams[t]->myBuildings[slot];
+				if (unit && (!unit->scriptIdentity || unit->scriptIdentity !=
+					scriptGenerations[scriptGenerationIndex(false, t, slot)]))
+					throw std::runtime_error("Invalid unit script identity");
+				if (building && (!building->scriptIdentity || building->scriptIdentity !=
+					scriptGenerations[scriptGenerationIndex(true, t, slot)]))
+					throw std::runtime_error("Invalid building script identity");
+			}
 	}
 	gameSection.commit();
 
@@ -362,7 +400,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 
 	if (versionMinor >= FILE_FORMAT_VERSION_CONTINUATION_STATE && mapHeader.getIsSavedGame())
 	{
-		syncRandEngine() = savedRandom;
+		syncRandom = savedRandom;
 		hasSavedRandomState = true;
 	}
 
@@ -500,6 +538,9 @@ bool Game::integrity(void)
 	return true;
 }
 
+// The legacy hash sees the header captured before backpatching. Hashing its
+// final serialized form instead would change save bytes, even with the same body.
+// Both storage adapters substitute initialHeader, then patch only the digest.
 void DeferredGameSHA1::apply(std::string& contents) const
 {
 	assert(start <= headerOffset && headerOffset + initialHeader.size() <= end && end <= contents.size());
@@ -514,6 +555,22 @@ void DeferredGameSHA1::apply(std::string& contents) const
 	unsigned char sha1[SHA1_BYTE_LEN];
 	SHA1Final(sha1, &context);
 	std::copy(sha1, sha1 + SHA1_BYTE_LEN, contents.begin() + sha1Offset);
+}
+
+void DeferredGameSHA1::apply(GAGCore::ChunkedBuffer& contents) const
+{
+    assert(start <= headerOffset && headerOffset + initialHeader.size() <= end && end <= contents.size());
+    assert(sha1Offset + SHA1_BYTE_LEN <= headerOffset + initialHeader.size());
+    SHA1_CTX context;
+    SHA1Init(&context);
+    const auto hash = [&context](const unsigned char* data, size_t size) { SHA1Update(&context, data, size); };
+    contents.forEachRange(start, headerOffset - start, hash);
+    SHA1Update(&context, reinterpret_cast<const unsigned char*>(initialHeader.data()), initialHeader.size());
+    const size_t afterHeader = headerOffset + initialHeader.size();
+    contents.forEachRange(afterHeader, end - afterHeader, hash);
+    unsigned char sha1[SHA1_BYTE_LEN];
+    SHA1Final(sha1, &context);
+    contents.writeAt(sha1Offset, sha1, SHA1_BYTE_LEN);
 }
 
 void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::string& name, DeferredGameSHA1* deferredSHA1)
@@ -551,16 +608,19 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 		MapHeader &header;
 		std::string savedMapName;
 		bool savedIsSavedGame;
-		MapHeaderRestoreGuard(MapHeader &h)
-			: header(h), savedMapName(h.getMapName()), savedIsSavedGame(h.getIsSavedGame()) {}
+        Uint32 savedMapOffset;
+        bool restoreOffset;
+		MapHeaderRestoreGuard(MapHeader &h,bool restoreOffset)
+			: header(h), savedMapName(h.getMapName()), savedIsSavedGame(h.getIsSavedGame()), savedMapOffset(h.getMapOffset()), restoreOffset(restoreOffset) {}
 		MapHeaderRestoreGuard(const MapHeaderRestoreGuard &) = delete;
 		MapHeaderRestoreGuard &operator=(const MapHeaderRestoreGuard &) = delete;
 		~MapHeaderRestoreGuard()
 		{
 			header.setMapName(savedMapName);
 			header.setIsSavedGame(savedIsSavedGame);
+            if(restoreOffset) header.setMapOffset(savedMapOffset);
 		}
-	} mapHeaderRestore(mapHeader);
+	} mapHeaderRestore(mapHeader,dynamic_cast<GAGCore::DeferredStream*>(stream)!=nullptr);
 
 	Uint32 mapHeaderOffset = stream->getPosition();
 	mapHeader.setMapName(name);
@@ -645,7 +705,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	{
 		std::ostringstream randomState;
 		randomState.imbue(std::locale::classic());
-		randomState << syncRandEngine();
+		randomState << syncRandom;
 		std::istringstream state(randomState.str());
 		state.imbue(std::locale::classic());
 		stream->writeEnterSection("randomState");
@@ -663,7 +723,24 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	}
 
 	stream->writeEnterSection("scriptGenerations");
-	for(unsigned i=0;i<scriptGenerations.size();++i){stream->writeEnterSection(i);stream->writeUint32(scriptGenerations[i],"value");stream->writeLeaveSection();}
+	stream->writeUint32(Team::MAX_COUNT, "teamSlots");
+    if(binary)
+    {
+        Uint32 count=0;
+        for(auto value:scriptGenerations) if(value) ++count;
+        stream->writeUint32(count,"nonzero");
+        for(unsigned i=0;i<scriptGenerations.size();++i) if(scriptGenerations[i])
+        {
+            stream->writeUint32(i,"index");
+            stream->writeUint32(scriptGenerations[i],"value");
+        }
+    }
+    else for (unsigned i = 0; i < scriptGenerations.size(); ++i)
+	{
+		stream->writeEnterSection(i);
+		stream->writeUint32(scriptGenerations[i], "value");
+		stream->writeLeaveSection();
+	}
 	stream->writeLeaveSection();
 
 	Uint8 sha1[SHA1_BYTE_LEN];

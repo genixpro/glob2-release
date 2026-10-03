@@ -71,15 +71,15 @@ struct CustomGamePreferences
 		// stay unchanged regardless of which generator module is selected.
 		const auto legacy = toLegacyDescriptor(setup.generator);
 		std::ostringstream out;
-		out << "glob2-custom-game 3\n"
-			<< "setup " << setup.random << ' ' << setup.capacity << ' '
-			<< setup.prestige << ' ' << setup.revealed << ' ' << setup.locked << ' '
-			<< setup.speed << ' ' << userMaps << '\n'
+		out << "glob2-custom-game 5\n"
+			<< "setup " << setup.random << ' ' << setup.capacity << ' ' << setup.prestige << ' '
+			<< setup.revealed << ' ' << setup.locked << ' ' << setup.speed << ' ' << userMaps
+			<< '\n'
 			<< "rules " << setup.noResourceGrowth << ' ' << setup.resourceScarcity << ' '
-			<< setup.instantConstruction << ' ' << setup.stockpileStart << ' ' << setup.noHunger << ' '
-			<< setup.unitUpgradesDisabled << ' ' << setup.glassCannonLevel << ' '
-			<< setup.unitsFearless << ' ' << setup.permadeathDisabled << ' ' << setup.peacefulMode << ' '
-			<< setup.buildingHpLevel << ' ' << setup.startingUnitLevel << ' '
+			<< setup.instantConstruction << ' ' << setup.stockpileStart << ' ' << setup.noHunger
+			<< ' ' << setup.unitUpgradesDisabled << ' ' << setup.glassCannonLevel << ' '
+			<< setup.unitsFearless << ' ' << setup.permadeathDisabled << ' ' << setup.peacefulMode
+			<< ' ' << setup.buildingHpLevel << ' ' << setup.startingUnitLevel << ' '
 			<< setup.suddenDeathMinutes << '\n'
 			<< "labels " << std::quoted(setup.format) << ' ' << std::quoted(setup.ruleset) << '\n'
 			<< "map " << std::quoted(setup.premadeMap) << '\n'
@@ -87,8 +87,7 @@ struct CustomGamePreferences
 			<< std::quoted(librarySelection[1]) << '\n'
 			<< "sections " << expanded[0] << ' ' << expanded[1] << ' ' << expanded[2] << '\n'
 			<< "picker " << landscapeSortOrder << '\n'
-			<< "generator " << int(legacy.method) << ' '
-			<< legacy.logRepeatAreaTimes << '\n';
+			<< "generator " << int(legacy.method) << ' ' << legacy.logRepeatAreaTimes << '\n';
 		for (const auto &f : fields())
 			out << f.name << ' ' << legacy.*(f.member) << '\n';
 		out << "resources";
@@ -102,9 +101,10 @@ struct CustomGamePreferences
 		out << "\noptions " << options.size() << '\n';
 		for (const auto *c : options)
 			out << c->id << ' ' << c->get(setup.generator) << '\n';
-		out << "colonies\n";
+		out << "colonies " << setup.colonies.size() << '\n';
 		for (const auto &c : setup.colonies)
-			out << int(c.controller) << ' ' << int(c.ai) << ' ' << c.alliance << '\n';
+			out << int(c.controller) << ' ' << int(c.ai) << ' ' << c.alliance << ' '
+				<< std::quoted(c.aiLibraryId) << '\n';
 		out << "end\n";
 		return out.str();
 	}
@@ -128,10 +128,11 @@ struct CustomGamePreferences
 			return true;
 		};
 		int version, random, prestige, revealed, locked, user, method, repeat;
-		if (!word("glob2-custom-game") || !number(version, 1, 3) || !word("setup") ||
+		if (!word("glob2-custom-game") || !number(version, 1, 5) || !word("setup") ||
 			!number(random, 0, 1) || !number(s.capacity, 1, Team::MAX_COUNT) ||
 			!number(prestige, 0, 1) || !number(revealed, 0, 1) || !number(locked, 0, 1) ||
-			!number(s.speed, 0, Settings::GAME_SPEED_MAXIMUM) || !number(user, 0, 1)) return false;
+			!number(s.speed, 0, Settings::GAME_SPEED_MAXIMUM) || !number(user, 0, 1))
+			return false;
 		// Older preferences did not store these rules; retain their normal defaults.
 		if (version >= 3) {
 			if (!word("rules") || !boolean(s.noResourceGrowth) || !number(s.resourceScarcity, 0, 3) ||
@@ -189,13 +190,22 @@ struct CustomGamePreferences
 			}
 			if (!word("colonies")) return false;
 		} else if (section != "colonies") return false;
+		// Versions 1–3 wrote exactly twelve uncounted colony records. Keep
+		// that wire size independent of the live cap; version 4 stores a count.
+		constexpr int legacyColonyCount = 12;
+		int colonyCount = legacyColonyCount;
+		if (version >= 4 && !number(colonyCount, 1, Team::MAX_COUNT)) return false;
+		if (s.capacity > colonyCount) return false;
 		int humans = 0;
-		for (auto &c : s.colonies) {
+		for (int i = 0; i < colonyCount; ++i) {
+			auto &c = s.colonies[i];
 			int controller, ai;
 			if (!number(controller, 0, CustomGameSetup::Closed) || !number(ai, 0, AI::SIZE - 1) ||
 				!number(c.alliance, 0, Team::MAX_COUNT - 1)) return false;
 			c.controller = CustomGameSetup::Controller(controller);
 			c.ai = AI::ImplementationID(ai);
+			if (version >= 5 && (!(in >> std::quoted(c.aiLibraryId)) || c.aiLibraryId.size() > 128))
+				return false;
 			humans += controller == CustomGameSetup::Human || controller == CustomGameSetup::Shared;
 		}
 		if (humans > 1 || !word("end")) return false;

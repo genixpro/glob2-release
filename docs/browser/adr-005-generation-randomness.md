@@ -9,9 +9,9 @@ The port does not retain the replaced Perlin/legacy generator implementation.
 
 `GenerationContext` owns named random streams. `GenerationService` saves and
 restores the calling thread's synchronized engine RNG around each complete roll.
-Native landscape previews retain their worker threads. The single-threaded browser
+Native and threaded browser landscape previews use the same worker threads. The serial browser fallback
 calls `LandscapePreviewer::poll()` to complete one queued generation attempt;
-no native thread is started in WebAssembly. The lobby and landscape picker both
+the serial WebAssembly runtime starts no worker threads. The lobby and landscape picker both
 service this queue. Failed attempts are requeued up to the same three-attempt
 budget. The picker starts work after layout, orders pending maps by distance
 from the viewport center, and only advances cards intersecting the viewport. It
@@ -49,6 +49,6 @@ and staged fertility publication against master's `Fertility::Field`.
 Native/WebAssembly simulation checks use the same retained saved-game bytes and
 compare per-tick checksums. This does not prove that every generator produces
 bit-identical maps across platforms: floating-point terrain generation needs
-separate qualification. YOG distributes the host's selected map file rather than
-asking clients to independently regenerate it, so all clients start with the same
-map bytes.
+separate qualification. Online rooms and LAN hosts distribute the selected map file (checked by its hash)
+rather than asking clients to independently regenerate it, so all clients start
+with the same map bytes.

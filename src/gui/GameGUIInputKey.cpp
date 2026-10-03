@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <algorithm>
 
-#include <SDL_keycode.h>
+#include <SDL3/SDL_keycode.h>
 
 #include <FormatableString.h>
 #include <StringTable.h>
@@ -16,6 +16,7 @@
 #include "GameGUIInternal.h"
 #include "GameGUIKeyActions.h"
 #include "GameUtilities.h"
+#include "EngineTiming.h"
 #include "GlobalContainer.h"
 #include "Order.h"
 #include "Player.h"
@@ -88,12 +89,56 @@ bool GameGUI::canChangeGameSpeed() const
 	return globalContainer->replaying || !game.gameHeader.hasNetworkPlayer();
 }
 
+static_assert(GameSpeedControl::presets.front() == Settings::GAME_SPEED_NORMAL &&
+	GameSpeedControl::presets.back() == Settings::GAME_SPEED_MAXIMUM);
+
+int GameGUI::litSpeedChevrons() const
+{
+	if (globalContainer->replaying && globalContainer->replayFastForward)
+		return GameSpeedControl::CHEVRONS;
+	return GameSpeedControl::lit(globalContainer->settings.gameSpeed);
+}
+
+void GameGUI::cycleGameSpeed(bool forwards)
+{
+	if(!canChangeGameSpeed())
+		return;
+	// The chevrons replace a replay's fast-forward instead of hiding behind it.
+	if (globalContainer->replaying)
+		globalContainer->replayFastForward = false;
+	const int speed=globalContainer->settings.gameSpeed;
+	setGameSpeed(forwards ? GameSpeedControl::faster(speed) : GameSpeedControl::slower(speed));
+}
+
+double GameGUI::targetTickRate() const
+{
+	int stepMs = GAME_TICK_MS;
+	if (canChangeGameSpeed())
+		stepMs = (globalContainer->replaying && globalContainer->replayFastForward)
+			? REPLAY_FAST_FORWARD_MS : globalContainer->settings.getGameSpeedStepDuration();
+	return stepMs > 0 ? 1000.0 / stepMs : 0;
+}
+
+int GameGUI::tickRateShortfall() const
+{
+	const auto rate = tickRate.rate();
+	const double target = targetTickRate();
+	if (!rate || target <= 0 || gamePaused || hardPause)
+		return 0;
+	return *rate < target * .75 ? 2 : *rate < target * .9 ? 1 : 0;
+}
+
 void GameGUI::changeGameSpeed(int amount)
+{
+	setGameSpeed(globalContainer->settings.gameSpeed+amount);
+}
+
+void GameGUI::setGameSpeed(int speed)
 {
 	if(!canChangeGameSpeed())
 		return;
 	const int oldSpeed=globalContainer->settings.gameSpeed;
-	globalContainer->settings.changeGameSpeed(amount);
+	globalContainer->settings.changeGameSpeed(speed-oldSpeed);
 	if(oldSpeed!=globalContainer->settings.gameSpeed)
 		globalContainer->settings.save();
 	addMessage(Color(230, 230, 230), FormattableString("%0: %1")
@@ -101,11 +146,11 @@ void GameGUI::changeGameSpeed(int amount)
 		.arg(globalContainer->settings.getGameSpeedText()), false);
 }
 
-void GameGUI::handleKey(SDL_Keysym key, bool pressed, bool repeat)
+void GameGUI::handleKey(SDL_KeyboardEvent key, bool pressed, bool repeat)
 {
 	if (!typingInputScreen)
 	{
-		if(key.sym == SDLK_SPACE && pressed && swallowSpaceKey)
+		if(key.key == SDLK_SPACE && pressed && swallowSpaceKey)
 		{
 			setIsSpaceSet(true);
 		}
@@ -116,12 +161,12 @@ void GameGUI::handleKey(SDL_Keysym key, bool pressed, bool repeat)
 			// Provide a fallback when the configurable shortcut system did not
 			// resolve an action; configured actions still take precedence.
 			if(action_t==GameGUIKeyActions::DoNothing && pressed
-				&& (key.mod&KMOD_CTRL))
+				&& (key.mod&SDL_KMOD_CTRL))
 			{
-				if(key.sym==SDLK_PLUS || key.sym==SDLK_EQUALS
-					|| key.sym==SDLK_KP_PLUS)
+				if(key.key==SDLK_PLUS || key.key==SDLK_EQUALS
+					|| key.key==SDLK_KP_PLUS)
 					action_t=GameGUIKeyActions::IncreaseGameSpeed;
-				else if(key.sym==SDLK_MINUS || key.sym==SDLK_KP_MINUS)
+				else if(key.key==SDLK_MINUS || key.key==SDLK_KP_MINUS)
 					action_t=GameGUIKeyActions::DecreaseGameSpeed;
 			}
 
@@ -166,6 +211,9 @@ void GameGUI::handleKey(SDL_Keysym key, bool pressed, bool repeat)
 						Building* selBuild = selectionBuilding();
 						int typeNum = selBuild->typeNum; //determines type of updated building
 						int unitWorking = defaultAssign.getDefaultAssignedUnits(typeNum - 1);
+						// Another team's building can be selected for viewing; its upgrade is not ours to cancel.
+						if (selBuild->owner->teamNumber != localTeamNo)
+							break;
 						if (selBuild->constructionResultState == Building::UPGRADE)
 							orderQueue.push_back(shared_ptr<Order>(new OrderCancelConstruction(selBuild->gid, unitWorking)));
 						else if ((selBuild->constructionResultState==Building::NO_CONSTRUCTION) && (selBuild->buildingState==Building::ALIVE))
@@ -252,7 +300,7 @@ void GameGUI::handleKey(SDL_Keysym key, bool pressed, bool repeat)
 				break;
 				case GameGUIKeyActions::PauseGame:
                     if(globalContainer->liveSpectating){hardPause=!hardPause;break;}
-					orderQueue.push_back(shared_ptr<Order>(new PauseGameOrder(!gamePaused)));
+					requestPause(!gamePaused);
 					break;
 				case GameGUIKeyActions::HardPause:
 					// Hard-pause freezes this client's entire order/checksum
@@ -297,6 +345,9 @@ void GameGUI::handleKey(SDL_Keysym key, bool pressed, bool repeat)
 						Building* selBuild = selectionBuilding();
 						int typeNum = selBuild->typeNum; //determines type of updated building
 						int unitWorking = defaultAssign.getDefaultAssignedUnits(typeNum);
+						// Another team's building can be selected for viewing; its repair is not ours to cancel.
+						if (selBuild->owner->teamNumber != localTeamNo)
+							break;
 						if (selBuild->constructionResultState == Building::REPAIR)
 							orderQueue.push_back(shared_ptr<Order>(new OrderCancelConstruction(selBuild->gid, unitWorking)));
 						else if ((selBuild->constructionResultState==Building::NO_CONSTRUCTION) && (selBuild->buildingState==Building::ALIVE))
@@ -435,13 +486,13 @@ void GameGUI::handleKeyAlways(void)
 		/* We check that only Control is held to avoid accidentally
 			matching window manager bindings for switching windows
 			and/or desktops. */
-		if (!(modState & (KMOD_ALT|KMOD_SHIFT)))
+		if (!(modState & (SDL_KMOD_ALT|SDL_KMOD_SHIFT)))
 		{
 			/* It violates good abstraction principles that I
 				have to do the calculations in the next two
 				lines.  There should be methods that abstract
 				these computations. */
-			if ((modState & KMOD_CTRL))
+			if ((modState & SDL_KMOD_CTRL))
 			{
 				/* We move by half screens if Control is held while
 					the arrow keys are held.  So we shift by 6

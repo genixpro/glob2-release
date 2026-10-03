@@ -7,6 +7,7 @@ import atexit
 from pathlib import Path
 sys.path.append( os.path.abspath("scons") )
 import bundle
+import official_instance
 import ccache
 import dmg
 import nsis
@@ -31,6 +32,9 @@ def establish_options(env):
     opts.Add("BINDIR", "Binary Installation Directory", "/usr/local/bin")
     opts.Add("DATADIR", "Directory where data will be put, set to the same as INSTALLDIR", "/usr/local/share")
     opts.Add(BoolVariable("release", "Build for release", 0))
+    opts.Add("size_optimization", "Opt-in GCC release experiment: none, gc, lto, size", "none")
+    opts.Add(BoolVariable("lean_images", "Use private PNG/JPEG/WebP SDL_image for native release packages", 0))
+    opts.Add("optimized_assets", "Optimize installed client assets: auto, 0, or 1", "auto")
     opts.Add(BoolVariable("china", "Build the mainland China local-play client", 0))
     opts.Add(BoolVariable("opengl", "Enable OpenGL detection; set to 0 for software rendering only", 1))
     opts.Add(BoolVariable("wss", "Enable native secure WebSocket transport", 1))
@@ -38,8 +42,8 @@ def establish_options(env):
     opts.Add(BoolVariable("mingw", "Build with mingw enabled if not auto-detected", 0))
     opts.Add(BoolVariable("mingwcross", "Cross-compile with mingw for Win32", 0))
     opts.Add("crossroot", "Path to include/ and lib/ containing Win32 files for cross-compiling", "../local")
-    opts.Add(BoolVariable("server", "Build only the YOG server, excluding the game and any GUI/sound components", 0))
     opts.Add("font", "Build the game using an alternative font placed in the data/font folder", "sans.ttf")
+    opts.Add("official_instance", "Origin of the official multiplayer platform instance", official_instance.DEFAULT_ORIGIN)
     Help(opts.GenerateHelpText(env))
     opts.Update(env)
     opts.Save(str(Path(env["BUILDDIR"]) / "options.py"), env)
@@ -69,7 +73,7 @@ class Configuration:
         self.f.write("#define %s %s\n" % (variable, value))
         self.f.write("\n")
     
-def configure(env, server_only):
+def configure(env, server_only, relay=False):
     """Configures glob2"""
     conf = Configure(env.Clone(), conf_dir=str(Path(env["BUILDDIR"]) / "configure"), log_file=str(Path(env["BUILDDIR"]) / "configure.log"))
     configfile = Configuration(env)
@@ -105,18 +109,19 @@ def configure(env, server_only):
         missing.append("CXX compiler")
 
     #Simple checks for required libraries
-    if not server_only and not conf.CheckLib("SDL2"):
-        print("Could not find libSDL2")
-        missing.append("SDL2")
-    if not server_only and not conf.CheckLib("SDL2_ttf"):
+    if not server_only and not conf.CheckLib("SDL3"):
+        print("Could not find libSDL3")
+        missing.append("SDL3")
+    if not server_only and not conf.CheckLib("SDL3_ttf"):
         print("Could not find libSDL_ttf")
-        missing.append("SDL2_ttf")
-    if not server_only and not conf.CheckLib("SDL2_image"):
-        print("Could not find libSDL2_image")
-        missing.append("SDL2_image")
-    if not conf.CheckLib("SDL2_net"):
-        print("Could not find libSDL2_net")
-        missing.append("SDL2_net")
+        missing.append("SDL3_ttf")
+    if not server_only and not conf.CheckLib("SDL3_image"):
+        print("Could not find libSDL3_image")
+        missing.append("SDL3_image")
+    # The relay links no SDL library; it only needs SDL's headers for libgag's types.
+    if not relay and not conf.CheckLib("SDL3_net"):
+        print("Could not find libSDL3_net")
+        missing.append("SDL3_net")
     if not server_only and (not conf.CheckLib("speex") or not conf.CheckCXXHeader("speex/speex.h")):
         print("Could not find libspeex or could not find 'speex/speex.h'")
         missing.append("speex")
@@ -157,15 +162,14 @@ def configure(env, server_only):
     if not env["wss"]:
         print("Native multiplayer requires WSS; wss=0 is no longer supported")
         Exit(1)
-    if True:
-        if not conf.CheckCXXHeader("openssl/ssl.h") or not conf.CheckLib("ssl") or not conf.CheckLib("crypto"):
-            missing.append("OpenSSL development headers and libraries")
-        env.Append(LIBS=["ssl", "crypto"])
-        # Boost.Beast and Boost.Asio (header-only) implement the WebSocket and TLS
-        # transport; nothing else in the game uses Boost.
-        if not conf.CheckCXXHeader("boost/beast/websocket.hpp") or not conf.CheckCXXHeader("boost/asio/ssl.hpp"):
-            missing.append("Boost.Beast and Boost.Asio headers")
-        configfile.add("GLOB2_NATIVE_WSS", "Defined when native secure WebSocket support is compiled")
+    if not conf.CheckCXXHeader("openssl/ssl.h") or not conf.CheckLib("ssl") or not conf.CheckLib("crypto"):
+        missing.append("OpenSSL development headers and libraries")
+    env.Append(LIBS=["ssl", "crypto"])
+    # Boost.Beast and Boost.Asio (header-only) implement the WebSocket and TLS
+    # transport; nothing else in the game uses Boost.
+    if not conf.CheckCXXHeader("boost/beast/websocket.hpp") or not conf.CheckCXXHeader("boost/asio/ssl.hpp"):
+        missing.append("Boost.Beast and Boost.Asio headers")
+    configfile.add("GLOB2_NATIVE_WSS", "Defined when native secure WebSocket support is compiled")
     if env["mingw"] or env["mingwcross"] or isWindowsPlatform:
         env.Append(LIBS=["ws2_32", "mswsock", "crypt32"])
     elif sys.platform == 'darwin':
@@ -320,6 +324,7 @@ def main():
     env['ENV'].update(TMPDIR=temporary, TMP=temporary, TEMP=temporary)
     env["VERSION"] = PACKAGE_VERSION
     establish_options(env)
+    env.Append(CPPDEFINES=official_instance.cppdefines(official_instance.origin({'official_instance': env['official_instance']})))
     # SCons treats a command-line flag string as one shell argument unless it
     # is split into a list. Distro RPM macros provide multiple flags at once.
     for flags in ('CXXFLAGS', 'LINKFLAGS'):
@@ -330,10 +335,10 @@ def main():
     if env['release'] and not isDarwinPlatform:
         for flags in ('CXXFLAGS', 'LINKFLAGS'):
             env[flags] = [flag for flag in env.Split(env[flags]) if flag != '-g']
-    env["server"] = identity["role"] in ("server", "router")
+    # "server" means a build without the game client: the match relay.
+    env["server"] = identity["role"] == "relay"
     env["role"] = identity["role"]
-    if identity["role"] == "router":
-        env.Append(CPPDEFINES=["GLOB2_ROUTER_ONLY"])
+    relay = identity["role"] == "relay"
 
     # Emit compile_commands.json for clangd / IDE LSPs.
     env.Tool('compilation_db')
@@ -386,16 +391,56 @@ def main():
         env.Append(LIBPATH=[crossroot_abs + '/lib'])
         env.Append(CPPPATH=[crossroot_abs + '/include'])
 
-    server_only = False
-    if env['server']:
-        env.Append(CPPDEFINES=["YOG_SERVER_ONLY"])
-        server_only = True
+    # Optional isolated dependency prefix, shared by native CI and local builds.
+    sdl_prefix = os.environ.get('GLOB2_SDL3_PREFIX')
+    if sdl_prefix:
+        sdl_prefix = str(Path(sdl_prefix).resolve())
+        env.Prepend(CPPPATH=[sdl_prefix + '/include'], LIBPATH=[sdl_prefix + '/lib'])
+        env['ENV']['PKG_CONFIG_PATH'] = sdl_prefix + '/lib/pkgconfig' + os.pathsep + os.environ.get('PKG_CONFIG_PATH', '')
+        env.Append(RPATH=[sdl_prefix + '/lib'])
+        env['ENV']['PATH'] = sdl_prefix + '/bin' + os.pathsep + env['ENV'].get('PATH', '')
+        if not isDarwinPlatform and not isWindowsPlatform and not env['mingw'] and not env['mingwcross']:
+            # RPATH entries undergo another SCons expansion; protect the linker
+            # flag directly so the loader receives a literal $ORIGIN.
+            env.Append(LINKFLAGS=[env.Literal("-Wl,-rpath,$ORIGIN/../lib/glob2")])
+            runtime = env.Install(str(Path(env['BINDIR']).parent / 'lib/glob2'),
+                                  [path for path in Path(sdl_prefix, 'lib').glob('libSDL3*.so*')
+                                   if not (identity.get('lean_images') and path.name.startswith('libSDL3_image'))])
+            env.Alias('install', runtime)
+            for license in Path(sdl_prefix, 'share/licenses').glob('SDL3*/LICENSE.txt'):
+                notices = env.Install(str(Path(env['INSTALLDIR']) / 'glob2/licenses' / license.parent.name), str(license))
+                env.Alias('install', notices)
+
+    server_only = relay
     env.Append(CXXFLAGS=["-std=gnu++20"])
     # Strict C++ mode omits MinGW's nonstandard WIN32 alias. Legacy platform
     # guards rely on it (including disabling the Unix OSS audio backend).
     if env['mingw'] or isWindowsPlatform or env['mingwcross']:
         env.Append(CPPDEFINES=["WIN32"])
-    configure(env, server_only)
+    if isDarwinPlatform and env['release'] and not server_only and any(
+            target in COMMAND_LINE_TARGETS for target in ('bundle', 'package')) and not GetOption('clean') and not GetOption('no_exec'):
+        from mac_image_dependency import ensure
+        image_environment = dict(os.environ)
+        image_environment.update(env["ENV"])
+        if sdl_prefix:
+            image_environment["GLOB2_SDL3_PREFIX"] = sdl_prefix
+        image_prefix = ensure(Path.cwd(), jobs=2, environment=image_environment)
+        env.Prepend(LIBPATH=[str(image_prefix/'lib')], CPPPATH=[str(image_prefix/'include')])
+        env['LEAN_IMAGE_PREFIX'] = str(image_prefix)
+    if identity.get('lean_images') and not GetOption('clean') and not GetOption('no_exec'):
+        from native_image_dependency import ensure
+        image_environment = dict(os.environ)
+        image_environment.update(env['ENV'])
+        image_prefix = ensure(Path.cwd(), cc=str(env['CC']), cxx=str(env['CXX']), jobs=2, environment=image_environment)
+        env.Prepend(LIBPATH=[str(image_prefix/'lib')], CPPPATH=[str(image_prefix/'include/SDL3')])
+        env['LEAN_IMAGE_PREFIX'] = str(image_prefix)
+        from build_layout import write_if_changed
+        import json
+        write_if_changed(Path(bdir)/'image-runtime.json', json.dumps({'prefix': str(image_prefix)})+'\n')
+        if not (isWindowsPlatform or env['mingw']):
+            # The staged private decoder is next to the executable's lib tree.
+            env.Append(LINKFLAGS=[r'-Wl,-rpath,\$$ORIGIN/../lib/glob2'])
+    configure(env, server_only, relay)
 
     env.Append(CPPPATH=['#'+path for path in INCLUDE_DIRECTORIES])
     env.Append(CXXFLAGS=["-Wall", "-fPIC"])
@@ -406,9 +451,10 @@ def main():
         env.Append(CXXFLAGS=['-ftrivial-auto-var-init=' + _detinit])
         env.Append(CCFLAGS=' -ftrivial-auto-var-init=' + _detinit)
     env.Append(LINKFLAGS=["-Wall"])
-    env.Append(LIBS=['SDL2_net'])
+    if not relay:
+        env.Append(LIBS=['SDL3_net'])
     if not server_only:
-        env.Append(LIBS=['vorbisfile', 'SDL2_ttf', 'SDL2_image', 'speex'])
+        env.Append(LIBS=['vorbisfile', 'SDL3_ttf', 'SDL3_image', 'speex'])
 
     if env['release']:
         env.Append(CXXFLAGS=["-O3"])
@@ -416,6 +462,8 @@ def main():
         if not isDarwinPlatform:
             env.Append(CXXFLAGS=["-s"])
             env.Append(LINKFLAGS=["-s", "-fwhole-program"])
+    from size_optimization import apply as apply_size_optimization
+    apply_size_optimization(env, env['size_optimization'])
     if env['profile']:
         env.Append(CXXFLAGS=["-pg"])
         env.Append(LINKFLAGS=["-pg"])
@@ -425,9 +473,11 @@ def main():
         # TODO: Remove unneccessary dependencies for server.
         env.Append(LIBS=['vorbis', 'ogg', 'wsock32', 'winmm'])
         env.Append(LINKFLAGS=['-mwindows'])
-        env.ParseConfig("pkg-config sdl2 --cflags --libs")
+        env.ParseConfig("pkg-config sdl3 --cflags --libs")
+    elif relay:
+        env.ParseConfig("pkg-config sdl3 --cflags")
     else:
-        env.ParseConfig("pkg-config sdl2 --cflags --libs")
+        env.ParseConfig("pkg-config sdl3 --cflags --libs")
     
     
     env["TARFILE"] = env.Dir("#").abspath + "/glob2-" + env["VERSION"] + ".tar.gz"
@@ -451,11 +501,13 @@ def main():
     PackTar(env["TARFILE"], Split("tools/icons/export_tabler.cjs libgag/include/ui/Icon.h"))
     PackTar(env["TARFILE"], [p for p in sorted(__import__("glob").glob("third_party/**/*", recursive=True)) if os.path.isfile(p)])
     #packaging for apple
-    if isDarwinPlatform and env["release"] and "package" in COMMAND_LINE_TARGETS:
+    if isDarwinPlatform and env["release"] and any(
+            target in COMMAND_LINE_TARGETS for target in ("bundle", "package")):
         bundle.generate(env)
         dmg.generate(env)
         env.Replace(
             BUNDLE_NAME=bdir+"/Glob2",
+            BUNDLE_SYMBOL_DIR=bdir+"/symbols",
             BUNDLE_BINARIES=[bdir+"/src/glob2"],
             BUNDLE_RESOURCEDIRS=["data","maps", "campaigns", "scripts"],
             BUNDLE_PLIST="darwin/Info.plist",
@@ -475,9 +527,14 @@ def main():
         # A Dir node, not a string: bundleEmitter looks the app up as a directory,
         # and a string target would already have been created as a File.
         application = env.Bundle(env.Dir(env["BUNDLE_NAME"] + ".app"), env["BUNDLE_BINARIES"])
-        image = env.Dmg("Glob2-%s.dmg" % env["VERSION"], application)
-        env.Alias("bundle", [application, image])
-        env.Alias("package", [application, image])
+        from tools.package_assets import source_files
+        bundle_assets = [str(p) for p in source_files(Path.cwd(), 'macos')]
+        env.Depends(application, bundle_assets + ['tools/package_assets.py', 'tools/asset-requirements.txt',
+            'scons/bundle.py', 'scons/addDependentLibsToBundle.py', Value(bundle_assets)])
+        env.Alias("bundle", application)
+        if "package" in COMMAND_LINE_TARGETS:
+            image = env.Dmg("Glob2-%s.dmg" % env["VERSION"], application)
+            env.Alias("package", [application, image])
 
         import subprocess
         arch = subprocess.check_output(["uname", "-p"], text=True).strip()
@@ -495,7 +552,6 @@ def main():
         "data",
         "debian",
         "fedora",
-        "gnupg",
         "libgag",
         "libusl",
         "maps",
@@ -507,6 +563,17 @@ def main():
         "tools",
         "windows"
     ]
+    from runtime_assets import optimized_install_enabled
+    optimized_install = optimized_install_enabled(env['release'], env['optimized_assets']) and not env['server'] and 'install' in COMMAND_LINE_TARGETS
+    if optimized_install and 'dist' in COMMAND_LINE_TARGETS:
+        raise ValueError('Run release install and source dist as separate SCons invocations')
+    if optimized_install:
+        from runtime_assets import install_assets
+        install_assets(env)
+    env['OPTIMIZED_ASSET_INSTALL'] = bool(optimized_install)
+    if identity.get('lean_images') and env.get('LEAN_IMAGE_PREFIX') and 'install' in COMMAND_LINE_TARGETS and not (isWindowsPlatform or env['mingw']):
+        from install_image_runtime import install_runtime
+        install_runtime(env, env['LEAN_IMAGE_PREFIX'])
     for target in targets:
         # Upstream release archives omit the historical Debian packaging files.
         if target == "debian" and not os.path.isfile("debian/SConscript"):

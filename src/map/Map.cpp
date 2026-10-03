@@ -1,21 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include <atomic>
 #include "Map.h"
 #include "gradient/GradientRuntime.h"
 #include "Game.h"
-#ifndef YOG_SERVER_ONLY
 #include "render/SoftwareTerrainCache.h"
-#endif
 #include "Utilities.h"
 #include "Unit.h"
 #include "MapInternal.h"
 #include "BuildingGradientSearch.h"
 #include <algorithm>
 
-#ifndef YOG_SERVER_ONLY
 #include "render/GameAnimations.h"
-#endif  // !YOG_SERVER_ONLY
 
 
 
@@ -98,6 +95,22 @@ Map::~Map(void)
 	clear();
 }
 
+std::shared_ptr<const std::vector<Uint8>> Map::frozenWaterSnapshot() const
+{
+	// Executor jobs may initialize together; terrain edits remain serialized by
+	// simulation scheduling. This mutex protects cache creation, not terrain writes.
+	std::lock_guard<std::mutex> lock(waterSnapshotMutex);
+	if (!waterSnapshot)
+	{
+		auto snapshot = std::make_shared<std::vector<Uint8>>(size);
+		// Called by independent executor jobs too; do not dispatch while holding
+		// this lock. All readers share this one initialization pass.
+		for (size_t i = 0; i < size; ++i) (*snapshot)[i] = isWater(static_cast<unsigned>(i));
+		waterSnapshot = std::move(snapshot);
+	}
+	return waterSnapshot;
+}
+
 Uint16 *Map::acquireBuildingGradientBuffer()
 {
 	{
@@ -141,9 +154,15 @@ void Map::configureCompute(unsigned threads, unsigned experiments)
 
 void Map::clear()
 {
+	static std::atomic<Uint64> nextIdentity{1};
+	identityValue = nextIdentity.fetch_add(1);
 	gradientRuntime->pipeline.reset();
 	clearGradientBufferPool();
 	clearBuildingGradientSearchPool();
+	{
+		std::lock_guard<std::mutex> lock(waterSnapshotMutex);
+		waterSnapshot.reset();
+	}
 	growthCoverage.clear();
 	for (auto &counts : growthCoverageCounts) counts.clear();
 	for (auto &buildings : growthCoverageBuildings) buildings.clear();
@@ -204,9 +223,6 @@ void Map::clear()
 
 void Map::setSize(int wDec, int hDec, TerrainType terrainType)
 {
-#ifndef YOG_SERVER_ONLY
-    if (game) game->softwareTerrainCache.reset();
-#endif
 
 	clear();
 
@@ -267,7 +283,5 @@ void Map::setGame(Game *game)
 	assert(sectors);
 	for (int i=0; i<sizeSector; i++)
 		sectors[i].setGame(game);
-#ifndef YOG_SERVER_ONLY
 	game->animations->resize(sizeSector);
-#endif  // !YOG_SERVER_ONLY
 }

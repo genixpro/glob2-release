@@ -8,6 +8,7 @@
 #ifndef AI_MAXIMA_RUNTIME_H
 #define AI_MAXIMA_RUNTIME_H
 
+#include "field/Frontier.h"
 #include "AIImplementation.h"
 #include "Map.h"
 #include "Order.h"
@@ -268,7 +269,7 @@ public:
 	bool has_sources() const { return sourceCount!=0; }
 private:
 	friend class GradientManager;
-	void recalculate(Player* player);
+	void recalculate(Player* player, field::Frontier& frontier);
 	GradientInfo info;
 	int width;
 	int sourceCount;
@@ -285,12 +286,13 @@ public:
 	void update(Uint32 worldStep);
 	void invalidate();
 	void saveExecutionState(GAGCore::OutputStream*) const;
-	void loadExecutionState(GAGCore::InputStream*);
+	void loadExecutionState(GAGCore::InputStream*, Sint32 versionMinor);
 private:
 	int find(const GradientInfo& info) const;
 	Player* player;
 	std::vector<std::shared_ptr<Gradient> > gradients;
 	std::vector<int> ages;
+	field::Frontier frontier; // transient, shared by this manager's fields
 	std::queue<int> queued;
 	std::set<int> queuedIndexes;
 	Uint32 lastWorldStep;

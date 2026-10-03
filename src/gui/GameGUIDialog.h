@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 #pragma once
 #include "ui/FrontendUI.h"
+#include "Team.h"
 #include <GraphicContext.h>
 #include <array>
 #include <optional>
@@ -25,10 +26,21 @@ class InGameMainScreen : public Glob2UI::InGameDialog
 		OPTIONS = 2,
 		RETURN_GAME = 5,
 		QUIT_GAME = 6,
-		PAUSE_GAME = 7
+		PAUSE_GAME = 7,
+		AI_TELEMETRY = 8
 	};
 	explicit InGameMainScreen(bool isReplay = false, bool canSave = true, bool paused = false);
 	Glob2UI::Element build(const Glob2UI::Presentation &presentation) override;
+	/// A networked (turn-protocol) game: no Load or Save, and "Leave match" instead
+	/// of "Quit the game".
+	void setNetworked(bool value) { networked = value; }
+	/// Network matches: what the Pause item says and whether it can be used (a
+	/// queue match's pause limit, TurnLockstepSession). Pause shows on both looks there.
+	void setPauseOffer(std::string label, bool enabled)
+	{
+		pauseLabel = std::move(label);
+		pauseEnabled = enabled;
+	}
 
   protected:
 	void onEscape() override { finish(RETURN_GAME); }
@@ -36,6 +48,29 @@ class InGameMainScreen : public Glob2UI::InGameDialog
 
   private:
 	bool replay, canSave, paused;
+	bool networked = false;
+	std::string pauseLabel;
+	bool pauseEnabled = true;
+};
+
+/// A yes/no question over the game ("Leave match?"), Cancel on Escape.
+class InGameConfirmScreen : public Glob2UI::InGameDialog
+{
+  public:
+	enum
+	{
+		CANCEL = 0,
+		CONFIRM = 1
+	};
+	InGameConfirmScreen(std::string title, std::string body, std::string confirmLabel, std::string cancelLabel);
+	Glob2UI::Element build(const Glob2UI::Presentation &presentation) override;
+
+  protected:
+	void onEscape() override { finish(CANCEL); }
+	double maxWidth() const override { return classic() ? 420 : -1; }
+
+  private:
+	std::string title, body, confirmLabel, cancelLabel;
 };
 
 class InGameEndOfGameScreen : public Glob2UI::InGameDialog
@@ -102,7 +137,9 @@ class InGameAllianceScreen : public Glob2UI::InGameDialog
 
   protected:
 	void onEscape() override { finish(OK); }
-	double maxWidth() const override { return classic() ? (rows.size() > 8 ? 580 : 300) : -1; }
+	double maxWidth() const override { return classic() ? (rows.size() > 8 ? 580 : 300) : 640; }
+	GAGGUI::ui::Rect available(const Glob2UI::Presentation &p, const GAGGUI::ui::Metrics &m) override
+	{ return insetAvailable(p, m); }
 
   private:
 	GameGUI *gameGUI;
@@ -110,8 +147,8 @@ class InGameAllianceScreen : public Glob2UI::InGameDialog
 	bool editable = true;
 	int players = 0;
 	// Settings of every player of the local team, kept for the masks.
-	std::array<bool, 16> ownAlliance{}, ownNormal{}, ownFood{}, ownMarket{}, ownChat{};
-	std::array<int, 16> teamOf{};
+	std::array<bool, Team::MAX_COUNT> ownAlliance{}, ownNormal{}, ownFood{}, ownMarket{}, ownChat{};
+	std::array<int, Team::MAX_COUNT> teamOf{};
 	bool &field(Entry &entry, Setting setting) const;
 	// Players of one team share alliance and vision.
 	void mirror(int player, Setting setting);
@@ -188,8 +225,9 @@ class InGameObjectivesScreen : public Glob2UI::InGameDialog
 
   protected:
 	void onEscape() override { finish(OK); }
-	bool fillHeight() const override { return !classic(); }
-	double maxWidth() const override { return classic() ? 450 : -1; }
+	double maxWidth() const override { return classic() ? 450 : 560; }
+	GAGGUI::ui::Rect available(const Glob2UI::Presentation &p, const GAGGUI::ui::Metrics &m) override
+	{ return insetAvailable(p, m); }
 
   private:
 	struct Line
@@ -201,4 +239,24 @@ class InGameObjectivesScreen : public Glob2UI::InGameDialog
 	std::string briefing;
 	std::vector<Line> primary, secondary, hints;
 	bool hasSecondary = false;
+};
+
+// Reads only access-filtered immutable Scene data.
+class InGameAITelemetryScreen : public Glob2UI::InGameDialog
+{
+  public:
+	explicit InGameAITelemetryScreen(GameGUI *gui) : gui(gui) {}
+	Glob2UI::Element build(const Glob2UI::Presentation &p) override;
+
+  protected:
+	void onEscape() override { finish(0); }
+	void onUpdate(Uint32) override;
+	double maxWidth() const override { return 720; }
+	bool fillHeight() const override { return true; }
+
+  private:
+	GameGUI *gui;
+	int player = -1;
+	Uint32 sample = ~0u, accessiblePlayers = 0;
+	std::string search;
 };

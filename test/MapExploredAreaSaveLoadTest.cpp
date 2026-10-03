@@ -13,10 +13,11 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
-#include <SDL.h>
+#include <SDL3/SDL.h>
 #include "BinaryStream.h"
 #include "StreamBackend.h"
 #include "Map.h"
+#include "Version.h"
 
 using namespace GAGCore;
 
@@ -99,7 +100,7 @@ void testRoundTripRestoresEveryTeam()
 	auto istream = writeSection(original);
 
 	TeamMap loaded;
-	loaded.loadExploredArea(istream.get(), kTeams, true);
+	loaded.loadExploredArea(istream.get(), kTeams, true, VERSION_MINOR);
 
 	bool allAllocated = true;
 	bool allEqual = true;
@@ -129,7 +130,7 @@ void testDiscardConsumesSectionWithoutAllocating()
 	auto istream = writeSection(original);
 
 	TeamMap loaded;
-	loaded.loadExploredArea(istream.get(), kTeams, false);
+	loaded.loadExploredArea(istream.get(), kTeams, false, VERSION_MINOR);
 
 	bool noneAllocated = true;
 	for (int t = 0; t < Team::MAX_COUNT; t++)

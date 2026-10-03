@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <Environment.h>
 #include "Headless.h"
 #include "script/ScriptCommand.h"
+#include "script/ScriptRuntime.h"
 #include "script/ScriptValue.h"
 #include "PerformanceTelemetry.h"
 #include "Engine.h"
@@ -17,11 +19,20 @@
 #include "GenerationRequest.h"
 #include "GeneratorRegistry.h"
 #include "ReplayWriter.h"
+#include "SimVersion.h"
+#include <nlohmann/json.hpp>
 #include <BinaryStream.h>
 #include <FileManager.h>
 #include <Toolkit.h>
 #include <algorithm>
 #include <chrono>
+#include <ctime>
+#ifdef WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -56,6 +67,7 @@ void writeJson(const std::string &path, const std::string &json)
 	fs::rename(temporary, path);
 }
 }
+
 namespace
 {
 using Headless::quote;
@@ -89,13 +101,13 @@ void isolateEnvironment()
 		"GLOB2_MAXIMA_PLAYER_OVERRIDES", "GLOB2_MAXIMA_TUNING", "GLOB2_NICOWAR_V3_OVERRIDES",
 		"GLOB2_NICOWAR_V3_TUNING", "GLOB2_MAXIMA_TELEMETRY", "GLOB2_DATASET_PATH",
 		"GLOB2_CHECKSUM_SIDECAR", "GLOB2_REPLAY_PATH", "GLOB2_TEAM_TIMELINE", "GLOB2_TEAM_RESULTS",
-		"GLOB2_DUMP_GAME", "GLOB2_STUDY_EXPLAIN", "GLOB2_USER_DIR",
+		"GLOB2_DUMP_GAME", "GLOB2_STUDY_EXPLAIN", "GLOB2_USER_DIR", "GLOB2_USER_DATA_DIR",
 		"GLOB2_PERF_DISABLE", "GLOB2_PERF_BUILD_LABEL",
 		"GLOB2_CORTEX_POLICY", "GLOB2_CORTEX_NET", "GLOB2_CORTEX_DECISION_NET",
 		"GLOB2_CORTEX_TRACE", "GLOB2_CORTEX_DECIDE_TRACE", "GLOB2_CORTEX_INN_TRACE",
 		"GLOB2_CHECKSUM_SIDECAR_MAX_TICKS", "CORTEX_DUMP_PERIODIC", "CORTEX_DUMP_OFFENSE",
 		"CORTEX_DUMP_ATTACK", "CORTEX_DUMP_GATES", "CORTEX_DUMP_POSTURE", "CORTEX_DUMP_AMPHIB"};
-	for (const char* key : keys) SDL_setenv(key, "", 1);
+	for (const char* key : keys) SDL_UnsetEnvironmentVariable(SDL_GetEnvironment(), key);
 	// getenv-based presence flags need removal, including on Windows.
 	for (const char* key : keys)
 #ifdef WIN32
@@ -106,12 +118,29 @@ void isolateEnvironment()
 }
 void setHeadlessEnvironment(const char* key, const char* value)
 {
-	SDL_setenv(key, value, 1);
+	GAGCore::setProcessEnvironment(key, value, 1);
 #ifdef WIN32
 	// The engine reads these flags with the C runtime's getenv. On Windows,
 	// SDL's environment update does not repopulate the runtime view after the
 	// isolation step removed the key with _putenv_s.
 	_putenv_s(key, value);
+#endif
+}
+uint64_t processCpuNs()
+{
+#ifdef WIN32
+	FILETIME created, exited, kernel, user;
+	if (!GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))
+		throw std::runtime_error("Cannot read process CPU time");
+	ULARGE_INTEGER k{},u{}; k.LowPart=kernel.dwLowDateTime;k.HighPart=kernel.dwHighDateTime;
+	u.LowPart=user.dwLowDateTime;u.HighPart=user.dwHighDateTime;
+	return (k.QuadPart+u.QuadPart)*100;
+#elif defined(CLOCK_PROCESS_CPUTIME_ID)
+	timespec time{};
+	if(clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&time)!=0) throw std::runtime_error("Cannot read process CPU time");
+	return uint64_t(time.tv_sec)*1000000000+time.tv_nsec;
+#else
+	return uint64_t(std::clock())*1000000000/CLOCKS_PER_SEC;
 #endif
 }
 void jsonArray(std::ostream& out, int value) { out << value; }
@@ -151,11 +180,77 @@ void manifest(const fs::path &directory)
 }
 }
 
+void Headless::writeManifest(const std::string &directory)
+{
+	manifest(fs::path(directory));
+}
+
+void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::vector<Sint32> &eliminatedTicks)
+{
+	bool comma=false;
+	result << "\"players\":[";
+	for(int p=0;p<game.gameHeader.getNumberOfPlayers();++p)
+	{
+		const auto &bp=game.gameHeader.getBasePlayer(p);
+		if(p) result << ',';
+		result << "{\"player\":" << p << ",\"team\":" << bp.teamNumber << ",\"ai\":"
+			<< quote(bp.type>=BasePlayer::P_AI ? AINames::getCLIName(BasePlayer::implementationIdFromPlayerType(bp.type)) : bp.type==BasePlayer::P_IP ? "human" : "local")
+			<< ",\"runtime_values\":" << quote(game.gameHeader.getAIConfig(p)) << '}';
+	}
+	result << "],\"teams\":[";
+	std::set<int> winningAlliances; std::vector<int> winningTeams;
+	for(int t=0;t<game.mapHeader.getNumberOfTeams();++t)
+	{
+		Team *team=game.teams[t];
+		int units=0,workers=0,explorers=0,warriors=0,buildings=0,sites=0;
+		long long warriorHP=0,warriorAttack=0;
+		for(int i=0;i<Unit::MAX_COUNT;++i) if(const Unit *u=team->myUnits[i])
+		{
+			++units;workers+=u->typeNum==WORKER;explorers+=u->typeNum==EXPLORER;
+			if(u->typeNum==WARRIOR){++warriors;warriorHP+=u->hp;warriorAttack+=u->getRealAttackStrength();}
+		}
+		for(int i=0;i<Building::MAX_COUNT;++i) if(const Building *b=team->myBuildings[i])
+			if(!b->type->isVirtual){if(b->type->isBuildingSite)++sites;else ++buildings;}
+		int alliance=game.gameHeader.getAllyTeamNumber(t);
+		if(team->hasWon){winningTeams.push_back(t);winningAlliances.insert(alliance);}
+		if(t) result << ',';
+		result << "{\"team\":" << t << ",\"alliance\":" << alliance << ",\"allies_mask\":" << team->allies
+			<< ",\"start\":[" << team->startPosX << ',' << team->startPosY << "],\"alive\":" << (team->isAlive?"true":"false")
+			<< ",\"outcome\":" << quote(team->hasWon?"won":team->hasLost?"lost":"unresolved")
+			<< ",\"eliminated_tick\":" << eliminatedTicks[t] << ",\"prestige\":" << team->prestige
+			<< ",\"units\":" << units << ",\"workers\":" << workers << ",\"explorers\":" << explorers
+			<< ",\"warriors\":" << warriors << ",\"warrior_hp\":" << warriorHP << ",\"warrior_attack\":" << warriorAttack
+			<< ",\"buildings\":" << buildings << ",\"sites\":" << sites;
+		const TeamStat &stats=*team->stats.getLatestStat();
+		result << ",\"standard_statistics\":"; standardStatistics(result,stats);
+		result << ",\"statistics\":{\"total_units\":" << stats.totalUnit << ",\"total_buildings\":" << stats.totalBuilding
+			<< ",\"total_hp\":" << stats.totalHP << ",\"total_attack_power\":" << stats.totalAttackPower
+			<< ",\"total_defense_power\":" << stats.totalDefensePower << ",\"food\":" << stats.totalFood
+			<< ",\"food_capacity\":" << stats.totalFoodCapacity << ",\"need_food\":" << stats.needFood << "},\"history\":[";
+		comma=false;
+		for(const auto &stat:team->stats.getEndOfGameStats())
+		{
+			if(comma)result<<',';comma=true;result<<'[';
+			for(int k=0;k<EndOfGameStat::TYPE_NB_STATS;++k){if(k)result<<',';result<<stat.value[k];}
+			result<<']';
+		}
+		result << "]}";
+	}
+	result << "],\"winning_teams\":[";
+	comma=false;for(int t:winningTeams){if(comma)result<<',';comma=true;result<<t;}
+	result << "],\"winning_alliances\":[";
+	comma=false;for(int t:winningAlliances){if(comma)result<<',';comma=true;result<<t;}
+	result << "],\"unresolved\":" << (winningTeams.empty()?"true":"false");
+}
+
 struct HeadlessRunner
 {
 	static int game(const Options &options, const fs::path &output)
 	{
 		const auto setupStart = std::chrono::steady_clock::now();
+		const bool benchmark=options.count("--benchmark-warmup")!=0;
+		const auto setupCpuStart=benchmark?processCpuNs():0;
+		const unsigned benchmarkWarmup=integer(one(options,"--benchmark-warmup","0"),0,std::numeric_limits<int>::max());
 		const unsigned gradientWorkers = integer(one(options, "--gradient-workers", "1"), 0, 16);
 		const unsigned gradientDelay = integer(one(options, "--gradient-delay", "8"), 1, 16);
 		GlobalContainer globals(one(options, "--profile", "glob2-tournament").c_str());
@@ -200,7 +295,6 @@ struct HeadlessRunner
 		{
 			for(const auto &key : {"--player","--ai-param","--ai-script","--map-script","--alliance","--win-condition","--game-seed","--experiment"})
 				if(options.count(key)) throw std::invalid_argument(std::string(key)+" cannot override a saved game");
-			if(Engine::loadGameHeader(saved).getNumberOfPlayers()==0) throw std::invalid_argument("saved game has no players");
 			if(engine.initCustom(saved)!=Engine::EE_NO_ERROR) throw std::invalid_argument("cannot load saved game");
 			if(globals.automaticEndingSteps <= int(engine.gui.game.stepCounter)) throw std::invalid_argument("tick limit must exceed the saved tick");
 		}
@@ -281,7 +375,8 @@ struct HeadlessRunner
 				const auto colon=assignment.find(':');if(colon==std::string::npos)throw std::invalid_argument("Expected --ai-script player:source.js");
 				int p=integer(assignment.substr(0,colon),0,players.size()-1);
 				if(!scriptedPlayers.insert(p).second || BasePlayer::implementationIdFromPlayerType(header.getBasePlayer(p).type)!=AI::JAVASCRIPT)throw std::invalid_argument("AI script requires a unique JavaScript player");
-				header.setAIConfig(p,Script::config(Script::readSource(assignment.substr(colon+1))));
+				const auto source = Script::readSource(assignment.substr(colon + 1));
+				header.setAIConfig(p, Script::config(source, Script::inspectAI(source).apiVersion));
 			}
 			for(size_t p=0;p<players.size();++p)if(BasePlayer::implementationIdFromPlayerType(header.getBasePlayer(p).type)==AI::JAVASCRIPT && !scriptedPlayers.count(p))throw std::invalid_argument("JavaScript player requires --ai-script");
 			engine.gui.localPlayer=0;engine.gui.localTeamNo=0;
@@ -318,10 +413,32 @@ struct HeadlessRunner
 		}
 		if(initial) engine.saveInitialGameStateOrExit((output/"initial.game").string(),"initial",engine.gui.game.mapHeader.getMapName());
 		const auto runStart = std::chrono::steady_clock::now();
-		engine.run();
-		engine.gui.game.map.finishGradientPipeline();
+		uint64_t setupCpu=0,runCpu=0,measureStart=0;
+		unsigned measuredTicks=0;
+		if(benchmark)
+		{
+			const uint64_t first=engine.gui.game.stepCounter;
+			const uint64_t start=first+benchmarkWarmup;
+			if(start>=uint64_t(globals.automaticEndingSteps)) throw std::invalid_argument("benchmark warmup must leave measured ticks");
+			setupCpu=processCpuNs()-setupCpuStart;
+			engine.prepareRun(); engine.beginSession(SDL_GetTicks());
+			if(benchmarkWarmup==0) measureStart=processCpuNs();
+			while(engine.gui.isRunning)
+			{
+				engine.stepSession(SDL_GetTicks()); engine.drawSession();
+				if(!measureStart && engine.gui.game.stepCounter>=start) measureStart=processCpuNs();
+			}
+			engine.finishSession();
+			engine.gui.game.map.finishGradientPipeline();
+			if(!measureStart || engine.gui.game.stepCounter<=start) throw std::runtime_error("game ended before benchmark measurement");
+			runCpu=processCpuNs()-measureStart;
+			measuredTicks=engine.gui.game.stepCounter-start;
+		}
+		else { engine.run(); engine.gui.game.map.finishGradientPipeline(); }
 		const auto runEnd = std::chrono::steady_clock::now();
+		const auto saveCpuStart=benchmark?processCpuNs():0;
 		if(final) engine.saveInitialGameStateOrExit((output/"final.game").string(),"final",engine.gui.game.mapHeader.getMapName());
+		const auto saveCpu=benchmark?processCpuNs()-saveCpuStart:0;
 		PerformanceTelemetry::collector().capture(engine.gui.game.stepCounter, true, true);
 		PerformanceTelemetry::collector().reset();
 		Game &game=engine.gui.game;
@@ -329,6 +446,10 @@ struct HeadlessRunner
 		engine.trackTeamEliminations();
 		std::ostringstream result;
 		result << "{\"schema_version\":1,\"job_type\":\"game\",\"status\":\"completed\",\"ticks\":" << game.stepCounter
+			<< ",\"benchmark_setup_cpu_ns\":" << setupCpu
+			<< ",\"benchmark_run_cpu_ns\":" << runCpu
+			<< ",\"benchmark_save_cpu_ns\":" << saveCpu
+			<< ",\"benchmark_measured_ticks\":" << measuredTicks
 			<< ",\"setup_ns\":" << std::chrono::duration_cast<std::chrono::nanoseconds>(runStart - setupStart).count()
 			<< ",\"run_ns\":" << std::chrono::duration_cast<std::chrono::nanoseconds>(runEnd - runStart).count()
 			<< ",\"gradient_pipeline\":" << "true"
@@ -359,59 +480,8 @@ struct HeadlessRunner
 		result << "],\"experiments\":[";
 		comma=false;
 		for(const auto &key:game.gameHeader.getExperiments().keys()) { if(comma)result<<',';comma=true;result<<quote(key); }
-		result << "]},\"players\":[";
-		for(int p=0;p<game.gameHeader.getNumberOfPlayers();++p)
-		{
-			const auto &bp=game.gameHeader.getBasePlayer(p);
-			if(p) result << ',';
-			result << "{\"player\":" << p << ",\"team\":" << bp.teamNumber << ",\"ai\":"
-				<< quote(bp.type>=BasePlayer::P_AI ? AINames::getCLIName(BasePlayer::implementationIdFromPlayerType(bp.type)) : "local")
-				<< ",\"runtime_values\":" << quote(game.gameHeader.getAIConfig(p)) << '}';
-		}
-		result << "],\"teams\":[";
-		std::set<int> winningAlliances; std::vector<int> winningTeams;
-		for(int t=0;t<game.mapHeader.getNumberOfTeams();++t)
-		{
-			Team *team=game.teams[t];
-			int units=0,workers=0,explorers=0,warriors=0,buildings=0,sites=0;
-			long long warriorHP=0,warriorAttack=0;
-			for(int i=0;i<Unit::MAX_COUNT;++i) if(const Unit *u=team->myUnits[i])
-			{
-				++units;workers+=u->typeNum==WORKER;explorers+=u->typeNum==EXPLORER;
-				if(u->typeNum==WARRIOR){++warriors;warriorHP+=u->hp;warriorAttack+=u->getRealAttackStrength();}
-			}
-			for(int i=0;i<Building::MAX_COUNT;++i) if(const Building *b=team->myBuildings[i])
-				if(!b->type->isVirtual){if(b->type->isBuildingSite)++sites;else ++buildings;}
-			int alliance=game.gameHeader.getAllyTeamNumber(t);
-			if(team->hasWon){winningTeams.push_back(t);winningAlliances.insert(alliance);}
-			if(t) result << ',';
-			result << "{\"team\":" << t << ",\"alliance\":" << alliance << ",\"allies_mask\":" << team->allies
-				<< ",\"start\":[" << team->startPosX << ',' << team->startPosY << "],\"alive\":" << (team->isAlive?"true":"false")
-				<< ",\"outcome\":" << quote(team->hasWon?"won":team->hasLost?"lost":"unresolved")
-				<< ",\"eliminated_tick\":" << engine.teamEliminatedTick[t] << ",\"prestige\":" << team->prestige
-				<< ",\"units\":" << units << ",\"workers\":" << workers << ",\"explorers\":" << explorers
-				<< ",\"warriors\":" << warriors << ",\"warrior_hp\":" << warriorHP << ",\"warrior_attack\":" << warriorAttack
-				<< ",\"buildings\":" << buildings << ",\"sites\":" << sites;
-			const TeamStat &stats=*team->stats.getLatestStat();
-			result << ",\"standard_statistics\":"; standardStatistics(result,stats);
-			result << ",\"statistics\":{\"total_units\":" << stats.totalUnit << ",\"total_buildings\":" << stats.totalBuilding
-				<< ",\"total_hp\":" << stats.totalHP << ",\"total_attack_power\":" << stats.totalAttackPower
-				<< ",\"total_defense_power\":" << stats.totalDefensePower << ",\"food\":" << stats.totalFood
-				<< ",\"food_capacity\":" << stats.totalFoodCapacity << ",\"need_food\":" << stats.needFood << "},\"history\":[";
-			comma=false;
-			for(const auto &stat:team->stats.getEndOfGameStats())
-			{
-				if(comma)result<<',';comma=true;result<<'[';
-				for(int k=0;k<EndOfGameStat::TYPE_NB_STATS;++k){if(k)result<<',';result<<stat.value[k];}
-				result<<']';
-			}
-			result << "]}";
-		}
-		result << "],\"winning_teams\":[";
-		comma=false;for(int t:winningTeams){if(comma)result<<',';comma=true;result<<t;}
-		result << "],\"winning_alliances\":[";
-		comma=false;for(int t:winningAlliances){if(comma)result<<',';comma=true;result<<t;}
-		result << "],\"unresolved\":" << (winningTeams.empty()?"true":"false");
+		result << "]},";
+		Headless::playersAndTeamsJson(result, game, engine.teamEliminatedTick);
 		if(fs::exists(output/"generated/result.json"))
 		{
 			std::ifstream generation(output/"generated/result.json");
@@ -427,18 +497,29 @@ int runHeadlessCommand(int argc,char **argv)
 {
 	if(argc<2) return -1;
 	const std::string command=argv[1];
-	if(command!="--headless-catalog" && command!="--run-game" && command!="--generate-map") return -1;
+	if(command!="--headless-catalog" && command!="--run-game" && command!="--generate-map"
+		&& command!="--verify-match" && command!="--sim-version" && command!="--turn-client") return -1;
 	fs::path output;
 	try
 	{
 		isolateEnvironment();
+		if(command=="--verify-match") return runVerifyMatch(argc,argv);
+		if(command=="--turn-client") return runTurnClient(argc,argv);
+		if(command=="--sim-version")
+		{
+			if(argc!=2) throw std::invalid_argument("--sim-version takes no arguments");
+			GlobalContainer globals("glob2-sim-version");
+			globalContainer=&globals;globals.runNoX=true;
+			std::cout << Online::currentSimVersion().toJson().dump() << std::endl;
+			return 0;
+		}
 		if(command=="--headless-catalog")
 		{
 			if(argc!=2) throw std::invalid_argument("catalog takes no arguments");
 			GlobalContainer globals("glob2-tournament-catalog");
 			globalContainer=&globals;globals.runNoX=true;
 			std::cout << "{\"schema_version\":1,\"save_version\":" << VERSION_MINOR << ",\"protocol_version\":" << NET_PROTOCOL_VERSION
-				<< ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"ai_telemetry_version\":1,\"performance_telemetry_version\":1,\"commands\":[\"game\",\"generate_map\"],\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\"],\"ais\":[";
+				<< ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"ai_telemetry_version\":1,\"performance_telemetry_version\":1,\"commands\":[\"game\",\"generate_map\",\"verify_match\",\"sim_version\"],\"sim_version\":" << Online::currentSimVersion().toJson().dump() << ",\"verify_match_version\":1,\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\"],\"ais\":[";
 			bool comma=false;
 			for(int ai:AINames::selectionOrder())
 			{
@@ -455,7 +536,7 @@ int runHeadlessCommand(int argc,char **argv)
 			std::cout << "}" << std::endl;return 0;
 		}
 		const std::set<std::string> common={"--output-dir","--profile"};
-		const std::set<std::string> gameKeys={"--ai-script","--map-script","--map-file","--load-game","--game-seed","--player","--ai-param","--alliance","--win-condition","--experiment","--ticks","--compute-threads","--compute-experiments","--gradient-workers","--gradient-delay","--save","--telemetry","--replay","--generator","--map-seed","--param","--candidates"};
+		const std::set<std::string> gameKeys={"--benchmark-warmup","--ai-script","--map-script","--map-file","--load-game","--game-seed","--player","--ai-param","--alliance","--win-condition","--experiment","--ticks","--compute-threads","--compute-experiments","--gradient-workers","--gradient-delay","--save","--telemetry","--replay","--generator","--map-seed","--param","--candidates"};
 		const std::set<std::string> mapKeys={"--generator","--map-seed","--param","--candidates","--rotations","--write-map","--report","--perturb"};
 		Options options;
 		for(int i=2;i<argc;++i)
@@ -469,7 +550,8 @@ int runHeadlessCommand(int argc,char **argv)
 		output=fs::absolute(one(options,"--output-dir"));
 		fs::create_directories(output);
 		fs::create_directories(output / "profile");
-		SDL_setenv("GLOB2_USER_DIR", (output / "profile").string().c_str(), 1);
+		setHeadlessEnvironment("GLOB2_USER_DIR", (output / "profile").string().c_str());
+		setHeadlessEnvironment("GLOB2_USER_DATA_DIR", (output / "profile").string().c_str());
 		if(fs::exists(output/"result.json")) throw std::invalid_argument("output directory already contains a result");
 		int code;
 		if(command=="--run-game")
@@ -491,7 +573,8 @@ int runHeadlessCommand(int argc,char **argv)
 					manifest(output);return generated;
 				}
 				options["--map-file"]={glob2GzipWritePath((output/"generated/map-r0.map").string())};
-				SDL_setenv("GLOB2_USER_DIR",(output/"profile").string().c_str(),1);
+				setHeadlessEnvironment("GLOB2_USER_DIR",(output/"profile").string().c_str());
+				setHeadlessEnvironment("GLOB2_USER_DATA_DIR",(output/"profile").string().c_str());
 			}
 			else if(options.count("--map-seed") || options.count("--param") || options.count("--candidates"))
 				throw std::invalid_argument("generator options require --generator");

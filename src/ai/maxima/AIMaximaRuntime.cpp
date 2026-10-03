@@ -1,3 +1,5 @@
+#include "field/UniformTraversal.h"
+#include "FileFormatVersions.h"
 #include <PerformanceTelemetry.h>
 #include "AITelemetryFields.h"
 #include "AIMaximaRuntime.h"
@@ -70,7 +72,7 @@ namespace Entities
 {
 Entity* Entity::load(GAGCore::InputStream* stream)
 {
-	const EntityType kind=static_cast<EntityType>(stream->readUint8("type"));
+	const Uint8 kind=stream->readUint8("type");
 	switch(kind)
 	{
 		case EBuilding:
@@ -97,7 +99,7 @@ Entity* Entity::load(GAGCore::InputStream* stream)
 		}
 		case ESand: return new Sand;
 	}
-	return NULL;
+	throw std::runtime_error("Unknown saved gradient entity");
 }
 
 Building::Building(int buildingType, int team, bool includeConstruction)
@@ -228,24 +230,24 @@ void GradientInfo::save(GAGCore::OutputStream* stream) const
 bool GradientInfo::load(GAGCore::InputStream* stream)
 {
 	sources.clear();obstacles.clear();stream->readEnterSection("GradientInfo");
-	Uint32 count=stream->readUint32("source_count");
+	Uint32 count=stream->readCount("source_count");
 	for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);sources.push_back(shared_ptr<Entities::Entity>(Entities::Entity::load(stream)));stream->readLeaveSection();}
-	const Uint32 sourceCount=count;count=stream->readUint32("obstacle_count");
+	const Uint32 sourceCount=count;count=stream->readCount("obstacle_count");
 	for(Uint32 i=0;i<count;++i){stream->readEnterSection(i+sourceCount);obstacles.push_back(shared_ptr<Entities::Entity>(Entities::Entity::load(stream)));stream->readLeaveSection();}
 	stream->readLeaveSection();return true;
 }
 
 Gradient::Gradient(const GradientInfo& info) : info(info),width(0),sourceCount(0) {}
 
-void Gradient::recalculate(Player* player)
+void Gradient::recalculate(Player* player, field::Frontier& frontier)
 {
 	Map* map=player->map;
 	width=map->getW();
 	const int height=map->getH();
 	values.assign(width*height,UnreachableCell);
 	sourceCount=0;
-	std::vector<int> queue;
-	queue.reserve(width*height);
+	auto& queue=frontier;
+	queue.clear();
 	for(int x=0;x<width;++x)
 		for(int y=0;y<height;++y)
 		{
@@ -253,24 +255,7 @@ void Gradient::recalculate(Player* player)
 			if(info.matches_source(player,x,y)) { values[at]=SourceCell; queue.push_back(at);++sourceCount; }
 			else if(info.matches_obstacle(player,x,y)) values[at]=ObstacleCell;
 		}
-	for(size_t head=0;head<queue.size();++head)
-	{
-		const int at=queue[head];
-		const int px=at%width;
-		const int py=at/width;
-		const Sint16 next=values[at]+1;
-		const int xs[3]={px==0?width-1:px-1,px,px+1==width?0:px+1};
-		const int ys[3]={py==0?height-1:py-1,py,py+1==height?0:py+1};
-		for(int dy=-1;dy<=1;++dy)
-			for(int dx=-1;dx<=1;++dx)
-			{
-				if(dx==0 && dy==0) continue;
-				const int nx=xs[dx+1];
-				const int ny=ys[dy+1];
-				Sint16& value=values[ny*width+nx];
-				if(value==UnreachableCell) { value=next; queue.push_back(ny*width+nx); }
-			}
-	}
+	field::expandDistances(values,queue,{width,height},field::Surrounding,UnreachableCell);
 }
 
 int Gradient::get_height(int x,int y) const
@@ -299,7 +284,7 @@ Gradient& GradientManager::get_gradient(const GradientInfo& info)
 	{
 		gradients.push_back(shared_ptr<Gradient>(new Gradient(info)));
 		ages.push_back(0); index=int(gradients.size())-1;
-		gradients[index]->recalculate(player);
+		gradients[index]->recalculate(player,frontier);
 	}
 	else if(ages[index]>150 && info.needs_updating())
 	{
@@ -335,13 +320,13 @@ void GradientManager::update(Uint32 step)
 	{
 		const int index=queued.front(); queued.pop();queuedIndexes.erase(index);
 		if(index>=0 && index<int(gradients.size()) && ages[index]>50)
-		{ gradients[index]->recalculate(player); ages[index]=0; }
+		{ gradients[index]->recalculate(player,frontier); ages[index]=0; }
 	}
 }
 void GradientManager::saveExecutionState(GAGCore::OutputStream* stream) const
 {
     stream->writeEnterSection("GradientExecution95");
-    AIMaximaContinuation::Writer archive(stream);
+    AIMaximaContinuation::Writer archive(stream,true);
     archive("lastWorldStep",lastWorldStep);
     archive("ages",ages);
     stream->writeUint32(gradients.size(),"size");
@@ -361,14 +346,14 @@ void GradientManager::saveExecutionState(GAGCore::OutputStream* stream) const
     archive("queued",pending);
     stream->writeLeaveSection();
 }
-void GradientManager::loadExecutionState(GAGCore::InputStream* stream)
+void GradientManager::loadExecutionState(GAGCore::InputStream* stream,Sint32 versionMinor)
 {
     invalidate();
     stream->readEnterSection("GradientExecution95");
-    AIMaximaContinuation::Reader archive(stream);
+    AIMaximaContinuation::Reader archive(stream,versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE);
     archive("lastWorldStep",lastWorldStep);
     archive("ages",ages);
-    const Uint32 size=stream->readUint32("size");
+    const Uint32 size=stream->readCount("size");
     if(size!=ages.size()) throw std::runtime_error("Invalid gradient continuation count");
     for(Uint32 i=0;i<size;++i)
     {
@@ -451,20 +436,21 @@ namespace Conditions
 {
 Condition* Condition::load(GAGCore::InputStream* stream)
 {
+	GAGCore::InputStream::NestedRead nesting(*stream);
 	stream->readEnterSection("Condition");
 	const int kind=stream->readSint32("type");Condition* result=NULL;
 	if(kind==0){const int id=stream->readSint32("id");result=new ParticularBuilding(BuildingCondition::load(stream),id);}
 	else if(kind==1)result=new BuildingDestroyed(stream->readSint32("id"));
 	else if(kind==2)result=new EnemyBuildingDestroyed(stream->readSint32("gid"));
-	else if(kind==3){Condition* first=Condition::load(stream);Condition* second=Condition::load(stream);result=new EitherCondition(first,second);}
-	stream->readLeaveSection();return result;
+	else if(kind==3){std::unique_ptr<Condition> first(Condition::load(stream));std::unique_ptr<Condition> second(Condition::load(stream));result=new EitherCondition(first.release(),second.release());}
+	stream->readLeaveSection();if(!result)throw std::runtime_error("Unknown saved AI type");return result;
 }
 BuildingCondition* BuildingCondition::load(GAGCore::InputStream* stream)
 {
 	stream->readEnterSection("BuildingCondition");
 	const int kind=stream->readSint32("type");BuildingCondition* result=NULL;
 	switch(kind){case 0:result=new NotUnderConstruction;break;case 1:result=new UnderConstruction;break;case 2:result=new BeingUpgraded;break;case 3:result=new BeingUpgradedTo(stream->readSint32("value"));break;case 4:result=new SpecificBuildingType(stream->readSint32("value"));break;case 5:result=new BuildingLevel(stream->readSint32("value"));break;case 6:result=new Upgradable;break;case 7:result=new StaffableConstructionSite;break;default:break;}
-	stream->readLeaveSection();return result;
+	stream->readLeaveSection();if(!result)throw std::runtime_error("Unknown saved AI type");return result;
 }
 ParticularBuilding::ParticularBuilding(BuildingCondition* condition,int id)
 	: condition(condition),id(id) {}
@@ -541,9 +527,10 @@ void ResourceTracker::save(GAGCore::OutputStream* stream) const
 }
 ResourceTracker* ResourceTracker::load(Context& context,GAGCore::InputStream* stream)
 {
-	const int id=stream->readUint32("building_id");const int resource=stream->readSint32("resource");const Uint32 position=stream->readUint32("position");const int timer=stream->readSint32("timer");const Uint32 size=stream->readUint32("size");
-	ResourceTracker* tracker=new ResourceTracker(context,id,size,resource);tracker->position=size?position%size:0;tracker->timer=timer;
-	for(Uint32 i=0;i<size;++i){stream->readEnterSection(i);tracker->record[i]=stream->readSint32("value");stream->readLeaveSection();}return tracker;
+	const int id=stream->readUint32("building_id");const int resource=stream->readSint32("resource");const Uint32 position=stream->readUint32("position");const int timer=stream->readSint32("timer");const Uint32 size=stream->readCount("size");
+	if(resource<0 || resource>=MAX_RESOURCES || !size || position>=size)throw std::runtime_error("Invalid saved resource tracker");
+	std::unique_ptr<ResourceTracker> tracker(new ResourceTracker(context,id,size,resource));tracker->position=size?position%size:0;tracker->timer=timer;
+	for(Uint32 i=0;i<size;++i){stream->readEnterSection(i);tracker->record[i]=stream->readSint32("value");stream->readLeaveSection();}return tracker.release();
 }
 
 void ManagementOrder::add_condition(Condition* condition){conditions.push_back(shared_ptr<Condition>(condition));}
@@ -557,25 +544,25 @@ void ManagementOrder::save(GAGCore::OutputStream* stream) const
 }
 ManagementOrder* ManagementOrder::load(GAGCore::InputStream* stream)
 {
-	stream->readEnterSection("ManagementOrder");const int kind=stream->readSint32("type");ManagementOrder* order=NULL;
+	stream->readEnterSection("ManagementOrder");const int kind=stream->readSint32("type");std::unique_ptr<ManagementOrder> order;
 	switch(kind)
 	{
-		case 0:{const int workers=stream->readSint32("workers");const int id=stream->readSint32("id");order=new AssignWorkers(workers,id);break;}
-		case 1:{const int worker=stream->readSint32("worker");const int explorer=stream->readSint32("explorer");const int warrior=stream->readSint32("warrior");order=new ChangeSwarm(worker,explorer,warrior,stream->readSint32("id"));break;}
-		case 2:order=new DestroyBuilding(stream->readSint32("id"));break;
-		case 3:{const int length=stream->readSint32("length");const int resource=stream->readSint32("resource");order=new AddResourceTracker(length,resource,stream->readSint32("id"));break;}
-		case 4:{const int size=stream->readSint32("value");order=new ChangeFlagSize(size,stream->readSint32("id"));break;}
-		case 5:{const int level=stream->readSint32("value");order=new ChangeFlagMinimumLevel(level,stream->readSint32("id"));break;}
-		case 6:{const int x=stream->readSint32("x");const int y=stream->readSint32("y");order=new ChangeFlagPosition(x,y,stream->readSint32("id"));break;}
-		case 7:case 8:{const AreaType area=static_cast<AreaType>(stream->readSint32("area_type"));const Uint32 count=stream->readUint32("location_count");if(kind==7){AddArea* areaOrder=new AddArea(area);for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);const int x=stream->readSint32("x");const int y=stream->readSint32("y");areaOrder->add_location(x,y);stream->readLeaveSection();}order=areaOrder;}else{RemoveArea* areaOrder=new RemoveArea(area);for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);const int x=stream->readSint32("x");const int y=stream->readSint32("y");areaOrder->add_location(x,y);stream->readLeaveSection();}order=areaOrder;}break;}
-		case 9:{const int team=stream->readSint32("team");const OptionalBool allied=static_cast<OptionalBool>(stream->readSint32("allied"));const OptionalBool enemy=static_cast<OptionalBool>(stream->readSint32("enemy"));const OptionalBool market=static_cast<OptionalBool>(stream->readSint32("market"));const OptionalBool inn=static_cast<OptionalBool>(stream->readSint32("inn"));const OptionalBool other=static_cast<OptionalBool>(stream->readSint32("other"));order=new ChangeAlliances(team,allied,enemy,market,inn,other);break;}
-		case 10:order=new UpgradeRepair(stream->readSint32("id"));break;
-		case 11:{const RuntimeEvent::Type eventType=static_cast<RuntimeEvent::Type>(stream->readSint32("event_type"));const int first=stream->readSint32("first");const int second=stream->readSint32("second");order=new Notify(RuntimeEvent(eventType,first,second));break;}
-		case 12:{const int priority=stream->readSint32("value");order=new ChangePriority(priority,stream->readSint32("id"));break;}
+		case 0:{const int workers=stream->readSint32("workers");const int id=stream->readSint32("id");order.reset(new AssignWorkers(workers,id));break;}
+		case 1:{const int worker=stream->readSint32("worker");const int explorer=stream->readSint32("explorer");const int warrior=stream->readSint32("warrior");order.reset(new ChangeSwarm(worker,explorer,warrior,stream->readSint32("id")));break;}
+		case 2:order.reset(new DestroyBuilding(stream->readSint32("id")));break;
+		case 3:{const int length=stream->readSint32("length");const int resource=stream->readSint32("resource");if(length<=0 || length>1048576 || resource<0 || resource>=MAX_RESOURCES)throw std::runtime_error("Invalid resource tracker order");order.reset(new AddResourceTracker(length,resource,stream->readSint32("id")));break;}
+		case 4:{const int size=stream->readSint32("value");order.reset(new ChangeFlagSize(size,stream->readSint32("id")));break;}
+		case 5:{const int level=stream->readSint32("value");order.reset(new ChangeFlagMinimumLevel(level,stream->readSint32("id")));break;}
+		case 6:{const int x=stream->readSint32("x");const int y=stream->readSint32("y");order.reset(new ChangeFlagPosition(x,y,stream->readSint32("id")));break;}
+		case 7:case 8:{const int savedArea=stream->readSint32("area_type");if(savedArea<0 || savedArea>GuardArea)throw std::runtime_error("Invalid saved area type");const AreaType area=static_cast<AreaType>(savedArea);const Uint32 count=stream->readCount("location_count");if(kind==7){std::unique_ptr<AddArea> areaOrder(new AddArea(area));for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);const int x=stream->readSint32("x");const int y=stream->readSint32("y");areaOrder->add_location(x,y);stream->readLeaveSection();}order.reset(areaOrder.release());}else{std::unique_ptr<RemoveArea> areaOrder(new RemoveArea(area));for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);const int x=stream->readSint32("x");const int y=stream->readSint32("y");areaOrder->add_location(x,y);stream->readLeaveSection();}order.reset(areaOrder.release());}break;}
+		case 9:{const int team=stream->readSint32("team");const OptionalBool allied=static_cast<OptionalBool>(stream->readSint32("allied"));const OptionalBool enemy=static_cast<OptionalBool>(stream->readSint32("enemy"));const OptionalBool market=static_cast<OptionalBool>(stream->readSint32("market"));const OptionalBool inn=static_cast<OptionalBool>(stream->readSint32("inn"));const OptionalBool other=static_cast<OptionalBool>(stream->readSint32("other"));order.reset(new ChangeAlliances(team,allied,enemy,market,inn,other));break;}
+		case 10:order.reset(new UpgradeRepair(stream->readSint32("id")));break;
+		case 11:{const RuntimeEvent::Type eventType=static_cast<RuntimeEvent::Type>(stream->readSint32("event_type"));const int first=stream->readSint32("first");const int second=stream->readSint32("second");order.reset(new Notify(RuntimeEvent(eventType,first,second)));break;}
+		case 12:{const int priority=stream->readSint32("value");order.reset(new ChangePriority(priority,stream->readSint32("id")));break;}
 		default:break;
 	}
-	const Uint32 count=stream->readUint32("condition_count");for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);Conditions::Condition* condition=Conditions::Condition::load(stream);if(order&&condition)order->add_condition(condition);else delete condition;stream->readLeaveSection();}
-	stream->readLeaveSection();return order;
+	const Uint32 count=stream->readCount("condition_count");for(Uint32 i=0;i<count;++i){stream->readEnterSection(i);Conditions::Condition* condition=Conditions::Condition::load(stream);if(order&&condition)order->add_condition(condition);else delete condition;stream->readLeaveSection();}
+	stream->readLeaveSection();if(!order)throw std::runtime_error("Unknown saved AI order");return order.release();
 }
 
 AssignWorkers::AssignWorkers(int workers,int id)
@@ -741,6 +728,7 @@ int BuildingRegister::get_on_site(unsigned id) const
 		unit!=b->unitsWorking.end();++unit)
 		if(*unit && player->map->warpDistSquare(b->posX,b->posY,
 			(*unit)->posX,(*unit)->posY)<range*range)++result;
+	if(!result)throw std::runtime_error("Unknown saved AI type");
 	return result;
 }
 
@@ -768,9 +756,9 @@ void BuildingRegister::save(GAGCore::OutputStream* stream) const
 bool BuildingRegister::load(GAGCore::InputStream* stream)
 {
 	pendingBuildings.clear(); foundBuildings.clear(); stream->readEnterSection("V3BuildingRegister");
-	nextId=stream->readUint32("next_id"); Uint32 size=stream->readUint32("pending_size");
+	nextId=stream->readUint32("next_id"); Uint32 size=stream->readCount("pending_size");
 	for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);int id=stream->readSint32("id");BuildingRecord r;r.x=stream->readSint32("x");r.y=stream->readSint32("y");r.type=stream->readSint32("type");r.gid=stream->readSint32("gid");r.age=stream->readSint32("age");r.issued=stream->readUint8("issued");pendingBuildings[id]=r;stream->readLeaveSection();}
-	size=stream->readUint32("found_size");
+	size=stream->readCount("found_size");
 	for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);int id=stream->readSint32("id");BuildingRecord r;r.x=stream->readSint32("x");r.y=stream->readSint32("y");r.type=stream->readSint32("type");r.gid=stream->readSint32("gid");r.upgrading=stream->readUint8("upgrading");r.upgradeSeen=stream->readUint8("upgrade_seen");foundBuildings[id]=r;stream->readLeaveSection();}
 	for(auto& record:foundBuildings)
 	{
@@ -797,6 +785,7 @@ Constraint* Constraint::load(GAGCore::InputStream* stream)
 	else if(kind==4)result=new CenterOfBuilding(stream->readSint32("gid"));
 	else if(kind==5){const int x=stream->readSint32("x");const int y=stream->readSint32("y");result=new SinglePosition(x,y);}
 	stream->readLeaveSection();
+	if(!result)throw std::runtime_error("Unknown saved AI type");
 	return result;
 }
 
@@ -838,10 +827,10 @@ void BuildingOrder::save(GAGCore::OutputStream* s) const
 }
 BuildingOrder* BuildingOrder::load(GAGCore::InputStream* s)
 {
-	s->readEnterSection("BuildingOrder");const int buildingType=s->readSint32("building_type");const int workerCount=s->readSint32("workers");BuildingOrder* order=new BuildingOrder(buildingType,workerCount);order->id=s->readSint32("id");
-	Uint32 count=s->readUint32("constraint_count");for(Uint32 i=0;i<count;++i){s->readEnterSection(i);order->add_constraint(Constraint::load(s));s->readLeaveSection();}
-	const Uint32 offset=count;count=s->readUint32("condition_count");for(Uint32 i=0;i<count;++i){s->readEnterSection(i+offset);order->add_condition(Conditions::Condition::load(s));s->readLeaveSection();}
-	s->readLeaveSection();return order;
+	s->readEnterSection("BuildingOrder");const int buildingType=s->readSint32("building_type");const int workerCount=s->readSint32("workers");std::unique_ptr<BuildingOrder> order(new BuildingOrder(buildingType,workerCount));order->id=s->readSint32("id");
+	Uint32 count=s->readCount("constraint_count");for(Uint32 i=0;i<count;++i){s->readEnterSection(i);order->add_constraint(Constraint::load(s));s->readLeaveSection();}
+	const Uint32 offset=count;count=s->readCount("condition_count");for(Uint32 i=0;i<count;++i){s->readEnterSection(i+offset);order->add_condition(Conditions::Condition::load(s));s->readLeaveSection();}
+	s->readLeaveSection();return order.release();
 }
 void BuildingOrder::add_constraint(Constraint* c){constraints.push_back(shared_ptr<Constraint>(c));}
 void BuildingOrder::add_condition(Conditions::Condition* c){conditions.push_back(shared_ptr<Conditions::Condition>(c));}
@@ -1328,7 +1317,7 @@ void Context::save(GAGCore::OutputStream* stream) const
 void Context::saveExecutionState(GAGCore::OutputStream* stream) const
 {
     stream->writeEnterSection("RuntimeExecution95");
-    AIMaximaContinuation::Writer archive(stream);
+    AIMaximaContinuation::Writer archive(stream,true);
     stream->writeUint32(buildingOrders.size(),"size");
     for(size_t i=0;i<buildingOrders.size();++i)
     {
@@ -1354,11 +1343,11 @@ void Context::saveExecutionState(GAGCore::OutputStream* stream) const
     stream->writeLeaveSection();
     stream->writeLeaveSection();
 }
-void Context::loadExecutionState(GAGCore::InputStream* stream, Sint32)
+void Context::loadExecutionState(GAGCore::InputStream* stream, Sint32 versionMinor)
 {
     stream->readEnterSection("RuntimeExecution95");
-    AIMaximaContinuation::Reader archive(stream);
-    const Uint32 size=stream->readUint32("size");
+    AIMaximaContinuation::Reader archive(stream,versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE);
+    const Uint32 size=stream->readCount("size");
     if(size!=buildingOrders.size()) throw std::runtime_error("Invalid building search continuation count");
     for(Uint32 i=0;i<size;++i)
     {
@@ -1373,7 +1362,7 @@ void Context::loadExecutionState(GAGCore::InputStream* stream, Sint32)
         archive("searchActive",order.searchActive);
         stream->readLeaveSection();
     }
-    gradients.loadExecutionState(stream);
+    gradients.loadExecutionState(stream,versionMinor);
     {
         stream->readEnterSection("FoundBuildingExecution96");
         for(auto& entry:buildings.foundBuildings)
@@ -1388,11 +1377,11 @@ void Context::loadExecutionState(GAGCore::InputStream* stream, Sint32)
 bool Context::load(GAGCore::InputStream* stream,Sint32 versionMinor)
 {
 	stream->readEnterSection("V3Runtime");timer=stream->readSint32("timer");previousBuildingId=stream->readSint32("previous_building_id");initialized=stream->readUint8("initialized");fruitOnMap=stream->readUint8("fruit_on_map");allies=stream->readUint32("allies");enemies=stream->readUint32("enemies");inn_view=stream->readUint32("inn_view");market_view=stream->readUint32("market_view");other_view=stream->readUint32("other_view");
-	orders.clear();stream->readEnterSection("orders");Uint32 size=stream->readUint32("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);Uint32 length=stream->readUint32("size");std::vector<Uint8> data(length+1);data[0]=stream->readUint8("type");stream->read(&data[1],length,"data");orders.push_back(Order::getOrder(&data[0],length+1,versionMinor));stream->readLeaveSection();}stream->readLeaveSection();
+	orders.clear();stream->readEnterSection("orders");Uint32 size=stream->readCount("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);Uint32 length=stream->readCount("size");std::vector<Uint8> data(length+1);data[0]=stream->readUint8("type");stream->read(data.data()+1,length,"data");auto order=Order::getOrder(data.data(),data.size(),versionMinor);if(!order)throw std::runtime_error("Invalid saved AI order");orders.push_back(order);stream->readLeaveSection();}stream->readLeaveSection();
 	buildings.load(stream);gradients.invalidate();
-	buildingOrders.clear();stream->readEnterSection("building_orders");size=stream->readUint32("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);shared_ptr<Construction::BuildingOrder> order(Construction::BuildingOrder::load(stream));if(order){order->queue_gradients(gradients);buildingOrders.push_back(order);}stream->readLeaveSection();}stream->readLeaveSection();
-	managementOrders.clear();stream->readEnterSection("management_orders");size=stream->readUint32("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);shared_ptr<Management::ManagementOrder> order(Management::ManagementOrder::load(stream));if(order)managementOrders.push_back(order);stream->readLeaveSection();}stream->readLeaveSection();
-	trackers.clear();stream->readEnterSection("trackers");size=stream->readUint32("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);const int id=stream->readSint32("id");trackers[id]=shared_ptr<Management::ResourceTracker>(Management::ResourceTracker::load(*this,stream));stream->readLeaveSection();}stream->readLeaveSection();
+	buildingOrders.clear();stream->readEnterSection("building_orders");size=stream->readCount("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);shared_ptr<Construction::BuildingOrder> order(Construction::BuildingOrder::load(stream));if(order){order->queue_gradients(gradients);buildingOrders.push_back(order);}stream->readLeaveSection();}stream->readLeaveSection();
+	managementOrders.clear();stream->readEnterSection("management_orders");size=stream->readCount("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);shared_ptr<Management::ManagementOrder> order(Management::ManagementOrder::load(stream));if(order)managementOrders.push_back(order);stream->readLeaveSection();}stream->readLeaveSection();
+	trackers.clear();stream->readEnterSection("trackers");size=stream->readCount("size");for(Uint32 n=0;n<size;++n){stream->readEnterSection(n);const int id=stream->readSint32("id");trackers[id]=shared_ptr<Management::ResourceTracker>(Management::ResourceTracker::load(*this,stream));stream->readLeaveSection();}stream->readLeaveSection();
 	stream->readLeaveSection();return true;
 }
 

@@ -118,7 +118,7 @@ bool GradientInfo::load(GAGCore::InputStream *stream, Player *player, Sint32 ver
 	stream->readEnterSection("GradientInfo");
 
 	stream->readEnterSection("sources");
-	int size=stream->readUint32("size");
+	int size=stream->readCount("size");
 	sources.resize(size);
 	for(int n=0; n<size; ++n)
 	{
@@ -129,7 +129,7 @@ bool GradientInfo::load(GAGCore::InputStream *stream, Player *player, Sint32 ver
 	stream->readLeaveSection();
 
 	stream->readEnterSection("obstacles");
-	size=stream->readUint32("size");
+	size=stream->readCount("size");
 	obstacles.resize(size);
 	for(int n=0; n<size; ++n)
 	{
@@ -214,14 +214,14 @@ GradientInfo make_gradient_info_obstacle(Entities::Entity* source1, Entities::En
 
 
 
-void Gradient::recalculate(Map* map)
+void Gradient::recalculate(Map* map, field::Frontier& frontier)
 {
 	PERF_SCOPE_TIME(AIGradient);
 	width=map->getW();
 	gradient.resize(map->getW()*map->getH());
 	std::fill(gradient.begin(), gradient.end(),0);
 
-	std::queue<position> positions;
+	frontier.clear();
 	for(int x=0; x<map->getW(); ++x)
 	{
 		for(int y=0; y<map->getH(); ++y)
@@ -229,13 +229,13 @@ void Gradient::recalculate(Map* map)
 			if(gradient_info.match_source(map, x, y))
 			{
 				gradient[get_pos(x, y)]=AI_SHARED_RUNTIME_GRADIENT_SOURCE_SEED;
-				positions.push(position(x, y));
+				frontier.push_back(get_pos(x,y));
 			}
 			else if(gradient_info.match_obstacle(map, x, y))
 				gradient[get_pos(x, y)]=AI_SHARED_RUNTIME_GRADIENT_OBSTACLE_MARKER;
 		}
 	}
-	expand_bfs(positions);
+	expand_bfs(frontier);
 }
 
 
@@ -293,7 +293,7 @@ Gradient& GradientManager::get_gradient(const GradientInfo& gi)
 			if(ticks_since_update[i-gradients.begin()]>AI_SHARED_RUNTIME_GRADIENT_STALE_TICKS)
 			{
 				ticks_since_update[i-gradients.begin()]=0;
-				(*i)->recalculate(map);
+				(*i)->recalculate(map,frontier);
 			}
 			return **i;
 		}
@@ -301,7 +301,7 @@ Gradient& GradientManager::get_gradient(const GradientInfo& gi)
 
 	//Did not find a matching gradient
 	gradients.push_back(std::shared_ptr<Gradient>(new Gradient(gi)));
-	(*(gradients.end()-1))->recalculate(map);
+	(*(gradients.end()-1))->recalculate(map,frontier);
 	ticks_since_update.push_back(0);
 	return **(gradients.end()-1);
 }
@@ -359,7 +359,7 @@ void GradientManager::update()
 		int g=queuedGradients.front();
 		if(ticks_since_update[g]>AI_SHARED_RUNTIME_GRADIENT_QUEUE_MIN_AGE_TICKS)
 		{
-			gradients[g]->recalculate(map);
+			gradients[g]->recalculate(map,frontier);
 			ticks_since_update[g]=0;
 		}
 		queuedGradients.pop();
@@ -410,7 +410,7 @@ bool GradientManager::load(GAGCore::InputStream* stream,Player* player,Sint32 ve
 	stream->readEnterSection("GradientManager");
 	timer=stream->readSint32("timer");
 	cur_update=stream->readUint32("curUpdate");
-	const Uint32 count=stream->readUint32("count");
+	const Uint32 count=stream->readCount("count");
 	stream->readEnterSection("gradients");
 	for(Uint32 i=0;i<count;++i)
 	{
@@ -421,7 +421,7 @@ bool GradientManager::load(GAGCore::InputStream* stream,Player* player,Sint32 ve
 		auto g=std::make_shared<Gradient>(info);
 		ticks_since_update.push_back(stream->readSint32("age"));
 		g->width=stream->readSint32("width");
-		const Uint32 size=stream->readUint32("size");
+		const Uint32 size=stream->readCount("size");
 		// A queued gradient can be uncomputed; materialized fields must match
 		// the loaded map. Values use explicit endian-safe signed 16-bit IO.
 		if(size ? (size!=Uint32(map->getW()*map->getH()) || g->width!=map->getW()) : g->width!=0)
@@ -434,7 +434,7 @@ bool GradientManager::load(GAGCore::InputStream* stream,Player* player,Sint32 ve
 		stream->readLeaveSection();
 	}
 	stream->readLeaveSection();
-	const Uint32 queued=stream->readUint32("queuedCount");
+	const Uint32 queued=stream->readCount("queuedCount");
 	stream->readEnterSection("queued");
 	for(Uint32 i=0;i<queued;++i)
 	{

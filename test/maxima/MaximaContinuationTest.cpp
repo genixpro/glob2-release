@@ -51,21 +51,45 @@ template<class A> void fields(A& a,Record& r) {
 }
 }
 struct Saved {std::string bytes;std::array<Uint8,20> hash{};bool operator==(const Saved&)const=default;};
-Saved save(const Probe::Record& r,bool binary,bool scalarPath) {
+Saved save(const Probe::Record& r,bool binary,bool scalarPath,bool compact=false) {
  auto m=new GAGCore::MemoryStreamBackend();
  std::unique_ptr<GAGCore::OutputStream> s(binary?static_cast<GAGCore::OutputStream*>(new GAGCore::BinaryOutputStream(m)):static_cast<GAGCore::OutputStream*>(new GAGCore::TextOutputStream(m)));
  Saved result;
  if(binary)dynamic_cast<GAGCore::BinaryOutputStream*>(s.get())->enableSHA1();
  ScalarStream scalar(*s);
- AIMaximaContinuation::Writer a(scalarPath?&scalar:s.get());
- s->writeUint8(31,"first_marker");a("record",r);
- s->writeUint16(0xAA55,"middle_marker");a("wide",r.wide);
- s->writeUint32(0x99887766,"last_marker");a("edge",r.edge);
+ AIMaximaContinuation::Writer a(scalarPath?&scalar:s.get(),compact);
+ s->writeUint8(31,"firstMarker");a("record",r);
+ s->writeUint16(0xAA55,"middleMarker");a("wide",r.wide);
+ s->writeUint32(0x99887766,"lastMarker");a("edge",r.edge);
  if(binary)dynamic_cast<GAGCore::BinaryOutputStream*>(s.get())->finishSHA1(result.hash.data());
  result.bytes=m->takeContents();return result;
 }
 TEST_SUITE("Maxima.Continuation")
 {
+TEST_CASE("compact arrays preserve nested state and signed limits [save-format]")
+{
+ Probe::Record r;
+ r.small={INT8_MIN,-1,0,1,INT8_MAX};
+ r.wide={0,UINT64_MAX,UINT64_MAX-1,0,1};
+ r.entries[{-1,UINT32_MAX}]={INT_MIN,-1,0,INT_MAX};r.keys={INT_MIN,-1,0,INT_MAX};r.text="contents";
+ for(bool binary:{false,true}) {
+  const auto saved=save(r,binary,false,true);
+  auto* m=new GAGCore::MemoryStreamBackend(saved.bytes.data(),saved.bytes.size());m->seekFromStart(0);
+  std::unique_ptr<GAGCore::InputStream> in(binary?static_cast<GAGCore::InputStream*>(new GAGCore::BinaryInputStream(m)):static_cast<GAGCore::InputStream*>(new GAGCore::TextInputStream(m)));
+  GAGCore::BinaryInputStream::CheckedReads checked(in.get());
+  AIMaximaContinuation::Reader reader(in.get(),true);
+  REQUIRE(in->readUint8("firstMarker")==31);
+  Probe::Record restored;reader("record",restored);
+  CHECK(restored.small==r.small);CHECK(restored.wide==r.wide);CHECK(restored.text==r.text);
+  CHECK(restored.entries==r.entries);CHECK(restored.keys==r.keys);
+  for(int i=0;i<3;++i)CHECK(restored.edge[i]==r.edge[i]);
+  CHECK(in->readUint16("middleMarker")==0xAA55);
+  reader("wide",restored.wide);CHECK(restored.wide==r.wide);
+  CHECK(in->readUint32("lastMarker")==0x99887766);
+  reader("edge",restored.edge);
+  CHECK(save(restored,binary,false,true)==saved);
+ }
+}
 TEST_CASE("binary bytes; SHA1; text fallback; nested records; signed limits; 64-bit order; strings; container boundaries and interleaved writes are identical [save-format]")
 {
  for(size_t n: {0u,1u,4095u,4096u,4097u,65536u}) {
@@ -77,6 +101,40 @@ TEST_CASE("binary bytes; SHA1; text fallback; nested records; signed limits; 64-
    auto old=save(r,binary,true);auto now=save(r,binary,false);
    REQUIRE_MESSAGE(old==now, "mismatch " << n << " " << binary);
   }
+ }
+}
+}
+
+TEST_SUITE("Maxima.Continuation")
+{
+TEST_CASE("compact fields retain legacy binary and text encodings [save-format]")
+{
+ using AIMaximaPlacement::DistanceField;
+ const std::vector<int32_t> oldDistances={0,1,512,65534,INT_MAX};
+ const std::vector<uint64_t> oldFood={0,1,UINT32_MAX};
+ DistanceField distances; distances.assign(oldDistances.size(),0);
+ for(size_t i=0;i<oldDistances.size();++i) distances[i]=oldDistances[i];
+ std::vector<uint32_t> food(oldFood.begin(),oldFood.end());
+ for(bool binary:{true,false}) for(bool scalar:{true,false}) {
+  auto emit=[&](bool compact){
+   auto* backend=new GAGCore::MemoryStreamBackend();
+   std::unique_ptr<GAGCore::OutputStream> out(binary?static_cast<GAGCore::OutputStream*>(new GAGCore::BinaryOutputStream(backend)):static_cast<GAGCore::OutputStream*>(new GAGCore::TextOutputStream(backend)));
+   ScalarStream wrapped(*out); AIMaximaContinuation::Writer a(scalar?&wrapped:out.get());
+   if(compact) {
+    a("distances",distances);
+    a.legacyVector<uint64_t>("food",food,[](uint32_t x){return uint64_t(x);},[](uint64_t){return uint32_t{};});
+   } else { a("distances",oldDistances); a("food",oldFood); }
+   return backend->takeContents();
+  };
+  const auto bytes=emit(false); REQUIRE(bytes==emit(true));
+  auto* backend=new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size());backend->seekFromStart(0);
+  std::unique_ptr<GAGCore::InputStream> in(binary?static_cast<GAGCore::InputStream*>(new GAGCore::BinaryInputStream(backend)):static_cast<GAGCore::InputStream*>(new GAGCore::TextInputStream(backend)));
+  AIMaximaContinuation::Reader reader(in.get()); DistanceField restored; std::vector<uint32_t> restoredFood;
+  reader("distances",restored);
+  reader.legacyVector<uint64_t>("food",restoredFood,[](uint32_t){return uint64_t{};},[](uint64_t x){return uint32_t(x);});
+  REQUIRE(restored.size()==oldDistances.size());
+  for(size_t i=0;i<oldDistances.size();++i) REQUIRE(int(restored[i])==oldDistances[i]);
+  REQUIRE(restoredFood==food);
  }
 }
 }

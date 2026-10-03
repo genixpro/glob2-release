@@ -15,6 +15,13 @@ scanout. No GPU queries, synchronization, or additional world scans are introduc
 
 - `loop` measures complete main-loop iterations, including pacing.
 - `loop.work` excludes intentional sleep, network sleep, and the presentation call.
+- `pacing.sleep` and `pacing.network_sleep` time the host's wait between iterations.
+  A wait counts as network sleep only while `Engine::waitingOnNetwork()`: in turn games
+  while the relay's authorized horizon is used up, in legacy games while a peer's
+  orders are missing. Jitter-buffer pacing in a turn game is ordinary `pacing.sleep`.
+  Both the native loop and the in-game screen host time these waits; menus do not.
+  Turn games also export [network telemetry](network-telemetry.md) (`GLOB2_NET_*`
+  records and a per-match `ClientNetworkSummary`).
 - `simulation.tick` measures an executed simulation step; rendered frames and ticks need not
   have the same cadence.
 - `pacing.presentation_interval` measures time between presentation returns. Its population
@@ -95,6 +102,14 @@ Add a descriptor and place `PERF_SCOPE_TIME(Name)` around an existing operation 
 Use a named `PerformanceTelemetry::Scope` and `stop()` where only part of a function belongs
 to the scope. Keep timers outside entity/cell inner loops. Background threads must publish
 explicit aggregates through existing synchronization; the implicit collector is thread-local.
+
+When the simulation runs on its own thread (`src/sim/SimulationRunner`), that thread records
+into a collector its runner owns (`PerformanceTelemetry::bindCollector`). Each client frame,
+with the simulation parked, the main thread absorbs that window into the session collector
+(`Collector::absorb`) and configures and captures the session there, as `advanceSession` does
+in serial play; it absorbs once more after the thread stops. Records name the thread a scope
+ran on: `thread=main`, `thread=simulation` or `thread=main+simulation`. Threaded sessions
+budget presentation against 60 Hz instead of the serial render interval.
 
 Run `scons -j8 release=1 server=0 tests`, then
 `python3 test/run_tests.py --binary unit --filter 'PerformanceTelemetry/*'` and
@@ -182,7 +197,8 @@ uses `--compute-threads N`; `--compute-experiments none` disables AI batching.
 A game-owned executor uses persistent workers, main-thread participation and a
 barrier before simulation resumes. Nested jobs run inline. Eager propagation
 scratch is owned by executor slot; lazy searches retain their own queues. Thread
-creation failure and the browser target use serial execution. Thread count and
+creation failure and the serial browser fallback use serial execution; threaded
+browser builds use the same executor as native builds. Thread count and
 performance counters are not saved or included in simulation checksums.
 
 `result.json` reports actual `compute_threads`, selected `compute_experiments`,

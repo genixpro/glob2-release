@@ -75,7 +75,7 @@ TrueTypeFont::~TrueTypeFont()
 				std::cout << "TrueTypeFont : font" <<
 					/*TTF_FontFaceFamilyName(font) << ", " <<
 						  TTF_FontFaceStyleName(font) << ", " <<
-						  TTF_FontHeight(font) <<*/
+						  TTF_GetFontHeight(font) <<*/
 					" had " << cacheHit + cacheMiss << " requests, " << cacheHit << " hits ("
 						  << static_cast<float>(cacheHit) / cacheTotal << "), " << cacheMiss
 						  << " misses (" << static_cast<float>(cacheMiss) / cacheTotal << ")"
@@ -90,23 +90,90 @@ TrueTypeFont::~TrueTypeFont()
 	}
 }
 
+bool TrueTypeFont::kerningMovesPen(TTF_Font *kerned, TTF_Font *unkerned)
+{
+	// T and o kern strongly in the game's font (DejaVu Sans) and in most Latin fonts.
+	int kerning = 0;
+	if (!TTF_GetGlyphKerning(kerned, 'T', 'o', &kerning) || kerning == 0)
+		return true;
+	// The measured width ends at the pen. A correct layout moves the pen by the kerning;
+	// the broken one moves only the glyph, so both widths come out the same.
+	const char *const sample = "ToTo";
+	int withKerning = 0, withoutKerning = 0;
+	size_t length = 0;
+	if (!TTF_MeasureString(kerned, sample, 0, 0, &withKerning, &length) ||
+		!TTF_MeasureString(unkerned, sample, 0, 0, &withoutKerning, &length))
+		return true;
+	return withKerning != withoutKerning;
+}
+
+TTF_Font *TrueTypeFont::openFont(const std::string &filename, unsigned size)
+{
+	// -1 unknown, 0 kerning misplaces glyphs, 1 kerning works
+	static int kerningWorks = -1;
+	auto open = [&](unsigned openSize) -> TTF_Font *
+	{
+		SDL_IOStream *stream = Toolkit::getFileManager()->open(filename, "rb");
+		return stream ? TTF_OpenFontIO(stream, 1, openSize) : NULL;
+	};
+	TTF_Font *opened = open(size);
+	if (!opened)
+		return NULL;
+	if (kerningWorks < 0)
+	{
+		// Probe at a size where one kerning unit is several pixels.
+		TTF_Font *kerned = open(32), *unkerned = open(32);
+		if (kerned && unkerned)
+		{
+			TTF_SetFontKerning(unkerned, false);
+			int kerning = 0;
+			if (TTF_GetGlyphKerning(kerned, 'T', 'o', &kerning) && kerning != 0)
+			{
+				kerningWorks = kerningMovesPen(kerned, unkerned) ? 1 : 0;
+				if (!kerningWorks)
+					std::cerr << "TrueTypeFont: this SDL3_ttf misplaces kerned glyphs; drawing text without kerning" << std::endl;
+			}
+		}
+		if (kerned)
+			TTF_CloseFont(kerned);
+		if (unkerned)
+			TTF_CloseFont(unkerned);
+	}
+	if (kerningWorks == 0)
+		TTF_SetFontKerning(opened, false);
+	return opened;
+}
+
 bool TrueTypeFont::load(const std::string filename, unsigned size)
 {
-	SDL_RWops *fontStream = Toolkit::getFileManager()->open(filename, "rb");
-	if (fontStream)
-	{
-		font = TTF_OpenFontRW(fontStream, 1, size);
-		if (font)
-		{
-			fontFilename = filename;
-			baseSize = size;
-			renderFont = font;
-			renderScale = 1.0f;
-			setStyle(Style(STYLE_NORMAL, 255, 255, 255));
-			return true;
-		}
-	}
-	return false;
+	font = openFont(filename, size);
+	if (!font)
+		return false;
+	fontFilename = filename;
+	baseSize = size;
+	renderFont = font;
+	renderScale = 1.0f;
+	setStyle(Style(STYLE_NORMAL, 255, 255, 255));
+	return true;
+}
+
+bool TrueTypeFont::reload(void)
+{
+	if (!font)
+		return false;
+	TTF_Font *replacement = openFont(fontFilename, baseSize);
+	if (!replacement)
+		return false;
+	clearCache();
+	for (const auto &[size, raster] : rasterFonts)
+		TTF_CloseFont(raster);
+	rasterFonts.clear();
+	TTF_CloseFont(font);
+	font = replacement;
+	renderFont = font;
+	renderScale = 1.0f;
+	applyStyle();
+	return true;
 }
 
 void TrueTypeFont::clearCache(void)
@@ -144,9 +211,7 @@ void TrueTypeFont::updateRenderScale(void)
 		auto found = rasterFonts.find(wantedSize);
 		if (found == rasterFonts.end())
 		{
-			TTF_Font *replacement = nullptr;
-			if (SDL_RWops *stream = Toolkit::getFileManager()->open(fontFilename, "rb"))
-				replacement = TTF_OpenFontRW(stream, 1, wantedSize);
+			TTF_Font *replacement = openFont(fontFilename, wantedSize);
 			if (replacement)
 				found = rasterFonts.emplace(wantedSize, replacement).first;
 		}
@@ -218,7 +283,7 @@ int TrueTypeFont::getStringHeight(const std::string string)
 	}
 	else
 	{
-		h = TTF_FontHeight(font);
+		h = TTF_GetFontHeight(font);
 	}
 	return h;
 }
@@ -259,7 +324,7 @@ bool TrueTypeFont::hasGlyphsFor(const std::string &utf8Text)
 		for (int i = 1; i < len && s[i]; i++)
 			codepoint = (codepoint << 6) | (s[i] & 0x3F);
 
-		if (!TTF_GlyphIsProvided32(font, codepoint))
+		if (!TTF_FontHasGlyph(font, codepoint))
 			return false;
 
 		s += len;
@@ -326,7 +391,7 @@ const TrueTypeFont::CacheData *TrueTypeFont::getStringCached(const std::string t
 		c.b = styleStack.top().color.b;
 		c.a = styleStack.top().color.a;
 		const std::string shaped = shapeText(text);
-		SDL_Surface *temp = TTF_RenderUTF8_Blended(scaled ? renderFont : font, shaped.c_str(), c);
+		SDL_Surface *temp = TTF_RenderText_Blended(scaled ? renderFont : font, shaped.c_str(), 0, c);
 		if (temp == NULL)
 			return NULL;
 
@@ -335,12 +400,12 @@ const TrueTypeFont::CacheData *TrueTypeFont::getStringCached(const std::string t
 		data.lastAccessed = now;
 		data.s = new DrawableSurface(temp);
 		assert(data.s);
-		SDL_FreeSurface(temp);
+		SDL_DestroySurface(temp);
 		// The raster may be finer than the layout; callers only ever see the authored size
 		const float rasterScale = (scaled && renderScale > 0.0f) ? renderScale : 1.0f;
 		data.drawW = data.s->getW() / rasterScale;
 		data.drawH = data.s->getH() / rasterScale;
-		if (!scaled || TTF_SizeUTF8(font, shaped.c_str(), &data.w, &data.h) != 0)
+		if (!scaled || !TTF_GetStringSize(font, shaped.c_str(), 0, &data.w, &data.h))
 		{
 			data.w = static_cast<int>(std::lround(data.drawW));
 			data.h = static_cast<int>(std::lround(data.drawH));

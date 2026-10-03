@@ -13,11 +13,55 @@
 #include <StringTable.h>
 using namespace GAGCore;
 
-Building *GameGUITouch::inspectedBuilding() const
+namespace
 {
-	if (gui.selectionMode != GameGUI::BUILDING_SELECTION)
+	//! The construction action a building offers (cancel repair/upgrade, repair,
+	//! upgrade), or empty. One rule for the drawn panel and for input validation.
+	std::string constructionActionLabel(int constructionResultState, int buildingState, const BuildingType *type,
+										int hp, bool hardSpaceForRepair, bool hardSpaceForUpgrade, int maxBuildLevel)
+	{
+		auto tr = [](const char *key) { return std::string(Toolkit::getStringTable()->getString(key)); };
+		if (constructionResultState == Building::REPAIR)
+			return tr("[cancel repair]");
+		if (constructionResultState == Building::UPGRADE)
+			return tr("[cancel upgrade]");
+		if (buildingState == Building::ALIVE && !type->isBuildingSite)
+		{
+			if (hp < type->hpMax && type->regenerationSpeed == 0 && hardSpaceForRepair && maxBuildLevel >= type->level)
+				return tr("[repair]");
+			if (hp == type->hpMax && type->nextLevel != -1 && hardSpaceForUpgrade && maxBuildLevel > type->level)
+				return tr("[upgrade]");
+		}
+		return {};
+	}
+
+	//! The same, from the live building: input checks a held action against it.
+	std::string liveConstructionActionLabel(Building &b, Team &local)
+	{
+		const bool offersConstruction = b.constructionResultState == Building::NO_CONSTRUCTION &&
+			b.buildingState == Building::ALIVE && !b.type->isBuildingSite;
+		return constructionActionLabel(b.constructionResultState, b.buildingState, b.type, b.hp,
+			offersConstruction && b.isHardSpaceForBuildingSite(Building::REPAIR),
+			offersConstruction && b.type->nextLevel != -1 && b.isHardSpaceForBuildingSite(Building::UPGRADE),
+			local.maxBuildLevel());
+	}
+}
+
+bool GameGUITouch::inspecting() const
+{
+	return gui.selectionMode == GameGUI::BUILDING_SELECTION && std::holds_alternative<BuildingRef>(gui.selection);
+}
+
+const SceneBuildingPanel *GameGUITouch::inspectedBuilding() const
+{
+	if (!inspecting())
 		return nullptr;
-	return gui.selectionBuilding();
+	// The panel was extracted for the selection current when the frame was drawn.
+	const SceneBuildingPanel &panel = gui.drawnScene().panels.building;
+	const BuildingRef selected = std::get<BuildingRef>(gui.selection);
+	if (!panel.valid || panel.gid != selected.gid || panel.generation != selected.generation)
+		return nullptr;
+	return &panel;
 }
 std::vector<GameGUITouch::BuildingAction> GameGUITouch::buildingActions() const
 {
@@ -25,14 +69,14 @@ std::vector<GameGUITouch::BuildingAction> GameGUITouch::buildingActions() const
 	auto *b = inspectedBuilding();
 	if (!b)
 		return result;
-	if (b->owner != gui.localTeam || globalContainer->isViewingGame())
+	if (b->owner.teamNumber != gui.drawnScene().panels.local.teamNumber || globalContainer->isViewingGame())
 		return result;
 	if (allocationBuilding())
 	{
 		result.push_back({GAGCore::FormattableString(GAGCore::Toolkit::getStringTable()->getString(
 														 "[Assigned %0 · Target %1]"))
-							  .arg(b->unitsWorking.size())
-							  .arg(allocation && allocation->building == b->gid
+							  .arg(b->unitsWorking)
+							  .arg(allocation && allocation->kind == 6 && allocation->building == b->gid
 									   ? allocation->requested
 									   : gui.displayedMaxUnitWorking(*b)),
 						  6});
@@ -69,21 +113,10 @@ std::vector<GameGUITouch::BuildingAction> GameGUITouch::buildingActions() const
 		for (int i = 0; i < EXPLORATION_FLAG_OPTION_COUNT; ++i)
 			result.push_back({tr(names[i]), 2, i, gui.displayedMinLevelToFlag(*b) == i});
 	}
-	if (b->constructionResultState == Building::REPAIR)
-		result.push_back({tr("[cancel repair]"), 3});
-	else if (b->constructionResultState == Building::UPGRADE)
-		result.push_back({tr("[cancel upgrade]"), 3});
-	else if (b->buildingState == Building::ALIVE && !b->type->isBuildingSite)
-	{
-		if (b->hp < b->type->hpMax && b->type->regenerationSpeed == 0 &&
-			b->isHardSpaceForBuildingSite(Building::REPAIR) &&
-			gui.localTeam->maxBuildLevel() >= b->type->level)
-			result.push_back({tr("[repair]"), 3});
-		else if (b->hp == b->type->hpMax && b->type->nextLevel != -1 &&
-				 b->isHardSpaceForBuildingSite(Building::UPGRADE) &&
-				 gui.localTeam->maxBuildLevel() > b->type->level)
-			result.push_back({tr("[upgrade]"), 3});
-	}
+	const std::string construction = constructionActionLabel(b->constructionResultState, b->buildingState, b->type, b->hp,
+		b->hardSpaceForRepair, b->hardSpaceForUpgrade, gui.drawnScene().panels.local.maxBuildLevel);
+	if (!construction.empty())
+		result.push_back({construction, 3});
 	if (b->buildingState == Building::WAITING_FOR_DESTRUCTION)
 		result.push_back({tr("[cancel destroy]"), 4});
 	else if (b->buildingState == Building::ALIVE)
@@ -232,21 +265,22 @@ void GameGUITouch::drawBuildingActions()
 
 bool GameGUITouch::processAllocationPointer(const SDL_Event &event, ViewPoint point)
 {
-	const TouchPlacementSession::Pointer pointer{event.tfinger.touchId, event.tfinger.fingerId};
+	const TouchPlacementSession::Pointer pointer{event.tfinger.touchID, event.tfinger.fingerID};
 	gui.checkSelection();
-	auto *building = allocationBuilding();
+	// Input issues orders against the live building (see allocationBuilding for drawing).
+	Building *building = allocationBuilding() ? gui.selectionBuilding() : nullptr;
 	const double unit = globalContainer->gfx->logicalUnitsPerPoint();
 	if (!allocation)
 	{
-		if (event.type != SDL_FINGERDOWN || !fingers.empty() || placement || activeDialog() ||
+		if (event.type != SDL_EVENT_FINGER_DOWN || !fingers.empty() || placement || activeDialog() ||
 			!building)
 			return false;
 		if (usesDial())
 		{
-			// Dial sliders: workers on the outer ring, a unit ratio or flag range
-			// on the inner ring. The value follows the thumb's angle.
+			// Dial sliders follow the thumb angle; the shared production arc
+			// captures the nearer divider for the full gesture.
 			const auto region = dialRegionAt(point);
-			if (!region || region->part != DialRegion::Arc ||
+			if (!region || (region->part != DialRegion::Arc && region->part != DialRegion::Proportions) ||
 				(region->action.kind != 6 && region->action.kind != 0 && region->action.kind != 8))
 				return false;
 			TouchAllocationSession session{pointer, {}, building->gid, gui.localTeamNo};
@@ -260,6 +294,21 @@ bool GameGUITouch::processAllocationPointer(const SDL_Event &event, ViewPoint po
 			session.requested = session.kind == 6   ? gui.displayedMaxUnitWorking(*building)
 								: session.kind == 8 ? gui.displayedUnitStayRange(*building)
 													: gui.displayedRatio(*building)[session.value];
+			if (region->part == DialRegion::Proportions)
+			{
+				session.ratios = gui.displayedRatio(*building);
+				session.initialRatios = TouchDial::shares(session.ratios, MAX_RATIO_RANGE);
+				session.start = point;
+				const auto g = dialLayout(layout()).geometry;
+				const auto polar = TouchDial::polar(g, point);
+				const int total = session.ratios[0] + session.ratios[1] + session.ratios[2];
+				const double first = TouchDial::angleOf(session.ratios[0], region->from, region->to, std::max(1, total));
+				const double second = TouchDial::angleOf(session.ratios[0] + session.ratios[1], region->from, region->to, std::max(1, total));
+				const double d0 = std::abs(polar->angle - first), d1 = std::abs(polar->angle - second);
+				session.divider = std::abs(d0 - d1) < 0.01
+					? (polar->radius < g.rings[region->ring].middle() ? 0 : 1)
+					: (d0 < d1 ? 0 : 1);
+			}
 			allocation = session;
 		}
 	}
@@ -283,7 +332,7 @@ bool GameGUITouch::processAllocationPointer(const SDL_Event &event, ViewPoint po
 	}
 	if (pointer != allocation->pointer)
 	{
-		if (event.type == SDL_FINGERDOWN)
+		if (event.type == SDL_EVENT_FINGER_DOWN)
 		{
 			fingers = {allocation->pointer, pointer};
 			allocation.reset();
@@ -302,18 +351,43 @@ bool GameGUITouch::processAllocationPointer(const SDL_Event &event, ViewPoint po
 		const auto g = dialLayout(layout()).geometry;
 		const auto polar = TouchDial::polar(g, point);
 		allocation->position = point;
-		if (polar)
+		if (allocation->divider >= 0)
+		{
+			allocation->moved |= std::hypot(point.x - allocation->start.x, point.y - allocation->start.y) >= 4 * unit;
+			if (polar && allocation->moved)
+			{
+				const int at = TouchDial::value(polar->angle, allocation->sweepFrom, allocation->sweepTo, MAX_RATIO_RANGE);
+				auto values = allocation->initialRatios;
+				if (allocation->divider == 0)
+				{
+					const int pair = values[0] + values[1];
+					values[0] = std::clamp(at, 0, pair);
+					values[1] = pair - values[0];
+				}
+				else
+				{
+					values[1] = std::clamp(at - values[0], 0, MAX_RATIO_RANGE - values[0]);
+					values[2] = MAX_RATIO_RANGE - values[0] - values[1];
+				}
+				allocation->ratios = values;
+			}
+		}
+		else if (polar)
 			allocation->requested =
 				TouchDial::value(polar->angle, allocation->sweepFrom, allocation->sweepTo, allocation->maximum);
-		if (event.type == SDL_FINGERUP)
+		if (event.type == SDL_EVENT_FINGER_UP)
 		{
 			// Commit once, if the thumb is still near its ring; a release
 			// elsewhere abandons the preview.
-			const auto &ring = g.rings[allocation->ring];
-			const double tolerance = InGameTouchTheme::target / 2;
-			if (polar && polar->radius >= ring.inner - tolerance && polar->radius <= ring.outer + tolerance)
+			const auto released = dialRegionAt(point);
+			if (polar && released && released->ring == allocation->ring)
 			{
-				if (allocation->kind == 6)
+				if (allocation->divider >= 0)
+				{
+					if (allocation->moved)
+						commitRatios(*building, allocation->ratios);
+				}
+				else if (allocation->kind == 6)
 					gui.requestWorkerAllocation(*building, allocation->requested);
 				else if (allocation->kind == 8)
 					gui.requestFlagRange(*building, allocation->requested);
@@ -327,7 +401,7 @@ bool GameGUITouch::processAllocationPointer(const SDL_Event &event, ViewPoint po
 	allocation->requested = int(std::lround(
 		std::clamp((point.x - allocation->track.x) / std::max(1.0, allocation->track.w), 0.0, 1.0) *
 		MAX_UNIT_WORKING));
-	if (event.type == SDL_FINGERUP)
+	if (event.type == SDL_EVENT_FINGER_UP)
 	{
 		const auto row = actionAt(point);
 		if (row && row->kind == 6)
@@ -340,7 +414,7 @@ std::optional<GameGUITouch::BuildingAction> GameGUITouch::actionAt(ViewPoint poi
 {
 	if (usesDial())
 	{
-		if (inspectedBuilding())
+		if (inspecting())
 			if (const auto region = dialRegionAt(point))
 				return region->action;
 		return std::nullopt;
@@ -359,7 +433,8 @@ std::optional<GameGUITouch::BuildingAction> GameGUITouch::actionAt(ViewPoint poi
 }
 void GameGUITouch::tapBuildingAction(ViewPoint point)
 {
-	auto *b = inspectedBuilding();
+	// Input issues orders against the live building (see inspectedBuilding for drawing).
+	Building *b = inspecting() ? gui.selectionBuilding() : nullptr;
 	if (!b || b->owner != gui.localTeam || globalContainer->isViewingGame())
 		return;
 	if (usesDial())
@@ -367,7 +442,8 @@ void GameGUITouch::tapBuildingAction(ViewPoint point)
 		const auto region = dialRegionAt(point);
 		if (!region || region->action.kind != heldActionKind || region->action.value != heldActionValue ||
 			heldActionConfirmation != confirmDestroy ||
-			(region->action.kind == 3 && region->action.label != heldActionLabel))
+			(region->action.kind == 3 && (region->action.label != heldActionLabel ||
+										  liveConstructionActionLabel(*b, *gui.localTeam) != heldActionLabel)))
 			return;
 		tapDial(*b, *region, point);
 		return;
@@ -376,7 +452,9 @@ void GameGUITouch::tapBuildingAction(ViewPoint point)
 	if (!picked || picked->kind != heldActionKind || picked->value != heldActionValue ||
 		heldActionConfirmation != confirmDestroy)
 		return;
-	if (picked->kind == 3 && picked->label != heldActionLabel)
+	// The panel shows the last drawn state; commit only if the live building still offers it.
+	if (picked->kind == 3 && (picked->label != heldActionLabel ||
+							  liveConstructionActionLabel(*b, *gui.localTeam) != heldActionLabel))
 		return;
 	const auto row = *picked;
 	auto content = panelContent();
@@ -426,9 +504,19 @@ void GameGUITouch::setRatio(Building &building, int type, int value)
 	if (next == values[type])
 		return;
 	values[type] = next;
-	gui.pendingFor(building.gid).pendingRatio = values;
-	gui.orderQueue.push_back(std::make_shared<OrderModifySwarm>(building.gid, values.data()));
+	commitRatios(building, values);
 }
+// Both inspector presentations share the pending UI value and send exactly one
+// existing simulation order. Drawing and drag previews never mutate the building.
+void GameGUITouch::commitRatios(Building &building, const std::array<int, 3> &values)
+{
+	if (values == gui.displayedRatio(building))
+		return;
+	gui.pendingFor(building.gid).pendingRatio = values;
+	auto wire = values;
+	gui.orderQueue.push_back(std::make_shared<OrderModifySwarm>(building.gid, wire.data()));
+}
+
 // Clearing resources, flag requirements, construction and destruction: the
 // same orders from the row list and the dial.
 void GameGUITouch::applyDiscreteAction(Building &building, const BuildingAction &row)

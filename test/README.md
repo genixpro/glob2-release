@@ -5,7 +5,7 @@ the same objects as the game:
 
 | Binary | Links | How it runs |
 | --- | --- | --- |
-| `glob2-unit-tests` | libgag, libusl, a few production sources and the stubs in `test/unit/stubs/` | one process, in-process |
+| `glob2-unit-tests` | libgag, libusl, a few production sources and the stubs in `test/unit/stubs/` | headless cases share a process; display cases run in separate processes |
 | `glob2-engine-tests` | every client object except the entry point | one process per test case, each in a disposable profile |
 
 Both are listed in `test/tests.py`, built by `test/SConscript` and land in
@@ -38,8 +38,10 @@ python3 test/run_tests.py --update-fixtures --filter 'WinningConditions/*'
 a fresh `GLOB2_USER_DATA_DIR`, `HOME`, temp directory and SDL's dummy drivers, a
 timeout by tag, output captured and shown only on failure, and a check that the
 profile's preferences were not rewritten. `[display]` cases get a real video driver,
-under `xvfb-run` on Linux without `DISPLAY`, with server resets disabled so SDL
-can recreate contexts without racing X server reinitialization; they are skipped on Windows and with
+under `xvfb-run` on Linux without `DISPLAY`, with an isolated Openbox window
+manager to apply SDL3 fullscreen requests. Install `xvfb`, `xauth`, `openbox` and
+`x11-utils`. Server resets are disabled so SDL can recreate contexts without racing
+X server reinitialization; they are skipped on Windows and with
 `--no-display`. Results merge into one JUnit file (`--junit`) and, under GitHub
 Actions, into the step summary with a `::error file=,line=` annotation per failure.
 `test/test_run_tests.py` covers the runner itself.
@@ -50,7 +52,10 @@ Standard runs keep display tests windowed. The HD artwork integration test's
 fullscreen camera-continuity checks and the text raster test's fullscreen
 downscaling check run only with `--fullscreen`; all their windowed checks still
 run by default, including with `--in-process`. Linux CI enables `--fullscreen`
-under its virtual display. To opt in when invoking a test binary directly, set
+under its virtual display, with `--display-jobs 1` to avoid concurrent software
+renderer startup stalls. Headless cases remain parallel. Linux timeout reports
+include the owned process group, thread wait locations and Xvfb window mapping state; GitHub Actions also
+collects a bounded GDB backtrace before cleanup when available. To opt in when invoking a test binary directly, set
 `GLOB2_TEST_FULLSCREEN=1`; the Python runner overrides that variable according to
 its flag, so an inherited setting cannot enable fullscreen in a standard run.
 
@@ -125,6 +130,57 @@ scripts compare full-game traces against retained fixtures and are documented wi
 the harness they accompany below. `tests/` at the repository root tests the build
 system and the browser services.
 
+## Match relay
+
+`scons role=relay release=1 relay` builds `glob2-relay` and `glob2-relay-tests`, a
+doctest binary of its own (the relay role builds no engine or SDL code). Run it
+directly, then `python3 -m unittest discover -s tests/relay -v` for the end-to-end
+tests against the real binary. `test/fixtures/relay-tickets/` copies the protocol
+package's ticket fixtures. See [docs/multiplayer/relay.md](../docs/multiplayer/relay.md#tests).
+## Online screens and test switches
+
+Release builds have no switch that opens an online screen directly; players reach
+them through the online hub. To look at a screen offline, render its canned states:
+`test/OnlineUIFixtures.h` holds the fixtures (hub, room, match start, quick match,
+profile, maps) for the `UIPresentation` cases and `scons release=1 mobile-gallery`.
+`PlatformClientTest` in the unit binary covers the client's request lifetimes,
+including screens destroyed with requests in flight.
+
+Switches the online and LAN tests use:
+
+- `--instance <origin>`: the instance an invite code given with `--join <code>`
+  belongs to; a `glob2://` or `https://<instance>/j/<code>` argument works too.
+- `--turn-client`, `--verify-match`, `--sim-version`: headless relay client, match
+  verifier and sim version report ([headless replays](../docs/development/headless-replays.md)).
+- `GLOB2_LAN_ADDRESS=<ip>`: the address a LAN host advertises and puts in its
+  certificate, for machines with several interfaces.
+- `GLOB2_LAN_DELAY_BUNDLE=1`: only the one-tick-bundle rows of the LAN input delay
+  benchmark (below).
+
+## Team capacity and format 127
+
+`TeamLimit` checks all sixteen controller/header slots, entity identifiers, packed
+resource-growth attribution, full-array enemy iteration, indexed text alliances,
+dense-map request boundaries, malformed script-generation counts, and
+deterministic sixteen-team save/load continuation. `Maxima.Economy` covers counted opponents,
+legacy twelve-record loading and malformed counts. Replay and network boundaries
+remain covered by `JavaScriptCompatibility` and `TeamStatsSave`.
+
+`fixtures/team-limit/pre-v127-maxima.game.gz` is an actual format-126 tick-zero
+save: Even Ground (method 60), map/game seed 7, 256×256, four colonies with
+Maxima controllers and default generator controls. It checks both Maxima records
+and the unit/building generation-plane migration, compares serialized AI state,
+and advances paired continuations through 128 actual AI decisions and simulation
+ticks after a new-format reload. Each continuation owns its RNG snapshot.
+
+The five expanded designed generators retain golden cases at 13–16 colonies on
+512×512. Refresh selected landscapes on the current platform with
+`MapGeneratorGoldenTest <profile> --update --only=gauntlet,encircled-kingdom,faulted-city,portage-lakes,hungry-marches`.
+`--require-rows` requires the current revision of every registered generator on
+the executing platform; fresh foreign rows cannot substitute for local coverage.
+`MapGeneratorGoldenCoverageTest` covers stale, missing and mixed-revision tables.
+Regenerate each affected platform's rows using its actual binary.
+
 ## Maxima
 
 See [Maxima tests](maxima/README.md) for policy, configuration, integration and
@@ -134,14 +190,23 @@ saved-game continuation coverage.
 
 `GameGUISelectionHarness.cpp` links the real client objects with a test entry
 point. It exercises selected building/unit deletion before the next GUI draw,
-null selections, and a live unit with no peer. It runs headlessly, using the real
-`GameGUI`, entity classes, selection setters, and destruction hooks. A friend
-fixture accesses the private selection API without exposing it to game callers.
+null selections, a live unit with no peer, gid reuse (the selection and the
+failing-unit recording must not move to the newcomer), a building destroyed by
+a tick (selection and pending shadow cleared through `ClientEvents`) and unit
+conversion (the selection follows the unit). It runs headlessly, using the real
+`GameGUI`, entity classes and selection setters. A friend fixture accesses the
+private selection API without exposing it to game callers.
 
-Runs as the `GameGUISelection` suite of `glob2-engine-tests`:
+`ClientChannelsTest.cpp` covers the `src/sim/` channels: team events reaching the
+GUI once, in order and aged like `Team::updateEvents`; script presentation going
+through `ClientCommandSink`; the SGSL Space acknowledgement in `ClientRequests`;
+and order effects such as pause arriving as events.
+
+Run as the `GameGUISelection` and `ClientChannels` suites of `glob2-engine-tests`:
 
 ```sh
 python3 test/run_tests.py --filter 'GameGUISelection/*'
+python3 test/run_tests.py --filter 'ClientChannels/*'
 ```
 
 For AddressSanitizer and UndefinedBehaviorSanitizer on macOS or Linux, build the
@@ -154,8 +219,8 @@ scons -j8 release=0 server=0 --build=build/tests-asan engine-tests \
 python3 test/run_tests.py --build-dir build/tests-asan --filter 'GameGUISelection/*'
 ```
 
-If Homebrew sdl2-compat cannot locate SDL3 under the macOS sanitizer, prefix
-the harness command with `DYLD_LIBRARY_PATH=/opt/homebrew/lib`.
+Use `GLOB2_SDL3_PREFIX` when building against the pinned SDL3 dependency prefix.
+The native build records its library directory in the runtime search path.
 
 SCons caches compiler/linker flags; pass `CXXFLAGS=-g LINKFLAGS=-g` to return to a
 normal build. This is a direct method regression, not an interactive replay test.
@@ -285,12 +350,16 @@ To poke `cases[i].terrain` directly (`regenerateMap` is protected): grass < 16, 
 The direct transport/security checks use `scons release=1 transport-test`,
 `python3 test/run-network-transport-tests.py`,
 `build/darwin/client/release/src/lan-discovery-test` (substitute your platform),
-and `python3 -m unittest discover -s tests/transport -v`. Container lifecycle
-checks use `python3 -m unittest discover -s tests/deployment -v` after building
-the server image and browser assets. They run an isolated Compose project and
-verify persistence, backup restoration, router-loss readiness, state ownership,
-graceful draining, and forced deadline interruption. Keep capture output from
+and `python3 -m unittest discover -s tests/transport -v`. Deployment script
+checks use `python3 -m unittest discover -s tests/deployment -v`; the whole
+platform stack is exercised by `tests/deployment/platform_stack_smoke.py` (see
+`docs/hosting/README.md`). Keep capture output from
 `tests/transport/capture_container.py` under ignored `artifacts/`.
+
+The online client's integration test, `tests/online/test_platform_client.py`,
+drives `platform-client-probe` (also built by `transport-test`) against a real
+platform API; it needs a `platform/` checkout and a Postgres role that may
+create databases, and is skipped otherwise (see `docs/multiplayer/client.md`).
 
 From the repository root:
 
@@ -299,16 +368,37 @@ scons -j2 release=1 server=0 lan-test
 python3 test/run_lan_session_test.py build/native-tests/src/LANSessionHarness
 ```
 
-This runs separate host and joining client processes with real SDL lobby widgets,
-YOG anonymous LAN server, game router, and paired WSS connections. The joiner uses the
-actual `LANFindScreen` Pair and connect path with the host session fingerprint. It clicks Ready and Leave Game, then rejoins.
-Both cycles force a map download and compare the downloaded `.gz` bytes against
-the fixture source (`maps/FourSquares1.map.gz`) byte for byte: the host's private
-copy is already gzip-compressed, so the transfer exercises sending a locally
-compressed map without gzipping it again, and a new receiver stores the download
-as `.gz` without unzipping it. The host verifies readiness, roster size, unique
-player IDs, slot masks, and both departures. The map's current size is not hardcoded
-in the test. Linux CI runs this automatically with SDL's dummy video/audio drivers.
+This runs separate host and joining client processes with real SDL lobby widgets, a
+`LanRoom` host (room and in-process turn relay) and paired WSS connections. The joiner
+uses the actual `LANFindScreen` Pair and connect path with the host session fingerprint.
+It clicks Ready and Leave Game, then rejoins. Both cycles download the map into the
+guest's content-addressed map cache and compare its bytes with the fixture source
+(`maps/FourSquares1.map`). The host verifies readiness, roster size, unique names and
+seat numbering, and both departures. Linux CI runs this automatically with SDL's dummy
+video/audio drivers.
+
+`--play SECONDS` plays a real game instead: the host presses Start in the room, both
+processes run their `GameSessionScreen`s, the host quits after SECONDS, and the guest's
+game must end with "host left". The two processes' per-tick checksum sidecars must agree
+on every tick both executed:
+
+```sh
+python3 test/run_lan_session_test.py build/native-tests/src/LANSessionHarness --play 30
+```
+
+`LanMatchHarness` in the engine binary covers the match itself in one process: a host
+and two guests over loopback WSS with real engines, a dropped connection, a guest that
+restarts and rejoins by name, the host leaving, identical per-tick checksums and a
+verified match record. Its `[benchmark]` case measures input delay, per stage and with
+stall counts (`docs/multiplayer/lan-playtest.md`; `GLOB2_LAN_DELAY_BUNDLE=1` runs only
+the one-tick-bundle rows). `TurnHarness` (unit binary) and `TurnEngineHarness` (engine
+binary) have `[benchmark]` cases that measure the same on the simulated network, per
+link profile (`docs/multiplayer/turn-protocol.md#measured-delay`).
+
+`OnlinePlayHarness` (`scons release=1 server=0 online-play-test`) plays an online
+room through the real hub, Room, starting and results screens against a live
+instance in a host and a guest process; see "End-to-end check" in
+[docs/multiplayer/client.md](../docs/multiplayer/client.md).
 
 For two physical machines, run these from each machine's repository root, using
 absolute capture prefixes whose parent directories already exist:
@@ -319,8 +409,8 @@ SDL_VIDEODRIVER=dummy ./build/native-tests/src/LANSessionHarness join 'HOST_PAIR
 ```
 
 Start the joiner after the host prints `HOST roster=1`, copying its full
-`PAIRING` string. TLS/WebSocket TCP ports 7489 and 7491
-must be reachable; this does not connect to the public YOG service. Omit
+`PAIRING` string. The host's TLS/WebSocket TCP port 7489 must be reachable;
+nothing connects to a public service. Omit
 `SDL_VIDEODRIVER=dummy` to show the real window. Normal game profiles are preserved;
 the harness uses `.glob2-lan-test-host` and `.glob2-lan-test-join` profiles containing
 only test data. Fixed input timers allow map transfer before leaving; the runner
@@ -745,7 +835,10 @@ speed, through pause and hard pause, and plays the recorded replay back at 1x,
 maximum and fast-forward. The last case captures the engine's per-run checksums
 and requires the first four (speed and pause) and the last three (playback) to
 agree. `python3 test/run_tests.py --filter 'GameSpeed/settings*'` runs the settings
-case alone.
+case alone. That case also clicks the top bar's speed chevrons. The `GameSpeedControl`
+suite (`test/GameSpeedControlTest.cpp`, unit binary) covers the chevron presets and
+the tick-rate readout's window, one-second refresh, stall decay and formatting with
+explicit times.
 
 ## Pre-game map preview regression
 
@@ -771,7 +864,7 @@ the model may select has a C++ expression waiting for it. The fitting checks nee
 and skip without them; the rest is stdlib.
 The `TournamentCompatibility` engine suite (`python3 test/run_tests.py --filter
 'TournamentCompatibility/*'`) covers real per-player Cortex/Maxima and partial
-network-header checks. `python3 test/tournament_cli_integration.py --output DIR`
+game-header round trips. `python3 test/tournament_cli_integration.py --output DIR`
 runs production CLI cases and retains saves, traces and logs. Use a fresh output
 directory. `--initial FILE --ticks N` runs a retained initial state on another platform.
 
@@ -977,8 +1070,12 @@ Set `GLOB2_ZONE_EVIDENCE_DIR` to an existing ignored artifact directory to captu
 the 33% outline fixtures.
 
 Zone boundaries use `GraphicContext::drawMapBoundary`: positions snap to the
-active target's pixel grid and strokes remain at least one target pixel wide.
-Ordinary UI lines retain their existing sizing behavior.
+active target's pixel grid and strokes remain at least one target pixel wide,
+up to an optional cap in screen points. Ordinary UI lines retain their existing
+sizing behavior. With adaptive zoom detail the game fades these outlines out as
+the map zooms out and fills zones with `drawMapFill` instead; see
+[Adaptive zoom detail](../docs/development/reference.md#adaptive-zoom-detail).
+`ZoomDetail/*` in the unit tests covers the curves that decide when.
 
 ## Parallel compute prototype
 
@@ -995,6 +1092,19 @@ Omit `--baseline` to compare the candidate's default execution; `--output DIR`
 retains all evidence. This subprocess runner uses Unix `wait4`; native Windows
 uses the C++ harnesses. See the existing performance guide for corpus preparation
 and paired CPU/wall-time benchmarking.
+
+
+### Simulation-thread equivalence
+
+`python3 test/check_sim_thread.py CANDIDATE --baseline BASELINE` runs new games
+(RNG seeding), a generated map, a version 121 save and save continuation (RNG
+restore) with both executables, and requires identical checksum sidecars, final
+saves and replay bytes. `--candidate-args` passes extra engine arguments to the
+candidate only; `--output DIR` retains the evidence. Each scenario also runs the
+baseline twice: replay bytes that differ between those two runs (known
+run-varying header fields) are reported and excluded. Run it with
+`GLOB2_SYNC_RAND_STRICT=1` to abort on any synchronized draw that is not bound to
+the simulated game's stream. Unix only (`wait4`), like `check_parallel_compute.py`.
 
 
 ### Delayed gradient pipeline
@@ -1044,12 +1154,13 @@ one-local-player header and seed they need. Design and numbers:
 See the [scripting guide](../docs/development/javascript.md) and
 [API reference](../docs/development/javascript-api.md) for the public boundary.
 
-Current saves use format 125, preserving released format 124's experiment-header
-layout through version-gated loading. Formats 58–124 receive scripting identities
-on load; format 125 validates its stored identities and complete generation tables.
-The minimum save version remains 58, the network protocol is 48, and the replay
-minimum remains 123. Draft JavaScript fixtures use format 125; released historical
-fixtures remain unchanged.
+Current saves use format 127, with counted generation tables for sixteen teams.
+Version-gated loading preserves released format 124's experiment-header layout
+and remaps the twelve-team generation tables stored by formats 125 and 126.
+Formats 58–124 receive scripting identities on load; later formats validate their
+stored identities and generation tables. The minimum save version remains 58,
+the network protocol is 50, and the replay minimum is 127. Draft JavaScript
+fixtures use format 125; released historical fixtures remain unchanged.
 
 Build `unit-tests engine-tests` with SCons and run
 `python3 test/run_tests.py --build-dir build/darwin/client/release --filter 'JavaScript*/*'`
@@ -1153,3 +1264,201 @@ for fixture capture, paired CPU measurements and diagnostic overrides. The
 `SoftwareRenderer` suite checks raster sampling, ordering, opacity revisions and
 terrain-cache correctness; `PortableRenderer`, `WindowResize`, `MapRenderResize` and
 `HighResolutionIntegration` cover the shared facade and window lifecycle.
+
+## Castor saved-game continuation
+
+`CastorContinuationTest.cpp` compares emitted order bytes, per-tick simulation
+checksums and RNG state across saves during boot, map computation and active
+colony management. It also checks binary/text snapshot round trips and the
+historical timer-only Castor AI formats (versions 1 and 2).
+
+```sh
+python3 test/run_tests.py --filter 'CastorContinuation/*'
+```
+
+Save format 126 writes Castor AI format 3, preserving project order, boot progress,
+strategy, control timers and map-cache history. Older saves remain readable with
+their historical restart behavior; omitted state cannot be recovered from them.
+New games retain the existing decision sequence. This save change does not raise
+the replay acceptance floor.
+
+## CI coverage ownership
+
+Primary GCC 13 runs the complete applicable native suite. Secondary platforms
+use `python3 test/run_tests.py --coverage-profile compatibility` with the reviewed
+suite inventory in `test/ci-compatibility.json`; full nightly/release verification
+uses `--coverage-profile full`. Map-generator contracts run in their dedicated lane.
+Add new compatibility suites when introducing save, replay, scheduling, scripting
+or platform boundaries. The selector fails closed for shared/unknown inputs.
+
+`--write-inventory PATH` retains exact eligible and assigned cases, excluded cases,
+platform, profile and shard ownership alongside JUnit evidence. CI audits shard
+inventories for missing and duplicated cases. Empty compatibility selection fails
+rather than reporting a successful empty suite. Portable primary regressions need
+not be repeated on every compiler; platform, renderer and thread-count repeats
+must have a named compatibility purpose.
+
+The [development reference](../docs/development/reference.md#tiered-pull-request-coverage-rollout)
+records draft behavior, expansion labels, release-only checks and activation gates.
+
+## Native coverage workflow
+
+Build and measure the regular native tier with a matching Clang/LLVM toolchain:
+
+```sh
+python3 test/run_coverage.py --quick --timeout 900 -j4
+python3 -m unittest discover -s test -p test_run_coverage.py -v
+```
+
+Use an optimized coverage build for the full tier, including expensive generator
+registry contracts and custom-game previews:
+
+```sh
+python3 test/run_coverage.py --optimization 1 --timeout 1800 -j4
+```
+
+Native macOS binaries hold a scoped user-initiated activity while tests run,
+preventing App Nap from throttling long background cases. The activity ends
+when the test binary exits.
+
+Each optimization level uses a separate default build directory. Keep reports
+from different optimization levels separate. The manifest records the flags and
+selection; the explicit timeout accommodates instrumented integration runs. Add `--fullscreen` only on a display that supports mode
+switches. `--no-display` selects a headless subset and is recorded in the report.
+Versioned Linux tools can be selected with `--cc clang-18 --cxx clang++-18
+--llvm-profdata llvm-profdata-18 --llvm-cov llvm-cov-18`.
+
+Each run gets a fresh directory under ignored `artifacts/native-coverage/`, with
+build/test logs, JUnit, compiler/tool versions, source revision, selection,
+profiles, full coverage JSON, weighted implementation summaries and HTML.
+Engine and unit profiles are merged and exported separately: the engine report
+is the implementation baseline, and the unit report supplements it. Never
+average their percentages or merge independently linked copies of the same
+source. Multiplayer (`src/net` and network-tagged cases), external
+libraries and test implementations are excluded from implementation totals.
+Unlinked/platform-specific sources are listed as unmeasured, rather than assigned
+zero coverage. Header coverage remains in the file inventory, apart from the
+implementation area totals. Coverage-tool diagnostics fail the run so a damaged
+export cannot appear successful.
+
+The added behavior coverage focuses on the following native boundaries:
+
+| Cases | Behaviors protected |
+| --- | --- |
+| `AIDecisionCoverage`, `CastorContinuation` | Seeded AI orders, pause neutrality, saved continuation, simulation checksums and RNG state |
+| `CortexNetCoverage`, `CortexPolicyCoverage`, `CortexActionCoverage` | Integer model arithmetic, malformed models, eligibility and thresholds, worker budgets, and orders applied by the engine |
+| `LegacyScriptCoverage`, `USLCoverage` | Parsing failures, legacy and painted area waits, counts, flags and suspension, summons and alliances, recursion, thread yields, garbage collection and runtime errors |
+| `GUIOrderCoverage`, `GUIInteractionCoverage` | Queued requests, clamps, deduplication, field reconciliation, replay input, desktop menu interactions and unit information |
+| `EditorActionCoverage` | Action dispatch, unit/building editing, matching controls and save/load persistence |
+| `SurfaceCoverage` | Alpha grids, cropped/scaled blits, clip boundaries and progress-bar pixels |
+
+Use uncovered functions and branch annotations to choose the next scenario by
+consequence: saves and deterministic decisions first, then authoritative orders,
+script execution and editable state, followed by rendering and diagnostics.
+Line coverage alone does not establish save continuity, equivalent execution on
+another platform, or playable game behavior. The Linux CI coverage artifact
+uses the regular tier; slow integration and cross-platform checks remain separate.
+
+The slow `[map-generators]` tier reports default repeatability, rectangular-map
+and rejection checks separately for each registered generator. Registry stress,
+landscape, framework and editor-default checks also have independent timeouts
+and logs; a timeout must identify its case rather than hide the whole catalog.
+
+Use `python3 test/test_cli_smoke.py --binary <client> --artifacts artifacts/cli --junit artifacts/cli.xml`
+for real executable contracts: argument validation, map image/report workflows,
+headless worker parity and saved continuation. `test/run_coverage.py --with-cli`
+builds the instrumented client and exports these profiles separately under `client/`;
+never merge its counts with independently linked engine or unit reports.
+
+Native CLI platform evidence can be compared with
+`python3 test/check_cli_evidence.py <artifact-root> --require-platform linux --require-platform windows`.
+It compares all 64 complete tick records, including aggregate and entity checksums.
+The browser saved-match smoke checks resize, menu cancellation and resumed ticks;
+Android smoke also exercises Settings input and verifies application profile
+files survive background/resume and a fresh-process relaunch.
+
+## Untrusted file regression coverage
+
+`UntrustedFiles` mutates serialized entity types, levels and identities, terrain
+resources/occupants, sector dimensions and SGSL resume points. It also checks the
+compressed-input size limit, the legacy twenty-byte create-order boundary, USL
+file-loading denial, unsafe output filenames, AI tags/counts/nesting, network
+queue indices and invalid replay order references. Every native AI also loads
+its initial saved state under checked reads. `ReplayStepCounter`
+checks every truncated prefix of a replay body and step-total overflow;
+`USLCoverage` checks native argument type errors, invalid calls, arithmetic
+overflow, excessive syntax nesting and runtime recursion limits. Run these alongside
+`SavegameSafety`, `LegacyScriptCoverage` and `TeamLimit` for continuation and
+legacy compatibility. These targeted tests are not an exhaustive fuzz campaign.
+
+
+## Memory representation compatibility
+
+`MaximaContinuation` compares compact distance fields and food source masks against
+the legacy binary and text encodings, including infinity and maximum finite values.
+`Maxima.Farming` checks the box sums against wide reference arithmetic, including
+maximum-density maps. `TeamStatsSave` compares compact overlap counters against a
+wide oracle on minimum-size tori with 1024 overlapping anchors and replacement of
+an entire generation. `PathGradient` checks shared water snapshots, classification
+invalidation and frozen readers; `GradientPipeline` checks job lifetime and scheduling.
+`SavegameSafety` compares chunked streams against the contiguous backend across
+block boundaries, gaps, seeks, zero-length writes and overreads; verifies moved
+ownership and byte-capacity bounds; and compares deferred SHA1 and exact gzip bytes
+for incompressible input and compression levels zero, one, six and nine. It rejects
+truncated, bad-CRC, trailing and concatenated gzip inputs before game loading,
+injects allocation/finalization exceptions, checks atomic failure cleanup, and
+stalls an autosave writer to verify nonblocking deferral and exact saved ticks
+at the later capture. It compares owned snapshot output against ordinary saves
+after mutating the live game, and exercises both native-thread and cooperative
+finalization, including failure and subsequent reuse. It checks mixed snapshot/legacy
+queues, exact cooperative gzip bytes at the default compression level, and manual save
+ordering through delayed capture and persistence, including terminal failures and
+exactly-once success callbacks. The optional level-zero compatibility path retains whole buffers;
+normal save-memory measurements use the default compression level.
+
+Run these alongside the existing placement, continuation and engine lifecycle suites.
+For full-game checks, retain identical initial saves, seeds and orders, compare
+per-tick simulation state and replay/save bytes, and test continuation from populated
+checkpoints. The native paired CPU runner and profiling workflow are described in
+[the development reference](../docs/development/reference.md#native-simulation-memory-and-cpu-comparisons).
+
+## Save size measurements
+
+Build `scons release=1 server=0 save-size-harness`, then run:
+
+```sh
+python3 test/measure_save_sizes.py build/darwin/client/release/test/SaveSizeHarness \
+  artifacts/save-size/baseline maps/SmallForTwo.map.gz maps/Holiday_Island_2.map.gz \
+  games/gd-small-2ai.game.gz games/gd-large-4ai.game.gz
+```
+
+Use the native build directory for the host (or the explicit custom build path).
+Repeat with the comparison revision's harness, the same input files and a different
+output directory. Each invocation uses disposable profiles, retains gzip outputs
+and JSON section sizes, and reports median load/serialization/compression times
+from three processes. Input and harness hashes identify the measured inputs.
+Peak RSS is the process high-water mark through serialization/compression, including
+loading; it is not isolated serializer allocation. Independently compressed section
+sizes do not add up exactly to the final gzip size. Run the harness on its emitted
+files as well when comparing load times for the old and new encodings. Keep timing
+runs separate from concurrent builds/tests and compare matching compilers and flags.
+
+`PackedArray` checks all integer widths, wraparound, block boundaries and malformed
+payloads. `Maxima.Continuation` covers legacy and compact arrays, signed limits and
+nested archives. `Maxima.Placement` retains explicit noncanonical neighborhood
+contents. `TeamStatsSave` checks binary measurement/end-game histories and binary/text
+telemetry histories across two 256-sample batch boundaries;
+`TeamLimit`, `JavaScriptCompatibility`, `UntrustedFiles` and `SavegameSafety` cover
+sparse identities, format boundaries, decoded validation and save/load continuation.
+Run these together with the existing AI and gradient continuation suites. An encoding
+change must preserve decoded state and per-tick simulation records; old and new
+serialized bytes and header checksums are expected to differ.
+
+For interactive snapshot capture/finalization measurements, set
+`GLOB2_BENCH_SNAPSHOT=1` when running `test/measure_save_sizes.py`. The report
+separates `capture_ms` from `encode_ms`; `serialize_ms` is their sum. Compare with
+ordinary serialization using the same fixtures and build. Capture timing includes
+the immutable copy and its lightweight in-memory representation; encoding includes
+final array/history packing, offset relocation and hashing. The benchmark flattens
+the finished output for section-independent measurement, so its process peak is
+not an isolated allocation bound for the production writer.

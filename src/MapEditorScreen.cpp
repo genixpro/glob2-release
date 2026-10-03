@@ -4,6 +4,7 @@
 #include "MessageScreen.h"
 #include "FertilityScreen.h"
 #include "EditorLoadScreen.h"
+#include "OnlineMapsScreen.h"
 #include <Toolkit.h>
 #include <StringTable.h>
 #include <stdexcept>
@@ -25,12 +26,18 @@ void MapEditorScreen::updateExecution(Uint32 tick)
 		editor->beginEditing();
 		started = true;
 	}
-	const bool running = editor->advanceEditing(input, tick);
+	const bool running = editor->advanceEditing(input.events(), tick);
 	input.clear();
 	if (!running)
 	{
 		endExecute(editor->editingReturnCode());
 		return;
+	}
+	const auto shared = editor->takeShareRequest();
+	if (!shared.empty())
+	{
+		editor->suspendInput();
+		screens.push(std::make_unique<MapShareScreen>(shared));
 	}
 	const auto replacement = editor->takeLoadRequest();
 	if (!replacement.empty())

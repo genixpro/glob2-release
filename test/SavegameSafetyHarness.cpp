@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
+#include "SaveSnapshot.h"
+#include "LoadSaveDialog.h"
 #include <vector>
 #include <string>
 #include <utility>
@@ -16,6 +18,10 @@
 #include "Order.h"
 #include "Player.h"
 #include <BackgroundFileWriter.h>
+#include <ThreadSupport.h>
+#include <ChunkedStreamBackend.h>
+#include <future>
+#include <atomic>
 #include "Version.h"
 #include "FileImport.h"
 #include "Campaign.h"
@@ -42,6 +48,33 @@
 #include <csignal>
 #endif
 
+class SavegameSafetyHarness
+{
+public:
+    static void openSaveDialog(GameGUI& gui, std::unique_ptr<LoadSaveDialog> dialog)
+    {
+        gui.openDialog(GameGUI::IGM_SAVE, std::move(dialog));
+    }
+    static void closeDialog(GameGUI& gui) { gui.closeDialog(); }
+    static void pollSaveDialog(GameGUI& gui)
+    {
+        auto* dialog = static_cast<LoadSaveDialog*>(gui.gameMenuScreen.get());
+        if (dialog->pollPersistence()) gui.closeDialog();
+        else if (dialog->finished()) gui.processGameMenu(nullptr);
+    }
+    static void stop(GameGUI& gui)
+    {
+        gui.localTeam = gui.game.teams[0];
+        gui.isRunning = false;
+    }
+
+    static GAGCore::BackgroundFileWriter& writer(GameGUI& gui, GAGCore::FileManager& files)
+    {
+        if (!gui.autosaveWriter) gui.autosaveWriter = std::make_unique<GAGCore::BackgroundFileWriter>(&files);
+        return *gui.autosaveWriter;
+    }
+};
+
 namespace
 {
 
@@ -53,6 +86,55 @@ static std::string contents(const fs::path& path)
 	std::ifstream file(path, std::ios::binary);
 	REQUIRE(file);
 	return std::string(std::istreambuf_iterator<char>(file), {});
+}
+
+static void checkChunkedStreams()
+{
+    MemoryStreamBackend legacy;
+    ChunkedStreamBackend chunks;
+    std::string data(3 * ChunkedBuffer::blockSize + 17, 'x');
+    uint32_t rng = 19;
+    for (char& c : data) { rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5; c = char(rng); }
+    for (StreamBackend* stream : {static_cast<StreamBackend*>(&legacy), static_cast<StreamBackend*>(&chunks)})
+    {
+        stream->write(data.data(), data.size());
+        stream->seekFromStart(ChunkedBuffer::blockSize - 4);
+        stream->write("header backpatch", 16);
+        stream->seekFromEnd(-9);
+        REQUIRE(stream->readExact(nullptr, 0));
+        stream->write("", 0);
+        stream->write("gap", 3);
+        stream->seekFromStart(-1);
+        stream->seekRelative(-27);
+    }
+    REQUIRE(chunks.getPosition() == legacy.getPosition());
+    std::string expected(legacy.getPosition(), '\0'), actual(expected.size(), '\0');
+    legacy.read(expected.data(), expected.size()); // overread: zeros, no movement
+    chunks.read(actual.data(), actual.size());
+    REQUIRE(actual == expected);
+    REQUIRE(chunks.getPosition() == legacy.getPosition());
+    chunks.seekFromStart(0); legacy.seekFromStart(0);
+    auto snapshot = chunks.takeContents();
+    REQUIRE(chunks.contents().size() == 0);
+    REQUIRE(snapshot.allocatedCapacity() >= snapshot.size());
+    REQUIRE(snapshot.allocatedCapacity() < snapshot.size() + ChunkedBuffer::blockSize);
+    const unsigned char* address = nullptr;
+    snapshot.forEachRange(0, 1, [&](const unsigned char* p, size_t) { address = p; });
+    ChunkedStreamBackend moved(std::move(snapshot));
+    REQUIRE(snapshot.size() == 0);
+    moved.contents().forEachRange(0, 1, [&](const unsigned char* p, size_t) { REQUIRE(p == address); });
+    const size_t size = moved.contents().size();
+    expected.resize(size); actual.resize(size);
+    legacy.read(expected.data(), size); moved.read(actual.data(), size);
+    REQUIRE(actual == expected);
+    REQUIRE(moved.isEndOfStream());
+    REQUIRE(!moved.readExact(actual.data(), 1));
+    REQUIRE(moved.getPosition() == size);
+    unsigned char byte = 99; moved.read(&byte, 1);
+    REQUIRE(byte == 0);
+    REQUIRE(moved.getPosition() == size);
+    chunks.write("reuse", 5); REQUIRE(chunks.contents().size() == 5);
+    std::cout << "PASS chunked boundary reads/writes, seeks, gaps, overreads, capacity bound and ownership transfer" << std::endl;
 }
 
 static void checkGzipWrites(FileManager& files, const fs::path& directory)
@@ -81,6 +163,68 @@ static void checkGzipWrites(FileManager& files, const fs::path& directory)
 	REQUIRE(!files.writeGzipAtomic(blocked.string(), original));
 	for (const auto& entry : fs::directory_iterator(directory))
 		REQUIRE(entry.path().filename().string().find(".tmp-") == std::string::npos);
+	// Exercise several full output buffers with incompressible input too.
+	for (size_t size : {size_t(0),size_t(262143),size_t(262144),size_t(262145),size_t(1048576),size_t(1048577),size_t(3*1048576+17)})
+	{
+		std::string input(size,'\0'); uint32_t rng=19;
+		for (char &c : input) { rng ^= rng<<13; rng ^= rng>>17; rng ^= rng<<5; c=char(rng); }
+		for (int level : {0,1,6,9})
+		{
+			REQUIRE(gzipCompress(input,level,compressed));
+			REQUIRE(files.writeGzipAtomic(path,input,level));
+			REQUIRE(contents(path)==compressed);
+            ChunkedBuffer chunks;
+            // Deliberately split writes independently of storage/output boundaries.
+            const size_t split = input.size() / 3;
+            chunks.writeAt(0, input.data(), split);
+            chunks.writeAt(split, input.data() + split, input.size() - split);
+            REQUIRE(writeGzipAtomicToPath(path, chunks, level));
+            REQUIRE(contents(path) == compressed);
+			std::unique_ptr<StreamBackend> stream(openInflatingFileStreamBackend(path));
+			REQUIRE(stream->getPosition()==0);
+			std::string loaded(size,'\0'); stream->read(loaded.data(),loaded.size());
+			REQUIRE(loaded==input);
+            auto* chunked = dynamic_cast<ChunkedStreamBackend*>(stream.get());
+            REQUIRE(chunked != nullptr);
+            REQUIRE(chunked->contents().allocatedCapacity() <= input.size() + ChunkedBuffer::blockSize);
+			stream->seekFromStart(0); REQUIRE(stream->getPosition()==0);
+		}
+	}
+    // Invalid gzip must fail before any decoded bytes reach the game loader.
+    const std::string valid = contents(path);
+    for (const std::string& corrupt : {valid.substr(0, valid.size()-1), valid + "trailing", valid + valid})
+    {
+        std::ofstream(path, std::ios::binary).write(corrupt.data(), corrupt.size());
+        std::unique_ptr<StreamBackend> rejected(files.openInflatingInputStreamBackend(path));
+        REQUIRE(!rejected->isValid());
+    }
+    // Expansion budgets include the exact payload but must still validate its
+    // trailer. A full final block needs no spare block just to consume the CRC.
+    std::string bounded(ChunkedBuffer::blockSize, 'z'), boundedGzip;
+    REQUIRE(gzipCompress(bounded, 6, boundedGzip));
+    std::ofstream(path, std::ios::binary).write(boundedGzip.data(), boundedGzip.size());
+    std::unique_ptr<StreamBackend> exact(openInflatingFileStreamBackend(path, bounded.size()));
+    REQUIRE(exact->isValid());
+    auto* exactChunks = dynamic_cast<ChunkedStreamBackend*>(exact.get());
+    REQUIRE(exactChunks != nullptr);
+    REQUIRE(exactChunks->contents().size() == bounded.size());
+    REQUIRE(exactChunks->contents().allocatedCapacity() == bounded.size());
+    std::unique_ptr<StreamBackend> tooLarge(openInflatingFileStreamBackend(path, bounded.size() - 1));
+    REQUIRE(!tooLarge->isValid());
+    std::unique_ptr<StreamBackend> emptyBudget(openInflatingFileStreamBackend(path, 0));
+    REQUIRE(!emptyBudget->isValid());
+    std::string corrupt = valid; corrupt[corrupt.size()-8] ^= 1;
+    std::ofstream(path, std::ios::binary).write(corrupt.data(), corrupt.size());
+    std::unique_ptr<StreamBackend> rejected(openInflatingFileStreamBackend(path));
+    REQUIRE(!rejected->isValid());
+    std::ofstream(path, std::ios::binary).write(valid.data(), valid.size());
+    REQUIRE(!files.writeGzipAtomically(path, [](OutputStream&) { throw std::bad_alloc(); }));
+    REQUIRE(contents(path) == valid);
+	std::string owned(1048576,'m'); const char *allocation=owned.data();
+	MemoryStreamBackend moved(std::move(owned));
+	REQUIRE(moved.getBuffer()==allocation);
+	REQUIRE(moved.getPosition()==0);
+	REQUIRE(moved.getChar()=='m');
 	std::cout << "PASS gzip deterministic encoding, round trip, size limit, corruption rejection and failed atomic replacement" << std::endl;
 }
 
@@ -172,9 +316,283 @@ static void checkBackgroundWriter(FileManager& files, const fs::path& directory)
 		   perf.saved + perf.failed);
 	REQUIRE(perf.window[unsigned(PerformanceTelemetry::Id::SaveQueue)].time.count ==
 		   perf.saved + perf.failed);
+    {
+        BackgroundFileWriter writer(&files);
+        writer.write(path, "never published", [](std::string&) { throw std::bad_alloc(); });
+        writer.waitUntilIdle();
+        REQUIRE(contents(path) == "written after a failure");
+        ChunkedBuffer bytes; bytes.writeAt(0, "chunked after failure", 21);
+        writer.write(path, std::move(bytes));
+        writer.waitUntilIdle();
+        std::string decoded;
+        REQUIRE(gzipDecompress(contents(path), decoded));
+        REQUIRE(decoded == "chunked after failure");
+        const auto previous = contents(path);
+        ChunkedBuffer failed; failed.writeAt(0, "partial", 7);
+        writer.write(path, std::move(failed), [](ChunkedBuffer&) { throw std::runtime_error("injected chunk finalization failure"); });
+        writer.waitUntilIdle();
+        REQUIRE(contents(path) == previous);
+    }
+
+    for(bool cooperative:{false,true}) {
+        BackgroundFileWriter writer(&files,cooperative);
+        const auto owner=std::this_thread::get_id();
+        bool encoded=false;
+        auto job=writer.submit(path,[&](ChunkedBuffer& out)->CooperativeTask {
+            CHECK((std::this_thread::get_id()==owner)==(cooperative || !ThreadSupport::available));
+            for(unsigned i=0;i<8;++i) {
+                std::string block(65536,char(i));out.writeAt(out.size(),block.data(),block.size());
+                co_await CooperativeTask::checkpoint();
+            }
+            encoded=true;co_return true;
+        });
+        if(cooperative) CHECK(!encoded);
+        writer.waitUntilIdle();REQUIRE(job->state==BackgroundFileWriter::State::Succeeded);REQUIRE(encoded);
+        std::string decoded;REQUIRE(gzipDecompress(contents(path),decoded));
+        REQUIRE(decoded.size()==8*65536);
+        for(unsigned i=0;i<8;++i) REQUIRE(decoded.substr(i*65536,65536)==std::string(65536,char(i)));
+        const auto prior=contents(path);
+        auto bad=writer.submit(path,[](ChunkedBuffer&)->CooperativeTask {throw std::runtime_error("injected snapshot failure");co_return false;});
+        writer.waitUntilIdle();REQUIRE(bad->state==BackgroundFileWriter::State::Failed);REQUIRE(contents(path)==prior);
+    }
+
+    {
+        const auto prior=contents(path);
+        ChunkedBuffer bytes;std::string raw(256*1024,'x');bytes.writeAt(0,raw.data(),raw.size());
+        {
+            auto task=files.writeGzipTask(path,bytes);
+            CHECK(!task.advance());CHECK(contents(path)==prior);
+            // Destroy a suspended write: its exclusive temporary must disappear.
+        }
+        CHECK(contents(path)==prior);
+        for(const auto& entry:fs::directory_iterator(directory))
+            CHECK(entry.path().filename().string().find(".save-job-")==std::string::npos);
+    }
+
 	for (const auto& entry : fs::directory_iterator(directory))
 		REQUIRE(entry.path().filename().string().find(".tmp-") == std::string::npos);
 	std::cout << "PASS background writes keep the newest snapshot with its finish step, finish on destruction and continue after a failure" << std::endl;
+}
+
+static void checkSaveOperation(FileManager& files, const fs::path& directory)
+{
+    using State = ApplicationHost::PersistenceState;
+    struct ControlledPersistence final : ApplicationHost::Persistence
+    {
+        State& status;
+        explicit ControlledPersistence(State& status) : status(status) {}
+        State state() const override { return status; }
+    };
+    const auto path = (directory / "operation.game").string();
+    BackgroundFileWriter writer(&files, true);
+    bool releasePrior = false;
+    auto prior = writer.submit(path, [&](ChunkedBuffer& bytes) -> CooperativeTask {
+        while (!releasePrior) co_await CooperativeTask::checkpoint();
+        bytes.writeAt(0, "prior", 5);
+        co_return true;
+    });
+    unsigned captures = 0, persisted = 0, completed = 0;
+    State storage = State::Pending;
+    SaveOperation save(writer, path,
+        [&]() -> BackgroundFileWriter::Encode {
+            ++captures;
+            return [](ChunkedBuffer& bytes) -> CooperativeTask {
+                bytes.writeAt(0, "manual", 6);
+                co_return true;
+            };
+        }, [&] { ++completed; }, [&]() -> std::unique_ptr<ApplicationHost::Persistence> {
+            ++persisted;
+            std::string decoded;
+            REQUIRE(gzipDecompress(contents(path), decoded));
+            CHECK(decoded == "manual"); // Persistence cannot begin before replacement.
+            return std::make_unique<ControlledPersistence>(storage);
+        });
+    for (int i = 0; i < 3; ++i) CHECK(save.state() == State::Pending);
+    CHECK(captures == 0);
+    CHECK(persisted == 0);
+    releasePrior = true;
+    for (int i = 0; i < 100 && persisted == 0; ++i) CHECK(save.state() == State::Pending);
+    REQUIRE(persisted == 1);
+    CHECK(prior->state == BackgroundFileWriter::State::Succeeded);
+    CHECK(captures == 1);
+    CHECK(completed == 0);
+    storage = State::Succeeded;
+    for (int i = 0; i < 3; ++i) CHECK(save.state() == State::Succeeded);
+    CHECK(completed == 1);
+    CHECK(captures == 1);
+    CHECK(persisted == 1);
+
+    // Each failure is terminal for its operation. Retrying creates a new job;
+    // a failed persistence must never publish success or keep capturing state.
+    for (bool captureFailure : {false, true})
+    {
+        captures = persisted = completed = 0;
+        storage = State::Failed;
+        const auto previous = contents(path);
+        SaveOperation failed(writer, path,
+            [&]() -> BackgroundFileWriter::Encode {
+                ++captures;
+                if (captureFailure) throw std::runtime_error("injected capture failure");
+                return [](ChunkedBuffer& bytes) -> CooperativeTask {
+                    bytes.writeAt(0, "retry", 5);
+                    co_return true;
+                };
+            }, [&] { ++completed; }, [&]() -> std::unique_ptr<ApplicationHost::Persistence> {
+                ++persisted;
+                return std::make_unique<ControlledPersistence>(storage);
+            });
+        State status = State::Pending;
+        for (int i = 0; i < 100 && status == State::Pending; ++i) status = failed.state();
+        REQUIRE(status == State::Failed);
+        for (int i = 0; i < 3; ++i) CHECK(failed.state() == State::Failed);
+        CHECK(captures == 1);
+        CHECK(completed == 0);
+        CHECK(persisted == (captureFailure ? 0 : 1));
+        if (captureFailure) CHECK(contents(path) == previous);
+    }
+}
+
+static void checkSaveDialogExitLifecycle()
+{
+    using State = ApplicationHost::PersistenceState;
+    struct ControlledPersistence final : ApplicationHost::Persistence
+    {
+        State& status;
+        explicit ControlledPersistence(State& status) : status(status) {}
+        State state() const override { return status; }
+    };
+    glob2test::GameOptions options; options.header = true;
+    glob2test::HeadlessGame world(options);
+    auto dialog = std::make_unique<LoadSaveDialog>("games", "game", false);
+    auto* active = dialog.get();
+    State storage = State::Pending;
+    active->beginPersistence(std::make_unique<ControlledPersistence>(storage));
+    SavegameSafetyHarness::openSaveDialog(world.gui, std::move(dialog));
+    SavegameSafetyHarness::stop(world.gui);
+    REQUIRE(world.gui.savePending());
+    SavegameSafetyHarness::closeDialog(world.gui);
+    SavegameSafetyHarness::openSaveDialog(world.gui,
+        std::make_unique<LoadSaveDialog>("games", "game", false));
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    CHECK(active->isPersisting()); // Pending operation survived both panel actions.
+    storage = State::Failed;
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    CHECK(active->filePresentation().failed);
+    CHECK(world.gui.savePending()); // Session exit must retain retry/cancel UI.
+    storage = State::Pending;
+    active->beginPersistence(std::make_unique<ControlledPersistence>(storage));
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    CHECK(world.gui.savePending());
+    storage = State::Succeeded;
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    CHECK_FALSE(world.gui.savePending());
+
+    dialog = std::make_unique<LoadSaveDialog>("games", "game", false);
+    active = dialog.get();
+    storage = State::Failed;
+    active->beginPersistence(std::make_unique<ControlledPersistence>(storage));
+    SavegameSafetyHarness::openSaveDialog(world.gui, std::move(dialog));
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    REQUIRE(world.gui.savePending());
+    active->cancelPresentedFile();
+    SavegameSafetyHarness::pollSaveDialog(world.gui);
+    CHECK_FALSE(world.gui.savePending());
+}
+
+static void checkCooperativeWriterCompatibility(FileManager& files, const fs::path& directory)
+{
+    const auto path = (directory / "cooperative-mixed.game").string();
+    BackgroundFileWriter writer(&files, true);
+    auto snapshot = writer.submit(path, [](ChunkedBuffer& bytes) -> CooperativeTask {
+        co_await CooperativeTask::checkpoint();
+        bytes.writeAt(0, "snapshot", 8);
+        co_return true;
+    });
+    writer.write(path, "queued legacy");
+    writer.waitUntilIdle();
+    CHECK(snapshot->state == BackgroundFileWriter::State::Succeeded);
+    CHECK_FALSE(writer.busy());
+    CHECK(contents(path) == "queued legacy");
+    writer.write(path, "legacy before snapshot");
+    writer.waitUntilIdle();
+    auto next = writer.submit(path, [](ChunkedBuffer& bytes) -> CooperativeTask {
+        bytes.writeAt(0, "next", 4);
+        co_return true;
+    });
+    writer.waitUntilIdle();
+    CHECK(next->state == BackgroundFileWriter::State::Succeeded);
+    std::string decoded;
+    REQUIRE(gzipDecompress(contents(path), decoded));
+    CHECK(decoded == "next");
+
+    // Polling completes the job; the next submission publishes its metrics,
+    // just like the legacy write API, without requiring a teardown wait.
+    const auto completedBefore = PerformanceTelemetry::collector().saved;
+    const auto encode = [](ChunkedBuffer& bytes) -> CooperativeTask {
+        bytes.writeAt(0, "metrics", 7);
+        co_return true;
+    };
+    auto measured = writer.submit(path, encode);
+    for (int i = 0; i < 100 && writer.busy(); ++i) {}
+    REQUIRE(measured->state == BackgroundFileWriter::State::Succeeded);
+    auto following = writer.submit(path, encode);
+    CHECK(PerformanceTelemetry::collector().saved == completedBefore + 1);
+    writer.waitUntilIdle();
+    CHECK(following->state == BackgroundFileWriter::State::Succeeded);
+
+    const auto immediate = (directory / "immediate-gzip.game").string();
+    // Cross output/input-buffer boundaries, with both repetitive and random data.
+    std::string raw(300000, 'x');
+    Uint32 random = 42;
+    for (size_t i = 65500; i < 200000; ++i)
+    {
+        random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+        raw[i] = char(random);
+    }
+    ChunkedBuffer bytes;
+    bytes.writeAt(0, raw.data(), raw.size());
+    REQUIRE(files.writeGzipAtomic(immediate, bytes));
+    REQUIRE(files.writeGzipTask(path, bytes).run());
+    CHECK(contents(path) == contents(immediate));
+}
+
+static void checkSlowAutosave(FileManager& files, const fs::path& directory)
+{
+#ifndef __EMSCRIPTEN__
+    GameGUI gui;
+    auto map = Engine::loadMapHeader("maps/balanced.map");
+    GameHeader header; header.setNumberOfPlayers(1); header.setRandomSeed(123456);
+    header.getBasePlayer(0) = BasePlayer(0, "Test", 0, BasePlayer::P_LOCAL);
+    REQUIRE(gui.loadFromHeaders(map, header, true, true));
+    gui.localPlayer = gui.localTeamNo = 0; gui.adjustLocalTeam();
+    const fs::path save = directory / "games" / "Auto_save.game.gz";
+    std::promise<void> started, release;
+    auto ready = started.get_future(); auto released = release.get_future();
+    std::atomic<bool> finalized{false};
+    ChunkedBuffer previous; previous.writeAt(0, "previous", 8);
+    SavegameSafetyHarness::writer(gui, files).write(save.string(), std::move(previous), [&](ChunkedBuffer&) {
+        started.set_value(); released.wait(); finalized = true;
+    });
+    ready.wait();
+    std::thread unblock([&] { std::this_thread::sleep_for(std::chrono::milliseconds(100)); release.set_value(); });
+    globalContainer->settings.autosaveGames = true;
+    gui.game.stepCounter = AUTOSAVE_PHASE_TICKS;
+    gui.syncStep();
+    const bool waited = finalized.load();
+    unblock.join();
+    REQUIRE(!waited);
+    gui.waitForAutosave();
+    ++gui.game.stepCounter;
+    gui.syncStep();
+    gui.waitForAutosave();
+    BinaryInputStream stream(files.openInflatingInputStreamBackend(save.string()));
+    GameGUI restored;
+    REQUIRE(restored.load(&stream));
+    REQUIRE(restored.game.stepCounter == AUTOSAVE_PHASE_TICKS+1);
+    globalContainer->settings.autosaveGames = false;
+    fs::remove(save);
+    std::cout << "PASS busy autosave defers capture without blocking and retains the later exact tick" << std::endl;
+#endif
 }
 
 static std::unique_ptr<BinaryInputStream> input(const std::string& bytes, bool file)
@@ -263,7 +681,8 @@ static void checkRandomContinuation(bool text, bool ai)
 	header.setRandomSeed(123456);
 	header.getBasePlayer(0) = BasePlayer(0, "Test", 0, ai ? BasePlayer::playerTypeFromImplementationID(AI::NUMBI) : BasePlayer::P_LOCAL);
 	REQUIRE(gui.loadFromHeaders(map, header, true, true));
-	for (int i=0; i<713; ++i) syncRand();
+	// Advance the game's own stream away from its seed before checkpointing.
+	for (int i=0; i<713; ++i) gui.game.syncRandom();
 	const auto step = [](Game &game) {
 		if (game.players[0]->ai)
 		{
@@ -274,7 +693,7 @@ static void checkRandomContinuation(bool text, bool ai)
 		game.syncStep(0);
 	};
 	for (int i=0; i<100; ++i) step(gui.game);
-	const auto savedRandom = syncRandEngine();
+	const auto savedRandom = gui.game.syncRandom;
 	auto *backend = new MemoryStreamBackend();
 	class CheckpointOutput : public BinaryOutputStream
 	{
@@ -300,10 +719,10 @@ static void checkRandomContinuation(bool text, bool ai)
 		runtimeText.assign(storage->getBuffer(),storage->getPosition());
 	}
 
-	if (!(syncRandEngine() == savedRandom))
+	if (!(gui.game.syncRandom == savedRandom))
 	{
 		std::ostringstream now, was;
-		now << syncRandEngine();
+		now << gui.game.syncRandom;
 		was << savedRandom;
 		std::cerr << "sync RNG changed across save:\n  was " << was.str().substr(0, 96)
 				  << "\n  now " << now.str().substr(0, 96) << std::endl;
@@ -328,6 +747,7 @@ static void checkRandomContinuation(bool text, bool ai)
 		for (int t=0; t<gui.game.teamsCount(); ++t) measurements.push_back(gui.game.teams[t]->stats.measurements);
 		measurementContinuation.push_back(measurements);
 	}
+	// Unrelated draws from the process stream must not affect the restored game.
 	for (int i=0; i<37; ++i) syncRand();
 	GameGUI restored;
 	if (!text && !ai)
@@ -374,9 +794,7 @@ static void checkRandomContinuation(bool text, bool ai)
 
 	// The normal saved-game loader replaces the player header after loading.
 	restored.game.setGameHeader(header, true);
-	auto expected = savedRandom;
-	for (int i=0; i<2000; ++i) REQUIRE(syncRand() == expected());
-	syncRandEngine() = savedRandom;
+	REQUIRE(restored.game.syncRandom == savedRandom);
 	for (int i=0; i<700; ++i)
 	{
 		step(restored.game);
@@ -665,8 +1083,13 @@ TEST_SUITE("SavegameSafety")
 			for (bool ai : {false,true}) checkRandomContinuation(text,ai);
 		const fs::path directory = fs::absolute(globals->fileManager->getDir(0));
 		checkAtomicWrites(*globals->fileManager, directory);
+		checkChunkedStreams();
 		checkGzipWrites(*globals->fileManager, directory);
 		checkBackgroundWriter(*globals->fileManager, directory);
+        checkSaveOperation(*globals->fileManager, directory);
+        checkSaveDialogExitLifecycle();
+        checkCooperativeWriterCompatibility(*globals->fileManager, directory);
+		checkSlowAutosave(*globals->fileManager, directory);
 	    checkPreferences(directory);
 		checkMapHeaders();
 	    checkCampaignProgress(directory);
@@ -699,6 +1122,15 @@ TEST_SUITE("SavegameSafety")
 				BinaryOutputStream initial(new MemoryStreamBackend());
 				gui.save(&initial, "Auto save");
 			}
+            {
+                auto encode=captureSave([&](OutputStream* out,DeferredGameSHA1* sha){gui.save(out,"Owned snapshot",sha);});
+                auto* memory=new MemoryStreamBackend;BinaryOutputStream reference(memory);
+                gui.save(&reference,"Owned snapshot");const auto expected=memory->takeContents();
+                const auto tick=gui.game.stepCounter;gui.game.stepCounter+=77;
+                ChunkedBuffer restored;REQUIRE(encode(restored).run());
+                std::string actual(restored.size(),'\0');restored.readAt(0,actual.data(),actual.size());
+                REQUIRE(actual==expected);gui.game.stepCounter=tick;
+            }
 			const fs::path save = directory / "games" / "Auto_save.game.gz";
 			gui.syncStep();
 			gui.waitForAutosave();
@@ -706,6 +1138,7 @@ TEST_SUITE("SavegameSafety")
 			globals->settings.autosaveGames = true;
 			gui.syncStep();
 			gui.waitForAutosave();
+
 			const auto compressedBytes = contents(save);
 			std::string bytes;
 			REQUIRE(gzipDecompress(compressedBytes, bytes));
@@ -736,17 +1169,20 @@ TEST_SUITE("SavegameSafety")
 				// A stale map offset makes the header backpatch rewrite hashed bytes; the deferred hash must still match.
 				const auto serialize = [&](DeferredGameSHA1* deferred) {
 					gui.game.mapHeader.setMapOffset(0);
-					auto *backend = new MemoryStreamBackend();
+					auto *backend = new ChunkedStreamBackend();
 					BinaryOutputStream stream(backend);
 					gui.save(&stream, "Stale offset", deferred);
 					return backend->takeContents();
 				};
-				const std::string inlineHashed = serialize(nullptr);
+				auto inlineHashed = serialize(nullptr);
 				DeferredGameSHA1 deferred;
-				std::string deferredHashed = serialize(&deferred);
-				REQUIRE(deferredHashed != inlineHashed);
+				auto deferredHashed = serialize(&deferred);
+
 				deferred.apply(deferredHashed);
-				REQUIRE(deferredHashed == inlineHashed);
+				REQUIRE(deferredHashed.size() == inlineHashed.size());
+                std::string first(inlineHashed.size(), '\0'), second(deferredHashed.size(), '\0');
+                inlineHashed.readAt(0, first.data(), first.size()); deferredHashed.readAt(0, second.data(), second.size());
+                REQUIRE(first == second);
 			}
 
 			{
@@ -805,14 +1241,26 @@ TEST_SUITE("SavegameSafety")
 			const size_t offset = savedHeader.getMapOffset();
 			REQUIRE(bytes.substr(offset, 4) == "MapB");
 			const auto mapBytes = bytes.substr(offset);
-			const size_t cells = size_t(gui.game.map.getW()) * gui.game.map.getH();
-			const size_t cellsStart = 12 + cells;
-			const size_t cellsEnd = cellsStart + cells * 33;
-			const size_t mapEnd = mapBytes.find("MapE");
-			REQUIRE((mapEnd != std::string::npos && cellsEnd < mapEnd));
-			const size_t cuts[] = {0, 1, 3, 4, 7, 11, 12, cellsStart - 1, cellsStart,
-				cellsStart + 6, cellsStart + 7, cellsStart + 32, cellsEnd - 2171,
-				cellsEnd - 1, cellsEnd, cellsEnd + 1, mapEnd, mapEnd + 3};
+			struct CellBounds : BinaryOutputStream
+            {
+                using BinaryOutputStream::BinaryOutputStream;
+                size_t depth=0,cellDepth=0,start=0,end=0;
+                void writeEnterSection(const std::string name) override {
+                    ++depth;if(name=="cases") {start=getPosition();cellDepth=depth;}
+                }
+                void writeEnterSection(unsigned) override {++depth;}
+                void writeLeaveSection(size_t count=1) override {
+                    while(count--) {if(depth==cellDepth && cellDepth) {end=getPosition();cellDepth=0;} --depth;}
+                }
+            };
+            auto* measured=new MemoryStreamBackend;
+            CellBounds bounds(measured);gui.game.map.save(&bounds);
+            const size_t cellsStart=bounds.start,cellsEnd=bounds.end;
+            REQUIRE(measured->takeContents().substr(0,cellsEnd)==mapBytes.substr(0,cellsEnd));
+            const size_t mapEnd=mapBytes.find("MapE");
+            REQUIRE((mapEnd!=std::string::npos && cellsStart<cellsEnd && cellsEnd<mapEnd));
+            const size_t cuts[] = {0,1,3,4,7,11,12,cellsStart-1,cellsStart,
+                cellsStart+(cellsEnd-cellsStart)/2,cellsEnd-1,cellsEnd,cellsEnd+1,mapEnd,mapEnd+3};
 			int count = 0;
 			for (bool file : {false, true})
 				for (size_t cut : cuts)

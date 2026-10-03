@@ -4,6 +4,7 @@
 #pragma once
 
 #include <memory>
+#include "ReplayTelemetry.h"
 #include <assert.h>
 #include <string>
 #include "Types.h"
@@ -15,16 +16,13 @@ namespace GAGCore
 
 class Order;
 
-//! Minimum number of well-formed orders read from a replay before the
-//! reader will treat a corrupt order as recoverable (substituting a
-//! NullOrder). Below this threshold a malformed order aborts the replay.
-//! See ReplayReader.cpp.
-static constexpr Uint32 REPLAY_MIN_VALID_ORDERS = 5;
+//! Malformed or truncated replay bodies are rejected, including partial recordings.
 
 //! Oldest replay format (the VERSION_MINOR the replay was written with) that
-//! the reader still accepts. Version 123 changes scoped invalidation, escape refresh
-//! and Numbi RNG; earlier replays can diverge even when their orders match.
-static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = 123;
+//! the reader still accepts. Version 127 expands team capacity and serialized
+//! state/checksum layouts; older replay headers describe the previous capacity.
+//! Save compatibility has a separate floor in Version.h.
+static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = 127;
 
 /// This class is used for reading replays.
 /// The replay stream is kept open and read every time you do retrieveOrder.
@@ -74,7 +72,11 @@ public:
 	/// Get the next order on the current step
 	std::shared_ptr<Order> retrieveOrder();
 
-private:
+	void applyTelemetry(Game &game) { telemetry.apply(game, currentStep); }
+	bool hasTelemetry() const { return telemetry.available(); }
+
+  private:
+	ReplayTelemetry::Stream telemetry;
 	/// You shouldn't copy-construct this class
 	ReplayReader(const ReplayReader &copy) { assert(false); };
 

@@ -7,7 +7,7 @@
 #include <memory>
 #include <vector>
 
-#include "kernel/GradientBucket.h"
+#include "field/GradientBucket.h"
 
 class Map;
 
@@ -19,12 +19,12 @@ class Map;
 class BuildingGradientSearch
 {
 	std::array<GradientBucket, GradientBucket::COUNT> buckets;
-	std::vector<std::uint8_t> water;
+	std::shared_ptr<const std::vector<std::uint8_t>> water;
 	std::uint16_t *gradient = nullptr;
 	std::size_t cells = 0, pending = 0;
 	int currentCost = 0, swimClass = 0;
 	std::uint64_t popped = 0;
-	int widthMask = 0, heightMask = 0, widthShift = 0;
+	int widthMask = 0, heightMask = 0;
 
 public:
 	void begin(const Map &map, std::uint16_t *seeded, int swim);

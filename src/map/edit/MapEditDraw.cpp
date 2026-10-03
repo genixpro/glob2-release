@@ -14,7 +14,7 @@
 #include "Unit.h"
 #include "UnitType.h"
 #include "Utilities.h"
-#include "SDLCompat.h"
+#include <SDL3/SDL.h>
 
 void MapEdit::draw(Uint64 frameTick)
 {
@@ -32,6 +32,7 @@ void MapEdit::draw(Uint64 frameTick)
 void MapEdit::drawMap(int sx, int sy, int sw, int sh)
 {
 	updateCamera();
+	view.render.minimumZoom = camera.minimumZoom();
 	globalContainer->gfx->setClipRect();
 	globalContainer->gfx->drawFilledRect(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH(),0,0,32);
 	globalContainer->gfx->beginMapTransform(camera.zoom, camera.offsetX-camera.fractionX()*camera.zoom, camera.offsetY-camera.fractionY()*camera.zoom, camera.offsetX, std::max(16, int(camera.offsetY)), camera.visibleW()*camera.zoom, camera.visibleH()*camera.zoom-std::max(0,16-int(camera.offsetY)));
@@ -103,7 +104,7 @@ globalContainer->gfx->drawMapCopies(game.map.getW()*32,game.map.getH()*32,game.m
 
 void MapEdit::drawMiniMap(void)
 {
-	minimap.draw(team, viewportX, viewportY, int(std::ceil(camera.visibleW()/32)), int(std::ceil(camera.visibleH()/32)) );
+	minimap.draw(view.drawnScene(), team, viewportX, viewportY, int(std::ceil(camera.visibleW()/32)), int(std::ceil(camera.visibleH()/32)) );
 }
 
 

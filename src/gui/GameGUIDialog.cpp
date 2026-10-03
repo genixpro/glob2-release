@@ -5,6 +5,7 @@
 #include "FormatableString.h"
 #include "ScrollTuning.h"
 #include "GameGUI.h"
+#include "scene/Scene.h"
 #include "GlobalContainer.h"
 #include "Player.h"
 #include "SoundMixer.h"
@@ -38,40 +39,89 @@ Element InGameMainScreen::build(const Presentation &p)
 {
 	const std::string returnLabel = fe::tr(replay ? "[return to replay]" : "[return to game]");
 	const std::string loadLabel = fe::tr(replay ? "[load replay]" : "[load game]");
-	const std::string quitLabel = fe::tr(replay ? "[quit the replay]" : "[quit the game]");
+	const std::string quitLabel = fe::tr(replay ? "[quit the replay]" : networked ? "[leave match]" : "[quit the game]");
+	// A networked match cannot be loaded over or saved: the relay owns its turns.
+	const bool files = !networked;
+	const std::string pauseText = !pauseLabel.empty() ? pauseLabel : fe::tr(paused ? "[resume game]" : "[pause game]");
 	if (classic())
 	{
 		// The classic desktop menu: a column of gold buttons, Return last.
 		std::vector<Element> buttons;
-		buttons.push_back(classicButton("load", loadLabel, [this] { finish(LOAD_GAME); }));
-		if (!replay && canSave)
+		if (files)
+			buttons.push_back(classicButton("load", loadLabel, [this] { finish(LOAD_GAME); }));
+		if (files && !replay && canSave)
 			buttons.push_back(classicButton("save", fe::tr("[save game]"), [this] { finish(SAVE_GAME); }));
+		buttons.push_back(
+			classicButton("telemetry", fe::tr("[AI telemetry]"), [this] { finish(AI_TELEMETRY); }));
 		buttons.push_back(classicButton("options", fe::tr("[Options]"), [this] { finish(OPTIONS); }));
+		// Single player pauses with its key; a network match shows the rule here
+		// too, as the touch sheet does.
+		if (networked)
+			buttons.push_back(classicButton("pause", pauseText, [this] { finish(PAUSE_GAME); }, SDLK_UNKNOWN, pauseEnabled));
 		buttons.push_back(classicButton("quit", quitLabel, [this] { finish(QUIT_GAME); }));
 		buttons.push_back(classicButton("return", returnLabel, [this] { finish(RETURN_GAME); }, SDLK_ESCAPE));
 		return fe::column(std::move(buttons), {p.pt(10)});
 	}
 	// The touch sheet: titled, Return highlighted at the bottom.
-	auto item = [&](const char *key, const std::string &label, int code, bool selected = false, SDL_Keycode shortcut = SDLK_UNKNOWN)
+	auto item = [&](const char *key, const std::string &label, int code, bool selected = false, SDL_Keycode shortcut = SDLK_UNKNOWN,
+					bool enabled = true)
 	{
 		fe::ButtonOptions options;
 		options.selected = selected;
 		options.shortcut = shortcut;
 		options.minHeight = 44;
+		options.enabled = enabled;
 		return fe::button(key, label, [this, code] { finish(code); }, options);
 	};
 	std::vector<Element> buttons;
-	if (!replay && canSave)
+	if (files && !replay && canSave)
 		buttons.push_back(item("save", fe::tr("[save game]"), SAVE_GAME));
-	buttons.push_back(item("load", loadLabel, LOAD_GAME));
+	if (files)
+		buttons.push_back(item("load", loadLabel, LOAD_GAME));
+	buttons.push_back(item("telemetry", fe::tr("[AI telemetry]"), AI_TELEMETRY));
 	buttons.push_back(item("options", fe::tr("[Options]"), OPTIONS));
+	buttons.push_back(item("pause", pauseText, PAUSE_GAME, false, SDLK_UNKNOWN, pauseEnabled));
+	// Leaving ends the list, away from the everyday choices (it asks first).
 	buttons.push_back(item("quit", quitLabel, QUIT_GAME));
-	buttons.push_back(item("pause", fe::tr(paused ? "[resume game]" : "[pause game]"), PAUSE_GAME));
 	// Return stays pinned below the list so it is always in reach.
 	return fe::column({fe::paragraph(fe::tr("[Menu]"), {fe::FontRole::Heading, false, fe::TextAlign::Center}),
 					   fe::footer(fe::scroll("menu/scroll", fe::column(std::move(buttons), {p.pt(8)})),
 								  item("return", returnLabel, RETURN_GAME, true, SDLK_ESCAPE))},
 					  {p.pt(12)});
+}
+
+InGameConfirmScreen::InGameConfirmScreen(std::string title, std::string body, std::string confirmLabel,
+										 std::string cancelLabel)
+	: title(std::move(title)), body(std::move(body)), confirmLabel(std::move(confirmLabel)),
+	  cancelLabel(std::move(cancelLabel))
+{
+}
+
+Element InGameConfirmScreen::build(const Presentation &p)
+{
+	std::vector<Element> parts;
+	parts.push_back(fe::paragraph(title, {fe::FontRole::Heading, false, fe::TextAlign::Center}));
+	parts.push_back(fe::paragraph(body, {fe::FontRole::Body}));
+	std::vector<Element> buttons;
+	if (classic())
+	{
+		buttons.push_back(classicButton("confirm", confirmLabel, [this] { finish(CONFIRM); }));
+		buttons.push_back(classicButton("cancel", cancelLabel, [this] { finish(CANCEL); }, SDLK_ESCAPE));
+	}
+	else
+	{
+		// Staying is the highlighted choice; leaving needs a deliberate tap.
+		fe::ButtonOptions stay;
+		stay.primary = true;
+		stay.shortcut = SDLK_ESCAPE;
+		stay.minHeight = 44;
+		fe::ButtonOptions go;
+		go.minHeight = 44;
+		buttons.push_back(fe::button("cancel", cancelLabel, [this] { finish(CANCEL); }, stay));
+		buttons.push_back(fe::button("confirm", confirmLabel, [this] { finish(CONFIRM); }, go));
+	}
+	parts.push_back(fe::column(std::move(buttons), {p.pt(classic() ? 10 : 8)}));
+	return fe::column(std::move(parts), {p.pt(12)});
 }
 
 InGameEndOfGameScreen::InGameEndOfGameScreen(std::string title, bool canContinue, std::optional<GAGCore::Color> teamColor,
@@ -149,7 +199,7 @@ InGameAllianceScreen::InGameAllianceScreen(GameGUI *gameGUI) : gameGUI(gameGUI)
 	for (int i = 0; i < players; i++)
 	{
 		const int otherTeam = game.players[i]->teamNumber;
-		const Uint32 otherTeamMask = 1 << otherTeam;
+		const Uint32 otherTeamMask = Team::teamNumberToMask(otherTeam);
 		teamOf[i] = otherTeam;
 		ownAlliance[i] = (gameGUI->localTeam->allies & otherTeamMask) != 0;
 		ownNormal[i] = (gameGUI->localTeam->sharedVisionOther & otherTeamMask) != 0;
@@ -272,8 +322,10 @@ Element InGameAllianceScreen::build(const Presentation &p)
 			parts.push_back(fe::paragraph(fe::tr("[Alliance and shared vision are fixed for this match.]"), {fe::FontRole::Support, true}));
 		parts.push_back(fe::spacer(p.pt(40)));
 		parts.push_back(notesColumn());
-		parts.push_back(classicButton("ok", fe::tr("[ok]"), [this] { finish(OK); }, SDLK_RETURN));
-		return fe::column(std::move(parts), {p.pt(10)});
+		// The outer gutter limits height on short desktop windows too. Keep the
+		// footer reachable while the full diplomacy table and its legend scroll.
+		auto ok = classicButton("ok", fe::tr("[ok]"), [this] { finish(OK); }, SDLK_RETURN);
+		return fe::footer(fe::scroll("ally/scroll", fe::column(std::move(parts), {p.pt(10)})), ok);
 	}
 	std::vector<Element> list;
 	for (auto &entry : rows)
@@ -313,13 +365,15 @@ Element InGameAllianceScreen::build(const Presentation &p)
 		body.push_back(fe::divider());
 		body.push_back(notesColumn());
 	}
-	parts.push_back(fe::scroll("ally/scroll", fe::column(std::move(body), {p.pt(8)})));
+	parts.push_back(fe::column(std::move(body), {p.pt(8)}));
 	fe::ButtonOptions okOptions;
 	okOptions.primary = true;
 	okOptions.shortcut = SDLK_RETURN;
 	okOptions.minHeight = 44;
 	auto ok = fe::button("ok", fe::tr("[ok]"), [this] { finish(OK); }, okOptions);
-	return fe::column({fe::footer(fe::column(std::move(parts), {p.pt(10)}), ok)});
+	// Include the heading and explanation in the scrolling content so large
+	// text cannot consume the fixed footer's available space.
+	return fe::footer(fe::scroll("ally/scroll", fe::column(std::move(parts), {p.pt(10)})), ok);
 }
 
 int InGameAllianceScreen::countNumberPlayersForLocalTeam(GameHeader &gameHeader, int localteam)
@@ -624,14 +678,14 @@ Element InGameObjectivesScreen::build(const Presentation &p)
 	if (classic())
 	{
 		auto ok = classicButton("ok", fe::tr("[ok]"), [this] { finish(OK); }, SDLK_RETURN);
-		return fe::column({header, fe::height(p.pt(300), body), ok}, {p.pt(10)});
+		return fe::column({header, fe::footer(body, ok)}, {p.pt(10)});
 	}
 	fe::ButtonOptions okOptions;
 	okOptions.primary = true;
 	okOptions.shortcut = SDLK_RETURN;
 	okOptions.minHeight = 44;
 	auto ok = fe::button("ok", fe::tr("[ok]"), [this] { finish(OK); }, okOptions);
-	return fe::column({header, fe::expanded(fe::footer(body, ok))}, {p.pt(10)});
+	return fe::column({header, fe::footer(body, ok)}, {p.pt(10)});
 }
 
 InGameTextInput::InGameTextInput() = default;
@@ -670,4 +724,110 @@ Element InGameTextInput::build(const Presentation &p)
 	auto close =
 		fe::compactButton("close", fe::tr("[Close]"), fe::UIIcon::Close, [this] { finish(1); }, p);
 	return fe::row({fe::expanded(entry), send, close}, {p.pt(6), fe::CrossAlign::Center});
+}
+
+void InGameAITelemetryScreen::onUpdate(Uint32)
+{
+	const auto &scene = gui->drawnScene();
+	Uint32 players = 0;
+	for (const auto &record : scene.panels.aiTelemetry)
+		players |= Uint32(1) << record.player;
+	// Values are sampled every 32 ticks. Permission changes still refresh the
+	// dialog immediately, including when the viewer changes while paused.
+	if (sample != scene.tick / 32 || players != accessiblePlayers)
+	{
+		sample = scene.tick / 32;
+		accessiblePlayers = players;
+		invalidate();
+	}
+}
+
+Element InGameAITelemetryScreen::build(const Presentation &p)
+{
+	const auto &records = gui->drawnScene().panels.aiTelemetry;
+	std::vector<std::string> names;
+	int selected = 0;
+	for (unsigned i = 0; i < records.size(); ++i)
+	{
+		names.push_back(std::to_string(records[i].player + 1) + " · " + records[i].name);
+		if (records[i].player == player)
+			selected = int(i);
+	}
+	std::vector<Element> rows;
+	if (records.empty())
+		rows.push_back(fe::paragraph(fe::tr("[No accessible AI telemetry.]")));
+	else
+	{
+		player = records[selected].player;
+		rows.push_back(fe::field(fe::tr("[Player]"),
+								 fe::choice("telemetry/player", names, selected,
+											[this](int index)
+											{
+												const auto &values =
+													gui->drawnScene().panels.aiTelemetry;
+												if (index >= 0 && size_t(index) < values.size())
+													player = values[index].player;
+												invalidate();
+											})));
+		rows.push_back(
+			fe::field(fe::tr("[Search fields]"), fe::textField("telemetry/search", search,
+															 [this](const std::string &value)
+															 {
+																 search = value;
+																 invalidate();
+															 })));
+		const auto &record = records[selected];
+		if (!record.available)
+			rows.push_back(
+				fe::paragraph(fe::tr("[Telemetry unavailable for this recording or controller.]")));
+		else
+		{
+			auto values = record.values;
+			std::sort(values.begin(), values.end(),
+					  [](const auto &a, const auto &b) { return a.name < b.name; });
+			// ASCII folding preserves UTF-8 bytes and makes common API field names easy to find.
+			auto folded = [](std::string text)
+			{
+				for (char &c : text)
+					if (c >= 'A' && c <= 'Z')
+						c += 'a' - 'A';
+				return text;
+			};
+			const auto query = folded(search);
+			bool matched = false;
+			std::string group;
+			for (const auto &value : values)
+			{
+				if (!search.empty() &&
+					folded(value.name + " " + value.meaning + " " + value.value).find(query) ==
+						std::string::npos)
+					continue;
+				matched = true;
+				auto category = value.name.substr(0, value.name.find('.'));
+				if (category != group)
+				{
+					group = category;
+					rows.push_back(fe::paragraph(group, {fe::FontRole::Heading}));
+				}
+				rows.push_back(fe::paragraph(
+					value.name + ": " + value.value + (value.unit.empty() ? "" : " " + value.unit) +
+					"  · " +
+					std::string(GAGCore::FormattableString(fe::tr("[Updated at tick %0]"))
+									.arg(value.updated))));
+				if (!value.meaning.empty())
+					rows.push_back(fe::paragraph(value.meaning));
+			}
+			if (!matched)
+				rows.push_back(fe::paragraph(fe::tr(
+					search.empty() ? "[No values published yet.]" : "[No fields match your search.]")));
+		}
+	}
+	fe::ButtonOptions close;
+	close.shortcut = SDLK_ESCAPE;
+	return fe::column({fe::paragraph(fe::tr("[AI telemetry]"), {fe::FontRole::Heading}),
+					   fe::expanded(fe::footer(
+						   fe::scroll("telemetry/scroll", fe::column(std::move(rows), {p.pt(8)})),
+						   fe::button(
+							   "telemetry/close", fe::tr("[Close]"), [this] { finish(0); }, close)))},
+					  {p.pt(12)});
 }

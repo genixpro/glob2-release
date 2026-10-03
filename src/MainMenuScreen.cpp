@@ -4,7 +4,7 @@
 #include "GlobalContainer.h"
 #include <algorithm>
 #include <cmath>
-#include <SDL_misc.h>
+#include <ApplicationHost.h>
 
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
@@ -31,10 +31,10 @@ void MainMenuScreen::loadWordmark(int logoWidth)
 		return;
 	SDL_Rect crop{76, 232, 1956, 284};
 	const int logoHeight = std::max(1, logoWidth * crop.h / crop.w);
-	auto *fitted = SDL_CreateRGBSurfaceWithFormat(0, logoWidth, logoHeight, 32, SDL_PIXELFORMAT_RGBA32);
+	auto *fitted = SDL_CreateSurface(logoWidth, logoHeight, SDL_PIXELFORMAT_RGBA32);
 	if (!fitted)
 		return;
-	if (SDL_BlitScaled(source.getSDLSurface(), &crop, fitted, nullptr) == 0)
+	if (SDL_BlitSurfaceScaled(source.getSDLSurface(), &crop, fitted, nullptr, SDL_SCALEMODE_NEAREST))
 	{
 		// The source asset has a pale matte. Recover coverage for its two
 		// flat inks before compositing, including the letter openings.
@@ -44,18 +44,18 @@ void MainMenuScreen::loadWordmark(int logoWidth)
 			for (int col = 0; col < logoWidth; ++col)
 			{
 				Uint8 red, green, blue, alpha;
-				SDL_GetRGBA(pixels[col], fitted->format, &red, &green, &blue, &alpha);
+				SDL_GetRGBA(pixels[col], SDL_GetPixelFormatDetails(fitted->format), SDL_GetSurfacePalette(fitted), &red, &green, &blue, &alpha);
 				const bool goldInk = red > green;
 				double coverage = goldInk ? (int(green) - int(blue) - 20) / 65.0 : (232 - int(red)) / 200.0;
 				coverage = coverage < 0.03 ? 0.0 : std::min(1.0, coverage);
-				pixels[col] = SDL_MapRGBA(fitted->format, goldInk ? 227 : 36, goldInk ? 192 : 69,
+				pixels[col] = SDL_MapSurfaceRGBA(fitted, goldInk ? 227 : 36, goldInk ? 192 : 69,
 										  goldInk ? 119 : 49, static_cast<Uint8>(std::lround(255 * coverage)));
 			}
 		}
 		SDL_SetSurfaceBlendMode(fitted, SDL_BLENDMODE_BLEND);
 		wordmark = std::make_unique<GAGCore::DrawableSurface>(fitted);
 	}
-	SDL_FreeSurface(fitted);
+	SDL_DestroySurface(fitted);
 }
 
 Element MainMenuScreen::build(const Presentation &p)
@@ -84,7 +84,7 @@ Element MainMenuScreen::build(const Presentation &p)
 			case TUTORIAL:
 				options.icon = uiIcon(UIIcon::Tutorial);
 				break;
-			case MULTIPLAYERS_YOG:
+			case PLAY_ONLINE:
 				options.icon = uiIcon(UIIcon::Online);
 				break;
 			case MULTIPLAYERS_LAN:
@@ -130,6 +130,10 @@ Element MainMenuScreen::build(const Presentation &p)
 		if (!more)
 		{
 			content.push_back(action("[custom game]", CUSTOM, primaryStyle));
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE)
+			// Play online sits on the main card, under Custom game; LAN stays under More.
+			content.push_back(action("[play online]", PLAY_ONLINE, rowStyle));
+#endif
 			const bool landscape = p.landscape() && p.safe.h < p.pt(480);
 			if (landscape)
 			{
@@ -161,10 +165,7 @@ Element MainMenuScreen::build(const Presentation &p)
 			back.shortcut = SDLK_ESCAPE;
 			back.icon = uiIcon(UIIcon::Back);
 			content.push_back(button("menu/back", tr("[Back]"), [this] { showMore(false); }, back));
-#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE) && !defined(GLOB2_MOBILE)
-			content.push_back(action("[yog]", MULTIPLAYERS_YOG, rowStyle));
-#endif
-#if !defined(__EMSCRIPTEN__) && (!defined(GLOB2_MOBILE) || defined(GLOB2_AMAZON_RELEASE))
+#ifndef __EMSCRIPTEN__
 			content.push_back(action("[lan]", MULTIPLAYERS_LAN, rowStyle));
 #endif
 			content.push_back(action("[editor]", EDITOR, rowStyle));
@@ -172,9 +173,9 @@ Element MainMenuScreen::build(const Presentation &p)
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 			content.push_back(button("menu/privacy", "Privacy policy", [] {
 #if defined(GLOB2_AMAZON_RELEASE)
-				SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
+				GAGCore::ApplicationHost::openUrl("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
 #else
-				SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
+				GAGCore::ApplicationHost::openUrl("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
 #endif
 			}, rowStyle));
 #endif
@@ -212,14 +213,16 @@ Element MainMenuScreen::build(const Presentation &p)
 		content.push_back(title("Globulation 2"));
 	content.push_back(spacer(p.pt(compact ? 8 : 16)));
 	content.push_back(action("[custom game]", CUSTOM, primary));
+	// Play online is a way to play like the others, under Custom game as on
+	// phones, not a small extra below them.
+#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE)
+	content.push_back(action("[play online]", PLAY_ONLINE, launch));
+#endif
 	content.push_back(action("[campaign]", CAMPAIGN, launch));
 	content.push_back(action("[load game]", LOAD_GAME, launch));
 	content.push_back(action("[tutorial]", TUTORIAL, launch));
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
-#if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE) && !defined(GLOB2_MOBILE)
-	content.push_back(action("[yog]", MULTIPLAYERS_YOG, utility));
-#endif
-#if !defined(__EMSCRIPTEN__) && (!defined(GLOB2_MOBILE) || defined(GLOB2_AMAZON_RELEASE))
+#ifndef __EMSCRIPTEN__
 	content.push_back(action("[lan]", MULTIPLAYERS_LAN, utility));
 #endif
 	content.push_back(spacer(p.pt(compact ? 6 : 12)));
@@ -228,9 +231,9 @@ Element MainMenuScreen::build(const Presentation &p)
 #if defined(GLOB2_MOBILE) && defined(__ANDROID__)
 	utilities.push_back(button("menu/privacy", "Privacy policy", [] {
 #if defined(GLOB2_AMAZON_RELEASE)
-		SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
+		GAGCore::ApplicationHost::openUrl("https://github.com/Globulation2/glob2/blob/master/docs/mobile/amazon-privacy-policy.md");
 #else
-		SDL_OpenURL("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
+		GAGCore::ApplicationHost::openUrl("https://github.com/Globulation2/glob2/blob/master/docs/mobile/privacy-policy.md");
 #endif
 	}, utility));
 #endif

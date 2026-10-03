@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <Environment.h>
 #include "EngineFixtures.h"
+#include "ScopedEnvironment.h"
 #include <vector>
 #include <string>
 #include <memory>
@@ -10,12 +12,13 @@
 #include <cstdint>
 #include <iterator>
 #include "Engine.h"
+#include "gui/GameGUITouch.h"
+#include <GraphicContext.h>
 #include "Unit.h"
 #include "Building.h"
 #include "GameSessionScreen.h"
 #include "GameUtilities.h"
 #include "MapEdit.h"
-#include "YOGLoginScreen.h"
 #include "SettingsScreen.h"
 #include "ChooseMapScreen.h"
 #include "GUIMapPreview.h"
@@ -23,11 +26,11 @@
 #include <FileManager.h>
 #include <Toolkit.h>
 #include "Application.h"
-#include "YOGClient.h"
-#include "YOGClientEvent.h"
-#include "GameLaunchMessages.h"
+#include "OnlineServices.h"
+#include "PlatformClient.h"
+#include "QuickMatch.h"
 #include "gui/LoadSaveDialog.h"
-#include "SessionTabsScreen.h"
+#include "gui/GameGUIDialog.h"
 #include "FertilityCalculator.h"
 #include "FertilityScreen.h"
 #include "EditorLoadScreen.h"
@@ -47,7 +50,7 @@
 #include "Order.h"
 #include "native.h"
 #include "code.h"
-#include <SDL_net.h>
+#include <SDL3_net/SDL_net.h>
 #include <iostream>
 #include <filesystem>
 #include <fstream>
@@ -65,13 +68,122 @@ GAGCore::CooperativeSlice fixedSlice()
 
 TEST_SUITE("EngineSession")
 {
+	TEST_CASE("momentum uses the SDL clock after session suspension [display][artifacts]")
+	{
+		glob2test::ScopedEnvironment desktopUI("GLOB2_MOBILE_UI", "0");
+		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.display = true, .loadStrings = true, .width = 800, .height = 600, .screenFlags = GAGCore::GraphicContext::PORTABLEGPU});
+		REQUIRE(NET_Init());
+		struct NetworkScope { ~NetworkScope() { NET_Quit(); } } network;
+		globalContainer->automaticEndingGame = false;
+		for (bool threaded : {false, true})
+		{
+			INFO("threaded client path=" << threaded);
+			Engine engine;
+			REQUIRE(engine.initCampaign("maps/balanced.map") == Engine::EE_NO_ERROR);
+			// A resumed session's clock trails SDL wall time. Keep it at zero
+			// while driving real timestamped touch events; no long sleep needed.
+			engine.beginSession(0);
+			engine.gui.gamePaused = true;
+			if (threaded)
+				REQUIRE(engine.startSimulationThread(0));
+			auto frame = [&](const std::vector<SDL_Event> &events = {}) {
+				REQUIRE(threaded ? engine.threadedClientFrame(0, events) : engine.stepSession(0, events));
+			};
+			auto finger = [&](Uint32 type, float x) {
+				SDL_Event event{};
+				event.type = type;
+				event.tfinger.timestamp = SDL_GetTicksNS();
+				event.tfinger.touchID = 7;
+				event.tfinger.fingerID = 1;
+				event.tfinger.x = x / 800;
+				event.tfinger.y = 300.f / 600;
+				frame({event});
+			};
+			for (int resume = 0; resume < 2; ++resume)
+			{
+				engine.suspendInput();
+				engine.suspendSimulation();
+				REQUIRE(!engine.gui.touch->scrollAnimating());
+				engine.resumeSimulation(0);
+				frame();
+				finger(SDL_EVENT_FINGER_DOWN, 300);
+				for (int move = 1; move <= 4; ++move)
+				{
+					SDL_Delay(16);
+					finger(SDL_EVENT_FINGER_MOTION, 300 + 30 * move);
+				}
+				finger(SDL_EVENT_FINGER_UP, 420);
+				const auto capture = [&](const char *phase) {
+					engine.gui.drawAll(0);
+					const std::string name = std::string("resume-") + (threaded ? "threaded-" : "serial-")
+						+ std::to_string(resume) + "-" + phase + ".bmp";
+					globalContainer->gfx->printScreen(name.c_str());
+					globalContainer->gfx->nextFrame();
+				};
+				const double released = engine.gui.camera.originX;
+				capture("released");
+				SDL_Delay(20);
+				frame();
+				capture("coasting");
+				const double coast = MapCamera::wrap(released - engine.gui.camera.originX,
+					engine.gui.game.map.getW() * 32.0);
+				std::cout << "Resume momentum: threaded=" << threaded << " cycle=" << resume
+					<< " session_ms=0 SDL_ms=" << SDL_GetTicks() << " coast_pixels=" << coast << "\n";
+				REQUIRE(coast > 1);
+				REQUIRE(coast < engine.gui.game.map.getW() * 16.0);
+			}
+			// Teardown's GUI-only service has no session-time argument and must
+			// park the producer even when there is no save left to finalize.
+			const auto stoppedTick = engine.gui.game.stepCounter;
+			REQUIRE_FALSE(engine.advancePendingSave({}));
+			REQUIRE_FALSE(engine.simulationThreaded());
+			REQUIRE(engine.gui.game.stepCounter == stoppedTick);
+			engine.abortSession();
+		}
+	}
+	TEST_CASE("serial sessions retain chat text across skipped GUI frames")
+	{
+		glob2test::ScopedEnvironment serialSession("GLOB2_SIM_THREAD", "0");
+		glob2test::ScopedEnvironment desktopUI("GLOB2_MOBILE_UI", "0");
+		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.display = true, .loadStrings = true, .width = 800, .height = 600});
+		REQUIRE(NET_Init());
+		struct NetworkScope { ~NetworkScope() { NET_Quit(); } } network;
+		globalContainer->settings.gameSpeed = Settings::GAME_SPEED_MAXIMUM;
+		globalContainer->automaticEndingGame = false;
+		Engine engine;
+		REQUIRE(engine.initCampaign("maps/balanced.map") == Engine::EE_NO_ERROR);
+		engine.beginSession(1000);
+		engine.gui.openChat();
+		REQUIRE(engine.gui.typingInputScreen);
+		REQUIRE(engine.stepSession(1000, {}));
+
+		// The host may reuse SDL's text storage before the engine's next GUI
+		// frame. Mutate a live buffer so shallow ownership fails deterministically.
+		char text[] = "deferred chat";
+		SDL_Event input{};
+		input.type = SDL_EVENT_TEXT_INPUT;
+		input.text.text = text;
+		REQUIRE(engine.stepSession(1001, {input}));
+		CHECK(engine.gui.typingInputScreen->getText().empty());
+		std::fill(std::begin(text), std::end(text) - 1, 'x');
+
+		const int interval = globalContainer->settings.getGameSpeedRenderInterval();
+		REQUIRE(interval > 1);
+		for (int frame = 1; frame < interval; ++frame)
+			REQUIRE(engine.stepSession(1001 + frame, {}));
+		CHECK(engine.gui.typingInputScreen->getText() == "deferred chat");
+		engine.gui.closeChat();
+		engine.gui.isRunning = false;
+		CHECK_FALSE(engine.finishSession());
+	}
+
 	TEST_CASE("incremental sessions; editor decisions; fertility equivalence and cancellation [writes-preferences]")
 	{
 		glob2test::CapturedStdout trace;
 		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.display = true, .loadStrings = true, .width = 800, .height = 600});
 		    // Session regressions use desktop menu coordinates and camera geometry.
 		    // GameGUITouchHarness covers the touch presentation with the same engine.
-		    SDL_setenv("GLOB2_MOBILE_UI", "0", 1);
+		    GAGCore::setProcessEnvironment("GLOB2_MOBILE_UI", "0", 1);
 			{
 				struct TrackedValue : Value
 				{
@@ -116,7 +228,7 @@ TEST_SUITE("EngineSession")
 		        std::cout << "PASS script GC roots, live frames, bytecode constants and interpreter isolation" << std::endl;
 			}
 		    globalContainer->settings.gameSpeed = 0;
-		    require(SDLNet_Init() == 0, "SDL networking init failed");
+		    require(NET_Init(), "SDL networking init failed");
 		    {
 		        // Both fixtures are listed at construction; one is then removed, the other truncated.
 		        for (const char* fixture : {"browser-missing-fixture.map", "browser-corrupt-fixture.map"}) {
@@ -130,7 +242,7 @@ TEST_SUITE("EngineSession")
 		            require(chooser.selectNamed("balanced") && chooser.getSelectedType() == ChooseMapScreen::MAP && chooser.hasPreview(), "Valid map must be selectable");
 		            require(chooser.selectNamed(invalid), "Fixture map must be listed");
 		            require(chooser.getSelectedType() == ChooseMapScreen::NONE && !chooser.hasPreview(), "Failed map read retained the previous selection or preview");
-		            SDL_Event enter{}; enter.type = SDL_KEYDOWN; enter.key.keysym.sym = SDLK_RETURN;
+		            SDL_Event enter{}; enter.type = SDL_EVENT_KEY_DOWN; enter.key.key = SDLK_RETURN;
 		            chooser.handleExecutionEvent(enter);
 		            require(chooser.isExecutionRunning(), "Invalid map was accepted by Enter");
 		            chooser.drawExecution();
@@ -153,7 +265,7 @@ TEST_SUITE("EngineSession")
 		    {
 		        Application application;
 		        SDL_Event quit{};
-		        quit.type = SDL_QUIT;
+		        quit.type = SDL_EVENT_QUIT;
 		        require(application.frame(SDL_GetTicks(), {quit}), "Quit must begin final persistence before returning");
 		        require(application.frame(SDL_GetTicks(), {quit}), "Repeated close must not bypass final persistence");
 		        require(application.frame(SDL_GetTicks(), {}), "Shutdown must present its completion before releasing graphics");
@@ -161,77 +273,32 @@ TEST_SUITE("EngineSession")
 		        std::cout << "PASS application quit waits for final persistence" << std::endl;
 		    }
 		    {
-		        struct LoginProbe : YOGLoginScreen {
-		            using YOGLoginScreen::YOGLoginScreen;
-		            std::string statusText() { return status; }
-		        };
-		        GAGGUI::ScreenStack screens(*globalContainer->gfx);
-		        LoginProbe login(screens, std::make_shared<YOGClient>());
-		        login.beginExecution(globalContainer->gfx);
-		        static_cast<YOGClientEventListener&>(login).handleYOGClientEvent(std::make_shared<YOGLoginRefusedEvent>(YOGClientVersionTooOld));
-		        require(login.statusText().find("same Glob2 release") != std::string::npos,
-		                "Protocol rejection must provide a translated actionable status");
-		        login.drawExecution();
-		        std::cout << "PASS protocol rejection provides an actionable translated status" << std::endl;
-		        login.endExecute(0); login.finishExecution();
+		        // The application owns its online services: created on first use while it
+		        // runs, connecting, and released (connection closed) when it goes. Earlier
+		        // cases may have created the harness-wide fallback services.
+		        const bool fallback = Online::servicesCreated();
+		        {
+		            Application application;
+		            require(!Online::servicesCreated(), "A new application must not create online services");
+		            Online::Services& online = Online::services();
+		            require(Online::servicesCreated() && &Online::services() == &online, "services() must return the application's");
+		            online.client.start("https://127.0.0.1:9");
+		            Online::quickMatch();
+		            for (int i = 0; i < 20; ++i)
+		                Online::pump();
+		            SDL_Event quit{};
+		            quit.type = SDL_EVENT_QUIT;
+		            while (application.frame(SDL_GetTicks(), {quit}))
+		                Online::pump();
+		        }
+		        require(Online::servicesCreated() == fallback, "The application must release its online services");
+		        std::cout << "PASS the application owns and releases its online services" << std::endl;
 		    }
-
-		    {
-		        struct StartProbe : MultiplayerGame {
-		            using MultiplayerGame::MultiplayerGame;
-		            using MultiplayerGame::receiveMessage;
-		        };
-		        auto client = std::make_shared<YOGClient>();
-		        auto game = std::make_shared<StartProbe>(client);
-		        require(!game->takeStartRequest(), "A room cannot start before the server request");
-		        game->receiveMessage(std::make_shared<NetStartGame>());
-		        require(game->takeStartRequest() && !game->takeStartRequest(),
-		                "Network dispatch must defer launch and the host must consume it once");
-		        require(game->isWaitingForEngine(), "Router orders must remain queued after the host consumes launch");
-		        game->sessionEnded(false);
-		        require(!game->isWaitingForEngine(), "Cancelled initialization must release the router queue hold");
-		        Engine engine;
-		        require(!engine.initMultiplayerTask(game, client, -1).run(),
-		                "Multiplayer initialization must reject a missing local player");
-		        std::cout << "PASS deferred multiplayer launch and invalid local-player rejection" << std::endl;
-		    }
-
-		    {
-		        struct TabProbe : SessionTab {
-		            std::string name;
-		            explicit TabProbe(std::string name) : name(std::move(name)) {}
-		            std::string title() const override { return name; }
-		            Glob2UI::Element build(const Glob2UI::Presentation&) override { return Glob2UI::label(name); }
-		        };
-		        SessionTabsScreen tabs;
-		        auto first = std::make_unique<TabProbe>("First");
-		        TabProbe remaining("Remaining");
-		        tabs.addTab(first.get(), false);
-		        tabs.addTab(&remaining, true);
-		        tabs.beginExecution(globalContainer->gfx);
-		        first->finish(7);
-		        tabs.onTimer(SDL_GetTicks());
-		        require(tabs.isExecutionRunning() && first->returnCode() == 7,
-		                "Completing an owned tab must not end the session");
-		        tabs.removeTab(first.get());
-		        first.reset();
-		        tabs.onTimer(SDL_GetTicks());
-		        require(tabs.isExecutionRunning() && remaining.isActivated() && tabs.activeTab() == &remaining,
-		                "Destroying a completed tab must activate the surviving tab");
-		        tabs.drawExecution();
-		        remaining.finish(0);
-		        tabs.onTimer(SDL_GetTicks());
-		        require(!tabs.isExecutionRunning(), "The primary tab ends the session");
-		        tabs.removeTab(&remaining);
-		        tabs.finishExecution();
-		        std::cout << "PASS owned tab destruction preserves surviving tabs" << std::endl;
-		    }
-
 		    {
 		        auto& gfx = *globalContainer->gfx;
 		        SDL_Window* window = nullptr;
 		        // GlobalContainer can recreate its initial window while applying settings.
-		        // This isolated SDL2 fixture owns a single window; IDs need not start at one.
+		        // This isolated SDL3 fixture owns a single window; IDs need not start at one.
 		        for (Uint32 id = 1; id < 100 && !window; ++id) window = SDL_GetWindowFromID(id);
 		        require(window != nullptr, "No native test window");
 		        const auto windowID = SDL_GetWindowID(window);
@@ -244,10 +311,10 @@ TEST_SUITE("EngineSession")
 		        // Mobile uses the portable renderer, not SDL_GetWindowSurface. Capture
 		        // the actual presentation backend on both platforms.
 		        auto* presented = SDL_LoadBMP((std::string(globalContainer->fileManager->getDir(0)) + "/resize-check.bmp").c_str());
-		        require(presented && presented->pixels && presented->format->BytesPerPixel == 4, "No presented test surface");
+		        require(presented && presented->pixels && SDL_BYTESPERPIXEL(presented->format) == 4, "No presented test surface");
 		        Uint8 red, green, blue;
-		        SDL_GetRGB(*static_cast<Uint32*>(presented->pixels), presented->format, &red, &green, &blue);
-		        SDL_FreeSurface(presented);
+		        SDL_GetRGB(*static_cast<Uint32*>(presented->pixels), SDL_GetPixelFormatDetails(presented->format), SDL_GetSurfacePalette(presented), &red, &green, &blue);
+		        SDL_DestroySurface(presented);
 		        require(red == 255 && green == 0 && blue == 0, "Resized surface was not presented to the window");
 		        require(!gfx.resizeViewport(0, 0) && gfx.getW() == 1200, "Zero viewport invalidated the render target");
 		        require(gfx.resizeViewport(800, 600), "Could not restore test viewport");
@@ -362,7 +429,7 @@ TEST_SUITE("EngineSession")
 		        const auto rng = getSyncRandState();
 		        GAGGUI::ScreenStack cancelled(*globalContainer->gfx);
 		        cancelled.push(std::make_unique<EditorGenerateScreen>(GenerationRequest(), 12345, fixedSlice()));
-		        SDL_Event escape{}; escape.type = SDL_KEYDOWN; escape.key.keysym.sym = SDLK_ESCAPE;
+		        SDL_Event escape{}; escape.type = SDL_EVENT_KEY_DOWN; escape.key.key = SDLK_ESCAPE;
 		        cancelled.frame(0, {escape}); cancelled.frame(1, {});
 		        require(!cancelled.running() && cancelled.result() == 0 && getSyncRandState() == rng,
 		                "Cancelled editor generation must release its state and preserve RNG");
@@ -435,7 +502,7 @@ TEST_SUITE("EngineSession")
 		            if (outcome == 0 && frames == 10) {
 		                reload.suspendExecution();
 		                reload.viewportResized(800,600,800,600);
-		                SDL_Event escape{}; escape.type = SDL_KEYDOWN; escape.key.keysym.sym = SDLK_ESCAPE;
+		                SDL_Event escape{}; escape.type = SDL_EVENT_KEY_DOWN; escape.key.key = SDLK_ESCAPE;
 		                events.push_back(escape);
 		            }
 		            reload.frame(frames, events);
@@ -465,12 +532,12 @@ TEST_SUITE("EngineSession")
 		        bool running;
 		        do {
 		            SDL_Event sentinel{};
-		            sentinel.type = SDL_USEREVENT;
+		            sentinel.type = SDL_EVENT_USER;
 		            sentinel.user.code = 7821;
 		            require(SDL_PushEvent(&sentinel) == 1, "Cannot enqueue host event");
 		            running = engine.stepSession(now, {});
 		            SDL_Event retained{};
-		            require(SDL_PeepEvents(&retained, 1, SDL_GETEVENT, SDL_USEREVENT, SDL_USEREVENT) == 1 &&
+		            require(SDL_PeepEvents(&retained, 1, SDL_GETEVENT, SDL_EVENT_USER, SDL_EVENT_USER) == 1 &&
 		                    retained.user.code == 7821, "Explicit session input must not consume the host queue");
 		            engine.drawSession();
 		            const Uint32 delay = engine.sessionDelay(now);
@@ -494,7 +561,7 @@ TEST_SUITE("EngineSession")
 		                return replay ? engine.loadReplayTask("replays/last_game.replay") : engine.initCampaignTask("maps/balanced.map");
 		            }, fixedSlice()));
 		            for (unsigned frame = 0; frame < 20; ++frame) cancelled.frame(frame, {});
-		            SDL_Event escape{}; escape.type = SDL_KEYDOWN; escape.key.keysym.sym = SDLK_ESCAPE;
+		            SDL_Event escape{}; escape.type = SDL_EVENT_KEY_DOWN; escape.key.key = SDLK_ESCAPE;
 		            cancelled.frame(20, {escape}); cancelled.frame(21, {});
 		            require(!cancelled.running() && cancelled.result() == 0, "Game/replay load must accept cancellation");
 		            require(getSyncRandState() == rng && !globalContainer->replaying && !globalContainer->replayReader &&
@@ -510,6 +577,9 @@ TEST_SUITE("EngineSession")
 		            require(failed.result() == 2 && getSyncRandState() == rng && !globalContainer->replaying,
 		                "Failed startup must return an error and restore global state");
 		        }
+		        {
+		        // Serial execution: exact frame counts against the scripted host clock.
+		        glob2test::ScopedEnvironment serialSession("GLOB2_SIM_THREAD", "0");
 		        GAGGUI::ScreenStack screens(*globalContainer->gfx);
 		        unsigned frames = 0, loadingFrames = 0;
 		        screens.push(std::make_unique<GameLoadScreen>([](Engine& engine) { return engine.initCampaignTask("maps/balanced.map"); }, fixedSlice()),
@@ -530,6 +600,32 @@ TEST_SUITE("EngineSession")
 		        // Resumption keeps the pending 40ms tick deadline; hidden time is excluded.
 		        require(loadingFrames > 20 && frames == loadingFrames + 52 && screens.result() == GAGGUI::Screen::QUIT_APPLICATION,
 		                "Suspension must exclude hidden time and retain the pending tick deadline");
+		        }
+		        {
+		            // Threaded execution (the default): the simulation thread paces on the
+		            // host clock, so the session still ends, and the scripted 60 s spent
+		            // suspended is not caught up.
+		            GAGGUI::ScreenStack screens(*globalContainer->gfx);
+		            unsigned frames = 0, loadingFrames = 0, resumedAt = 0;
+		            screens.push(std::make_unique<GameLoadScreen>([](Engine& engine) { return engine.initCampaignTask("maps/balanced.map"); }, fixedSlice()),
+		                [&](GAGGUI::Screen& screen, int result) {
+		                    require(result == 1, "Scheduled game initialization failed");
+		                    loadingFrames = frames;
+		                    screens.push(std::make_unique<GameSessionScreen>(screens, static_cast<GameLoadScreen&>(screen).takeEngine()));
+		                });
+		            bool suspended = false;
+		            while (screens.running()) {
+		                if (loadingFrames && frames == loadingFrames + 10) {
+		                    screens.suspendExecution();
+		                    suspended = true;
+		                    resumedAt = frames;
+		                }
+		                screens.frame(1000 + frames * 40 + (suspended ? 60000 : 0), {});
+		                require(++frames <= 4000, "Threaded stack-driven session failed to finish");
+		            }
+		            require(loadingFrames > 20 && frames > resumedAt + 20 && screens.result() == GAGGUI::Screen::QUIT_APPLICATION,
+		                    "Threaded session must end on the host clock without catching up hidden time");
+		        }
 		    }
 		    for (bool cancel : {false, true}) {
 		        auto editor = std::make_unique<MapEdit>();
@@ -543,7 +639,7 @@ TEST_SUITE("EngineSession")
 		        screens.frame(0, {});
 		        original->requestLoad(cancel ? "maps/balanced.map" : "maps/missing-replacement-fixture.map");
 		        screens.frame(33, {}); screens.frame(66, {});
-		        SDL_Event escape{}; escape.type = SDL_KEYDOWN; escape.key.keysym.sym = SDLK_ESCAPE;
+		        SDL_Event escape{}; escape.type = SDL_EVENT_KEY_DOWN; escape.key.key = SDLK_ESCAPE;
 		        screens.frame(99, {escape}); screens.frame(132, {});
 		        require(screens.running() && original->game.checkSum() == checksum && getSyncRandState() == rng,
 		                "Failed or cancelled replacement must preserve the existing map and RNG");
@@ -551,9 +647,9 @@ TEST_SUITE("EngineSession")
 		        require(original->hasDialog() && original->activeDialog(), "Escape must open the editor menu");
 		        original->activeDialog()->draw(0);
 		        const auto quit = original->activeDialog()->host().bounds("quit");
-		        SDL_Event down{}; down.type = SDL_MOUSEBUTTONDOWN; down.button.button = SDL_BUTTON_LEFT;
+		        SDL_Event down{}; down.type = SDL_EVENT_MOUSE_BUTTON_DOWN; down.button.button = SDL_BUTTON_LEFT;
 		        down.button.x = quit.x + quit.w / 2; down.button.y = quit.y + quit.h / 2;
-		        SDL_Event up = down; up.type = SDL_MOUSEBUTTONUP;
+		        SDL_Event up = down; up.type = SDL_EVENT_MOUSE_BUTTON_UP;
 		        screens.frame(198, {down, up}); screens.frame(231, {});
 		        require(original->needsQuitDecision(), "Replacement failure/cancellation must preserve unsaved edits");
 		        screens.stop(); screens.frame(264, {});
@@ -582,8 +678,8 @@ TEST_SUITE("EngineSession")
 		            script.draw(0);
 		            script.fileDialog()->draw(0);
 		            SDL_Event escape{};
-		            escape.type = SDL_KEYDOWN;
-		            escape.key.keysym.sym = SDLK_ESCAPE;
+		            escape.type = SDL_EVENT_KEY_DOWN;
+		            escape.key.key = SDLK_ESCAPE;
 		            script.fileDialog()->event(escape);
 		            require(script.fileDialog()->finished(), "Escape must close the script file dialog");
 		            script.finishFileDialog();
@@ -604,29 +700,29 @@ TEST_SUITE("EngineSession")
 						script.draw(0);
 						const auto r = script.host().bounds(key);
 						SDL_Event event{};
-						event.type = SDL_MOUSEBUTTONDOWN;
+						event.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
 						event.button.button = SDL_BUTTON_LEFT;
 						event.button.x = r.x + 8;
 						event.button.y = r.y + 8;
 						script.event(event);
-						event.type = SDL_MOUSEBUTTONUP;
+						event.type = SDL_EVENT_MOUSE_BUTTON_UP;
 						script.event(event);
 					};
 					tapKey("script");
 					const auto before = script.scriptText();
 					SDL_Event composition{};
-					composition.type = SDL_TEXTEDITING;
-					SDL_strlcpy(composition.edit.text, "provisional", sizeof(composition.edit.text));
+					composition.type = SDL_EVENT_TEXT_EDITING;
+					composition.edit.text = "provisional";
 					script.event(composition);
 					SDL_Event key{};
-					key.type = SDL_KEYDOWN;
-					key.key.keysym.sym = SDLK_RETURN;
+					key.type = SDL_EVENT_KEY_DOWN;
+					key.key.key = SDLK_RETURN;
 					script.event(key);
 					require(script.scriptText() == before,
 							"IME preedit or confirmation leaked into the script draft");
 					SDL_Event text{};
-					text.type = SDL_TEXTINPUT;
-					SDL_strlcpy(text.text.text, "draft", sizeof(text.text.text));
+					text.type = SDL_EVENT_TEXT_INPUT;
+					text.text.text = "draft";
 					script.event(text);
 					require(script.scriptText().find("draft") != std::string::npos,
 							"Script canvas did not accept committed text");
@@ -635,7 +731,7 @@ TEST_SUITE("EngineSession")
 							"Script canvas lost multiline editing");
 					script.showTab(ScriptEditorScreen::TAB_HINTS);
 					tapKey("hint/0");
-					SDL_strlcpy(text.text.text, "First line", sizeof(text.text.text));
+					text.text.text = "First line";
 					script.event(text);
 					script.showTab(ScriptEditorScreen::TAB_BRIEFING);
 					require(script.hint(0).find("First line") != std::string::npos,
@@ -646,7 +742,7 @@ TEST_SUITE("EngineSession")
 					script.draw(0);
 					require(script.scriptText() == retainedCode && script.hint(0) == retainedHint,
 							"Tab change modified an editing draft");
-					key.key.keysym.sym = SDLK_ESCAPE;
+					key.key.key = SDLK_ESCAPE;
 					script.event(key);
 					require(script.finished() && script.result() == ScriptEditorScreen::CANCEL,
 							"Script workspace cancellation failed");
@@ -664,26 +760,26 @@ TEST_SUITE("EngineSession")
 					const auto bounds = editor.host().bounds("description");
 					const int x = bounds.x, y = bounds.y, h = bounds.h;
 					auto finger = [&](Uint32 type, int py) {
-						SDL_Event event{}; event.type=type; event.tfinger.fingerId=1;
+						SDL_Event event{}; event.type=type; event.tfinger.fingerID=1;
 						event.tfinger.x=float(x+4)/globalContainer->gfx->getW();
 						event.tfinger.y=float(py)/globalContainer->gfx->getH();
 						editor.handleExecutionEvent(event);
 					};
-					finger(SDL_FINGERDOWN,y+5); finger(SDL_FINGERUP,y+5);
+					finger(SDL_EVENT_FINGER_DOWN,y+5); finger(SDL_EVENT_FINGER_UP,y+5);
 					require(editor.host().editing() == "description", "Campaign description tap did not open text input");
-					SDL_Event composition{}; composition.type=SDL_TEXTEDITING;
-					SDL_strlcpy(composition.edit.text,"provisional",sizeof(composition.edit.text));
+					SDL_Event composition{}; composition.type=SDL_EVENT_TEXT_EDITING;
+					composition.edit.text = "provisional";
 					editor.handleExecutionEvent(composition);
 					require(editor.draftDescription()=="First line\nSecond line", "Campaign preedit changed the draft");
-					SDL_Event text{}; text.type=SDL_TEXTINPUT;
-					SDL_strlcpy(text.text.text,"New\n",sizeof(text.text.text)); editor.handleExecutionEvent(text);
+					SDL_Event text{}; text.type=SDL_EVENT_TEXT_INPUT;
+					text.text.text = "New\n"; editor.handleExecutionEvent(text);
 					require(editor.draftDescription()=="New\nFirst line\nSecond line", "Campaign touch cursor or multiline insertion failed");
 					require(entry.getDescription()=="First line\nSecond line", "Campaign entry changed before confirmation");
 					const auto draft=editor.draftDescription();
-					finger(SDL_FINGERDOWN,y+h-5); finger(SDL_FINGERMOTION,y+5); finger(SDL_FINGERUP,y+5);
+					finger(SDL_EVENT_FINGER_DOWN,y+h-5); finger(SDL_EVENT_FINGER_MOTION,y+5); finger(SDL_EVENT_FINGER_UP,y+5);
 					require(editor.draftDescription()==draft, "Campaign scroll altered its draft");
 					editor.endExecute(CampaignMapEntryEditor::CANCEL); editor.finishExecution();
-					SDL_StopTextInput();
+					SDL_StopTextInput(SDL_GetKeyboardFocus());
 				}
 				const auto originalRng = getSyncRandState();
 				for (const char* stage : {"[Loading units]", "[Loading buildings]", "[Resolving team links]"}) {
@@ -715,7 +811,7 @@ TEST_SUITE("EngineSession")
 		            GAGGUI::ScreenStack screens(*globalContainer->gfx);
 		            screens.push(std::make_unique<EditorLoadScreen>("maps/balanced.map", fixedSlice()));
 		            for (unsigned frame = 0; frame < frames; ++frame) screens.frame(frame, {});
-		            SDL_Event escape{}; escape.type = SDL_KEYDOWN; escape.key.keysym.sym = SDLK_ESCAPE;
+		            SDL_Event escape{}; escape.type = SDL_EVENT_KEY_DOWN; escape.key.key = SDLK_ESCAPE;
 		            screens.frame(frames, {escape}); screens.frame(frames + 1, {});
 		            require(!screens.running() && screens.result() == 0, "Partial map loading must accept cancellation");
 		            require(getSyncRandState() == originalRng, "Cancelled load must restore RNG state");
@@ -783,8 +879,8 @@ TEST_SUITE("EngineSession")
 		            GAGGUI::ScreenStack screens(*globalContainer->gfx);
 		            screens.push(std::make_unique<FertilityScreen>(editor.game.map));
 		            SDL_Event escape{};
-		            escape.type = SDL_KEYDOWN;
-		            escape.key.keysym.sym = SDLK_ESCAPE;
+		            escape.type = SDL_EVENT_KEY_DOWN;
+		            escape.key.key = SDLK_ESCAPE;
 		            screens.frame(1000, {escape});
 		            screens.frame(1001, {});
 		            require(!screens.running() && screens.result() == 0, "Fertility screen must accept cancellation");
@@ -793,18 +889,18 @@ TEST_SUITE("EngineSession")
 		        editor.beginEditing();
 		        editor.mapHasBeenModified();
 		        SDL_Event open{};
-		        open.type = SDL_KEYDOWN;
-		        open.key.keysym.sym = SDLK_ESCAPE;
-		        open.key.keysym.scancode = SDL_SCANCODE_ESCAPE;
+		        open.type = SDL_EVENT_KEY_DOWN;
+		        open.key.key = SDLK_ESCAPE;
+		        open.key.scancode = SDL_SCANCODE_ESCAPE;
 		        require(editor.advanceEditing({open}, 1000), "Editor must accept menu input incrementally");
 		        require(editor.hasDialog(), "Escape must open the editor menu");
 		        editor.activeDialog()->draw(0);
 		        const auto quitButton = editor.activeDialog()->host().bounds("quit");
 		        SDL_Event down{};
-		        down.type = SDL_MOUSEBUTTONDOWN;
+		        down.type = SDL_EVENT_MOUSE_BUTTON_DOWN;
 		        down.button.button = SDL_BUTTON_LEFT;
 		        down.button.x = quitButton.x + quitButton.w / 2; down.button.y = quitButton.y + quitButton.h / 2;
-		        SDL_Event up = down; up.type = SDL_MOUSEBUTTONUP;
+		        SDL_Event up = down; up.type = SDL_EVENT_MOUSE_BUTTON_UP;
 		        require(editor.advanceEditing({down, up}, 1033) && editor.needsQuitDecision(),
 		                "Modified editor must request an explicit quit decision");
 		        editor.drawEditing();
@@ -817,13 +913,15 @@ TEST_SUITE("EngineSession")
 		        require(!editor.advanceEditing({}, 1165) && editor.editingReturnCode() == 0,
 		                "Discard must finish without advancing or drawing another editor frame");
 		    }
-		    SDLNet_Quit();
-		// The engine prints one checksum per completed session; all three must agree.
+		    NET_Quit();
+		// The engine prints one checksum per completed session; all must agree,
+		// including the session that ran on the simulation thread.
 		const std::string output = trace.text();
 		std::vector<std::string> checksums;
 		for (size_t at = output.find("nox::gui.game.checkSum() = "); at != std::string::npos; at = output.find("nox::gui.game.checkSum() = ", at + 1))
 			checksums.push_back(output.substr(at + 27, output.find('\n', at) - at - 27));
-		REQUIRE_MESSAGE(checksums.size() == 3, "expected three session checksums, saw " << checksums.size());
-		CHECK_MESSAGE((checksums[0] == checksums[1] && checksums[1] == checksums[2]), "session checksums differ: " << checksums[0] << " " << checksums[1] << " " << checksums[2]);
+		REQUIRE_MESSAGE(checksums.size() == 4, "expected four session checksums, saw " << checksums.size());
+		CHECK_MESSAGE(std::all_of(checksums.begin(), checksums.end(), [&](const std::string &c) { return c == checksums[0]; }),
+			"session checksums differ: " << checksums[0] << " " << checksums[1] << " " << checksums[2] << " " << checksums[3]);
 	}
 }
