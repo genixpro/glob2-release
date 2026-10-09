@@ -58,12 +58,33 @@ positioning drags stop on release. This distance is independent of map zoom and
 display density; deliberate swipes retain the configured momentum.
 
 The gameplay toolbar opens build choices, flags/zones, tactical tools, objectives,
-alliances and the session menu. The last cell of the stat grid holds the game-speed
+alliances and the session menu. Its six cells share a continuous themed surface,
+with display-density outline icons and labels rather than desktop sprite buttons.
+Open build, flag and tool panels have a gold indicator above their icon. Replay
+pause/play and fast-forward use the same stroke style. The last cell of the stat
+grid holds the game-speed
 chevrons and the simulation tick rate: a tap steps through 1x, 2x, 4x, 8x and
 maximum and wraps to 1x (the desktop top bar has the same control, where a right click steps
 back down). The rate is a rolling three-second average refreshed once per second,
 with one decimal below 25, and the cell is outlined when it falls under 75% of the
 speed's target. Network games have a fixed speed, so the cell shows the rate alone.
+The prestige cell pairs a trophy with the player’s score. A gold progress track
+shows the combined score of all teams against the match threshold when prestige
+victory is enabled. The conversions cell shows two Glob images joined by
+a directional arrow. The left Glob uses the local team’s colour and the right
+Glob uses a neutral colour representing other teams. A green arrow points toward
+the local team for recruits; a red arrow points away for defectors. These cumulative changes of
+allegiance are not births or deaths. Portrait puts speed above the minimap and
+gives prestige and conversions a larger second row; landscape gives these two
+readouts more width. Primary icons share a size and primary values share a type size and
+baseline across the HUD. Values sit to the right of their icons with a consistent
+gap and left alignment; each complete icon-and-value group is centred in its cell.
+Narrow layouts scale the shared icons and type together to keep the groups inline.
+Secondary prestige progress stays below that shared primary row. The continuous
+opaque surface keeps the figures clear over busy terrain.
+The desktop top bar shares the same Glob-and-arrow conversion renderer, with
+left-aligned totals beside each icon group. Its speed control follows the wider
+conversion readout, and its mouse hit area uses that same position.
 The minimap is a separate top-right HUD component.
 Tapping it centres the camera there; dragging keeps steering the camera and clamps
 at the minimap's edge when the finger leaves it. A still 400 ms press on it, or the
@@ -1115,3 +1136,18 @@ For focused custom-generator review, install the example packages in a disposabl
 profile and set `GLOB2_GALLERY_GENERATORS_ONLY=1` when running `mobile-gallery`.
 This captures the package list, the scripted editor selection and a generated
 local-game preview using `examples:swamp`.
+
+
+## Fast native development compilation
+
+After provisioning the pinned SDK and mobile dependencies, use
+`python3 tools/dev_build.py target=android arch=arm64-v8a` or
+`python3 tools/dev_build.py target=ios environment=simulator`. These build the
+existing native artifacts in separate fast-development directories; packaging,
+signing and device installation remain the responsibility of the existing mobile
+workflows. Fast/PCH/unity profiles reuse compatible mobile dependency manifests
+and never fall back to host libraries. Recording libraries share verified entries
+by architecture, SDK, toolchain and flags. Use ordinary debug builds for full
+variable inspection and release builds for packaging and performance assessment.
+See [fast development builds](../development/reference.md#fast-development-builds)
+for profile flags, dependency parallelism, cache controls and verification.
