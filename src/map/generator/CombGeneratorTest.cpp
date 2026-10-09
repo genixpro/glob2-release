@@ -79,7 +79,7 @@ void contracts()
 	require(restored.game.load(&in), "generated save loads");
 	for (int y = 0; y < 256; ++y)
 		for (int x = 0; x < 256; ++x)
-			require(first.game.map.getTerrain(x, y) == restored.game.map.getTerrain(x, y) &&
+			require(first.game.map.vertexTerrainAt(x, y) == restored.game.map.vertexTerrainAt(x, y) &&
 						first.game.map.getResource(x, y).getUint32() ==
 							restored.game.map.getResource(x, y).getUint32(),
 					"terrain and resources survive save/load");
@@ -90,7 +90,7 @@ void contracts()
 	const auto reserve = buildAnchors(t, potentialBuildingTiles(second.game.map), 6);
 	TerrainSketch terrain(t.size());
 	for (int i = 0; i < t.size(); ++i)
-		terrain[i] = TerrainType(second.game.map.getUMTerrain(i % t.w, i / t.w));
+		terrain[i] = TerrainType(second.game.map.vertexTerrainAt(i % t.w, i / t.w));
 	const auto fertility = cropGrowthField(terrain, t);
 	const auto envelope = fertileCropEnvelope(second.game.map, fertility);
 	const int home = unitTilesByTeam(second.game.map, 4).front().front();
@@ -106,7 +106,7 @@ void contracts()
 			}
 		}
 	require(stray >= 0, "unseeded construction ground exists");
-	second.game.map.setResource(stray % 256, stray / 256, WHEAT, 1);
+	second.game.map.setResourceByIndex(stray % 256, stray / 256, WHEAT, 1);
 	require(second.game.map.getResource(stray % 256, stray / 256).type == WHEAT,
 			"stray crop planted");
 	GenerationContext strayContext(r);
@@ -246,13 +246,13 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 	game.teams[0]->allies &= ~game.teams[1]->me;
 	game.teams[0]->enemies |= game.teams[1]->me;
 	tower->bullets = 0;
-	tower->resources[STONE] = 0;
+	tower->materials[STONE] = 0;
 	for (unsigned tick = 0; tick < 256; ++tick)
 		tower->turretStep(tick);
 	require(tower->bullets == 0, "unfed tower cannot shoot");
-	tower->resources[STONE] = 1;
+	tower->materials[STONE] = 1;
 	tower->turretStep(256);
-	require(tower->resources[STONE] == 0 &&
+	require(tower->materials[STONE] == 0 &&
 				tower->bullets == tower->type->multiplierStoneToBullets - 1,
 			"test stock becomes ammunition and a cross-channel shot");
 	const auto path =
@@ -274,7 +274,7 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 	{
 		// A second probe starts empty and hires trained workers through normal
 		// building updates. Only native quarry harvests can supply further fire.
-		tower->resources[STONE] = 0;
+		tower->materials[STONE] = 0;
 		tower->bullets = 0;
 		tower->maxUnitWorking = 3;
 		tower->update();

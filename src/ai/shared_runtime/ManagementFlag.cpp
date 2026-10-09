@@ -2,8 +2,11 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #include "shared_runtime/Runtime.h"
+#include "ai/observation/ObservationAreaOrders.h"
+#include "FileFormatVersions.h"
 #include "Order.h"
 #include "Brush.h"
+#include <algorithm>
 
 using namespace AISharedRuntime;
 using namespace AISharedRuntime::Management;
@@ -37,26 +40,26 @@ namespace
 		BrushAccumulator acc;
 		for(std::vector<position>::const_iterator i=locations.begin(); i!=locations.end(); ++i)
 		{
-			acc.applyBrush(BrushApplication(runtime.player->map->normalizeX(i->x), runtime.player->map->normalizeY(i->y), 0), runtime.player->map);
+			acc.applyBrush(BrushApplication(runtime.observation().normalizeX(i->x), runtime.observation().normalizeY(i->y), 0), runtime.observation().width, runtime.observation().height);
 		}
 		if(acc.getApplicationCount()==0)
 			return;
-		Uint8 team = runtime.player->team->teamNumber;
-		const Map* map = runtime.player->map;
+		Uint8 team = runtime.teamNumber();
+
 		switch(areatype)
 		{
 			case ClearingArea:
-				runtime.push_order(shared_ptr<Order>(new OrderAlterClearArea(team, mode, &acc, map)));
+				runtime.push_order(AIEngine::observationAreaOrder<OrderAlterClearArea>(team,mode,acc));
 				break;
 			case ForbiddenArea:
-				runtime.push_order(shared_ptr<Order>(new OrderAlterForbidden(team, mode, &acc, map)));
+				runtime.push_order(AIEngine::observationAreaOrder<OrderAlterForbidden>(team,mode,acc));
 				break;
 			case GuardArea:
-				runtime.push_order(shared_ptr<Order>(new OrderAlterGuardArea(team, mode, &acc, map)));
+				runtime.push_order(AIEngine::observationAreaOrder<OrderAlterGuardArea>(team,mode,acc));
 				break;
 			case FarmArea:
 				// Only issued when the game carries the farm-areas experiment.
-				runtime.push_order(shared_ptr<Order>(new OrderAlterFarmArea(team, mode, &acc, map)));
+				runtime.push_order(AIEngine::observationAreaOrder<OrderAlterFarmArea>(team,mode,acc));
 				break;
 		}
 	}
@@ -72,7 +75,8 @@ ChangeFlagSize::ChangeFlagSize(int size, int building_id) : size(size), building
 
 void ChangeFlagSize::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderModifyFlag(runtime.get_building_register().get_building(building_id)->gid, size)));
+	auto* building=runtime.get_building_register().get_building(building_id);
+ runtime.push_order(std::make_shared<OrderModifyFlag>(building->gid,std::clamp(size,0,AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).maxUnitStayRange)));
 }
 
 
@@ -107,7 +111,7 @@ void ChangeFlagSize::save(GAGCore::OutputStream *stream)
 
 
 
-ChangeFlagMinimumLevel::ChangeFlagMinimumLevel(int minimum_level, int building_id) : minimum_level(minimum_level), building_id(building_id)
+ChangeFlagMinimumLevel::ChangeFlagMinimumLevel(int minimum_level, int building_id, int targetRole) : minimum_level(minimum_level), building_id(building_id), targetRole(targetRole)
 {
 
 }
@@ -116,7 +120,13 @@ ChangeFlagMinimumLevel::ChangeFlagMinimumLevel(int minimum_level, int building_i
 
 void ChangeFlagMinimumLevel::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderModifyMinLevelToFlag(runtime.get_building_register().get_building(building_id)->gid, minimum_level-AI_SHARED_RUNTIME_LEVEL_OFFSET_USER_TO_ENGINE)));
+	const auto* building=runtime.get_building_register().get_building(building_id);
+	if(!building)return;
+	const bool explorers=targetRole==1 || (targetRole<0 && AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[EXPLORER]
+		&& !AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[WORKER] && !AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[WARRIOR]);
+	const int requirement=explorers ? (targetRole<0 ? minimum_level>1 : minimum_level!=0)
+		: minimum_level-AI_SHARED_RUNTIME_LEVEL_OFFSET_USER_TO_ENGINE;
+	runtime.push_order(std::make_shared<OrderModifyMinLevelToFlag>(building->gid,requirement,explorers ? 1 : 0));
 }
 
 
@@ -134,6 +144,8 @@ bool ChangeFlagMinimumLevel::load(GAGCore::InputStream *stream, Player *player, 
 	ManagementOrder::load(stream, player, versionMinor);
 	minimum_level=stream->readUint32("minimum_level");
 	building_id=stream->readUint32("building_id");
+	targetRole=versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG ? stream->readSint32("target_role") : -1;
+	if(targetRole < -1 || targetRole > 1) return false;
 	stream->readLeaveSection();
 	return true;
 }
@@ -146,6 +158,7 @@ void ChangeFlagMinimumLevel::save(GAGCore::OutputStream *stream)
 	ManagementOrder::save(stream);
 	stream->writeUint32(minimum_level, "minimum_level");
 	stream->writeUint32(building_id, "building_id");
+	stream->writeSint32(targetRole,"target_role");
 	stream->writeLeaveSection();
 }
 
@@ -160,7 +173,9 @@ ChangeFlagPosition::ChangeFlagPosition(int x, int y, int building_id)
 
 void ChangeFlagPosition::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderMoveFlag(runtime.get_building_register().get_building(building_id)->gid, x, y, true)));
+	const auto* building = runtime.get_building_register().get_building(building_id);
+	if (building && AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.relocatable)
+		runtime.push_order(shared_ptr<Order>(new OrderMoveFlag(building->gid, x, y, true)));
 }
 
 
@@ -213,7 +228,8 @@ AdjustPriority::AdjustPriority(int building_id, AdjustPriority::BuildingPriority
 
 void AdjustPriority::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderChangePriority(runtime.get_building_register().get_building(building_id)->gid, priority_to_int(priority))));
+    if(const auto* building=runtime.get_building_register().get_building(building_id))
+        runtime.push_order(shared_ptr<Order>(new OrderChangePriority(building->gid, priority_to_int(priority))));
 }
 
 

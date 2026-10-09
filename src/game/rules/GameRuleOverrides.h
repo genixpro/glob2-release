@@ -17,11 +17,13 @@ inline void applyGameRule(GameHeader& header, const std::string& item)
 {
 	struct Rule
 	{
-		const char* name;
+		std::string name;
 		long maximum;
 		std::function<void(GameHeader&, int)> apply;
 	};
 	std::vector<Rule> rules = {
+		{"aiOrderDelay", 8, [](GameHeader& h, int v) { h.setAIOrderDelay(v); }},
+		{"buildingGradientDelay", 8, [](GameHeader& h, int v) { h.setBuildingGradientDelay(v); }},
 		{"noGrowth", 1, [](GameHeader& h, int v) { h.setResourceGrowthDisabled(v); }},
 		{"scarcity", 3, [](GameHeader& h, int v) { h.setResourceScarcityLevel(v); }},
 		{"instantConstruction", 1, [](GameHeader& h, int v) { h.setInstantConstructionEnabled(v); }},
@@ -45,8 +47,11 @@ inline void applyGameRule(GameHeader& header, const std::string& item)
 		}},
 	};
 	// One 0/1 rule per experiment, named by its key (ExperimentalFeatures.cpp).
-	for (const auto& definition : experimentDefinitions())
-		rules.push_back({definition.key, 1, [id = definition.id](GameHeader& h, int v) { h.getExperiments().set(id, v != 0); }});
+	for (const auto& definition : registeredExperimentDefinitions())
+		rules.push_back({definition.key, 1, [key = definition.key](GameHeader& h, int v) { h.getExperiments().set(key, v != 0, h.catalogExperimentKeys()); }});
+	for (const auto& key : header.catalogExperimentKeys())
+		if (!knownExperimentKey(key))
+			rules.push_back({key, 1, [key](GameHeader& h, int v) { h.getExperiments().set(key, v != 0, h.catalogExperimentKeys()); }});
 	// Keep validation here identical for the legacy driver and structured CLI.
 	// In particular, reject trailing junk and overflow before narrowing to int.
 	const size_t equals=item.find('=');
@@ -58,7 +63,8 @@ inline void applyGameRule(GameHeader& header, const std::string& item)
 	const long value=equals==std::string::npos ? -1 : strtol(item.c_str()+equals+1, &end, 10);
 	if (!rule || equals==std::string::npos || errno || *end || end==item.c_str()+equals+1
 		|| value<0 || value>rule->maximum
-		|| (name=="winProbabilityPermille" && value!=0 && value<501))
+		|| (name=="winProbabilityPermille" && value!=0 && value<501)
+		|| (name=="buildingGradientDelay" && value<1))
 		throw std::invalid_argument("invalid game rule: "+item);
 	rule->apply(header, int(value));
 }
@@ -73,7 +79,7 @@ inline std::vector<std::pair<std::string, int>> gameRuleValues(const GameHeader&
 		if(c->getType()==WCSuddenDeath) timer=int(static_cast<const WinningConditionSuddenDeath&>(*c).endStepTick);
 		if(c->getType()==WCWinProbability) probability=int(static_cast<const WinningConditionWinProbability&>(*c).thresholdPermille);
 	}
-	return {{"noGrowth", h.isResourceGrowthDisabled()}, {"scarcity", h.getResourceScarcityLevel()},
+	return {{"aiOrderDelay", h.getAIOrderDelay()}, {"buildingGradientDelay", h.getBuildingGradientDelay()}, {"noGrowth", h.isResourceGrowthDisabled()}, {"scarcity", h.getResourceScarcityLevel()},
 		{"instantConstruction", h.isInstantConstructionEnabled()}, {"stockpile", h.getStockpileStartLevel()},
 		{"noHunger", h.isHungerDisabled()}, {"noUpgrades", h.isUnitUpgradesDisabled()},
 		{"glassCannon", h.getGlassCannonLevel()}, {"fearless", h.isUnitsFearless()},

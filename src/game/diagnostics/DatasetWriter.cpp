@@ -1,3 +1,4 @@
+#include <utility>
 #include "DatasetWriter.h"
 
 #include <algorithm>
@@ -5,7 +6,10 @@
 #include "Building.h"
 #include "FileManager.h"
 #include "Game.h"
-#include "IntBuildingType.h"
+#include "ai/model/BuildingProjection.h"
+#include "online/SimVersion.h"
+#include <nlohmann/json.hpp>
+#include <stdexcept>
 #include "Map.h"
 #include "Order.h"
 #include "Player.h"
@@ -26,18 +30,26 @@ DatasetWriter::~DatasetWriter()
 	close();
 }
 
+void DatasetWriter::writeU16(Uint16 v)
+{
+    const Uint8 bytes[] = {Uint8(v), Uint8(v >> 8)};
+    fwrite(bytes, sizeof(bytes), 1, file);
+}
+
 void DatasetWriter::writeU32(Uint32 v)
 {
-	fwrite(&v, 4, 1, file);
+    const Uint8 bytes[] = {Uint8(v), Uint8(v >> 8), Uint8(v >> 16), Uint8(v >> 24)};
+    fwrite(bytes, sizeof(bytes), 1, file);
 }
 
 void DatasetWriter::writeI32(Sint32 v)
 {
-	fwrite(&v, 4, 1, file);
+	writeU32(Uint32(v));
 }
 
 bool DatasetWriter::open(const std::string& path)
 {
+	close();
 	// Match ReplayWriter's absolute-path bypass: FileManager::openFP
 	// prepends every dirList entry, which turns absolute paths into
 	// nonsense (~/.glob2//tmp/foo). The trainer pipeline relies on
@@ -52,13 +64,11 @@ bool DatasetWriter::open(const std::string& path)
 
 	numRecords = 0;
 
-	// Header: magic + num_records placeholder. No version field — there's
-	// only one producer and one consumer (in this repo) and regenerating
-	// datasets is cheap, so we'd never need to support multiple versions
-	// in flight. If the format ever changes wire-incompatibly, bump the
-	// magic to "GDS2" and parsers reject by magic mismatch.
-	fwrite("GDS1", 4, 1, file);
-	writeU32(0); // num_records placeholder, patched in close()
+    catalogGame = nullptr;
+    modelChannels.clear();
+    fwrite("GDS2", 4, 1, file);
+    writeU32(0); // record count, patched on close
+    writeU32(0); // metadata length, patched on the first action
 
 	return true;
 }
@@ -77,6 +87,26 @@ void DatasetWriter::writeRecord(Uint32 tick, Order& order, Game& game)
 	Uint8 type = order.getOrderType();
 	if (type == ORDER_NULL || type == ORDER_VOICE_DATA)
 		return;
+
+    if (!catalogGame)
+    {
+        modelChannels=ModelBuildingProjection::channels(game.buildingsTypes);
+        const std::string snapshot=game.buildingsTypes.snapshotJson();
+        const nlohmann::json metadata={
+            {"schemaVersion",2}, {"projectionVersion",1}, {"modelChannels",modelChannels},
+            {"engineSimVersion",Online::SimVersion::local().toJson()},
+            {"buildingCatalog",{{"hash",game.buildingsTypes.fingerprint()},
+                {"snapshot",nlohmann::json::parse(snapshot)}}}};
+        const std::string bytes=metadata.dump();
+        fseek(file,8,SEEK_SET);
+        writeU32(Uint32(bytes.size()));
+        fwrite(bytes.data(),1,bytes.size(),file);
+        catalogGame=&game;
+    }
+    else if (catalogGame != &game)
+    {
+        throw std::logic_error("Dataset writer cannot combine different games/catalogs");
+    }
 
 	writeU32(tick);
 	Uint8 sender = (Uint8)order.sender;
@@ -112,7 +142,7 @@ void DatasetWriter::writeRecord(Uint32 tick, Order& order, Game& game)
 void DatasetWriter::writeStateBlob(int senderTeamNum, Game& game)
 {
 	Team* senderTeam = game.teams[senderTeamNum];
-	const TeamStat* stat = const_cast<TeamStats&>(senderTeam->stats).getLatestStat();
+	const TeamStat* stat = std::as_const(senderTeam->stats).getLatestStat();
 
 	// num_teams = 1 — bot-team-only by design (kyle approved). Enemy
 	// internal state would leak omniscient info; the spatial grid encodes
@@ -129,14 +159,16 @@ void DatasetWriter::writeStateBlob(int senderTeamNum, Game& game)
 	if (senderTeam->hasLost) flags |= 1u << 2;
 	writeU32(flags);
 
-	for (int i = 0; i < MAX_NB_RESOURCES; i++)
-		writeI32(senderTeam->teamResources[i]);
+	for (int i = 0; i < MaterialSlotCount; i++)
+		writeI32(senderTeam->teamMaterials[i]);
 
 	for (int i = 0; i < NB_UNIT_TYPE; i++)
 		writeI32(stat->numberUnitPerType[i]);
 
-	for (int i = 0; i < IntBuildingType::NB_BUILDING; i++)
-		writeI32(stat->numberBuildingPerType[i]);
+	std::array<Sint32,ModelBuildingProjection::Count> counts{};
+    for(size_t variant=0;variant<modelChannels.size() && variant<stat->buildingCountByVariant.size();++variant)
+        if(modelChannels[variant]>=0) counts[modelChannels[variant]]+=stat->buildingCountByVariant[variant];
+    for(const auto count:counts) writeI32(count);
 
 	// Spatial grid. Downsample from the actual map to a fixed-max
 	// GRID_W × GRID_H. For maps smaller than GRID_W/GRID_H we shrink the
@@ -167,17 +199,17 @@ void DatasetWriter::writeStateBlob(int senderTeamNum, Game& game)
 		{
 			int x0 = gx * stepX;
 
-			// Terrain: take the top-left source cell (categorical; we'd
-			// need a histogram to do better and the model can learn around
-			// downsample artifacts).
-			int tt = map.getTerrainType(x0, y0);
-			Uint8 terrain = (tt < 0) ? 255 : (Uint8)tt;
+			// Terrain: take the top-left source vertex, the top-left corner
+			// of the top-left source cell (categorical; we'd need a histogram
+			// to do better and the model can learn around downsample artifacts).
+			const auto tt = map.vertexTerrainAt(x0, y0);
+			Uint8 terrain = unsigned(tt) >= 255 ? 255 : static_cast<Uint8>(tt);
 
 			Uint32 resourceSum = 0;
 			Uint32 myUnitCount = 0;
 			Uint32 enemyUnitCount = 0;
-			Uint8 myBuilding = 0;
-			Uint8 enemyBuilding = 0;
+			Uint16 myBuilding = 0;
+			Uint16 enemyBuilding = 0;
 			bool anyCurrentlyVisible = false;
 			bool anyEverSeen = false;
 
@@ -224,9 +256,9 @@ void DatasetWriter::writeStateBlob(int senderTeamNum, Game& game)
 							b = game.teams[bTeam]->myBuildings[bId];
 						if (b)
 						{
-							// shortTypeNum is 0..NB_BUILDING-1; shift by 1 so
+							// Concrete catalog IDs shift by 1 so
 							// 0 == "no building" stays unambiguous.
-							Uint8 typeId = (Uint8)(b->shortTypeNum + 1);
+							Uint16 typeId = Uint16(b->typeNum + 1);
 							if (bTeam == senderTeamNum)
 							{
 								// First-write-wins on collision — multiple
@@ -247,16 +279,16 @@ void DatasetWriter::writeStateBlob(int senderTeamNum, Game& game)
 			Uint8 chResource = (Uint8)std::min(resourceSum, (Uint32)255);
 			Uint8 chMyUnits = (Uint8)std::min(myUnitCount, (Uint32)255);
 			Uint8 chEnemyUnits = (Uint8)std::min(enemyUnitCount, (Uint32)255);
-			Uint8 chMyBuilding = myBuilding;
-			Uint8 chEnemyBuilding = enemyBuilding;
+			Uint16 chMyBuilding = myBuilding;
+			Uint16 chEnemyBuilding = enemyBuilding;
 			Uint8 chDiscovery = anyCurrentlyVisible ? 2 : (anyEverSeen ? 1 : 0);
 
 			fwrite(&chTerrain, 1, 1, file);
 			fwrite(&chResource, 1, 1, file);
 			fwrite(&chMyUnits, 1, 1, file);
 			fwrite(&chEnemyUnits, 1, 1, file);
-			fwrite(&chMyBuilding, 1, 1, file);
-			fwrite(&chEnemyBuilding, 1, 1, file);
+			writeU16(chMyBuilding);
+			writeU16(chEnemyBuilding);
 			fwrite(&chDiscovery, 1, 1, file);
 		}
 	}

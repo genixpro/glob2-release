@@ -1,3 +1,4 @@
+#include "MapAssetBundle.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 // Copyright (C) 2006 Bradley Arsenault
@@ -14,6 +15,8 @@
 #include "PhoneEditor.h"
 #include "ScriptEditorScreen.h"
 #include <Stream.h>
+#include <StreamBackend.h>
+#include <FileManager.h>
 #include "Unit.h"
 #include "UnitType.h"
 #include "Utilities.h"
@@ -34,6 +37,9 @@ GAGCore::CooperativeTask MapEdit::loadTask(std::string filename)
         doQuitAfterLoadSave = true;
         co_return false;
     }
+    rebuildBuildingSelectors();
+    if (panelMode==AddBuildings) enableOnlyGroup("building view");
+    if (panelMode==AddFlagsAndZones) enableOnlyGroup("flag view");
     team = 0;
     areaNameLabel->setLabel(game.map.getAreaName(areaNumber->getIndex()));
     minimap.resetMinimapDrawing();
@@ -42,6 +48,11 @@ GAGCore::CooperativeTask MapEdit::loadTask(std::string filename)
     game.map.computeDisplayedGuardArea(team);
     game.map.computeDisplayedFarmArea(team);
     hasMapBeenModified = false;
+    savedFilename = filename;
+    fertilityStale = false;
+    view.selectedBuilding = nullptr; view.selectedUnit = nullptr;
+    selectedBuildingGID = NOGBID; selectedUnitGID = NOGUID;
+    preparePresentation();
     co_return true;
 }
 
@@ -57,6 +68,7 @@ bool MapEdit::save(const std::string filename, const std::string name)
 
     // Only publish the new editor name after the complete file was replaced.
     hasMapBeenModified = false;
+    savedFilename = filename;
     game.mapHeader.setMapName(name);
     game.mapHeader.setIsSavedGame(false);
     return true;
@@ -67,7 +79,7 @@ bool MapEdit::save(const std::string filename, const std::string name)
 void MapEdit::beginEditing()
 {
 	FrontendScope editor(false);
-	minimap.setGame(game);
+	minimap.setMapSize(game.map.getW(), game.map.getH());
 	globalContainer->gfx->setClipRect();
 	drawMap(0, 0, globalContainer->gfx->getW()-RIGHT_MENU_WIDTH, globalContainer->gfx->getH());
 	drawMiniMap();
@@ -89,7 +101,8 @@ bool MapEdit::touchAnimating() const
 bool MapEdit::advanceEditing(const std::vector<SDL_Event>& events, Uint32 tick)
 {
     if(saveWriter) saveWriter->poll();
-    if (!editing || quitDecision || fertilityRequested || !pendingLoadFilename.empty()) return editing;
+    if (!editing || !pendingLoadFilename.empty()) return editing;
+    pollDeviceImport();
     const bool wasPersisting=showingSave && loadSaveScreen->isPersisting();
     const auto isQuitRequest = [](const SDL_Event& event) {
         if (event.type == SDL_EVENT_QUIT) return true;
@@ -110,21 +123,27 @@ bool MapEdit::advanceEditing(const std::vector<SDL_Event>& events, Uint32 tick)
     if (showingSave && loadSaveScreen->pollPersistence()) {
         hasMapBeenModified = false;
         performAction("close save screen");
+        saveSucceeded();
     }
     if(wasPersisting && showingSave && loadSaveScreen->isPersisting()) {
         return true;
     }
     for (auto event : events) {
         if (quitAfterSave && showingSave && isQuitRequest(event)) continue;
+        // Window close, Cmd+Q and Alt+F4 ask about unsaved work in the editor.
+        if (isQuitRequest(event)) { requestApplicationQuit(); continue; }
+        if (handleFlowEvent(event)) continue;
         if(!(phone && phone->event(event))) {
             GAGCore::GraphicContext::translateMouseEvent(&event);
             processEvent(event);
         }
-        if (doFullQuit || doQuit || fertilityRequested || !pendingLoadFilename.empty() || (doQuitAfterLoadSave && !showingSave)) break;
+        if (doFullQuit || doQuit || !editing || !pendingLoadFilename.empty() || (doQuitAfterLoadSave && !showingSave)) break;
     }
     if (quitAfterSave && !showingSave) doFullQuit = true;
     if (doFullQuit) { editingResult = -1; editing = false; return false; }
-    if (fertilityRequested || !pendingLoadFilename.empty()) return true;
+    if (!editing) return false;
+    if (fertilityRequested && !progressDialog) openFertilityProgress();
+    if (!pendingLoadFilename.empty()) return true;
 	// While processing events the user could've tried to load a map that failed.
 	// Then we can't go through drawing everything because that would segfault.
 	if(doQuitAfterLoadSave && !showingSave)
@@ -133,7 +152,7 @@ bool MapEdit::advanceEditing(const std::vector<SDL_Event>& events, Uint32 tick)
             return false;
 	}
 
-	if(!showingMenuScreen && !showingLoad && !showingSave && !showingScriptEditor && !showingTeamsEditor)
+	if (!hasDialog())
 	{
 		if (!phone) handleMapScroll();
 		if (phone) phone->advance(tick);
@@ -177,7 +196,7 @@ bool MapEdit::advanceEditing(const std::vector<SDL_Event>& events, Uint32 tick)
     if (doFullQuit) { editingResult = -1; editing = false; }
     else if (doQuit) {
         doQuit = false;
-        if (hasMapBeenModified) quitDecision = true;
+        if (hasMapBeenModified) openConfirm(ConfirmPurpose::Quit);
         else editing = false;
     }
     return editing;
@@ -188,10 +207,13 @@ void MapEdit::drawEditing()
     if (!editing) return;
 	drawMap(0, 0, globalContainer->gfx->getW()-0, globalContainer->gfx->getH());
 
-	if(!phone) {drawMenu();drawMiniMap();}
+	if(!phone && !dock) {drawMenu();drawMiniMap();}
+	else if(dock) drawMenuEyeCandy();
 	wasMinimapRendered=false;
-	if(phone) {phone->draw();globalContainer->gfx->nextFrame();return;}
-	drawWidgets();
+	if(phone) {phone->draw();if(!hasDialog()) drawFlowOverlays();globalContainer->gfx->nextFrame();return;}
+	if(dock) drawDock(SDL_GetTicks());
+	else drawWidgets();
+	drawFlowOverlays();
 	drawDialog();
 
 
@@ -202,12 +224,8 @@ void MapEdit::drawEditing()
 
 void MapEdit::resolveQuitDecision(int choice)
 {
-    if (!quitDecision) return;
-    quitDecision = false;
-    if (choice == 0) {
-        doQuitAfterLoadSave = true;
-        performAction("open save screen");
-    } else if (choice == 1) editing = false;
+    // Choices: 0 save, 1 discard, 2 cancel (the confirmation card's order).
+    if (needsQuitDecision()) resolveConfirm(choice);
 }
 
 bool MapEdit::finishFertility(bool completed)
@@ -220,23 +238,26 @@ bool MapEdit::finishFertility(bool completed)
                 else {
                     if(!saveWriter) saveWriter=std::make_unique<GAGCore::BackgroundFileWriter>(Toolkit::getFileManager());
                     const auto name=pendingSaveName;
+                    const auto file=pendingSaveFilename;
                     loadSaveScreen->beginPersistence(std::make_unique<SaveOperation>(*saveWriter,glob2GzipWritePath(pendingSaveFilename),
                         [this,name]{return captureSave([&](OutputStream* stream,DeferredGameSHA1* sha){game.save(stream,true,name,sha);});},
-                        [this,name]{hasMapBeenModified=false;game.mapHeader.setMapName(name);game.mapHeader.setIsSavedGame(false);}));
+                        [this,name,file]{hasMapBeenModified=false;savedFilename=file;game.mapHeader.setMapName(name);game.mapHeader.setIsSavedGame(false);}));
                 }
             } catch (const std::exception&) { loadSaveScreen->showSaveFailure(); }
             // A local write is not a durable browser save. Keep the editor and
             // its quit intent until the shared save dialog acknowledges it.
             hasMapBeenModified = true;
         } else {
-            doQuitAfterLoadSave = false;
-            performAction("close save screen");
+            // Saving needs the fertility map. Keep the dialog, its name and any
+            // quit/share/load intent so OK can try again.
+            loadSaveScreen->showLoadFailure(Toolkit::getStringTable()->getString("[editor save needs fertility]"));
         }
         pendingSaveFilename.clear(); pendingSaveName.clear();
     } else if (completed) {
         overlay.forceRecompute();
-        overlay.compute(game, OverlayArea::Fertility, team);
-    } else isFertilityOn = false;
+        overlay.compute(game.captureReadBoundary({},true,SimulationSnapshot::bit(SimulationSnapshot::Component::Resources)), OverlayArea::Fertility, team,game.map.fertilityMaximum);
+        fertilityStale = false;
+    } else if (!fertilityStale) isFertilityOn = false;
     return true;
 }
 
@@ -247,8 +268,52 @@ void MapEdit::viewportResized(int oldWidth, int oldHeight, int width, int height
     viewportY = (viewportY + oldHeight / 64 - height / 64) & game.map.hMask;
     for (auto* widget : mew) widget->area.updateWindowWidth(width);
     for (MapEditorWidget* widget : std::initializer_list<MapEditorWidget*>{mapCoordinatesLabel, building_view_tcs,
-         building_view_level1, building_view_level2, building_view_level3, flag_view_tcs,
+         building_view_level1, building_view_level2, building_view_level3, buildingLevelNextPage, flag_view_tcs,
          flag_view_level1, flag_view_level2, flag_view_level3, flag_view_level4})
         widget->area.y += height - oldHeight;
     if (auto *dialog = activeDialog()) dialog->cancelInput();
+    // Rotation, window resizing and presentation changes can move the editor
+    // between the phone tray and the dock.
+    syncPresentation();
+}
+
+void MapEdit::importTerrainFile(const std::string &filename)
+{
+	std::unique_ptr<GAGCore::StreamBackend> input(
+		Toolkit::getFileManager()->openInputStreamBackend(filename));
+	if (!input || !input->isValid())
+		throw std::runtime_error("Cannot open terrain definitions");
+	input->seekFromEnd(0);
+	const auto bytes = input->getPosition();
+	input->seekFromStart(0);
+	if (bytes > TerrainRegistry::MaximumDefinitionBytes)
+		throw std::runtime_error("Terrain definitions exceed 32 MiB");
+	std::string json(bytes, '\0');
+	if (bytes && !input->readExact(json.data(), bytes))
+		throw std::runtime_error("Cannot read terrain definitions");
+	importTerrainJson(json);
+}
+
+void MapEdit::importResourceFile(const std::string& filename)
+{
+	std::unique_ptr<GAGCore::StreamBackend> input(Toolkit::getFileManager()->openInputStreamBackend(filename));
+	if (!input || !input->isValid()) throw std::runtime_error("Cannot open resource definitions");
+	input->seekFromEnd(0);
+	const auto bytes = input->getPosition();
+	input->seekFromStart(0);
+	if (bytes > ResourceRegistry::MaximumDefinitionBytes) throw std::runtime_error("Resource definitions exceed 32 MiB");
+	std::string json(bytes, '\0');
+	if (bytes && !input->readExact(json.data(), bytes)) throw std::runtime_error("Cannot read resource definitions");
+	importResourceJson(json);
+}
+
+void MapEdit::importSetFile(const std::string& filename)
+{
+    std::unique_ptr<GAGCore::StreamBackend> input(Toolkit::getFileManager()->openInputStreamBackend(filename));
+    if (!input || !input->isValid()) throw std::runtime_error("Cannot open set package");
+    input->seekFromEnd(0); const auto bytes = input->getPosition(); input->seekFromStart(0);
+    if (bytes > MapAssetBundle::MaximumBytes) throw std::runtime_error("Set exceeds 16 MiB");
+    std::string json(bytes, '\0');
+    if (bytes && !input->readExact(json.data(), bytes)) throw std::runtime_error("Cannot read set package");
+    importSetJson(json);
 }

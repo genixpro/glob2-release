@@ -3,7 +3,18 @@
 #include "ExperimentalFeatures.h"
 #include "MapEdit.h"
 #include "Race.h"
+#include "MapEditDialog.h"
+#include "EditorDock.h"
+#include "LoadSaveDialog.h"
+#include <FileManager.h>
+#include <Toolkit.h>
+#include <nlohmann/json.hpp>
+#include <algorithm>
 #include <filesystem>
+#include <set>
+#include "BuildingType.h"
+#include "Unit.h"
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -16,17 +27,151 @@ void blank(MapEdit& editor)
         editor.game.map.clearImmobileUnit(x,y);
     editor.viewportX=0; editor.viewportY=0;
     editor.updateCamera();
-    editor.minimap.setGame(editor.game);
+    editor.minimap.setMapSize(editor.game.map.getW(), editor.game.map.getH());
+    editor.preparePresentation();
 }
 void cursor(MapEdit& editor,int x,int y)
 {
     // MapEdit's action layer consumes the last event position in logical pixels.
-    editor.mouseX=x*32+16; editor.mouseY=y*32+16;
+    // The upper-left quarter of cell (x,y) is nearest its top-left vertex (x,y),
+    // which terrain brushes paint; resource brushes take the cell itself.
+    editor.mouseX=x*32+8; editor.mouseY=y*32+8;
 }
 }
 
 TEST_SUITE("EditorActionCoverage")
 {
+    TEST_CASE("rerolling the terrain look changes the map seed and marks the map modified [display]")
+    {
+        glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{
+            .display=true,.width=1024,.height=768,.screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        MapEdit editor; blank(editor);
+        editor.hasMapBeenModified=false;
+        editor.game.map.setTerrainSeed(0);
+        std::set<Uint32> seeds;
+        for (int i=0; i<4; ++i)
+        {
+            editor.performAction("reroll terrain look");
+            seeds.insert(editor.game.map.terrainSeed());
+        }
+        CHECK(seeds.size()>1);
+        CHECK(editor.hasMapBeenModified);
+    }
+    TEST_CASE("custom catalog editor exposes resources mixed controls and long upgrade paths [display][artifacts]")
+    {
+        glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{
+            .display=true,.width=1024,.height=768,.screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        MapEdit editor; blank(editor);
+        auto snapshot=nlohmann::json::parse(editor.game.buildingsTypes.snapshotJson());
+        auto& variants=snapshot["variants"];
+        variants[3]["properties"]["zonable"]={1,1,1};
+        variants[3]["properties"]["defaultUnitStayRange"]=5;
+        variants[3]["properties"]["maxUnitStayRange"]=20;
+        std::vector<int> capacity(MaterialSlotCount,0);
+        std::fill_n(capacity.begin(),MaterialCount,30);
+        variants[3]["properties"]["maxMaterial"]=capacity;
+        variants[3]["semantics"]["assignmentLimit"]=40;
+        variants[3]["semantics"]["production"]=variants[1]["semantics"]["production"];
+        int previous=7;
+        for (int depth=3; depth<5; ++depth)
+        {
+            auto site=variants[2], finished=variants[3];
+            const int siteId=variants.size(), finishedId=siteId+1;
+            const std::string family="fixture.refuge."+std::to_string(depth);
+            site["id"]=siteId; site["key"]=family+".site";
+            site["previous"]=variants[previous]["key"]; site["next"]=family+".finished";
+            site["properties"]["type"]=family; site["properties"]["level"]=0; // Presentation tier is independent of path depth.
+            site["semantics"]["placeable"]=false;
+            finished["id"]=finishedId; finished["key"]=family+".finished";
+            finished["previous"]=family+".site"; finished["next"]="";
+            finished["properties"]["type"]=family; finished["properties"]["level"]=0;
+            finished["semantics"]["placeable"]=false;
+            variants[previous]["next"]=site["key"];
+            variants.push_back(site); variants.push_back(finished); previous=finishedId;
+        }
+        const int overlayId=editor.game.buildingsTypes.getFinishedTypeNum("warflag");
+        variants[overlayId]["properties"]["width"]=2;
+        variants[overlayId]["properties"]["height"]=3;
+        editor.game.buildingsTypes.loadSnapshotJson(snapshot.dump());
+        editor.game.configureBuildingCatalog(); editor.game.buildingsTypes.loadSprites();
+        editor.rebuildBuildingSelectors();
+        CHECK(editor.buildingLevelCount==5);
+        editor.performAction("next building level page");
+        CHECK(editor.buildingLevel==3);
+        editor.building_view_level2->handleClick(8,8);
+        CHECK(editor.buildingLevel==4);
+        CHECK(editor.buildingSelectionType("inn.0.finished")==previous);
+        editor.performAction("next building level page"); CHECK(editor.buildingLevel==0);
+        auto* building=editor.game.addBuilding(4,4,3,0); REQUIRE(building);
+        for (unsigned material=materialIndex(MaterialId::Gold);material<MaterialCount;++material)
+            building->materials[material]=1; // Existing owned stock makes each configured row relevant.
+        cursor(editor,4,4); editor.performAction("select map building");
+        REQUIRE(editor.selectedBuildingGID==building->gid);
+        editor.drawMap(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH());
+        CHECK(editor.buildingAssignedScrollBox->maximumValue()==40);
+        for (int resource=0; resource<MaterialCount; ++resource)
+        {
+            CHECK(editor.buildingResourceControls[resource]->maximumValue()==30);
+            editor.buildingResourceControls[resource]->setValue(resource+1);
+            CHECK(building->materials[resource]==resource+1);
+        }
+        editor.buildingEditFirstRow=100; editor.layoutBuildingEditRows();
+        CHECK(editor.buildingWorkerLevelScrollBox->enabled);
+        CHECK(editor.buildingBombingScrollBox->enabled);
+        editor.buildingWorkerLevelScrollBox->setValue(2);
+        editor.buildingMinimumLevelScrollBox->setValue(1);
+        editor.buildingBombingScrollBox->setValue(1);
+        CHECK(building->minWorkerLevelToFlag==2);
+        CHECK(building->minLevelToFlag==1);
+        CHECK(building->explorersRequireBombing);
+        editor.draw(SDL_GetTicks());
+        globals->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory()+"/editor-composite.bmp");
+        globals->gfx->nextFrame();
+        auto* overlay=editor.game.addBuilding(31,31,overlayId,0); REQUIRE(overlay);
+        cursor(editor,0,1); editor.performAction("select map building");
+        CHECK(editor.selectedBuildingGID==overlay->gid);
+    }
+
+    TEST_CASE("editor material rows require configured capacity and natural or owned presence [display]")
+    {
+        glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{
+            .display=true,.width=1024,.height=768,.screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        MapEdit editor; blank(editor);
+        const auto gold=materialIndex(MaterialId::Gold),metal=materialIndex(MaterialId::Metal);
+        const int inn=editor.game.buildingsTypes.getFinishedTypeNum("inn");
+        auto catalog=nlohmann::json::parse(editor.game.buildingsTypes.snapshotJson());
+        catalog["variants"][inn]["properties"]["maxMaterial"][gold]=30;
+        catalog["variants"][inn]["properties"]["maxMaterial"][metal]=0;
+        editor.game.buildingsTypes.loadSnapshotJson(catalog.dump());
+        editor.game.configureBuildingCatalog();editor.game.buildingsTypes.loadSprites();
+        auto* selected=editor.game.addBuilding(4,4,inn,0);REQUIRE(selected);
+        auto* supplier=editor.game.addBuilding(12,12,inn,0);REQUIRE(supplier);
+        auto* worker=editor.game.addUnit(20,20,0,WORKER,0,0,0,0);REQUIRE(worker);
+        auto& team=*editor.game.teams[0];
+        team.teamMaterials[metal]=1; // Presence cannot expose an unconfigured slot.
+        auto shown=[&](unsigned material) {
+            return std::any_of(editor.buildingEditRows.begin(),editor.buildingEditRows.end(),
+                [&](const auto& row){return row.second==editor.buildingResourceControls[material];});
+        };
+        auto select=[&] {cursor(editor,4,4);editor.performAction("select map building");};
+        const auto deposit=*editor.game.map.resourceRegistry().find("gold-ore");
+        for (int source=0;source<5;++source)
+        {
+            CAPTURE(source);
+            select();CHECK_FALSE(shown(gold));CHECK_FALSE(shown(metal));
+            if(source==0)editor.game.map.setResource(24,24,deposit,0);
+            if(source==1)supplier->materials[gold]=1;
+            if(source==2)worker->carriedMaterial=gold;
+            if(source==3)team.teamMaterials[gold]=1;
+            if(source==4)team.reservedTeamMaterials[gold]=1;
+            select();CHECK(shown(gold));CHECK_FALSE(shown(metal));
+            editor.game.map.replaceResource(24,24,Resource{});
+            supplier->materials[gold]=0;worker->carriedMaterial=-1;
+            team.teamMaterials[gold]=team.reservedTeamMaterials[gold]=0;
+            select();CHECK_FALSE(shown(gold));CHECK_FALSE(shown(metal));
+        }
+    }
+
     TEST_CASE("editor selects and saves the sixteenth team [display][artifacts]")
     {
         glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{
@@ -87,6 +232,15 @@ TEST_SUITE("EditorActionCoverage")
             CHECK(editor.hasMapBeenModified);
             editor.performAction("select map unit");
             REQUIRE(editor.view.selectedUnit==unit);
+            editor.drawMap(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH());
+            const auto displayedHp=editor.unitHPScrollBox->currentValue();
+            REQUIRE(displayedHp==unit->hp);
+            REQUIRE(displayedHp>0);
+            editor.unitHPScrollBox->setValue(displayedHp-1);
+            CHECK(unit->hp==displayedHp-1);
+            CHECK(editor.unitHPScrollBox->currentValue()==displayedHp);
+            editor.drawMap(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH());
+            CHECK(editor.unitHPScrollBox->currentValue()==displayedHp-1);
             for (const auto& update : {std::pair{"update unit walk level",WALK},
                                       std::pair{"update unit swim level",SWIM},
                                       std::pair{"update unit attack speed level",ATTACK_SPEED},
@@ -133,10 +287,16 @@ TEST_SUITE("EditorActionCoverage")
             editor.performAction("select map building");
             CHECK(editor.selectedBuildingGID==building->gid);
             CHECK(editor.selectionMode==MapEdit::EditingBuilding);
+            editor.drawMap(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH());
+            const auto displayedHp=editor.buildingHPScrollBox->currentValue();
+            CHECK(displayedHp==building->hp);
             building->hp=building->type->hpMax/2;
             editor.hasMapBeenModified=false;
             editor.performAction("update building");
             CHECK(editor.hasMapBeenModified);
+            CHECK(editor.buildingHPScrollBox->currentValue()==displayedHp);
+            editor.drawMap(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH());
+            CHECK(editor.buildingHPScrollBox->currentValue()==building->hp);
             editor.performAction("unselect");
         }
         glob2test::TempDir scratch;
@@ -165,7 +325,7 @@ TEST_SUITE("EditorActionCoverage")
         {
             INFO(entry.first);
             editor.performAction(entry.first); editor.brush.setFigure(1); editor.brush.mode=BrushTool::MODE_ADD;
-            editor.game.map.getTile(0,31).*entry.second=2;
+            editor.game.map.setAreaMask(editor.game.map.coordToIndex(0,31),entry.second,2);
             cursor(editor,31,31); editor.performAction("zone drag start"); editor.performAction("zone drag end");
             CHECK((editor.game.map.getTile(31,31).*entry.second & 1)!=0);
             CHECK(editor.game.map.getTile(0,31).*entry.second==3);
@@ -199,8 +359,8 @@ TEST_SUITE("EditorActionCoverage")
         MapEdit editor; blank(editor); editor.performAction("add team"); editor.team=0;
         REQUIRE(editor.farmingZone!=nullptr);
         // Water down the left edge, so the grass beside it can grow wheat.
-        for (int y=0; y<32; ++y) for (int x=0; x<8; ++x) editor.game.map.setUMatPos(x,y,WATER,1);
-        editor.game.map.getTile(20,12).canResourcesGrow=0;
+        for (int y=0; y<32; ++y) for (int x=0; x<8; ++x) editor.game.map.paintVertexSquare(x,y,WATER,1);
+        editor.game.map.setResourcesGrow(20,12, 0);
         editor.performAction("select farm zone"); editor.brush.setFigure(1); editor.brush.mode=BrushTool::MODE_ADD;
         REQUIRE(editor.brushType==MapEdit::FarmAreaBrush);
         cursor(editor,12,12); editor.performAction("zone drag start"); editor.performAction("zone drag end");
@@ -262,4 +422,271 @@ TEST_SUITE("EditorActionCoverage")
         CHECK(restored.game.map.getTerrainType(8,8)==GRASS);
     }
 
+    TEST_CASE("terrain experiments independently gate whole-cell brushes [display]")
+    {
+        glob2test::HeadlessGlobals globals({.display=true,.width=1024,.height=768,
+            .screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        MapEdit disabled; blank(disabled);
+        CHECK(disabled.additionalTerrainSelectors.empty());
+        disabled.performAction("select grass");
+        disabled.performAction("select ice");
+        CHECK(disabled.terrainType==TerrainSelector::Grass);
+        disabled.performAction("select road");
+        CHECK(disabled.terrainType==TerrainSelector::Grass);
+        globals->settings.experiments.set(ExperimentId::IceTerrain,true);
+        MapEdit editor;blank(editor);
+        REQUIRE(editor.additionalTerrainSelectors.size()==1);
+        editor.performAction("select ice");editor.brush.setFigure(0);
+        cursor(editor,8,8);editor.performAction("terrain drag start");editor.performAction("terrain drag end");
+        CHECK(editor.game.map.vertexTerrainAt(8,8)==ICE);
+        CHECK(editor.game.map.vertexTerrainAt(7,8)==GRASS);
+        editor.performAction("select road");
+        CHECK(editor.terrainType==TerrainSelector::Ice);
+        globals->settings.experiments.set(ExperimentId::TrailTerrain,true);
+        editor.performAction("select road");
+        cursor(editor,8,8);editor.performAction("terrain drag start");editor.performAction("terrain drag end");
+        CHECK(editor.game.map.vertexTerrainAt(8,8)==TRAIL);
+        CHECK(editor.game.map.vertexTerrainAt(7,8)==GRASS);
+        glob2test::TempDir scratch;const auto filename=(scratch.path/"whole-cell-terrain.map").string();
+        REQUIRE(editor.save(filename,"whole-cell terrain"));
+        globals->settings.experiments.clear();
+        MapEdit restored;REQUIRE(restored.load(filename));
+        CHECK(restored.game.map.vertexTerrainAt(8,8)==TRAIL);
+    }
+
+    TEST_CASE("registered terrain stamps batch invalidation and reject invalid selector IDs [display]")
+    {
+        glob2test::HeadlessGlobals globals({.display=true,.width=1024,.height=768,
+            .screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        globals->settings.experiments.set(ExperimentId::IceTerrain,true);
+        globals->settings.experiments.set(ExperimentId::TrailTerrain,true);
+        MapEdit editor;blank(editor);
+        REQUIRE(editor.additionalTerrainSelectors.size()==2);
+        editor.performAction("select road");editor.brush.setFigure(6);
+        const auto generation=editor.game.map.topologyGeneration;
+        cursor(editor,8,8);editor.performAction("terrain drag start");editor.performAction("terrain drag end");
+        CHECK(editor.game.map.topologyGeneration==generation+1);
+        CHECK(editor.game.map.vertexTerrainAt(8,8)==TRAIL);
+        CHECK(editor.game.map.vertexTerrainAt(7,8)==TRAIL);
+        // Catalogue brushes are gated by their group's experiment, not listed in the side panel.
+        editor.performAction("select boulders");
+        CHECK(editor.terrainType==TerrainSelector::Trail);
+        globals->settings.experiments.set(ExperimentId::ObstacleTerrain,true);
+        editor.performAction("select boulders");
+        CHECK(editor.terrainType==TerrainSelector::selectorFor(BOULDERS));
+        editor.performAction("select hedge");
+        CHECK(editor.terrainType==TerrainSelector::selectorFor(HEDGE));
+        cursor(editor,20,20);editor.performAction("terrain drag start");editor.performAction("terrain drag end");
+        CHECK(editor.game.map.vertexTerrainAt(20,20)==HEDGE);
+        CHECK(editor.game.map.requiredTerrainExperiments().has(ExperimentId::ObstacleTerrain));
+        globals->settings.experiments.set(ExperimentId::ObstacleTerrain,false);
+        editor.performAction("select road");
+        for (auto invalid : {static_cast<TerrainSelector::TerrainType>(-1),
+                static_cast<TerrainSelector::TerrainType>(TerrainSelector::RegisteredBegin+TERRAIN_COUNT),
+                TerrainSelector::NoTerrain}) {
+            editor.beginTerrainPlacement(invalid,MapEdit::TerrainPlacementMode::BaseTerrain);
+            CHECK(editor.terrainType==TerrainSelector::Trail);
+        }
+        editor.beginTerrainPlacement(TerrainSelector::Trail,MapEdit::TerrainPlacementMode::Resource);
+        CHECK(editor.terrainType==TerrainSelector::Trail);
+        // Terrain brushes offer Add/Del like resources.
+        CHECK(editor.brush.addRemoveEnabled);
+        editor.beginTerrainPlacement(static_cast<TerrainSelector::TerrainType>(TerrainSelector::RegisteredBegin+GRASS),
+            MapEdit::TerrainPlacementMode::BaseTerrain);
+        CHECK(editor.terrainType==TerrainSelector::Grass);
+        // Legacy resource selectors normalise to the registry selector, so the
+        // side panel, palettes and actions share one canonical brush.
+        const auto wheat=TerrainSelector::selectorForResource(*editor.game.map.resourceRegistry().find("wheat"));
+        editor.performAction("select wheat");
+        CHECK(editor.terrainType==wheat);
+        CHECK(editor.currentBrushId()=="resource/wheat");
+        CHECK(editor.brush.addRemoveEnabled);
+        editor.beginTerrainPlacement(TerrainSelector::Wheat,MapEdit::TerrainPlacementMode::BaseTerrain);
+        CHECK(editor.terrainType==wheat);
+    }
+
+	TEST_CASE("catalogue group selectors and the palette actions navigate the dock [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals({.display=true,.width=1024,.height=768,
+			.screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+		globals->settings.experiments.set(ExperimentId::IceTerrain,true);
+		globals->settings.experiments.set(ExperimentId::TrailTerrain,true);
+		globals->settings.experiments.set(ExperimentId::ObstacleTerrain,true);
+		MapEdit editor; blank(editor);
+		REQUIRE(editor.dock);
+		// The legacy group selectors (kept for the phone tray) still route through
+		// "open terrain palette <group>", which now opens the dock's section.
+		REQUIRE(editor.additionalTerrainSelectors.size()==3);
+		auto *obstacles = dynamic_cast<TerrainGroupSelector*>(editor.additionalTerrainSelectors[2]);
+		REQUIRE(obstacles);
+		CHECK(obstacles->catalogueGroup==TerrainGroup::Obstacles);
+		editor.performAction("select road");
+		editor.dockCollapsed.insert("terrain/obstacles");
+		obstacles->activate();
+		CHECK_FALSE(editor.hasDialog());
+		CHECK(editor.dock->tab()==EditorDock::Tab::Terrain);
+		CHECK_FALSE(editor.dockCollapsed.count("terrain/obstacles"));
+		// Navigation keeps the brush the author had.
+		CHECK(editor.currentBrushId()=="terrain/road");
+		auto &host = editor.dock->host();
+		host.layoutIfNeeded();
+		// The group heading is scrolled to the top of the dock's list.
+		const auto scrollBounds = host.bounds("dock/scroll");
+		const auto heading = host.bounds("dock/section/terrain/obstacles");
+		CHECK(heading.y >= scrollBounds.y);
+		CHECK(heading.y <= scrollBounds.y + 4);
+		// Every enabled brush is listed; disabled experiments are absent.
+		for (const char *key : {"brush/terrain/hedge","brush/terrain/boulders","brush/terrain/ice",
+								"brush/terrain/water","brush/terrain/road"})
+			CHECK(host.find(key));
+		// Rough terrain is off: its brushes are shown locked and cannot be chosen.
+		REQUIRE(host.find("brush/terrain/mud"));
+		host.scrollIntoView("brush/terrain/mud");
+		host.layoutIfNeeded();
+		const auto mud = host.bounds("brush/terrain/mud");
+		host.tapAt({mud.x + mud.w / 2, mud.y + mud.h / 2});
+		CHECK(editor.currentBrushId()=="terrain/road");
+		CHECK(host.find("dock/enable/terrain/rough"));
+		editor.draw(SDL_GetTicks());
+		globals->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory() + "/dock-terrain-obstacles.bmp");
+		globals->gfx->nextFrame();
+		host.scrollIntoView("brush/terrain/hedge");
+		host.layoutIfNeeded();
+		const auto bounds = host.bounds("brush/terrain/hedge");
+		host.tapAt({bounds.x + bounds.w / 2, bounds.y + bounds.h / 2});
+		CHECK(editor.terrainType==TerrainSelector::selectorFor(HEDGE));
+		cursor(editor,12,12);editor.performAction("terrain drag start");editor.performAction("terrain drag end");
+		CHECK(editor.game.map.vertexTerrainAt(12,12)==HEDGE);
+		// Without a group the action shows the Terrain tab and keeps the brush;
+		// unknown groups are ignored the same way.
+		editor.dock->showTab(EditorDock::Tab::Buildings);
+		editor.performAction("select terrain hedge");
+		editor.performAction("open terrain palette");
+		CHECK(editor.dock->tab()==EditorDock::Tab::Terrain);
+		editor.performAction("select wheat");
+		editor.performAction("open terrain palette nonsense");
+		CHECK(editor.currentBrushId()=="resource/wheat");
+		editor.performAction("open resource palette");
+		CHECK(editor.dock->tab()==EditorDock::Tab::Resources);
+		CHECK(editor.currentBrushId()=="resource/wheat");
+		editor.dock->host().layoutIfNeeded();
+		CHECK(editor.dock->host().find("brush/resource/wheat"));
+	}
+	TEST_CASE("custom terrain imports reach the dock and saved maps work on desktop and phone "
+			  "[display][artifacts]")
+	{
+		const char *previous = SDL_getenv_unsafe("GLOB2_MOBILE_UI");
+		const std::string saved = previous ? previous : "";
+		struct Restore
+		{
+			bool set;
+			std::string value;
+			~Restore()
+			{
+				if (set)
+					glob2test::setEnv("GLOB2_MOBILE_UI", value.c_str());
+				else
+					glob2test::unsetEnv("GLOB2_MOBILE_UI");
+			}
+		} restore{previous != nullptr, saved};
+		for (bool phone : {false, true})
+		{
+			glob2test::setEnv("GLOB2_MOBILE_UI", phone ? "1" : "0");
+			glob2test::HeadlessGlobals globals(
+				{.display = true,
+				 .width = phone ? 800 : 1024,
+				 .height = phone ? 480 : 768,
+				 .screenFlags = GAGCore::GraphicContext::PORTABLEGPU});
+			MapEdit editor;
+			blank(editor);
+			CHECK(editor.usesPhone() == phone);
+			using Json = nlohmann::json;
+			Json definitions = Json::array();
+			for (unsigned i = 0; i < 40; ++i)
+				definitions.push_back({{"key", "example:t" + std::to_string(i)},
+									   {"name", "Terrain " + std::to_string(i)},
+									   {"base", "grass"},
+									   {"properties", {{"groundSpeedQ8", 192}}},
+									   {"appearance", "sand"}});
+			glob2test::TempDir scratch;
+			const auto directory = scratch.path / "terrain";
+			std::filesystem::create_directories(directory);
+			GAGCore::Toolkit::getFileManager()->addDir(scratch.path.string());
+			const auto file = directory / "runtime-review.json";
+			glob2test::writeFile(file, "invalid JSON");
+			// This picker must not advertise compressed files to the raw JSON loader.
+			glob2test::writeFile(directory / "compressed-only.json.gz", "not offered");
+			editor.performAction("import terrain definitions");
+			REQUIRE(editor.loadSaveScreen);
+			const auto files = editor.loadSaveScreen->filePresentation().files;
+			CHECK(std::find(files.begin(), files.end(), "compressed-only") == files.end());
+			const auto selected = std::find(files.begin(), files.end(), "runtime-review");
+			REQUIRE(selected != files.end());
+			editor.loadSaveScreen->selectPresentedFile(int(selected - files.begin()));
+			const auto original = editor.game.map.frozenTerrainRegistry();
+			editor.hasMapBeenModified = false;
+			editor.loadSaveScreen->confirmPresentedFile();
+			SDL_Event poll{};
+			poll.type = SDL_EVENT_USER;
+			editor.delegateMenu(poll);
+			REQUIRE(editor.loadSaveScreen);
+			CHECK(editor.loadSaveScreen->filePresentation().failed);
+			CHECK_FALSE(editor.loadSaveScreen->filePresentation().status.empty());
+			CHECK_FALSE(editor.loadSaveScreen->finished());
+			CHECK(editor.game.map.frozenTerrainRegistry() == original);
+			CHECK_FALSE(editor.hasMapBeenModified);
+
+			// Retry the selected file through the same dialog after correcting it.
+			glob2test::writeFile(file,
+								 Json{{"schemaVersion", 1}, {"terrains", definitions}}.dump());
+			editor.loadSaveScreen->confirmPresentedFile();
+			editor.delegateMenu(poll);
+			CHECK_FALSE(editor.loadSaveScreen);
+			CHECK(editor.game.map.terrainRegistry().size() == 40 + TERRAIN_COUNT);
+			CHECK(editor.hasMapBeenModified);
+			// Imported types appear in the dock's "custom" section without a restart.
+			const std::string key = "brush/terrain/example:t9";
+			const auto type = *editor.game.map.terrainRegistry().find("example:t9");
+			if (!phone)
+			{
+				REQUIRE(editor.dock);
+				CHECK(editor.dock->tab() == EditorDock::Tab::Terrain);
+				editor.draw(SDL_GetTicks());
+				globals->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory() + "/dock-terrain-custom.bmp");
+				globals->gfx->nextFrame();
+				// Select a type beyond the first viewport through the real scroll host.
+				auto &host = editor.dock->host();
+				host.layoutIfNeeded();
+				REQUIRE(host.find(key));
+				host.scrollIntoView(key);
+				host.layoutIfNeeded();
+				const auto bounds = host.bounds(key);
+				REQUIRE(bounds.w > 0);
+				REQUIRE(bounds.h > 0);
+				host.tapAt({bounds.x + bounds.w / 2, bounds.y + bounds.h / 2});
+			}
+			else
+			{
+				CHECK_FALSE(editor.dock);
+				editor.performAction("select terrain example:t9");
+			}
+			CHECK(editor.terrainType == TerrainSelector::selectorFor(type));
+			cursor(editor, 8, 8);
+			editor.performAction("terrain drag start");
+			editor.performAction("terrain drag end");
+			REQUIRE(editor.game.map.vertexTerrainAt(8, 8) == type);
+			const auto map = (scratch.path / "custom.map").string();
+			REQUIRE(editor.save(map, "Custom terrain"));
+			std::filesystem::remove(file);
+			MapEdit loaded;
+			REQUIRE(loaded.load(map));
+			CHECK(loaded.game.map.vertexTerrainAt(8, 8) == type);
+			CHECK(loaded.game.map.terrainProperties(type).groundSpeedQ8 == 192);
+			loaded.draw(SDL_GetTicks());
+			globals->gfx->printScreen(
+				glob2test::artifactDirFromWorkingDirectory() +
+				(phone ? "/terrain-map-phone.bmp" : "/terrain-map-desktop.bmp"));
+			globals->gfx->nextFrame();
+		}
+	}
 }

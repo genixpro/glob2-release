@@ -1,6 +1,9 @@
+import { ScriptGeneratorDescriptor, schemaIssues } from '@glob2/protocol';
+import { resolveReport } from '../admin/moderation.ts';
 // REST for the map catalog (/api/v1/maps) and its moderation
 // (/api/v1/admin/maps, /api/v1/admin/map-reports). Rules and views are in
 // catalog.ts; engine-job results are applied by the worker (play/catalog.ts).
+import { webpRendition } from '../http/webpRendition.ts';
 import { randomUUID } from 'node:crypto';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import { sql } from 'kysely';
@@ -355,10 +358,13 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
 
   // ----------------------------------------------------- owner: versions
 
-  app.post<{ Params: { id: string }; Querystring: { simVersion?: string; notes?: string } }>(
+  app.post<{
+    Params: { id: string };
+    Querystring: { simVersion?: string; notes?: string; generator?: string };
+  }>(
     '/api/v1/maps/:id/versions',
     {
-      bodyLimit: services.config.uploadMaxBytes ?? 16 * 1024 * 1024,
+      bodyLimit: services.config.uploadMaxBytes ?? 64 * 1024 * 1024,
     },
     async (request, reply) => {
       const viewer = await signedIn(request);
@@ -383,6 +389,14 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
           throw apiError('unavailable', 'No engine agent can validate maps right now.');
       }
       const notes = (request.query.notes ?? '').slice(0, 2000);
+      let claimedGenerator: ScriptGeneratorDescriptor | undefined;
+      if (request.query.generator) {
+        try {
+          claimedGenerator = body(ScriptGeneratorDescriptor, JSON.parse(request.query.generator));
+        } catch {
+          throw apiError('bad_request', 'Invalid claimed generator provenance.');
+        }
+      }
       // The quota is taken before the file is unpacked, so a flood of
       // compressed files costs the sender, not the server.
       await enforce(uploads, viewer.account.id, reply, 'Too many uploads; wait a while.');
@@ -445,10 +459,30 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
       const validateJobId = same?.validate_job_id ?? checked?.job_id ?? randomUUID();
       const reusePreview = same && same.preview_status !== 'failed';
       const previewJobId = reusePreview ? (same.preview_job_id ?? randomUUID()) : randomUUID();
+      const generated = await db
+        .selectFrom('generated_maps')
+        .select(['descriptor', 'chosen_seed'])
+        .where('map_hash', '=', stored.sha256)
+        .where('sim_version', '=', sim)
+        .where('status', '=', 'ready')
+        .executeTakeFirst();
+      const provenance =
+        generated && schemaIssues(ScriptGeneratorDescriptor, generated.descriptor).length === 0
+          ? {
+              verified: true,
+              generator: generated.descriptor,
+              ...(generated.chosen_seed !== null
+                ? { chosenSeed: Number(generated.chosen_seed) }
+                : {}),
+            }
+          : claimedGenerator
+            ? { verified: false, generator: claimedGenerator }
+            : undefined;
       const inserted = await db
         .insertInto('map_versions')
         .values({
           map_id: map.id,
+          ...(provenance ? { generator_provenance: JSON.stringify(provenance) } : {}),
           hash: stored.sha256,
           size: stored.size,
           sim_version: sim,
@@ -465,6 +499,9 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
                 team_count: same.team_count,
                 min_version_minor: same.min_version_minor,
                 file_title: same.file_title,
+                building_catalog: same.building_catalog,
+                resource_experiments: same.resource_experiments,
+                required_resource_experiments: same.required_resource_experiments,
               }
             : checked
               ? {
@@ -474,6 +511,9 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
                   team_count: checked.team_count,
                   min_version_minor: checked.version_minor,
                   file_title: checked.title,
+                  building_catalog: checked.building_catalog,
+                  resource_experiments: checked.resource_experiments,
+                  required_resource_experiments: checked.required_resource_experiments,
                 }
               : {}),
           ...(reusePreview && same.preview_status === 'ready'
@@ -568,7 +608,7 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
   );
 
   app.get<{ Params: { id: string; hash: string } }>(
-    '/api/v1/maps/:id/versions/:hash/preview.png',
+    '/api/v1/maps/:id/versions/:hash/preview.webp',
     async (request, reply) => {
       const viewer = await viewerOf(request);
       const map = await visibleMap(db, request.params.id, viewer);
@@ -583,8 +623,8 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
       }
       return sendBlob(
         reply,
-        row.preview_hash,
-        'image/png',
+        await webpRendition(db, blobs, row.preview_hash),
+        'image/webp',
         map.visibility !== 'private' && !map.hidden,
       );
     },
@@ -818,31 +858,21 @@ export async function mapCatalogRoutes(app: FastifyInstance, identity: Identity)
       const actor = (await requireRole(identity, request, 'moderator')).account;
       const input = body(ResolveMapReportRequest, request.body);
       if (!UUID.test(request.params.id)) throw apiError('not_found', 'No such report.');
-      const report = await db
-        .updateTable('map_reports')
-        .set({
-          status: input.status,
-          resolved_by_account_id: actor.id,
-          resolved_at: sql<Date>`now()`,
-          resolution_note: input.note ?? null,
-        })
-        .where('id', '=', request.params.id)
-        .returning(['id', 'map_id', 'reason'])
-        .executeTakeFirst();
-      if (!report) throw apiError('not_found', 'No such report.');
-      await audit(actor, `map.report.${input.status}`, report.map_id, {
-        report: report.id,
-        ...(input.note ? { note: input.note } : {}),
-      });
-      if (input.hideMap) {
-        await setHidden(
-          actor,
-          report.map_id,
-          true,
-          input.hideReason ?? input.note ?? `Reported: ${report.reason}`,
-        );
-      }
-      const row = await reportQuery().where('r.id', '=', report.id).executeTakeFirstOrThrow();
+      await resolveReport(
+        db,
+        'maps',
+        request.params.id,
+        {
+          resolution: input.status,
+          reason: input.hideReason ?? input.note ?? 'Reviewed through map moderation',
+          hide: input.hideMap,
+        },
+        actor.id,
+        { action: 'map.report.' + input.status, targetType: 'map', reportTarget: false },
+      );
+      const row = await reportQuery()
+        .where('r.id', '=', request.params.id)
+        .executeTakeFirstOrThrow();
       const [view] = await reportViews([row], { account: actor });
       if (!view) throw apiError('not_found', 'No such report.');
       return view;

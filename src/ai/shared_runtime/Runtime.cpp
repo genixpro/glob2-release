@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2006 Bradley Arsenault
 
+#include "Material.h"
 #include "AITelemetryFields.h"
 #include "shared_runtime/Runtime.h"
 #include "Building.h"
 #include <map>
-#include "IntBuildingType.h"
+#include "shared_runtime/BuildingDemands.h"
 #include "Game.h"
 #include "AIRules.h"
 #include "GlobalContainer.h"
 #include "Order.h"
 #include "AIRuleOrders.h"
+#include "Version.h"
 #include <tuple>
 
 using namespace AISharedRuntime;
@@ -21,6 +23,24 @@ using namespace AISharedRuntime::SearchTools;
 using std::shared_ptr;
 
 
+
+bool Runtime::ensure_production(const std::array<int,3>& desired,int workers,int futureWorkers)
+{
+    OwnerObservationScope scope(*this);
+    std::vector<int> pending;
+    for(const auto& order:building_orders) pending.push_back(order->get_concrete_type());
+    for(const auto& [id,record]:br.pending_buildings) pending.push_back(std::get<2>(record));
+    auto order=AIEngine::ObservationQueries::missingProductionOrder(observation(),teamNumber(),desired,workers,futureWorkers,pending);
+    if(!order) return false;
+    const auto& create=static_cast<const OrderCreate&>(*order);
+    const int id=br.register_building();br.issue_order(id,create.posX,create.posY,create.typeNum);
+    push_order(order);
+    auto* ratios=new ChangeSwarm(desired[WORKER],desired[EXPLORER],desired[WARRIOR],id);
+    ratios->add_condition(new ParticularBuilding(new NotUnderConstruction,id));add_management_order(ratios);
+    auto* tracker=new AddMaterialTracker(AI_SHARED_RUNTIME_RTI_TRACKER_LENGTH,RecurringInputStock,id);
+    tracker->add_condition(new ParticularBuilding(new NotUnderConstruction,id));add_management_order(tracker);
+    return true;
+}
 
 void AISharedRuntime::signature_write(GAGCore::OutputStream *stream)
 {
@@ -61,9 +81,34 @@ unsigned int Runtime::add_building_order(Construction::BuildingOrder* bo)
 	bo->queue_gradients(get_gradient_manager());
 	unsigned int id=br.register_building();
 	bo->id=id;
+    const auto intent=buildingIntent(bo->get_building_type());
+    if(intent==AIPlanning::BuildingIntent::AttractWarriors) begin_attraction(id,1u<<WARRIOR);
+    if(intent==AIPlanning::BuildingIntent::AttractExplorers) begin_attraction(id,1u<<EXPLORER);
+    if(intent==AIPlanning::BuildingIntent::AttractWorkers || intent==AIPlanning::BuildingIntent::ClearResources) begin_attraction(id,1u<<WORKER);
 	return id;
 }
 
+
+bool Runtime::begin_attraction(int id,unsigned unitMask)
+{
+    auto found=retired_attractions.find(id);
+    if(found==retired_attractions.end() || !(found->second&unitMask)) return false;
+    found->second&=~unitMask;
+    if(!found->second) retired_attractions.erase(found);
+    return true;
+}
+
+unsigned Runtime::complete_attraction_retirement(int buildingId,unsigned unitMask)
+{
+    return retired_attractions[buildingId]|=unitMask;
+}
+
+bool Runtime::attraction_retired_or_destroyed(int buildingId,unsigned unitMask) const
+{
+    const auto found=retired_attractions.find(buildingId);
+    if(found!=retired_attractions.end() && (found->second&unitMask)==unitMask) return true;
+    return !br.is_building_found(buildingId) && !br.is_building_pending(buildingId);
+}
 
 void Runtime::add_management_order(Management::ManagementOrder* mo)
 {
@@ -109,45 +154,45 @@ void Runtime::update_management_orders()
 
 
 
-void Runtime::add_resource_tracker(Management::ResourceTracker* rt, int building_id)
+void Runtime::add_material_tracker(Management::MaterialTracker* rt, int building_id)
 {
-	resource_trackers[building_id]=std::make_tuple(std::shared_ptr<ResourceTracker>(rt), true);
+	material_trackers[building_id]=std::make_tuple(std::shared_ptr<MaterialTracker>(rt), true);
 }
 
 
 
-std::shared_ptr<Management::ResourceTracker> Runtime::get_resource_tracker(int building_id)
+std::shared_ptr<Management::MaterialTracker> Runtime::get_material_tracker(int building_id)
 {
-	if(resource_trackers.find(building_id)==resource_trackers.end())
-		return std::shared_ptr<Management::ResourceTracker>();
-	return std::get<0>(resource_trackers[building_id]);
+	if(material_trackers.find(building_id)==material_trackers.end())
+		return std::shared_ptr<Management::MaterialTracker>();
+	return std::get<0>(material_trackers[building_id]);
 }
 
 
 
-void Runtime::pause_resource_tracker(int building_id)
+void Runtime::pause_material_tracker(int building_id)
 {
-	std::get<1>(resource_trackers[building_id])=false;
+	std::get<1>(material_trackers[building_id])=false;
 }
 
 
 
-void Runtime::unpause_resource_tracker(int building_id)
+void Runtime::unpause_material_tracker(int building_id)
 {
-	std::get<1>(resource_trackers[building_id])=true;
+	std::get<1>(material_trackers[building_id])=true;
 }
 
 
 
-void Runtime::update_resource_trackers()
+void Runtime::update_material_trackers()
 {
-	for(std::map<int, std::tuple<std::shared_ptr<Management::ResourceTracker>, bool> >::iterator i = resource_trackers.begin(); i!=resource_trackers.end();)
+	for(std::map<int, std::tuple<std::shared_ptr<Management::MaterialTracker>, bool> >::iterator i = material_trackers.begin(); i!=material_trackers.end();)
 	{
 		if(!br.is_building_found(i->first) && !br.is_building_pending(i->first))
 		{
-			std::map<int, std::tuple<std::shared_ptr<Management::ResourceTracker>, bool> >::iterator current=i;
+			std::map<int, std::tuple<std::shared_ptr<Management::MaterialTracker>, bool> >::iterator current=i;
 			++i;
-			resource_trackers.erase(current);
+			material_trackers.erase(current);
 			continue;
 		}
 		else if(br.is_building_found(i->first))
@@ -167,32 +212,23 @@ void Runtime::update_building_orders()
 	{
 		// A restored placement owns a register entry even before a building exists.
 		// Release both pieces before evaluating prerequisites that can never pass.
-		if (!AIRules::usefulBuilding(player->game->gameHeader,(*i)->get_building_type()))
+		if (!(*i)->bind(*this))
 		{ br.remove_building((*i)->id); i=building_orders.erase(i); continue; }
 		tribool passes=(*i)->passes_conditions(*this);
 		if(passes)
 		{
 			if(!(previous_building_id==-1 || br.is_building_found(previous_building_id) || !br.is_building_pending(previous_building_id)))
 				break;
-			position p=(*i)->find_location(*this, player->map, *gm);
-			if(p.x != 0 || p.y != 0)
+			position p=(*i)->find_location(*this, observation(), *gm);
+			if(p.x >= 0 && p.y >= 0)
 			{
-				br.issue_order((*i)->id, p.x, p.y, (*i)->get_building_type());
-				Sint32 type=-1;
-				if((*i)->get_building_type()>IntBuildingType::DEFENSE_BUILDING && (*i)->get_building_type() <IntBuildingType::STONE_WALL)
-				{
-					type=globalContainer->buildingsTypes.getTypeNum(IntBuildingType::reverseConversionMap[(*i)->get_building_type()], 0, false);
-					ManagementOrder* mo_flag=new AssignWorkers((*i)->get_number_of_workers(), (*i)->id);
-					add_management_order(mo_flag);
-				}
-				else
-				{
-					type=globalContainer->buildingsTypes.getTypeNum(IntBuildingType::reverseConversionMap[(*i)->get_building_type()], 0, true);
-					ManagementOrder* mo_during_construction=new AssignWorkers((*i)->get_number_of_workers(), (*i)->id);
-					mo_during_construction->add_condition(new ParticularBuilding(new UnderConstruction, (*i)->id));
-					add_management_order(mo_during_construction);
-				}
-				orders.push_back(shared_ptr<Order>(new OrderCreate(player->team->teamNumber, p.x, p.y, type, 1, 1)));
+    const int type=(*i)->get_concrete_type();
+    br.issue_order((*i)->id,p.x,p.y,type);
+    ManagementOrder* staffing=new AssignWorkers((*i)->get_number_of_workers(),(*i)->id);
+    if(observation().catalog->at(type).site)
+     staffing->add_condition(new ParticularBuilding(new UnderConstruction,(*i)->id));
+    add_management_order(staffing);
+				push_order(AIEngine::ObservationQueries::createOrder(observation(),teamNumber(),p.x,p.y,type,1,1));
 				telemetry.count(telemetry.series && telemetry.series->implementation == 4
 									? AITrace::AI4::shared_runtime_building_emitted
 									: AITrace::AI5::shared_runtime_building_emitted);
@@ -226,11 +262,11 @@ void Runtime::init_starting_buildings()
 {
 	for(int t=0; t<Team::MAX_COUNT; ++t)
 	{
-		if(player->game->teams[t])
+		if(std::size_t(t)<observation().teams.size())
 		{
 			for(int bu=0; bu<Building::MAX_COUNT; ++bu)
 			{
-				Building* b=player->game->teams[t]->myBuildings[bu];
+				auto* b=observation().buildingSlots(t)[bu];
 				if(b)
 				{
 					starting_buildings.insert(b->gid);
@@ -247,11 +283,11 @@ void Runtime::check_fruit()
 	{
 		for(int y=0; y<mi.get_height(); ++y)
 		{
-			if(mi.is_resource(x, y, CHERRY))
+			if(mi.is_resource(x, y, materialIndex(MaterialId::Cherries)))
 				is_fruit=true;
-			if(mi.is_resource(x, y, ORANGE))
+			if(mi.is_resource(x, y, materialIndex(MaterialId::Oranges)))
 				is_fruit=true;
-			if(mi.is_resource(x, y, PRUNE))
+			if(mi.is_resource(x, y, materialIndex(MaterialId::Prunes)))
 				is_fruit=true;
 			if(is_fruit)
 				return;
@@ -260,10 +296,11 @@ void Runtime::check_fruit()
 }
 
 
-std::shared_ptr<Order> Runtime::getOrder(void)
+std::shared_ptr<Order> Runtime::decide()
 {
 	if(!gm)
-		gm=std::make_unique<GradientManager>(player->map);
+		gm=std::make_unique<GradientManager>(observation());
+    gm->bindWorld(observation());
 
 	if(from_load_timer==0)
 	{
@@ -274,14 +311,18 @@ std::shared_ptr<Order> Runtime::getOrder(void)
 	{
 		br.initiate();
 		init_starting_buildings();
-		allies=player->team->allies;
-		enemies=player->team->attackableTeams();
-		market_view=player->team->sharedVisionExchange;
-		inn_view=player->team->sharedVisionFood;
-		other_view=player->team->sharedVisionOther;
+		allies=observedTeam().allies;
+		enemies=observedTeam().enemies;
+		market_view=observedTeam().exchangeVision;
+		inn_view=observedTeam().foodVision;
+		other_view=observedTeam().otherVision;
 	}
 
-	while (!orders.empty() && !AIRules::permittedQueuedOrder(*player->game, *orders.front())) orders.erase(orders.begin());
+	while (!orders.empty() && (!AIEngine::selectedTargetExists(*orders.front(),observation())
+        || !AIEngine::ObservationQueries::permittedQueuedOrder(observation(),*orders.front()))) {
+        orderExecutionCompleted(*orders.front(),false);
+        orders.erase(orders.begin());
+    }
 	if(!orders.empty())
 	{
 		std::shared_ptr<Order> order=orders.front();
@@ -290,7 +331,8 @@ std::shared_ptr<Order> Runtime::getOrder(void)
 	}
 	gm->update();
 	br.tick();
-	update_resource_trackers();
+    std::erase_if(retired_attractions,[&](const auto& entry){return !br.is_building_found(entry.first) && !br.is_building_pending(entry.first);});
+	update_material_trackers();
 	update_management_orders();
 	runtimeai->telemetry = telemetry;
 	runtimeai->tick(*this);
@@ -299,4 +341,83 @@ std::shared_ptr<Order> Runtime::getOrder(void)
 	timer++;
 	from_load_timer++;
 	return std::shared_ptr<Order>(new NullOrder());
+}
+
+void Runtime::orderExecutionCompleted(const Order& order, bool accepted)
+{
+    if (const auto* construction=dynamic_cast<const OrderConstruction*>(&order))
+        br.order_execution_completed(construction->gid,accepted,
+            order.aiSelectedTarget ? std::optional<Uint32>(order.aiSelectedTarget->generation) : std::nullopt);
+}
+
+void Runtime::releaseObservation()
+{
+    if(gm) gm->unbindWorld();
+    currentObservation.reset();
+}
+Runtime::OwnerObservationScope::OwnerObservationScope(Runtime& value)
+    : runtime(value), active(!value.deciding)
+{
+    if(active) ++runtime.ownerObservationDepth;
+}
+Runtime::OwnerObservationScope::~OwnerObservationScope()
+{
+    if(active && --runtime.ownerObservationDepth==0 && !runtime.deciding)
+        runtime.releaseObservation();
+}
+void Runtime::refreshOwnerObservation()
+{
+    if(deciding) return;
+    if(!ownerObservationDepth) throw std::logic_error("Runtime owner observation requires a scoped borrow");
+    releaseObservation();
+    observation();
+}
+const AIEngine::AIWorldView& Runtime::observation()
+{
+    if(!currentObservation) {
+        if(deciding || !ownerObservationDepth)
+            throw std::logic_error("Runtime query requires a decision or owner observation scope");
+        observationCatalog=AIEngine::AIWorldView::captureCatalog(*player->game);
+        currentObservation=AIEngine::AIWorldView::capture(*player->game,observationCatalog);
+        observedPlayerNumber=player->number;observedTeamNumber=player->team->teamNumber;
+    }
+    return *currentObservation;
+}
+std::shared_ptr<Order> Runtime::getOrder()
+{
+    if(!observationCatalog) observationCatalog=AIEngine::AIWorldView::captureCatalog(*player->game);
+    auto view=AIEngine::AIWorldView::capture(*player->game,observationCatalog);
+    const std::vector<AIEngine::ExecutionReceipt> receipts;
+    return getOrder(AIEngine::DecisionContext{*view,unsigned(player->number),unsigned(player->team->teamNumber),receipts,view});
+}
+std::shared_ptr<Order> Runtime::getOrder(const AIEngine::DecisionContext& context)
+{
+    // Cached field values and ages persist; the engine lease is borrowed only
+    // for this invocation and released on every exit.
+    deciding=true;
+    const auto release=[this] {
+        deciding=false;
+        releaseObservation();
+    };
+    try {
+    observedPlayerNumber=context.player;observedTeamNumber=context.team;
+    currentObservation=context.observation ? context.observation : std::make_shared<AIEngine::AIWorldView>(context.world.components());
+    observationCatalog=context.world.catalog;
+    for(const auto& receipt:context.receipts) {
+        if(receipt.command.empty()) continue;
+        auto order=Order::getOrder(receipt.command.data(),receipt.command.size(),VERSION_MINOR);
+        if(order) {
+            order->aiSelectedTarget=receipt.selectedTarget;
+            orderExecutionCompleted(*order,receipt.status==AIEngine::ExecutionStatus::Accepted);
+        }
+    }
+        auto order=decide();release();return order;
+    }
+    catch(...) {release();throw;}
+}
+
+std::optional<Uint64> AISharedRuntime::Runtime::retainedQueryVectorBytes() const
+{
+    return (gm ? gm->retainedVectorBytes() : 0) + fm.flagmap.capacity() * sizeof(int)
+        + (runtimeai ? runtimeai->retainedQueryVectorBytes() : 0);
 }

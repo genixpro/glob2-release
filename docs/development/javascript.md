@@ -2,8 +2,9 @@
 
 Glob2's optional JavaScript AI and map-script backend uses vendored QuickJS-NG
 and OpenLibm. It exposes copied game observations and accepts validated existing
-orders or scenario effects. Existing AIs and USL/SGSL maps retain their execution
-paths. Selecting JavaScript suppresses the map's retained legacy SGSL script,
+orders or scenario effects. AI controllers use the engine's immutable observation
+and order scheduling pipeline; USL/SGSL map scripts retain their execution paths. Selecting JavaScript
+suppresses the map's retained legacy SGSL script,
 including its presentation and win/loss results. Scripts are **trusted developer
 code**. Loading a map, save or replay
 with embedded JavaScript executes it automatically, without an enablement setting
@@ -156,6 +157,21 @@ require a game with a mission/GUI context; normal headless Engine sessions suppl
 one. AI observation history is recorded during simulation, even between decisions,
 and disabled/eliminated controllers stop recording it.
 
+AI callbacks read a frozen view of their logical `ctx.tick`. The match-wide order
+delay is 0–8 ticks, default 0, and applies to every AI controller. Returned orders
+execute at the engine's scheduled deadline rather than immediately during the
+callback. Account for outstanding actions and execution receipts before issuing
+another command for the same intent. Acceptance of an action is distinct from
+completion of its effect. Worker timing and thread count do not alter scheduled
+order ticks. Map-script effects keep their world-logic cadence.
+
+Remembered terrain is controller-owned and updated once per observation tick in
+the ordered decision stream. Unpolled replica/replay controllers receive a frozen
+post-step observation after an owner barrier. Scripts do not retain an engine
+world snapshot between callbacks. Saves preserve pending orders and their
+remaining deadlines along with script state, action IDs and RNG. See the
+[engine contract](reference.md#ai-observations-and-delayed-orders).
+
 Query arguments and returned results use a restricted data format:
 
 | Supported | Rejected at the boundary |
@@ -199,6 +215,11 @@ after a fatal scripting failure. Use small entity pages
 and map regions, avoid storing whole observation snapshots, and compare `ctx.tick`
 for scheduling. Exception messages are diagnostics, not stable API identifiers.
 There is no injected `console` or logging API in profile 1.
+
+Procedural map generators use a separate disposable host with the native shared
+toolkit and package-local modules. See [JavaScript map generators](../map-generators/JAVASCRIPT.md)
+for its manifest, authoring API and limits. The scenario and AI profiles below retain
+their existing restrictions.
 
 ## Runtime profile and determinism
 
@@ -311,13 +332,22 @@ network acceptance gates remain independent of this draft profile.
 
 Online natural-language commands use a separate [Hive Mind host](../multiplayer/hive-mind.md). Its isolated interpreter receives copied player observations and returns batches through the normal player-order queue. It does not change the existing AI or map-script callback contracts, save format, or replay execution.
 
-## Installing custom AI controllers (profile 2)
+## Installing custom AI controllers (profiles 1 and 2)
 
 Start with the public [JavaScript AI template](https://github.com/Globulation2/glob2-javascript-ai-starter-exampler).
 It contains modular source, pinned build/watch tools, editor declarations, installation
 screenshots, and a compatible engine revision in `engine.json`.
 
-Open **Settings → Custom AIs** and import a bundled `.js` file. Imports are copied
+Open **Settings → Custom AIs → Open AI Library**. **Discover** searches the online
+catalogue by name, description and author, with intent tags and sorting by likes,
+newest, updates or downloads. **Favourites** keeps a private shortlist. Select a
+release and use **Download & install** to verify its source hash and import it for
+local play. Installation requires passing compatibility evidence for the running
+engine version. Likes and favourites follow the AI across releases; download
+counts belong to each release. **Installed** works offline and shows available
+updates when connected. Updates are explicit and keep the local entry identity.
+
+The **Installed** view also lets you import a bundled `.js` file. Imports are copied
 under `ais/` in the existing user-data directory. Entries have stable identities;
 duplicate display names are allowed. **Update** replaces an entry after validation.
 Failed validation or durable-storage failure retains its prior version. **Validate**
@@ -332,10 +362,43 @@ Select the library entry for each computer-controlled seat in a local game. Glob
 reads each selected source once at launch and embeds those bytes. A missing or
 invalid linked file blocks launch with a diagnostic. Rebuilding or updating the
 library affects future games only. Saves and replays carry their original code;
-no source path or installed library is required to resume them. Online distribution
-of custom controllers is outside this feature.
+no source path or installed library is required to resume them. Online provenance
+is optional local registry metadata, never a simulation or save dependency.
+
+**Share your AI** opens the website publishing flow. Upload one bundled UTF-8
+`.js` file (up to 128 KiB), then choose a catalogue name, description, visibility,
+version label, release notes and up to five intent tags. Embedded metadata prefills
+the form; editing the catalogue never rewrites the downloaded source. Published
+versions are immutable. Uploading a new release requires the same compatibility
+checks and cannot replace or remove an existing release on failure.
+
+The persistent checklist covers file/profile restrictions, compilation, startup
+and callbacks, initial persistent state, two seeded gameplay fixtures, repeated
+per-tick checksums, and save/resume continuation. Checks do not require winning or
+a minimum order count. “Passed compatibility checks” is not a safety certification
+or a measure of playing strength: local execution retains the runtime trust limits
+described above. The website alone publishes; multiplayer custom controllers and
+tournaments are not supported. **How AIs work** remains available after dismissing
+the introduction.
 
 The [profile 2 API](javascript-api.md#custom-ai-profile-2) adds metadata, editable
 properties, queued actions, synchronous native spatial queries, placement, and
 telemetry while preserving profile 1 saves and execution. Save format 129 stores
 profile 2 queues and replay diagnostics; the minimum supported save format remains 58.
+
+## Browser AI Studio
+
+Instances with AI Studio enabled offer a chat and single-file editor at
+`/ai-studio`. Start with the working profile-2 example, import a `.js` file, or
+open an owned AI Library version. Assistant edits create restorable revisions.
+Manual editing, downloads and local live playtests require no credits; model
+requests use a separate Studio balance and a visible request spending cap.
+
+Use **Run checks** for server compatibility checks and **Playtest** to watch the
+selected revision in the browser. Tests and repairs never start automatically.
+The live game keeps its original code when you edit, and **Restart same setup**
+reuses its original revision, seed and opponent. **Run current revision** starts
+with the latest saved code. **Fix this** attaches diagnostics to a message you
+can review before sending. Publish is a separate action requiring a passing
+server validation for the exact source. The studio does not make custom AIs
+available in online multiplayer games.

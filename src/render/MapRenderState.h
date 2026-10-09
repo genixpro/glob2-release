@@ -17,7 +17,7 @@ namespace GAGCore { class DrawableSurface; }
 class SoftwareTerrainCache;
 
 //! Presentation state one map view keeps between frames: animation phases, the
-//! cloud field, the software terrain cache and scratch buffers. Owned by the
+//! cloud field, the terrain page cache and scratch buffers. Owned by the
 //! viewer (Game::ViewState), never by Game or Map, so the simulation neither
 //! reads nor writes it and each view animates independently.
 struct MapRenderState
@@ -42,7 +42,7 @@ struct MapRenderState
 	std::valarray<unsigned char> overlayAlphas;
 	//! How this frame's zoom draws each map element; set by Game::drawMap.
 	ZoomDetail detail;
-	//! The terrain overview's image, one pixel per visible tile, kept between frames.
+	//! The terrain overview's sampled palette image, kept between frames.
 	std::unique_ptr<GAGCore::DrawableSurface> overview;
 	//! The furthest this view's camera can zoom out, set by its owner; 0 when
 	//! unknown. It anchors the far end of the detail curves (ZoomDetail::rampTile).
@@ -51,18 +51,18 @@ struct MapRenderState
 	bool zonesEmphasised = false;
 	//! Constant-size overlays queued by this frame's map passes.
 	MapOverlayQueue overlays;
-	//! Scene this view extracts for itself when drawn without a published one.
-	Scene ownScene;
+	//! PresentationFrame explicitly prepared by a standalone owner before drawing.
+	PresentationFrame ownScene;
 
 	//! The cloud field for this view, created on first use.
 	DynamicClouds &clouds();
 	ColonySkinPreview &skinPreview();
 	// Keep match appearance while rebuilding the rest of a reconnect view.
 	void swapSkinPreview(MapRenderState &other);
-	//! The software terrain cache for map, rebuilt when the map was replaced.
+	//! The terrain page cache for map, rebuilt when the map was replaced.
 	//! May throw std::bad_alloc; callers fall back to uncached terrain.
 	SoftwareTerrainCache &terrainCache(Uint64 mapIdentity);
-	//! The current software terrain cache, or null if none was created yet.
+	//! The current terrain page cache, or null if none was created yet.
 	SoftwareTerrainCache *existingTerrainCache() const { return terrainCache_.get(); }
 
 private:

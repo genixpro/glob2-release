@@ -26,6 +26,7 @@ struct Fixture {
     int id;
     explicit Fixture(int resource = WOOD, int purpose = FEED) {
         setSyncRandSeed(180);
+        game.gameHeader.setRandomSeed(180);
         game.setWaitingOnMask(0);
         game.map.setSize(6, 6, GRASS);
         game.map.setGame(&game);
@@ -64,16 +65,17 @@ struct Fixture {
         for (int y = 19; y <= 20 + building->type->height; ++y)
             for (int x = 19; x <= 20 + building->type->width; ++x) {
                 if (x >= 20 && x < 20 + building->type->width && y >= 20 && y < 20 + building->type->height) continue;
-                auto& r = game.map.getResource(x, y);
+                auto r = game.map.getResource(x, y);
                 r.type = resource;
                 r.amount = 1;
+                game.map.replaceResource(x, y, r);
             }
         // Keep the existing feeding-availability rule satisfied.
         // Training fixtures have a separate stocked inn.
         Building* food = purpose == FEED ? building : game.addBuilding(30, 30,
             globalContainer->buildingsTypes.getTypeNum("inn", 0, false), 0);
         REQUIRE(food);
-        food->resources[WHEAT] = 10;
+        food->materials[WHEAT] = 10;
         food->updateConstructionState();
         int x, y, dx, dy;
         REQUIRE(!building->findGroundExit(&x, &y, &dx, &dy, false));
@@ -149,7 +151,7 @@ void rescue() {
     f.game.teams[0]->allies |= f.game.teams[1]->me;
     f.game.syncStep(0);
     REQUIRE((f.unit->hungry == 10 && f.game.teams[0]->isAlive));
-    f.game.map.getResource(20, 19).clear();
+    f.game.map.replaceResource(20, 19, Resource{});
     for (int i = 0; i < 16 && f.unit->attachedBuilding; ++i) f.game.syncStep(0);
     REQUIRE((f.game.teams[0]->myUnits[f.id] == f.unit && !f.unit->isDead));
     REQUIRE((f.unit->attachedBuilding == nullptr && f.building->unitsInside.empty()));
@@ -175,7 +177,7 @@ void freeUnitProtection() {
 }
 void openExitProtection() {
     Fixture f;
-    f.game.map.getResource(20, 19).clear();
+    f.game.map.replaceResource(20, 19, Resource{});
     // Even before its movement update, an available exit must protect the unit.
     f.unit->delta = 0;
     f.game.syncStep(0);
@@ -187,7 +189,7 @@ void productionRecovery(bool stocked, bool blocked) {
         globalContainer->buildingsTypes.getTypeNum("swarm", 0, false), 0);
     REQUIRE(swarm);
     f.game.teams[0]->addToStaticAbilitiesLists(swarm);
-    swarm->resources[WHEAT] = stocked ? swarm->type->resourceForOneUnit : 0;
+    swarm->materials[WHEAT] = stocked ? swarm->type->foodPerUnit : 0;
     swarm->productionTimeout = 100;
     // A player can enable production even when all sliders are at zero.
     for (int t = 0; t < NB_UNIT_TYPE; ++t) swarm->ratio[t] = 0;
@@ -197,9 +199,10 @@ void productionRecovery(bool stocked, bool blocked) {
                 if (x >= 5 && x < 5 + swarm->type->width && y >= 5 && y < 5 + swarm->type->height) {
                     f.game.map.setAirUnit(x, y, 0);
                 } else {
-                    auto& r = f.game.map.getResource(x, y);
+                    auto r = f.game.map.getResource(x, y);
                     r.type = WOOD;
                     r.amount = 1;
+                    f.game.map.replaceResource(x, y, r);
                 }
             }
     }

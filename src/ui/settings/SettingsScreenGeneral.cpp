@@ -1,3 +1,5 @@
+#include "MusicLibraryScreen.h"
+#include <ScreenStack.h>
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2007 Bradley Arsenault
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
@@ -187,6 +189,22 @@ void SettingsScreen::buildGeneral()
 				   commit();
 			   });
 		section("Advanced graphics");
+        {
+            const auto &presets = Settings::RENDER_FPS_PRESETS;
+            std::vector<std::string> labels;
+            for (int fps : presets) labels.push_back(fps ? std::to_string(fps) + " FPS" : tr("Unlimited"));
+            const auto selected = std::find(std::begin(presets), std::end(presets), s.targetRenderFps);
+            choice("graphics.fps", "Target render FPS",
+                   "Limit drawing across the application. Lower values reduce rendering work. Game speed is unchanged.",
+                   selected == std::end(presets) ? 2 : int(selected - std::begin(presets)), labels,
+                   [this](int v) {
+                       if (v < 0 || v >= int(std::size(Settings::RENDER_FPS_PRESETS))) return;
+                       auto &settings = globalContainer->settings;
+                       settings.targetRenderFps = Settings::RENDER_FPS_PRESETS[v];
+                       globalContainer->gfx->setTargetRenderFps(settings.targetRenderFps);
+                       commit();
+                   });
+        }
 		appearance("graphics.paths", "Path lines", "Choose translucent or opaque unit path lines.", &Settings::translucentPathLines, "Opaque", "Translucent");
 		effect("graphics.indicators", "Smooth progress indicators", "Smooth the moving edges of progress indicators.", &Settings::smoothProgressIndicators);
 		effect("graphics.animation", "Decorative interface animation", "Animate victory artwork. Reduced motion also disables this animation.", &Settings::decorativeAnimations);
@@ -239,6 +257,9 @@ void SettingsScreen::buildGeneral()
 	else if (current == Category::Audio)
 	{
 		info(tr("Adjust music and voice volume."));
+        if(screens) button("audio.library", tr("Music library · Browse, install and import"), [this] {
+            screens->push(std::make_unique<MusicLibraryScreen>(*screens), [this](GAGGUI::Screen&,int){ invalidate(); });
+        });
 		toggle("audio.mute", "Mute audio", "Keep your volume levels while silencing audio.", s.mute,
 			   [this](int v)
 			   {
@@ -339,20 +360,19 @@ void SettingsScreen::buildGeneral()
 	{
 		info(tr("Try features we are still testing. They can change balance and pacing."));
 		info(tr("Experiments apply to new games you start or host, never to campaign missions. A saved game keeps the ones it started with."));
-		if (experimentDefinitions().empty())
+		const auto definitions = registeredExperimentDefinitions();
+		if (definitions.empty())
 			info(tr("No experiments in this build."));
-		auto *strings = Toolkit::getStringTable();
-		for (const auto &definition : experimentDefinitions())
+		for (const auto &definition : definitions)
 		{
 			// Labels come from the experiment's own keys rather than the
 			// "[settings ...]" prefix, so the lobby and this page share them.
 			const std::string key = definition.key;
-			auto &r = add("experiments." + key, Kind::Toggle, strings->getString("[experiment " + key + "]"),
-						  strings->getString("[experiment " + key + " help]"));
-			r.number = s.experiments.has(definition.id);
-			r.change = [this, id = definition.id](int v)
+			auto &r = add("experiments." + key, Kind::Toggle, experimentLabel(definition), experimentHelp(definition));
+			r.number = s.experiments.has(key);
+			r.change = [this, key](int v)
 			{
-				globalContainer->settings.experiments.set(id, v != 0);
+				globalContainer->settings.experiments.set(key, v != 0);
 				commit();
 			};
 		}

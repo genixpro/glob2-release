@@ -11,6 +11,8 @@
 #include <memory>
 #include <vector>
 
+namespace GAGGUI { class ScreenStack; }
+
 // Settings form: category builders produce rows, and build() turns the rows
 // into a responsive page. Changes apply immediately and save automatically.
 class SettingsScreen : public Glob2UI::Screen
@@ -29,7 +31,8 @@ class SettingsScreen : public Glob2UI::Screen
 		HiveMind,
 		Recording,
 		Experiments,
-		CustomAIs
+		CustomAIs,
+		CustomGenerators
 	};
 	enum class Kind
 	{
@@ -65,7 +68,7 @@ class SettingsScreen : public Glob2UI::Screen
 		// Table entries share a line only when the viewport is wide enough.
 		int columns = 1, column = 0;
 	};
-	SettingsScreen();
+	explicit SettingsScreen(GAGGUI::ScreenStack* screens = nullptr);
 	~SettingsScreen() override;
 	Glob2UI::Element build(const Glob2UI::Presentation &presentation) override;
 	void onTimer(Uint32 tick) override;
@@ -96,8 +99,10 @@ class SettingsScreen : public Glob2UI::Screen
 		None,
 		Binding,
 		Conflict,
-		Restore
+		Restore,
+		AILibrary
 	};
+	GAGGUI::ScreenStack* screens = nullptr;
 	Category current = Category::Display;
 	Modal modal = Modal::None;
 	std::vector<Row> form;
@@ -142,11 +147,23 @@ class SettingsScreen : public Glob2UI::Screen
 	void buildRecording();
 	// Rebuild the Recording tab when session state changes.
 	int recordingState = -1;
+	struct CustomGeneratorState;
+	std::shared_ptr<CustomGeneratorState> customGenerators;
+	void buildCustomGenerators();
+	void pollCustomGenerators();
+	bool customGeneratorBusy() const;
 	struct CustomAIState;
 	std::shared_ptr<CustomAIState> customAIs;
 	void buildCustomAIs();
 	void pollCustomAIs();
 	bool customAIBusy() const;
+	Glob2UI::Element buildCustomAILibrary(const Glob2UI::Presentation &p);
+	void openCustomAILibrary();
+	void closeCustomAILibrary();
+	void fetchCustomAIs(bool more = false);
+	void selectOnlineAI(const std::string &id);
+	void installOnlineAI();
+	void socialOnlineAI(bool favourite);
 	void selectCustomAIFile(bool linked, const std::string &replace = {});
 	// Settings > Online: removes a linked sign-in method (never the last one).
 	void unlinkProvider(const std::string &provider, const std::string &name);

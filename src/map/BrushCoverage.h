@@ -15,4 +15,7 @@ Cell cellAt(double worldX, double worldY, double cornerOffset = 0);
 //! Cells covered by `figure` centred on each of `centres`. The first centre is
 //! the stroke origin that aligns the checkerboard figures.
 std::set<Cell> cells(unsigned figure, const std::vector<Cell> &centres);
+//! Cells of one stamp of `figure` centred on `centre`, with `origin` the
+//! stroke origin that aligns the checkerboard figures.
+std::set<Cell> stamp(unsigned figure, Cell centre, Cell origin);
 } // namespace BrushCoverage

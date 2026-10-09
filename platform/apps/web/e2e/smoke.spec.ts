@@ -22,7 +22,7 @@ test.beforeAll(async ({ request }) => {
   seed = (await (await request.get('/__seed')).json()) as SeededHistory;
 });
 
-// Screenshots and axe runs see the globs parked (reduced motion), so the
+// Screenshots and axe runs see the colony poster (reduced motion), so the
 // pictures are stable; a separate test covers the animation itself.
 test.use({ reducedMotion: 'reduce' });
 
@@ -110,8 +110,7 @@ test('home shows the colony, ways in, live stats, ladders, maps and matches', as
     '/play/',
   );
   const mobile = (page.viewportSize()?.width ?? 1280) < 900;
-  if (mobile)
-    await page.locator('.mobile-bar').getByRole('button', { name: 'Open navigation' }).click();
+  if (mobile) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
   await expect(
     page
       .locator(mobile ? '.drawer-content' : '.app-sidebar')
@@ -131,8 +130,7 @@ test('home shows the colony, ways in, live stats, ladders, maps and matches', as
 test('home: navigation and play controls remain reachable beside the colony', async ({ page }) => {
   await page.goto('/');
   const mobile = (page.viewportSize()?.width ?? 1280) < 900;
-  if (mobile)
-    await page.locator('.mobile-bar').getByRole('button', { name: 'Open navigation' }).click();
+  if (mobile) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
   const navigation = page.locator(mobile ? '.drawer-content' : '.app-sidebar');
   // Navigation controls must remain the topmost element at their own centre.
   for (const target of [
@@ -154,9 +152,8 @@ test('home: navigation and play controls remain reachable beside the colony', as
   }
   if (mobile) await navigation.getByRole('button', { name: 'Close navigation' }).click();
   const card = await page.locator('.hero-card').boundingBox();
-  const shell = await page.locator(mobile ? '.mobile-bar' : '.app-sidebar').boundingBox();
-  if (mobile) expect(card?.y ?? 0).toBeGreaterThanOrEqual((shell?.y ?? 0) + (shell?.height ?? 0));
-  else expect(card?.x ?? 0).toBeGreaterThanOrEqual((shell?.x ?? 0) + (shell?.width ?? 0));
+  const shell = await page.locator('.app-sidebar').boundingBox();
+  expect(card?.x ?? 0).toBeGreaterThanOrEqual((shell?.x ?? 0) + (shell?.width ?? 0));
 });
 
 test('missing pages and items have a heading and a title', async ({ page }) => {
@@ -322,6 +319,37 @@ test('moderation pages for administrators only', async ({ page }, info) => {
   await page.goto('/admin/reports');
   await expect(page.getByTestId('admin-report')).toContainText('north colony');
   await check(page, info, 'admin-reports');
+  for (const section of ['overview', 'content', 'operations', 'audit', 'finances']) {
+    await page.goto('/admin/' + section);
+    await expect(page.getByRole('heading', { level: 2 }).first()).toBeVisible();
+    await expect(page.locator('main')).not.toContainText('Internal server error');
+    if (section === 'overview') {
+      await expect(
+        page
+          .getByRole('figure', { name: 'Daily active accounts · Accounts per day' })
+          .locator('circle'),
+      ).toHaveCount(5);
+      await expect(
+        page.getByRole('region', { name: 'Completion time comparison table' }),
+      ).toBeVisible();
+    }
+    if (section === 'operations') {
+      const reconcile = page.getByRole('button', { name: 'Reconcile verified usage' });
+      await expect(reconcile).toBeDisabled();
+      await page.getByRole('button', { name: 'Inspect recovery details' }).click();
+      await expect(
+        page.getByRole('region', { name: /Provider attempt evidence for/ }),
+      ).toBeVisible();
+    }
+    if (section === 'finances') {
+      await expect(page.getByRole('region', { name: 'Confirmed cash table' })).toContainText('USD');
+      await expect(page.getByRole('region', { name: 'Confirmed cash table' })).toContainText(
+        '123.45',
+      );
+      await expect(page.getByRole('region', { name: 'Confirmed cash table' })).toContainText('500');
+    }
+    await check(page, info, 'admin-' + section);
+  }
   await page.goto('/admin/matches');
   await page.getByLabel('Status').selectOption('running');
   await expect(page.getByTestId('match-row')).toHaveCount(1);
@@ -345,8 +373,7 @@ test('the theme toggle cycles system, light and dark and is remembered', async (
   await page.emulateMedia({ colorScheme: 'light' });
   await page.goto('/leaderboard');
   const mobile = (page.viewportSize()?.width ?? 1280) < 900;
-  if (mobile)
-    await page.locator('.mobile-bar').getByRole('button', { name: 'Open navigation' }).click();
+  if (mobile) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
   const toggle = page
     .locator(mobile ? '.drawer-content' : '.app-sidebar')
     .getByTestId('theme-toggle');
@@ -361,8 +388,7 @@ test('the theme toggle cycles system, light and dark and is remembered', async (
   await page.reload();
   expect(await inPage(page, 'document.documentElement.dataset.theme')).toBe('dark');
   await expect.poll(bg).toBe('rgb(27, 18, 41)');
-  if (mobile)
-    await page.locator('.mobile-bar').getByRole('button', { name: 'Open navigation' }).click();
+  if (mobile) await page.getByRole('button', { name: 'Open navigation', exact: true }).click();
   await toggle.click();
   await expect(toggle).toHaveAccessibleName(/same as this device/);
 });
@@ -387,18 +413,59 @@ test('keyboard: skip link first, visible focus, focus moves to new pages', async
 test('the colony moves, can be paused, and keeps still for reduced motion', async ({ page }) => {
   await page.emulateMedia({ reducedMotion: 'no-preference' });
   await page.goto('/');
-  const walker = "getComputedStyle(document.querySelector('.walker'))";
-  const animation = () => inPage<string>(page, `${walker}.animationName`);
-  const state = () => inPage<string>(page, `${walker}.animationPlayState`);
-  expect(await animation()).toBe('cross');
-  expect(await state()).toBe('running');
+  const video = page.locator('.colony-video');
+  await expect
+    .poll(() =>
+      inPage<boolean>(
+        page,
+        "!document.querySelector('.colony-video').paused && document.querySelector('.colony-video').currentTime > 0",
+      ),
+    )
+    .toBe(true);
+  await expect(page.locator('.walker, .flyer')).toHaveCount(0);
   await page.getByRole('button', { name: /Pause the globs/ }).click();
-  expect(await state()).toBe('paused');
+  expect(await inPage<boolean>(page, "document.querySelector('.colony-video').paused")).toBe(true);
   await page.getByRole('button', { name: /Let the globs roam/ }).click();
-  expect(await state()).toBe('running');
+  await expect
+    .poll(() => inPage<boolean>(page, "document.querySelector('.colony-video').paused"))
+    .toBe(false);
   await page.emulateMedia({ reducedMotion: 'reduce' });
-  expect(await animation()).toBe('none');
-  await expect(page.getByRole('button', { name: /Pause the globs/ })).toBeHidden();
+  await expect
+    .poll(() => inPage<boolean>(page, "document.querySelector('.colony-video').paused"))
+    .toBe(true);
+  await expect(video).toBeHidden();
+  await expect(page.getByRole('button', { name: /Pause the globs/ })).toHaveCount(0);
+});
+
+test('pause keeps the resume control when a pending play is cancelled', async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await page.addInitScript(`
+    const originalPlay = HTMLMediaElement.prototype.play;
+    let firstPlay = true;
+    HTMLMediaElement.prototype.play = function () {
+      const started = originalPlay.call(this);
+      if (!firstPlay) return started;
+      firstPlay = false;
+      // Model WebKit starting playback before its play promise settles.
+      return new Promise((resolve, reject) => {
+        this.addEventListener('pause', () => {
+          this.setAttribute('data-play-aborted', 'true');
+          reject(new DOMException('Playback cancelled by pause', 'AbortError'));
+        }, { once: true });
+        started.catch(reject);
+      });
+    };
+`);
+  await page.goto('/');
+  const video = page.locator('.colony-video');
+  await page.getByRole('button', { name: /Pause the globs/ }).click();
+  await expect(video).toHaveAttribute('data-play-aborted', 'true');
+  const resume = page.getByRole('button', { name: /Let the globs roam/ });
+  await expect(resume).toBeVisible({ timeout: 2000 });
+  await resume.click();
+  await expect
+    .poll(() => inPage<boolean>(page, "document.querySelector('.colony-video').paused"))
+    .toBe(false);
 });
 
 test('phones: no sideways scrolling at 320 and 430 px, 44 px touch targets', async ({

@@ -1,3 +1,20 @@
+import { generatorSchemas } from './generators.ts';
+import { adminConsoleSchemas } from './adminConsole.ts';
+import {
+  BuildingPackage,
+  PublishBuildingRequest,
+  UpdateBuildingFamilyRequest,
+  SaveBuildingDraftRequest,
+  checkBuildingPackage,
+} from './buildings.ts';
+import { buildingStudioSchemas } from './buildingStudio.ts';
+import { terrainStudioSchemas } from './terrainStudio.ts';
+import { setSchemas } from './sets.ts';
+import { musicStudioSchemas } from './musicStudio.ts';
+import { generatorStudioSchemas } from './generatorStudio.ts';
+import { aiStudioSchemas } from './aiStudio.ts';
+import { aiSchemas } from './ais.ts';
+import { musicSchemas } from './music.ts';
 import { studioSchemas } from './mapStudio.ts';
 import { hiveSchemas } from './hive.ts';
 // Every schema exported as a JSON Schema file for non-TypeScript consumers,
@@ -24,6 +41,8 @@ import {
   ImportAiMapResult,
   EngineJob,
   EngineJobResult,
+  GenerateScriptMapPayload,
+  GenerateScriptMapResult,
   GenerateMapPayload,
   GenerateMapResult,
   RenderPreviewPayload,
@@ -163,6 +182,34 @@ realtimeEntries[realtimeSchemaName('match.start', 'Event')] = {
 };
 
 export const schemaRegistry: Record<string, RegisteredSchema> = {
+  ...Object.fromEntries(
+    Object.entries(adminConsoleSchemas).map(([name, schema]) => [name, { schema }]),
+  ),
+  PublishBuildingRequest: { schema: PublishBuildingRequest },
+  UpdateBuildingFamilyRequest: { schema: UpdateBuildingFamilyRequest },
+  SaveBuildingDraftRequest: {
+    schema: SaveBuildingDraftRequest,
+    semantic(value) {
+      try {
+        checkBuildingPackage((value as SaveBuildingDraftRequest).package);
+        return [];
+      } catch (error) {
+        return [{ path: '/package', message: String(error) }];
+      }
+    },
+  },
+  BuildingPackage: {
+    schema: BuildingPackage,
+    semantic(value) {
+      try {
+        checkBuildingPackage(value);
+        return [];
+      } catch (error) {
+        return [{ path: '/', message: String(error) }];
+      }
+    },
+  },
+  ...Object.fromEntries(Object.entries(musicSchemas).map(([name, schema]) => [name, { schema }])),
   SkinReportInfo: { schema: SkinReportInfo },
   SkinReportList: { schema: SkinReportList },
   SkinReportRequest: { schema: SkinReportRequest },
@@ -175,6 +222,24 @@ export const schemaRegistry: Record<string, RegisteredSchema> = {
   ColonySkinVersion: { schema: ColonySkinVersion },
   MatchColonySkin: { schema: MatchColonySkin },
   ColonySkinClaims: { schema: ColonySkinClaims },
+  ...Object.fromEntries(
+    Object.entries({ ...aiStudioSchemas, ...generatorStudioSchemas }).map(([name, schema]) => [
+      name,
+      { schema },
+    ]),
+  ),
+  ...setSchemas,
+  ...Object.fromEntries(Object.entries(aiSchemas).map(([name, schema]) => [name, { schema }])),
+  ...Object.fromEntries(
+    Object.entries(generatorSchemas).map(([name, schema]) => [name, { schema }]),
+  ),
+  ...Object.fromEntries(
+    Object.entries({
+      ...musicStudioSchemas,
+      ...terrainStudioSchemas,
+      ...buildingStudioSchemas,
+    }).map(([name, schema]) => [name, { schema }]),
+  ),
   ...Object.fromEntries(Object.entries(studioSchemas).map(([name, schema]) => [name, { schema }])),
   ...Object.fromEntries(Object.entries(hiveSchemas).map(([name, schema]) => [name, { schema }])),
   // Simulation and match description
@@ -274,6 +339,8 @@ export const schemaRegistry: Record<string, RegisteredSchema> = {
     },
   },
   EngineJobResult: { schema: EngineJobResult },
+  GenerateScriptMapPayload: { schema: GenerateScriptMapPayload },
+  GenerateScriptMapResult: { schema: GenerateScriptMapResult },
   GenerateMapPayload: { schema: GenerateMapPayload },
   GenerateMapResult: { schema: GenerateMapResult },
   ValidateMapPayload: { schema: ValidateMapPayload },

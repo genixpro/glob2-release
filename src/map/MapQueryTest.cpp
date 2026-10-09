@@ -5,6 +5,11 @@
 
 #include "Map.h"
 #include "TerrainType.h"
+#include "field/AirPathfind.h"
+#include "field/TerrainMovementCosts.h"
+#include <cstdlib>
+#include <cstdint>
+#include <limits>
 
 TEST_SUITE("MapQuery")
 {
@@ -61,6 +66,9 @@ namespace
 	{
 		GrassMap()
 		{
+            // Unit binaries do not initialize Toolkit or an installed asset search path.
+            resourceRegistryValue = ResourceRegistry::loadFile((glob2test::sourceRoot() / "data/resources/registry.json").string());
+            rebuildTerrainCounts();
 			wDec = kMapDec;
 			hDec = kMapDec;
 			w = 1 << kMapDec;
@@ -68,8 +76,32 @@ namespace
 			wMask = w - 1;
 			hMask = h - 1;
 			size = static_cast<size_t>(w * h);
-			tiles.assign(size, Tile());   // Tile() defaults: terrain=0 (grass), no building, no unit
+			// Test-only private access initializes the deliberately partial map;
+			// subsequent mutations use the same cache notifications as gameplay.
+			resourceCells.assign(size, {});
+			for (auto &cell : resourceCells) cell.mayGrow = 1;
+			occupancyCells.assign(size, {});
+			areaCells.assign(size, {});
+			scriptAreaCells.assign(size, 0);   // Tile() defaults: no building, no unit
+			vertexTerrain.assign(size, GRASS);
+			bindBootstrappedArrays();
+            rebuildTerrainCounts();
 		}
+		void enableRouting() { aStarPoints = new AStarAlgorithmPoint[size]; }
+        bool airRouteWithProperties(int x,int y,int tx,int ty,
+            const std::array<TerrainProperties,TERRAIN_COUNT>& properties,int* dx,int* dy)
+        {
+            const auto combined=[&](int px,int py) {
+                const auto c=cellCorners(px,py);
+                return combineCornerRules(properties[c[0]],properties[c[1]],properties[c[2]],properties[c[3]]);
+            };
+            unsigned minimum=GRADIENT_STEP;
+            for (const auto& p : properties) if (p.flyable)
+                minimum=std::min(minimum,gradient_kernel::scaledTerrainStep(GRADIENT_STEP,p.airSpeedQ8));
+            return field::airRoute(w,h,x,y,tx,ty,minimum,aStarPoints,aStarExaminedPoints,
+                [&](int px,int py) { return combined(px,py).flyable && getAirUnit(px,py)==NOGUID; },
+                [&](int px,int py) { return gradient_kernel::scaledTerrainStep(GRADIENT_STEP,combined(px,py).airSpeedQ8); },dx,dy);
+        }
 		~GrassMap()
 		{
 			w = h = 0;
@@ -80,23 +112,21 @@ namespace
 
 		void putBuilding(int x, int y, Uint16 gbid = 0)
 		{
-			tiles[coordToIndex(x, y)].building = gbid;
+			auto cell = getTile(x, y);
+			cell.building = gbid;
+			replaceTile(x, y, cell);
 		}
 		void putGroundUnit(int x, int y, Uint16 guid = 0)
 		{
-			tiles[coordToIndex(x, y)].groundUnit = guid;
+			setGroundUnit(x, y, guid);
 		}
 		void putResource(int x, int y, int type = 0)
 		{
-			Resource &r = tiles[coordToIndex(x, y)].resource;
-			r.type = type;
-			r.amount = 1;
-			r.variety = 0;
-			r.animation = 0;
+			replaceResource(x, y, Resource{static_cast<Uint8>(type), 0, 1, 0});
 		}
 		void setForbidden(int x, int y, Uint32 mask)
 		{
-			tiles[coordToIndex(x, y)].forbidden = mask;
+			setAreaMask(coordToIndex(x, y), &Tile::forbidden, mask);
 		}
 		// Terrain encoding (see Map.h:336-361):
 		//   grass : terrain <  16
@@ -104,11 +134,11 @@ namespace
 		//   water : 256..271
 		void makeWater(int x, int y)
 		{
-			tiles[coordToIndex(x, y)].terrain = 256;
+			paintCell(x,y,WATER);
 		}
 		void makeSand(int x, int y)
 		{
-			tiles[coordToIndex(x, y)].terrain = 128;
+			paintCell(x,y,SAND);
 		}
 	};
 
@@ -349,4 +379,207 @@ void MapQueryTest::testLocalTeam_SentinelValueIsMinusOne()
 	// so the sentinel must never collide with a real team index. -1 is the convention
 	// used elsewhere for "no team" (see Game::syncStep's localTeam parameter).
 	CHECK_EQ(static_cast<Sint32>(-1), Map::NO_DISPLAYED_TEAM);
+}
+
+TEST_SUITE("MapQuery")
+{
+TEST_CASE("trail and ice placement use properties independent of sprite variants")
+{
+    GrassMap map;
+    map.paintCell(2,2,TRAIL);
+    CHECK(map.isFreeForGroundUnit(2,2,false,1));
+    CHECK(map.isFreeForGroundUnit(2,2,true,1));
+    CHECK(map.isFreeForBuilding(2,2));
+    map.paintCell(2,2,ICE);
+    CHECK(map.isFreeForGroundUnit(2,2,false,1));
+    CHECK(map.isFreeForGroundUnit(2,2,true,1));
+    CHECK_FALSE(map.isFreeForBuilding(2,2));
+    CHECK(map.isFreeForAirUnit(2,2));
+}
+
+TEST_CASE("point routes prefer trails and reject impassable destination terrain")
+{
+    GrassMap map;map.enableRouting();
+    for(int x=0;x<8;++x)map.paintCell(x,2,TRAIL);
+    for(int x=2;x<=4;++x)map.paintCell(x,3,ICE);
+    int dx=0,dy=0;
+    REQUIRE(map.pathfindPointToPoint(1,3,5,3,&dx,&dy,0,1,100));
+    CHECK_EQ(dy,-1);
+    CHECK_EQ(std::abs(dx),1);
+    map.paintCell(5,3,WATER);
+    CHECK_FALSE(map.pathfindPointToPoint(1,3,5,3,&dx,&dy,0,1,100));
+    REQUIRE(map.pathfindPointToPoint(1,3,5,3,&dx,&dy,3,1,100));
+    CHECK_FALSE(map.pathfindPointToPoint(1,3,5,3,&dx,&dy,3,1,1));
+}
+
+TEST_CASE("air routes detour around blocked cells and reset reusable search state")
+{
+    GrassMap map;map.enableRouting();
+    for(int y=0;y<8;++y)if(y!=5)map.setAirUnit(2,y,123);
+    int dx=0,dy=0;
+    REQUIRE(map.pathfindAirPointToPoint(1,3,3,3,&dx,&dy));
+    CHECK_EQ(dx,0);CHECK_EQ(dy,1);
+    // Calling a different search on the same Map must not leave stale nodes.
+    REQUIRE(map.pathfindPointToPoint(1,3,3,3,&dx,&dy,0,1,100));
+    CHECK_EQ(dx,1);CHECK_EQ(dy,0);
+    map.setAirUnit(3,3,123);
+    REQUIRE(map.pathfindAirPointToPoint(1,3,3,3,&dx,&dy));
+    CHECK_EQ(dx,0);CHECK_EQ(dy,1);
+    // Already adjacent: wait without entering the occupant.
+    REQUIRE(map.pathfindAirPointToPoint(4,3,3,3,&dx,&dy));
+    CHECK_EQ(dx,0);CHECK_EQ(dy,0);
+}
+
+TEST_CASE("air property profiles honor no-fly barriers and weighted travel without registration")
+{
+    GrassMap map; map.enableRouting();
+    auto properties=TERRAIN_PROPERTIES;
+    properties[ICE].flyable=false;
+    // A no-fly vertex column at x=2 closes every cell touching it but those
+    // between the grass vertices (2,5) and (2,6). A closed column at x=6 keeps
+    // the route from wrapping around the small map instead.
+    for(int y=0;y<8;++y) if(y!=5 && y!=6) map.setVertexTerrain(2,y,ICE);
+    for(int y=0;y<8;++y) map.setVertexTerrain(6,y,ICE);
+    int dx=0,dy=0;
+    REQUIRE(map.airRouteWithProperties(0,3,3,3,properties,&dx,&dy));
+    CHECK_EQ(dx,0); CHECK_EQ(dy,1);
+    // A forbidden target is approached, never entered, and an enclosed unit
+    // cannot route through the forbidden cells to reach it.
+    REQUIRE(map.airRouteWithProperties(1,3,2,3,properties,&dx,&dy));
+    CHECK_EQ(dx,0); CHECK_EQ(dy,0);
+    for(int y=0;y<8;++y) for(int x=0;x<8;++x) map.paintCell(x,y,ICE);
+    map.paintCell(1,3,GRASS); map.paintCell(5,3,GRASS);
+    CHECK_FALSE(map.airRouteWithProperties(1,3,5,3,properties,&dx,&dy));
+    CHECK_EQ(dx,0); CHECK_EQ(dy,0);
+    for(int y=0;y<8;++y) for(int x=0;x<8;++x) map.paintCell(x,y,GRASS);
+    properties[ICE].flyable=true;
+    properties[ICE].airSpeedQ8=64;
+    properties[TRAIL].airSpeedQ8=1024;
+    for(int x=0;x<8;++x) map.paintCell(x,1,TRAIL);
+    for(int x=2;x<=4;++x) map.paintCell(x,3,ICE);
+    // A no-fly water column at x=7 again rules out wrapping around the map.
+    properties[WATER].flyable=false;
+    for(int y=0;y<8;++y) map.setVertexTerrain(7,y,WATER);
+    REQUIRE(map.airRouteWithProperties(1,3,5,3,properties,&dx,&dy));
+    CHECK_EQ(dy,-1); CHECK_EQ(std::abs(dx),1);
+}
+
+TEST_CASE("air building distance field resumes one source frontier for many candidates")
+{
+    // The callbacks model a corridor of fast terrain bounded by no-fly cells.
+    field::AirDistanceField routes(16,8,0,1,
+        [](int,int y){return y==1;},[](int,int){return 5u;});
+    CHECK_EQ(routes.costTo(3,1),15u);
+    CHECK_EQ(routes.costTo(6,1),30u);
+    CHECK_EQ(routes.costTo(1,1),5u);
+    CHECK_EQ(routes.costTo(15,1),5u);
+    CHECK_EQ(routes.costTo(4,2),15u); // cheapest adjacent accessible goal
+    CHECK_EQ(routes.costTo(8,5),decltype(routes)::unreachable);
+    CHECK_EQ(routes.costTo(8,1),40u);
+}
+
+TEST_SUITE("MapQuery")
+{
+TEST_CASE("reverse air field ranks many sources with forward entry costs")
+{
+    constexpr int width=8,height=4,cells=width*height;
+    unsigned state=9137;
+    const auto random=[&] { state=1664525u*state+1013904223u;return state; };
+    for(int trial=0;trial<80;++trial)
+    {
+        std::array<bool,cells> passable{};
+        std::array<unsigned,cells> costs{};
+        for(int i=0;i<cells;++i) { passable[i]=(random()%5)!=0;costs[i]=1+random()%32; }
+        const int tx=random()%width,ty=random()%height;
+        const auto access=[&](int x,int y){return passable[x*height+y];};
+        const auto entry=[&](int x,int y){return costs[x*height+y];};
+        field::AirDistanceField reverse(width,height,tx,ty,access,entry,true,field::AirDistanceDirection::ToDestination);
+        constexpr unsigned infinity=decltype(reverse)::unreachable;
+        // Independent Bellman-Ford relaxation of forward edges: the distance
+        // from u is min(entry(v)+distance(v)) over accessible neighbors v.
+        std::array<unsigned,cells> oracle;
+        oracle.fill(infinity);
+        if(access(tx,ty)) oracle[tx*height+ty]=0;
+        else for(int y=-1;y<=1;++y) for(int x=-1;x<=1;++x)
+        {
+            if(!x&&!y)continue;
+            const int nx=(tx+x+width)%width,ny=(ty+y+height)%height;
+            if(access(nx,ny))oracle[nx*height+ny]=0;
+        }
+        for(int iteration=0;iteration<cells;++iteration)
+            for(int x=0;x<width;++x) for(int y=0;y<height;++y)
+                if(access(x,y)) for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx)
+                {
+                    if(!dx&&!dy)continue;
+                    const int nx=(x+dx+width)%width,ny=(y+dy+height)%height;
+                    if(!access(nx,ny)||oracle[nx*height+ny]==infinity)continue;
+                    const unsigned cost=entry(nx,ny)*(dx&&dy?GRADIENT_DIAGONAL_STEP:GRADIENT_STEP)/GRADIENT_STEP;
+                    oracle[x*height+y]=std::min(oracle[x*height+y],cost+oracle[nx*height+ny]);
+                }
+        for(int x=0;x<width;++x) for(int y=0;y<height;++y)
+            CHECK_EQ(reverse.costTo(x,y),oracle[x*height+y]);
+    }
+}
+}
+
+}
+
+
+TEST_SUITE("MapQuery")
+{
+TEST_CASE("wrapped distance preserves negative coordinates and multiple periods")
+{
+    GrassMap map;
+    // Normalize each endpoint independently in widened arithmetic. This oracle
+    // does not subtract the original int endpoints or mirror the fast-path guard.
+    const auto circular = [](int p, int q, int length) -> std::int64_t {
+        const std::int64_t period = length;
+        const auto a = (std::int64_t(p) % period + period) % period;
+        const auto b = (std::int64_t(q) % period + period) % period;
+        const auto clockwise = (b - a + period) % period;
+        return std::min(clockwise, period - clockwise);
+    };
+    const auto verify = [&](int p, int q, int length) {
+        const auto difference = std::int64_t(p) - q;
+        REQUIRE(difference >= -std::int64_t(std::numeric_limits<int>::max()));
+        REQUIRE(difference <= std::numeric_limits<int>::max());
+        CHECK(map.warpDist1d(p, q, length) == circular(p, q, length));
+        CHECK(map.warpDist1d(q, p, length) == circular(q, p, length));
+    };
+    for (int length = 1; length <= 9; ++length)
+        for (int p = -3 * length; p <= 3 * length; ++p)
+            for (int q = -3 * length; q <= 3 * length; ++q)
+                verify(p, q, length);
+    constexpr int maximum = std::numeric_limits<int>::max();
+    for (int length : {31, 32, 64, 1000, maximum})
+    {
+        const std::int64_t period = length;
+        for (auto distance : {std::int64_t(0), std::int64_t(1), period / 2,
+                              period / 2 + 1, period - 1, period, period + 1,
+                              2 * period})
+            if (distance <= maximum)
+            {
+                verify(static_cast<int>(distance), 0, length);
+                verify(-static_cast<int>(distance), 0, length);
+            }
+        verify(maximum, 0, length);
+        verify(-maximum, 0, length);
+        verify(std::numeric_limits<int>::min(), std::numeric_limits<int>::min() + 1, length);
+        verify(maximum, maximum - 1, length);
+    }
+    // The initialized fixture is 8x8; these composed distances only read its
+    // dimensions, so also exercise a rectangular 8x4 torus without tile access.
+    for (int height : {8, 4})
+    {
+        map.h = height;
+        for (int px = -9; px <= 9; ++px)
+            for (int qx = -9; qx <= 9; ++qx)
+            {
+                const int py = 2 * px, qy = -2 * qx;
+                const auto dx = circular(px, qx, 8), dy = circular(py, qy, height);
+                CHECK(map.warpDistMax(px, py, qx, qy) == std::max(dx, dy));
+                CHECK(map.warpDistSquare(px, py, qx, qy) == dx * dx + dy * dy);
+            }
+    }
+}
 }

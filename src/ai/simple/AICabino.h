@@ -7,7 +7,10 @@
 static constexpr int AI_CABINO_SAVE_FORMAT_CONTINUATION = 132;
 
 #include "field/Frontier.h"
+#include "ai/observation/ObservationQueries.h"
+#include "ai/observation/WorldQueries.h"
 #include <memory>
+#include <sstream>
 
 #include "BuildingType.h"
 #include "Building.h"
@@ -17,7 +20,7 @@ static constexpr int AI_CABINO_SAVE_FORMAT_CONTINUATION = 132;
 #include <queue>
 #include <list>
 #include <algorithm>
-#include "IntBuildingType.h"
+#include "BuildingCapabilities.h"
 #include <map>
 #include "Utilities.h"
 #include <set>
@@ -34,6 +37,19 @@ class Team;
 ///just how devestating an attack of level 3 warriros can be to a guard half the size of level 1 warriors!
 namespace Cabino
 {
+ inline const AIEngine::TeamView* teamAt(const AIEngine::AIWorldView& world,int number);
+ template<class T> Uint64 queryVectorBytes(const std::vector<T>& values) { return Uint64(values.capacity())*sizeof(T); }
+
+ // Independent strategic demands; each concrete variant can fulfill several.
+ enum Demand { ProduceWorkers, FeedUnits, HealUnits, TrainWalking, TrainSwimming,
+  TrainAttack, TrainConstruction, DefendWithProjectiles, AttractExplorers,
+  AttractWarriors, ClearResources, ExchangeResources, DemandCount };
+ AIPlanning::BuildingIntent intentForDemand(unsigned demand);
+ bool provides(const AIEngine::AIWorldView& game,const AIEngine::BuildingView& building,unsigned demand);
+ class AICabino;
+ int selectBuilding(AICabino& ai,unsigned demand);
+ unsigned upgradeWeight(const AIEngine::AIWorldView& game,const AIEngine::BuildingView& building);
+
 	///This constant turns on status output. status is output to the file "CabinoStatus.txt" in the current
 	///working directory. It has plenty of information that explains Cabino's choices, which is good for
 	///fine tuning Cabino as well as debugging it.
@@ -90,14 +106,13 @@ namespace Cabino
 			bool load(GAGCore::InputStream *stream, AICabino& owner);
 		private:
 			friend class GradientManager;
+            Uint64 retainedQueryVectorBytes() const { return queryVectorBytes(gradient); }
 			bool isSource(unsigned x, unsigned y);
 			bool isObstacle(unsigned x, unsigned y);
 			unsigned width;
 			unsigned height;
 			unsigned sources;
 			unsigned obstacles;
-			Team* team;
-			Map* map;
 			AICabino* ai;
 			std::vector<short int> gradient;
 	};
@@ -108,6 +123,7 @@ namespace Cabino
 	{
 		public:
 			GradientManager() {};
+            Uint64 retainedQueryVectorBytes() const { Uint64 bytes=frontier.capacity()*sizeof(int); for(const auto& [signature,gradient]:gradients) bytes+=gradient.retainedQueryVectorBytes(); return bytes; }
 			GradientManager(AICabino* team) : team(team) {}
 			void setTeam(AICabino* aTeam)
 			{
@@ -154,14 +170,18 @@ namespace Cabino
 			~AICabino();
 
 			Player *player;
-			Team *team;
-			Game *game;
-			Map *map;
+			const AIEngine::TeamView*team;
+			const AIEngine::AIWorldView*game;
+			const AIEngine::AIWorldView*map;
 
 			bool load(GAGCore::InputStream *stream, Player *player, Sint32 versionMinor);
 			void save(GAGCore::OutputStream *stream);
 
 			std::shared_ptr<Order> getOrder(void);
+            std::shared_ptr<Order> getOrder(const AIEngine::DecisionContext&) override;
+            bool supportsObservation() const override { return true; }
+            SimulationSnapshot::Requirements observationRequirements() const override { return SimulationSnapshot::Simulation & ~SimulationSnapshot::bit(SimulationSnapshot::Component::ResourceFields); }
+            std::optional<Uint64> retainedQueryVectorBytes() const override;
 
 			void setDefenseModule(DefenseModule* module);
 			void setAttackModule(AttackModule* module);
@@ -187,6 +207,9 @@ namespace Cabino
 			}
 
 			std::queue<std::shared_ptr<Order> > orders;
+            void enqueueOrder(std::shared_ptr<Order>);
+            void discardInvalidQueuedOrders();
+            std::ostringstream diagnosticStream;
 
 			///This will remove all messages accocciatted with the given catagorizations
 			void clearDebugMessages(std::string module, std::string group, std::string variable)
@@ -211,11 +234,11 @@ namespace Cabino
 
 			void flare(unsigned x, unsigned y)
 			{
-				orders.push(std::shared_ptr<Order>(new MapMarkOrder(team->teamNumber, x, y)));
+				enqueueOrder(std::shared_ptr<Order>(new MapMarkOrder(team->number, x, y)));
 			}
 			void pause()
 			{
-				orders.push(std::shared_ptr<Order>(new PauseGameOrder(true)));
+				enqueueOrder(std::shared_ptr<Order>(new PauseGameOrder(true)));
 			}
 		private:
 
@@ -225,6 +248,9 @@ namespace Cabino
 
 			///Initiates the player
 			void init(Player *player);
+            std::shared_ptr<Order> decide();
+            void applyReceipts(const AIEngine::DecisionContext&);
+
 			unsigned int timer;
 			unsigned int iteration;
 			unsigned int center_x;
@@ -417,9 +443,9 @@ namespace Cabino
 
 			std::vector<zone> getBestZones(getBestZonesSplit* split_calc);
 		private:
-			Map* map;
-			Team* team;
-			Game* game;
+			const AIEngine::AIWorldView* map;
+			const AIEngine::TeamView* team;
+			const AIEngine::AIWorldView* game;
 			unsigned int center_x;
 			unsigned int center_y;
 	};
@@ -428,7 +454,7 @@ namespace Cabino
 	class TeamStatsGenerator
 	{
 		public:
-			TeamStatsGenerator(Team* team);
+			TeamStatsGenerator(const AIEngine::AIWorldView* world,const AIEngine::TeamView* team);
 			///Gets the number of units that follow the criteria. type is the type of unit. medical_state is the medical state of
 			///the unit. activity is what the unit is doing. ability is the ability the unit should have to qualify. level is the
 			///level of skill that unit should have in the ability, and isMinimum states whether the unit has to have exactly level
@@ -441,10 +467,10 @@ namespace Cabino
 			unsigned int getUnits(unsigned int type, unsigned int ability, unsigned int level, bool isMinimum);
 
 			///Returns the highest level that the team has for a particular building type, or 0 for none.
-			unsigned int getMaximumBuildingLevel(unsigned int building_type);
 
 			///The team that this team stats generator is connected to
-			Team* team;
+			const AIEngine::AIWorldView* world;
+			const AIEngine::TeamView* team;
 	};
 
 
@@ -454,6 +480,7 @@ namespace Cabino
 		public:
 			///Destructs the module, deconnecting it from the base.
 			virtual ~Module() {};
+            virtual Uint64 retainedQueryVectorBytes() const { return 0; }
 			virtual void captureTelemetry(const AITelemetry::Sink &) const {}
 			///Asks the Module to perform something in its timeslice. If this returns true,
 			///The main module will give it another tick, for split calculations. The function
@@ -536,6 +563,7 @@ namespace Cabino
 	class SimpleBuildingDefense : public DefenseModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { return queryVectorBytes(defending_zones); }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -593,6 +621,7 @@ namespace Cabino
 	class GeneralsDefense : public DefenseModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { return queryVectorBytes(defending_flags); }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -609,6 +638,7 @@ namespace Cabino
 		{
 			unsigned int flag;
 			unsigned int enemy_flag;
+			int x = -1, y = -1;
 		};
 
 			std::vector<defenseRecord> defending_flags;
@@ -629,6 +659,7 @@ namespace Cabino
 	class PrioritizedBuildingAttack : public AttackModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { return queryVectorBytes(attacks); }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -666,7 +697,8 @@ namespace Cabino
 
 			///Chooses an enemy to attack. Will change to a different enemy if the current enemy has been eradicated.
 			bool targetEnemy();
-			Team* enemy;
+			unsigned enemyTeamNumber=255;
+            const AIEngine::TeamView* enemy() const { return enemyTeamNumber==255 ? nullptr : teamAt(*ai.game,enemyTeamNumber); }
 
 			///If we have enough warriors of the best available skill level, launch an attack!
 			bool attack();
@@ -683,6 +715,7 @@ namespace Cabino
 	class DistributedNewConstructionManager : public NewConstructionModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { return queryVectorBytes(new_buildings)+queryVectorBytes(footprints)+queryVectorBytes(imap); }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -732,7 +765,8 @@ namespace Cabino
 				unsigned int x;
 				unsigned int y;
 				unsigned int assigned;
-				unsigned int building_type;
+				unsigned int building_type; // strategic demand
+    int concreteType = -1; // exact queued placement
 				int no_build_timeout;
 			};
 
@@ -767,11 +801,12 @@ namespace Cabino
 			///at the level, looking for the largest size. It will also set the offsets
 			///correctly, which are used if a building expands in multiple directions,
 			///if the current level is provided.
-			upgradeData findMaxSize(unsigned int building_type, unsigned int cur_level);
+			upgradeData findMaxSize(unsigned int concreteType);
+   std::vector<upgradeData> footprints;
 
 			///Find the best spot to put a prticular kind of building. This function does
 			///most of the calculation work.
-			point findBestPlace(unsigned int building_type);
+			point findBestPlace(unsigned int building_type,unsigned int concreteType);
 
 			///Constructs the various queued up buildings.
 			bool constructBuildings();
@@ -819,7 +854,7 @@ namespace Cabino
 		///(either repair or upgrade.)
 		struct constructionRecord
 		{
-			///The gid of the building that this record is for. A gid, not a Building*:
+			///The gid of the building that this record is for. A gid, not a const AIEngine::BuildingView*:
 			///the building can be destroyed while the record is still held.
 			unsigned int building;
 			///The number of units assigned to the building (or requested if its still pending)
@@ -828,6 +863,7 @@ namespace Cabino
 			unsigned int original;
 			///True if the construction is repair, false if it is an upgrade.
 			bool is_repair;
+   unsigned requiredLevel = 0;
 		};
 
 			///Removes construction records that are no longer being constructed (either from cancel or finish)
@@ -1032,6 +1068,7 @@ namespace Cabino
 	class InnManager : public OtherModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { Uint64 bytes=0; for(const auto& [gid,inn]:inns) bytes+=queryVectorBytes(inn.records); return bytes; }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -1134,6 +1171,7 @@ namespace Cabino
 	class HappinessHandler : public OtherModule
 	{
 	  public:
+        Uint64 retainedQueryVectorBytes() const override { return queryVectorBytes(fruit_trees)+queryVectorBytes(exploring_fruit_trees); }
 		void captureTelemetry(const AITelemetry::Sink &sink) const override;
 
 	  public:
@@ -1269,10 +1307,10 @@ namespace Cabino
 	const unsigned int MINIMUM_TO_REPAIR=2;
 	const unsigned int MAXIMUM_TO_REPAIR=8;
 	const unsigned int BUILDINGS_FOR_UPGRADE=5;
-	const int MAX_BUILDING_SPECIFIC_CONSTRUCTION_LIMITS[IntBuildingType::NB_BUILDING]=
-		{0, 4, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0};
-	const unsigned int BUILDING_UPGRADE_WEIGHTS[IntBuildingType::NB_BUILDING]=
-		{0, 6, 8, 10, 10, 20, 10, 8, 0, 0, 0, 0, 0};
+	const int MAX_BUILDING_SPECIFIC_CONSTRUCTION_LIMITS[DemandCount]=
+		{0, 4, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0};
+	const unsigned int BUILDING_UPGRADE_WEIGHTS[DemandCount]=
+		{0, 6, 8, 10, 10, 20, 10, 8, 0, 0, 0, 0};
 
 	//The following constants deal with the function iteration. All of these must be
 	//lower than TIMER_ITERATION.
@@ -1303,24 +1341,17 @@ namespace Cabino
 	const unsigned int BASE_DEFENSE_WARRIORS=10;
 
 	//These constants are for the attack system.
-	const IntBuildingType::Number ATTACK_PRIORITY[IntBuildingType::NB_BUILDING-3] =
+	const unsigned ATTACK_PRIORITY[DemandCount-3] =
 	{
-		IntBuildingType::HEAL_BUILDING,
-		IntBuildingType::FOOD_BUILDING,
-		IntBuildingType::ATTACK_BUILDING,
-		IntBuildingType::WALKSPEED_BUILDING,
-		IntBuildingType::SWIMSPEED_BUILDING,
-		IntBuildingType::SCIENCE_BUILDING,
-		IntBuildingType::SWARM_BUILDING,
-		IntBuildingType::DEFENSE_BUILDING,
-		IntBuildingType::MARKET_BUILDING,
-		IntBuildingType::STONE_WALL
-	};
-	const IntBuildingType::Number IGNORED_BUILDINGS[3] =
-	{
-		IntBuildingType::EXPLORATION_FLAG,
-		IntBuildingType::WAR_FLAG,
-		IntBuildingType::CLEARING_FLAG
+		HealUnits,
+		FeedUnits,
+		TrainAttack,
+		TrainWalking,
+		TrainSwimming,
+		TrainConstruction,
+		ProduceWorkers,
+		DefendWithProjectiles,
+		ExchangeResources
 	};
 
 	const unsigned int ATTACK_ZONE_BUILDING_PADDING=1;
@@ -1353,7 +1384,7 @@ namespace Cabino
 
 	const unsigned MAXIMUM_DISTANCE_TO_BUILDING=8;
 	typedef DistributedNewConstructionManager::GradientPoll GradientPoll;
-	const GradientPoll CONSTRUCTION_FACTORS[IntBuildingType::NB_BUILDING][CONSTRUCTOR_FACTORS_COUNT] = 
+	const GradientPoll CONSTRUCTION_FACTORS[DemandCount][CONSTRUCTOR_FACTORS_COUNT] =
 		{{	GradientPoll(Gradient::Wheat, Gradient::None, 4),
 			GradientPoll(Gradient::TeamBuildings, Gradient::Resource, 2), 
 			GradientPoll(Gradient::VillageCenter, Gradient::Resource, 1)}, //swarm
@@ -1394,21 +1425,21 @@ namespace Cabino
 
 	///This represents for every n buildings the team has, allow one to be upgraded
 	const unsigned int MAX_NEW_CONSTRUCTION_AT_ONCE=8;
-	const unsigned int MAX_NEW_CONSTRUCTION_PER_BUILDING[IntBuildingType::NB_BUILDING] =
-		{2, 4, 3, 1, 1, 2, 2, 2, 0, 0, 0, 0, 0};
+	const unsigned int MAX_NEW_CONSTRUCTION_PER_BUILDING[DemandCount] =
+		{2, 4, 3, 1, 1, 2, 2, 2, 0, 0, 0, 0};
 	const unsigned int MINIMUM_TO_CONSTRUCT_NEW=4;
 	const unsigned int MAXIMUM_TO_CONSTRUCT_NEW=8;
 	///How many units it requires to constitute construction another building, per type
-	const unsigned int UNITS_FOR_BUILDING[IntBuildingType::NB_BUILDING] =
-		{30, 12, 16, 80, 80, 30, 50, 30, 0, 0, 0, 0, 0};
+	const unsigned int UNITS_FOR_BUILDING[DemandCount] =
+		{30, 12, 16, 80, 80, 30, 50, 30, 0, 0, 0, 0};
 	///This is non-strict prioritizing, meaning that the priorities are used as multipliers on the percentages used
 	///for comparison. In otherwords, the lowest priorites will *almost* always be constructed first, however,
 	///in more extreme situations, higher priorites may be constructed first, even when its are missing lower
 	///priority buildings.
-	const unsigned int WEAK_NEW_CONSTRUCTION_PRIORITIES[IntBuildingType::NB_BUILDING] =
+	const unsigned int WEAK_NEW_CONSTRUCTION_PRIORITIES[DemandCount] =
 		{4, 2, 4, 6, 5, 4, 5, 5, 0, 0, 0, 0};
 	///Buildings with a higher strict priority will *always* go first
-	const unsigned int STRICT_NEW_CONSTRUCTION_PRIORITIES[IntBuildingType::NB_BUILDING] =
+	const unsigned int STRICT_NEW_CONSTRUCTION_PRIORITIES[DemandCount] =
 		{2, 2, 2, 1, 1, 1, 1, 2, 0, 0, 0, 0};
 	///The number of turns before a cached no-build zone gets erased
 	const unsigned int NO_BUILD_CACHE_TIMEOUT=1;
@@ -1439,31 +1470,15 @@ namespace Cabino
 
 	//These are just some handy functions
 
-	///Adapts syncRand to work as a RandomNumberFunctor for the std.
-	inline unsigned int syncRandAdapter(unsigned int x)
-	{
-		return syncRand()%x;
-	}
-
-	
-	inline bool buildingAttackPredicate(Building* a, Building* b)
-	{
-		if(a->constructionResultState==Building::NO_CONSTRUCTION && b->constructionResultState!=Building::NO_CONSTRUCTION)
-			return true;
-		else if(a->constructionResultState!=Building::NO_CONSTRUCTION && b->constructionResultState==Building::NO_CONSTRUCTION)
-			return false;
-		return syncRand()%2;
-	}
-
 	///Shuffles the given list.
-	template<typename T> void list_shuffle(std::list<T>& l)
+	template<typename T> void list_shuffle(MersenneTwister& random, std::list<T>& l)
 	{
 		std::vector<T> v(l.begin(), l.end());
 		// std::random_shuffle and its RandomNumberGenerator-functor overload were
-		// removed in C++17. Fisher-Yates by hand keeps this syncRand-driven and
+		// removed in C++17. Fisher-Yates by hand uses the controller stream and
 		// deterministic across clients, matching the old semantics exactly.
 		for (typename std::vector<T>::size_type i = v.size(); i > 1; --i)
-			std::swap(v[i - 1], v[syncRandAdapter(static_cast<unsigned int>(i))]);
+			std::swap(v[i - 1], v[random() % static_cast<unsigned int>(i)]);
 		typename std::list<T>::iterator i1 = l.begin();
 		typename std::vector<T>::iterator i2 = v.begin();
 		while (i1!=l.end())
@@ -1487,25 +1502,19 @@ namespace Cabino
 		return b-a;
 	}
 
-	///Returns the building* of the gid, or NULL
-	inline Building* getBuildingFromGid(Game* game, int gid)
-	{
-		if(gid==NOGBID)
-			return NULL;
-		return game->teams[Building::GIDtoTeam(gid)]->myBuildings[Building::GIDtoID(gid)];
-	}
-	///Returns a unit* of the gid, or NULL
-	inline Unit* getUnitFromGid(Game* game, int gid)
-	{
-		if(gid==NOGUID)
-			return NULL;
-		return game->teams[Unit::GIDtoTeam(gid)]->myUnits[Unit::GIDtoID(gid)];
-	}
+	inline const AIEngine::TeamView* teamAt(const AIEngine::AIWorldView& world,int number)
+	{ return number>=0 && std::size_t(number)<world.teams.size() ? &world.teams[number] : nullptr; }
+	inline bool resourceTakeable(const Resource& resource,int type)
+	{ return resource.type==type && resource.amount>0; }
+	inline const AIEngine::BuildingView* getBuildingFromGid(const AIEngine::AIWorldView* world,int gid)
+	{ return gid>=0 && gid<Building::MAX_COUNT*Team::MAX_COUNT ? world->buildingAtSlot(gid) : nullptr; }
+	inline const AIEngine::UnitView* getUnitFromGid(const AIEngine::AIWorldView* world,int gid)
+	{ return gid>=0 && gid<Unit::MAX_COUNT*Team::MAX_COUNT ? world->unitAtSlot(gid) : nullptr; }
 
 	///Returns true if the given building hasn't been destroyed
-	bool buildingStillExists(Game* team, Building* b);
+	bool buildingStillExists(const AIEngine::AIWorldView* team, const AIEngine::BuildingView* b);
 	///Returns true if the given building hasn't been destroyed
-	bool buildingStillExists(Game* game, unsigned int gid);
+	bool buildingStillExists(const AIEngine::AIWorldView* game, unsigned int gid);
 
 	///Implements a selection sort algorithm, which is usefull because it enables predicate sorting, or weighted random sorting etc based
 	///on the predicate. the iter type is any forward iterator, and predicate is a functor that takes in two iter::value_type's and returns
@@ -1518,18 +1527,6 @@ namespace Cabino
 		}
 	}
 
-	inline bool weighted_random_upgrade_comparison(Building* a, Building* b)
-	{
-		if(BUILDING_UPGRADE_WEIGHTS[a->type->shortTypeNum]==0)
-			return false;
-		if(BUILDING_UPGRADE_WEIGHTS[b->type->shortTypeNum]==0)
-			return true;
-		unsigned int num_a=syncRand()%BUILDING_UPGRADE_WEIGHTS[a->type->shortTypeNum];
-		unsigned int num_b=syncRand()%BUILDING_UPGRADE_WEIGHTS[b->type->shortTypeNum];
-		if(num_a>num_b)
-			return true;
-		return false;
-	}
 
 
 	inline int round_up(unsigned int a, unsigned int b)

@@ -112,6 +112,12 @@ services:
     <<: [*hardening, *platform-image]
     command: [node, apps/api/src/main.ts]
     environment:
+      AI_STUDIO_OPENAI_API_KEY: ${AI_STUDIO_OPENAI_API_KEY:-}
+      AI_STUDIO_STRIPE_SECRET_KEY: ${AI_STUDIO_STRIPE_SECRET_KEY:-}
+      AI_STUDIO_STRIPE_WEBHOOK_SECRET: ${AI_STUDIO_STRIPE_WEBHOOK_SECRET:-}
+      GENERATOR_STUDIO_OPENAI_API_KEY: ${GENERATOR_STUDIO_OPENAI_API_KEY:-}
+      GENERATOR_STUDIO_STRIPE_SECRET_KEY: ${GENERATOR_STUDIO_STRIPE_SECRET_KEY:-}
+      GENERATOR_STUDIO_STRIPE_WEBHOOK_SECRET: ${GENERATOR_STUDIO_STRIPE_WEBHOOK_SECRET:-}
       <<: *platform-environment
       DATABASE_URL: postgres://glob2_api@postgres:5432/glob2
       DATABASE_PASSWORD_FILE: /var/lib/glob2/db/api/password
@@ -120,6 +126,10 @@ services:
       HIVE_STRIPE_WEBHOOK_SECRET: ${HIVE_STRIPE_WEBHOOK_SECRET:-}
       MAP_STRIPE_SECRET_KEY: ${MAP_STRIPE_SECRET_KEY:-}
       MAP_STRIPE_WEBHOOK_SECRET: ${MAP_STRIPE_WEBHOOK_SECRET:-}
+      TERRAIN_STRIPE_SECRET_KEY: ${TERRAIN_STRIPE_SECRET_KEY:-}
+      TERRAIN_STRIPE_WEBHOOK_SECRET: ${TERRAIN_STRIPE_WEBHOOK_SECRET:-}
+      MUSIC_STRIPE_SECRET_KEY: ${MUSIC_STRIPE_SECRET_KEY:-}
+      MUSIC_STRIPE_WEBHOOK_SECRET: ${MUSIC_STRIPE_WEBHOOK_SECRET:-}
     # Provider secrets named in instance.yaml (`clientSecretEnv: …`) come from .env.
     env_file:
       - path: ${GLOB2_ENV_FILE:-.env}
@@ -171,6 +181,95 @@ services:
   # One service per sim version served. To keep serving an older version (its
   # verify-match jobs, its rooms), add a second service with that version's
   # image; see docs/hosting/README.md, "Sim versions".
+  music-worker:
+    <<: *hardening
+    image: ${GLOB2_MUSIC_IMAGE:-glob2-music-worker:development}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: music-worker
+    environment:
+      <<: *platform-environment
+      DATABASE_URL: postgres://glob2_worker@postgres:5432/glob2
+      DATABASE_PASSWORD_FILE: /var/lib/glob2/db/worker/password
+      RELAY_KEYS_FILE: ''
+      ENGINE_AGENT_KEYS_FILE: ''
+    volumes:
+      - db-worker-secret:/var/lib/glob2/db/worker:ro
+      - blobs:/var/lib/glob2/blobs
+      - *instance-config
+    networks: [backend]
+    tmpfs: ['/tmp:size=6g,mode=1777']
+    mem_limit: 12g
+    cpus: 2
+    pids_limit: 64
+    stop_grace_period: 32m
+    depends_on:
+      init: {condition: service_completed_successfully}
+
+  ai-music-worker:
+    <<: *hardening
+    profiles: [ai-music]
+    # Bubblewrap creates nested user/mount/PID namespaces. Keep confinement,
+    # with the scoped profiles installed as described in the hosting guide.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=${GLOB2_AI_MUSIC_SECCOMP_PROFILE:-./security/ai-music-seccomp.json}
+      - apparmor=${GLOB2_AI_MUSIC_APPARMOR_PROFILE:-glob2-ai-music}
+      - systempaths=unconfined
+    platform: linux/amd64
+    image: ${GLOB2_AI_MUSIC_IMAGE:-glob2-ai-music-worker:development}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: ai-music-worker
+    environment:
+      <<: *platform-environment
+      DATABASE_URL: postgres://glob2_worker@postgres:5432/glob2
+      DATABASE_PASSWORD_FILE: /var/lib/glob2/db/worker/password
+      MUSIC_OPENAI_API_KEY: ${MUSIC_OPENAI_API_KEY:-}
+      RELAY_KEYS_FILE: ''
+      ENGINE_AGENT_KEYS_FILE: ''
+    volumes:
+      - db-worker-secret:/var/lib/glob2/db/worker:ro
+      - blobs:/var/lib/glob2/blobs
+      - *instance-config
+    networks: [backend, egress]
+    tmpfs: ['/tmp:size=6g,mode=1777']
+    mem_limit: 12g
+    cpus: 2
+    pids_limit: 96
+    stop_grace_period: 40s
+    depends_on:
+      init: {condition: service_completed_successfully}
+
+  skin-render-worker:
+    <<: *hardening
+    image: ${GLOB2_SKIN_RENDER_IMAGE:-glob2-skin-render-worker:development}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: skin-render-worker
+      args: {JOBS: '${GLOB2_BUILD_JOBS:-4}'}
+    environment:
+      <<: *platform-environment
+      DATABASE_URL: postgres://glob2_worker@postgres:5432/glob2
+      DATABASE_PASSWORD_FILE: /var/lib/glob2/db/worker/password
+      RELAY_KEYS_FILE: ''
+      ENGINE_AGENT_KEYS_FILE: ''
+    volumes:
+      - db-worker-secret:/var/lib/glob2/db/worker:ro
+      - blobs:/var/lib/glob2/blobs
+      - *instance-config
+    networks: [backend]
+    tmpfs: ['/tmp:size=512m,mode=1777']
+    mem_limit: 3g
+    cpus: 2
+    pids_limit: 128
+    stop_grace_period: 6m
+    depends_on:
+      init: {condition: service_completed_successfully}
+
   ai-map-worker:
     <<: *hardening
     profiles: [ai-maps]
@@ -199,8 +298,71 @@ services:
       init: {condition: service_completed_successfully}
     stop_grace_period: 5m
 
+  ai-terrain-worker:
+    <<: *hardening
+    profiles: [ai-terrain]
+    image: ${GLOB2_AI_TERRAIN_IMAGE:-glob2-ai-terrain-worker:development}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: ai-terrain-worker
+      args: {JOBS: '${GLOB2_BUILD_JOBS:-4}'}
+    command: [node, apps/ai-terrain-worker/src/main.ts]
+    environment:
+      <<: *platform-environment
+      DATABASE_URL: postgres://glob2_worker@postgres:5432/glob2
+      DATABASE_PASSWORD_FILE: /var/lib/glob2/db/worker/password
+      ENGINE_AGENT_KEYS_FILE: ''
+      TERRAIN_OPENAI_API_KEY: ${TERRAIN_OPENAI_API_KEY:-}
+      RELAY_KEYS_FILE: ''
+      SHUTDOWN_GRACE_SECONDS: 290
+    tmpfs: ['/tmp:size=1024m,mode=1777']
+    volumes:
+      - db-worker-secret:/var/lib/glob2/db/worker:ro
+      - blobs:/var/lib/glob2/blobs
+      - *instance-config
+    networks: [backend, egress]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    stop_grace_period: 5m
+
+  ai-building-worker:
+    <<: *hardening
+    profiles: [ai-building]
+    image: ${GLOB2_AI_BUILDING_IMAGE:-glob2-ai-building-worker:development}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      target: ai-building-worker
+      args: {JOBS: '${GLOB2_BUILD_JOBS:-4}'}
+    command: [node, apps/ai-building-worker/src/main.ts]
+    environment:
+      <<: *platform-environment
+      DATABASE_URL: postgres://glob2_worker@postgres:5432/glob2
+      DATABASE_PASSWORD_FILE: /var/lib/glob2/db/worker/password
+      ENGINE_AGENT_KEYS_FILE: ''
+      BUILDING_OPENAI_API_KEY: ${BUILDING_OPENAI_API_KEY:-}
+      RELAY_KEYS_FILE: ''
+      SHUTDOWN_GRACE_SECONDS: 290
+    tmpfs: ['/tmp:size=1024m,mode=1777']
+    volumes:
+      - db-worker-secret:/var/lib/glob2/db/worker:ro
+      - blobs:/var/lib/glob2/blobs
+      - *instance-config
+    networks: [backend, egress]
+    depends_on:
+      init: {condition: service_completed_successfully}
+    stop_grace_period: 5m
+
   engine-agent:
     <<: *hardening
+    # Asset-capable engines require nested Bubblewrap namespaces. Reuse the
+    # confined namespace policy also used by the recipe worker.
+    security_opt:
+      - no-new-privileges:true
+      - seccomp=${GLOB2_ENGINE_SECCOMP_PROFILE:-./security/ai-music-seccomp.json}
+      - apparmor=${GLOB2_ENGINE_APPARMOR_PROFILE:-glob2-engine}
+      - systempaths=unconfined
     image: ${GLOB2_ENGINE_AGENT_IMAGE:-glob2-engine-agent:development}
     build:
       context: ..
@@ -218,6 +380,7 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-info}
       SHUTDOWN_GRACE_SECONDS: ${SHUTDOWN_GRACE_SECONDS:-25}
       ENGINE_CONCURRENCY: ${ENGINE_CONCURRENCY:-1}
+      ENGINE_SET_VALIDATION: ${ENGINE_SET_VALIDATION:-0}
       PLATFORM_INTERNAL_URL: http://platform-api:8080
       ENGINE_AGENT_KEY_FILE: /var/lib/glob2/engine-agent/agent.key
     volumes: [engine-agent-secret:/var/lib/glob2/engine-agent:ro]
@@ -319,6 +482,8 @@ networks:
     ipam:
       config:
         - subnet: ${GLOB2_BACKEND_SUBNET:-172.30.89.0/24}
+          # Keep dynamic service addresses away from Caddy's fixed proxy address.
+          ip_range: ${GLOB2_BACKEND_IP_RANGE:-172.30.89.128/25}
   egress: {}
   public: {}
 

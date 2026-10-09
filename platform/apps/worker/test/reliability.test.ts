@@ -452,7 +452,26 @@ describe('blob garbage collection', () => {
         .where('id', '=', matchId)
         .execute();
 
+      const playedGenerator = await put('a generator release removed from its catalogue', 'old');
+      await database.db
+        .updateTable('matches')
+        .set({
+          setup: {
+            map: {
+              kind: 'scripted',
+              descriptor: { fileHash: playedGenerator.sha256, packageHash: playedGenerator.sha256 },
+            },
+          },
+        })
+        .where('id', '=', matchId)
+        .execute();
+
       const paint = await put('a published colony paint', 'old');
+      const wirePaint = await put('its persistent WebP rendition', 'old');
+      await database.db
+        .insertInto('image_webp_renditions')
+        .values({ source_sha256: paint.sha256, webp_sha256: wirePaint.sha256 })
+        .execute();
       const paintMaterial = await put('a published colony material map', 'old');
       const skin = await database.db
         .insertInto('colony_skins')
@@ -542,7 +561,9 @@ describe('blob garbage collection', () => {
         fresh,
         artifact,
         playedMap,
+        playedGenerator,
         paint,
+        wirePaint,
         paintMaterial,
         studioMap,
         checkpoint,

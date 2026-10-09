@@ -27,21 +27,21 @@ ratings and history start fresh.
    ▼                                                  │
  platform-worker (TypeScript): result intake, scheduler, matchmaker, ratings
  engine-agent (TypeScript + glob2 headless, one image per sim version):
-   generate-map · validate-map · render-preview · verify-match
+   generate-map · validate-map · render-preview · verify-match · validate-ai · validate-buildings
  Caddy: TLS, static web client and web app, /api, /realtime, /relay
 ```
 
-| Part | Code | Role |
-| --- | --- | --- |
-| `platform-api` | `platform/apps/api` | Public REST (`/api/v1`), realtime WebSocket (`/realtime`), browser sign-in pages (`/signin`, `/auth/<provider>/…`), JWKS (`/.well-known/jwks.json`), internal endpoints for relays and agents (`/internal`), health (`/healthz`, `/readyz`). Stateless; run any number of replicas. |
-| `platform-worker` | `platform/apps/worker` | Applies engine-job results (recording verify-match verdicts and history, applying ratings, completing map jobs); runs the scheduler (maintenance, matchmaker, rating sweep, warm map pool, relay sweep) on the one replica holding the leader lock. The process code only: the domain logic it runs is in `@glob2/play`. |
-| `engine-agent` | `platform/apps/engine-agent` | Runs engine jobs for exactly one sim version with its glob2 binary; see [Engine agents](#engine-agents). |
-| web app | `platform/apps/web` | Home, leaderboards, player and match pages, map catalog, moderation (React + Vite); see [match history and the web app](history-and-web.md). Sign-in and invite pages are rendered by `platform-api`. |
-| relay | `src/relay/` (M2) | Clock and turn sequencing for matches; trusts only signed tickets. |
-| contracts | `platform/packages/protocol` | Every JSON shape, exported as JSON Schema with fixtures for C++. |
-| data | `platform/packages/db` | SQL migrations, typed Kysely access, pub/sub, leader lock. |
-| match domain | `platform/packages/play` | Shared by the API and the worker: ratings, queue tickets and proposals, the match start sequence, relay placement, map sources, match-end intake, catalog job results, the warm map pool and stored-JSON decoding. Test doubles and fixtures are exported as `@glob2/play/testing`. |
-| plumbing | `platform/packages/core` | Configuration, logging, AccessPolicy, blob store, job queue, engine-agent liveness, shutdown. |
+| Part              | Code                         | Role                                                                                                                                                                                                                                                                                                                     |
+| ----------------- | ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `platform-api`    | `platform/apps/api`          | Public REST (`/api/v1`), realtime WebSocket (`/realtime`), browser sign-in pages (`/signin`, `/auth/<provider>/…`), JWKS (`/.well-known/jwks.json`), internal endpoints for relays and agents (`/internal`), health (`/healthz`, `/readyz`). Stateless; run any number of replicas.                                      |
+| `platform-worker` | `platform/apps/worker`       | Applies engine-job results (recording verify-match verdicts and history, applying ratings, completing map jobs); runs the scheduler (maintenance, matchmaker, rating sweep, warm map pool, relay sweep) on the one replica holding the leader lock. The process code only: the domain logic it runs is in `@glob2/play`. |
+| `engine-agent`    | `platform/apps/engine-agent` | Runs engine jobs for exactly one sim version with its glob2 binary; see [Engine agents](#engine-agents).                                                                                                                                                                                                                 |
+| web app           | `platform/apps/web`          | Home, leaderboards, player and match pages, map catalog, moderation (React + Vite); see [match history and the web app](history-and-web.md). Sign-in and invite pages are rendered by `platform-api`.                                                                                                                    |
+| relay             | `src/relay/` (M2)            | Clock and turn sequencing for matches; trusts only signed tickets.                                                                                                                                                                                                                                                       |
+| contracts         | `platform/packages/protocol` | Every JSON shape, exported as JSON Schema with fixtures for C++.                                                                                                                                                                                                                                                         |
+| data              | `platform/packages/db`       | SQL migrations, typed Kysely access, pub/sub, leader lock.                                                                                                                                                                                                                                                               |
+| match domain      | `platform/packages/play`     | Shared by the API and the worker: ratings, queue tickets and proposals, the match start sequence, relay placement, map sources, match-end intake, catalog job results, the warm map pool and stored-JSON decoding. Test doubles and fixtures are exported as `@glob2/play/testing`.                                      |
+| plumbing          | `platform/packages/core`     | Configuration, logging, AccessPolicy, blob store, job queue, engine-agent liveness, shutdown.                                                                                                                                                                                                                            |
 
 Apps depend on packages, never on each other: ESLint rejects imports of an app
 package (`@glob2/api`, `@glob2/worker`, `@glob2/engine-agent`, `@glob2/web`)
@@ -102,17 +102,17 @@ exactly one thing to every engine (`MatchSetup`, requests, job payloads), reject
 unknown properties. Documents the platform emits (responses, events, REST
 resources) allow unknown properties, so newer servers can add fields without
 breaking older clients. Some rules cannot be expressed in JSON Schema; those are
-*semantic* checks (`matchSetupProblems()`) and a document is valid only if it
+_semantic_ checks (`matchSetupProblems()`) and a document is valid only if it
 passes both.
 
-| Area | Schemas |
-| --- | --- |
-| Match description | `SimVersion`, `MatchSetup`, `MapSource`, `GeneratorDescriptor`, `MatchRules` |
-| Tickets | `MatchTicketHeader`, `MatchTicketClaims` |
-| Relay ↔ platform | `RelayRegistration(Response)`, `RelayHeartbeat(Response)`, `RelayMatchEnded` |
-| Realtime | `RealtimeRequest`, `RealtimeResponse`, `RealtimeEvent`, `RealtimeServerMessage`, `MatchAssignment`, and per method `Realtime<Method>Params`/`Result`, per event `RealtimeEvent<Event>` |
-| REST | accounts and auth, `InstanceInfo`, rooms, matches, maps, leaderboards, `ErrorBody` |
-| Engine jobs | `EngineJob`, `EngineJobResult`, and per kind payload and result |
+| Area              | Schemas                                                                                                                                                                                |
+| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Match description | `SimVersion`, `MatchSetup`, `MapSource`, `GeneratorDescriptor`, `MatchRules`                                                                                                           |
+| Tickets           | `MatchTicketHeader`, `MatchTicketClaims`                                                                                                                                               |
+| Relay ↔ platform  | `RelayRegistration(Response)`, `RelayHeartbeat(Response)`, `RelayMatchEnded`                                                                                                           |
+| Realtime          | `RealtimeRequest`, `RealtimeResponse`, `RealtimeEvent`, `RealtimeServerMessage`, `MatchAssignment`, and per method `Realtime<Method>Params`/`Result`, per event `RealtimeEvent<Event>` |
+| REST              | accounts and auth, `InstanceInfo`, rooms, matches, maps, leaderboards, `ErrorBody`                                                                                                     |
+| Engine jobs       | `EngineJob`, `EngineJobResult`, and per kind payload and result                                                                                                                        |
 
 **Fixtures for other languages.** `platform/packages/protocol/fixtures/` holds:
 
@@ -135,17 +135,19 @@ validator. C++ contract tests read the manifest and must reach the same verdicts
 `MatchSetup` field names follow the `GameHeader` accessors they set, and every
 rule is required, so there are no defaults for two builds to disagree on.
 
-| MatchSetup | GameHeader |
-| --- | --- |
-| `seed` | `setRandomSeed` |
-| `seats[i]` (numbered 0..k-1) | `BasePlayer` *i*: `human` → `P_IP` on every client and in the verifier (as networked games do today, so heavy checksums agree), `ai` → `P_AI + id`; `name`, `team`; `setNumberOfPlayers(k)` |
-| `seats[i].aiConfig` | `setAIConfig(i, …)` |
-| `teams[t].alliance` (teams listed 0..n-1, n = map team count) | `setAllyTeamNumber(t, alliance + 1)` |
-| `rules.prestigeVictory`, `rules.suddenDeathMinutes` | prestige and sudden-death winning conditions (minutes × 60 × 25 ticks) |
-| `rules.mapDiscovered`, `rules.allyTeamsFixed` | `setMapDiscovered`, `setAllyTeamsFixed` |
-| economy and combat rules | the setter of the same name (`setResourceScarcityLevel`, …) |
-| `experiments` | `ExperimentSet` keys; an unknown key is an error, not ignored |
-| `map.hash` | the map or save the client loads (SHA-256 of the decompressed bytes) |
+| MatchSetup                                                                     | GameHeader                                                                                                                                                                                  |
+| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `seed`                                                                         | `setRandomSeed`                                                                                                                                                                             |
+| `seats[i]` (numbered 0..k-1)                                                   | `BasePlayer` _i_: `human` → `P_IP` on every client and in the verifier (as networked games do today, so heavy checksums agree), `ai` → `P_AI + id`; `name`, `team`; `setNumberOfPlayers(k)` |
+| `seats[i].aiConfig`                                                            | `setAIConfig(i, …)`                                                                                                                                                                         |
+| `teams[t].alliance` (teams listed 0..n-1, n = map team count)                  | `setAllyTeamNumber(t, alliance + 1)`                                                                                                                                                        |
+| `rules.prestigeVictory`, `rules.suddenDeathMinutes`                            | prestige and sudden-death winning conditions (minutes × 60 × 30 ticks)                                                                                                                      |
+| `rules.mapDiscovered`, `rules.allyTeamsFixed`                                  | `setMapDiscovered`, `setAllyTeamsFixed`                                                                                                                                                     |
+| economy and combat rules                                                       | the setter of the same name (`setResourceScarcityLevel`, …)                                                                                                                                 |
+| `rules.aiOrderDelay` (optional integer 0–8, new matches use 8; absent means 0) | `setAIOrderDelay`; one delay for every AI controller in the match                                                                                                                           |
+| `rules.buildingGradientDelay` (optional integer 1–8; absent means 8)           | `setBuildingGradientDelay`; ticks between a building walking-field capture and its publication                                                                                              |
+| `experiments`                                                                  | `ExperimentSet` keys; an unknown key is an error, not ignored                                                                                                                               |
+| `map.hash`                                                                     | the map or save the client loads (SHA-256 of the decompressed bytes)                                                                                                                        |
 
 Several seats may share a team: a human and an AI on one team is the custom-game
 shared control; several humans may also share a team. AI ids are the CLI names
@@ -190,6 +192,49 @@ grants; match tickets carry an `entitlements` claim that relays ignore. Product
 rules that are not about access, such as keeping guests out of rated queues,
 belong to the feature that owns them, not to the policy.
 
+## Building-family authoring and releases
+
+`platform/apps/api/src/buildings/` owns private drafts, normalized still WebP
+frames, publication and public library access. `BuildingPackage` in the protocol
+package describes namespaced, additive definitions; the native engine remains
+the authority for catalog semantics. Draft edits use revision UUIDs for
+compare-and-swap updates. Account locks serialize storage quota checks, and shared
+database rate limits apply across API replicas.
+
+A release references a content-addressed ZIP in `blobs` and a `validate-buildings`
+job for one stock hash, simulation version and validation suite. Validation
+constructs a bounded artwork bundle and invokes native catalog composition.
+Release status comes from the job's bound result; public library queries expose
+metadata and hashes, while the internal job retains the full resolved snapshot.
+Only validated releases can supply runtime installation resources. Every resource
+request rechecks visibility and moderation. First publication reserves namespace
+ownership, and forks allocate a new namespace with internal references rewritten.
+Owner metadata and visibility updates do not revalidate immutable releases;
+withdrawal deletes the family, and administrative changes enter the audit log.
+Maintenance retains validation jobs referenced by releases so published verdicts
+survive the normal completed-job retention period.
+
+Blob garbage collection retains every published archive. Account export includes
+private draft archives, releases and social activity; account deletion removes the
+account's authored families and drafts. Maps already containing those definitions
+and artwork remain self-contained. See [building catalogs](../features/building-catalogs.md)
+for the author workflow and format contract, and [rollout](../hosting/README.md#building-family-library-rollout)
+for deployment order.
+
+AI Building Studio uses `platform/packages/building-studio/` for private
+conversations, immutable candidates, revision UUID checks and building-credit
+reservations. `platform/apps/ai-building-worker/` journals text/image provider
+calls, assembles normalized frames, and validates complete archives through
+native building composition. `/api/v1/ai-building-studio` exposes owned projects,
+turns, references, progress/events, candidate downloads and explicit adoption.
+There is one active request per account; completed provider stages survive worker
+restarts and ambiguous dispatches require reconciliation. Candidate archives,
+artifacts and base snapshots stay reachable by blob garbage collection; account
+exports include studio metadata and exact candidate archives for offline recovery,
+and deletion removes private journals while
+retaining anonymous provider-call totals. Draft deletion is blocked during active
+work so reservations and provider outcomes cannot disappear.
+
 ## Colony skin ownership
 
 Skin identity (`colony_skins`) is separate from immutable published paint
@@ -197,7 +242,7 @@ Skin identity (`colony_skins`) is separate from immutable published paint
 (`texture_sha256`) and a material map (`material_sha256`), plus the layout
 `colony-v2`, building color and manifest digest. Database triggers reject edits
 and deletion of published versions; moderation disables the parent skin. Blob
-garbage collection retains both images of every published version. Account deletion removes private drafts
+garbage collection retains both images of every published version and all referenced sprite derivatives. Account deletion removes private drafts
 and equipment, replaces owned skin names with “Deleted skin” and disables their
 paint while preserving immutable version identifiers for match history. Guest
 retention keeps accounts referenced by skin reports so moderation records remain
@@ -229,36 +274,88 @@ mesh and integer `swarmViewAngle` (0–359, default 0), and two base64 PNG or We
 top-right, explorer bottom-left, swarm bottom-right.
 
 - `imageBase64`, the colour atlas, is at most 1 MiB. The server re-encodes it as
-  an opaque sRGB PNG without metadata.
+  an opaque sRGB lossless WebP without metadata.
 - `materialBase64`, the material map, is at most 256 KiB. Every pixel is grey
-  (R = G = B), opaque, and a material id: 0 glossy, 1 matte, 2 metallic,
-  3 hairy. Anything else is a 400. The server re-encodes it as an 8-bit
-  greyscale PNG.
+  (R = G = B), opaque, and a material id below the count registered in
+  `libgag/shaders/skin-materials.json` (mirrored as `COLONY_SKIN_MATERIALS` in
+  the protocol package). Anything else is a 400. The server re-encodes it as an
+  8-bit lossless WebP. Native clients built with the registry shade ids beyond
+  their own catalogue as matte, so later materials degrade gracefully; clients
+  from before the registry reject such a skin and keep that team's previous
+  appearance, since they only knew ids 0 to 3.
 
 The version's `manifestSha256` is described below; native clients recompute it.
-Publishing identical content again returns the existing version.
-`GET /api/v1/skins/versions/:id/texture` serves the colour atlas and
-`GET /api/v1/skins/versions/:id/material` the material map, both as `image/png`
-with the blob SHA-256 as ETag; disabled skins return 404. Raw uploads and arbitrary blob keys are never served
-by these endpoints. The designer can open any owned version or copy a preset
-into a new design. Publishing an edit updates the design's display name and
-creates an immutable content version; previously equipped versions and frozen
-match appearances retain their paint. Equipping the new version is a separate
-choice. “Make a separate design” publishes the current canvas under a new identity.
+Publishing identical content again returns the existing version. Publication and
+equipment are immediate. The publication transaction queues `skin:render:<revision>`
+with three bounded attempts, deduplicated by immutable version and render revision.
+`skin-render-worker` registers its revision and backfills published designs and
+presets at startup. Its one native OpenGL process runs with Mesa/llvmpipe under
+Xvfb, a five-minute timeout and resource limits. `colony_skin_sprites` records
+`pending`, `ready` or `failed`; manifests and page references commit together only
+after every image is validated and stored. The library exposes `softwareStatus`
+and explains preparing or unavailable software artwork while keeping equipment
+available. Ready derivatives are immutable. Renderer upgrades create new records
+without rewriting published paint.
 
-The `/skins` route opens Colony Studio, a full-window mesh painting workspace.
-Brush, eraser and eyedropper operate directly on visible geometry. Right-drag,
-Alt-drag or the Orbit tool navigates; touch uses explicit Paint/Orbit tools and
-two-finger navigation. The view menu and +/− keys also adjust inspection zoom.
+A signed optional `softwareSprites` descriptor carries `format`,
+`manifestSha256` and `renderRevision`. Its optional `source` identifies the immutable
+paint, material and canonical source manifest separately from WebP wire renditions.
+Clients verify this signed identity before accepting a bundle; older descriptors
+use the signed version identity. Appearance refresh pins the first ready
+bundle to the match; later renderer revisions cannot replace it. Its addresses
+come from the trusted instance origin:
+`GET /api/v1/skins/versions/:id/sprites/:manifestHash/manifest` and
+`.../pages/:pageHash`. These endpoints serve only ready, linked blobs and retain
+the source version's moderation checks. Blob garbage collection includes both
+bundle manifests and pages.
+`GET /api/v1/skins/versions/:id/texture` serves the colour atlas and
+`GET /api/v1/skins/versions/:id/material` the material map, both as `image/webp`
+with the blob SHA-256 as ETag; disabled skins return 404. Older published sources remain immutable. The API caches lossless WebP wire
+renditions in `image_webp_renditions`, signs their exact texture/material hashes
+and recomputes the wire manifest hash while retaining version IDs. Apply migration
+0041 and 0042 before deploying the API and worker together with the WebP-only client.
+Old clients that require PNG skins need upgrading; existing signed PNG tickets
+must be refreshed before a new client can install their appearances. Skin image
+requests include `?sha256=<wire hash>` so cached PNG responses from earlier
+releases cannot satisfy requests for the new renditions. Map catalog
+preview URLs end in `preview.webp`; existing engine-produced PNG preview sources
+are converted through the same persistent rendition cache. End-user PNG/WebP
+uploads remain accepted as imports on the server.
+
+Raw uploads and arbitrary blob keys are never served
+by these endpoints. The designer opens saved working designs or copies an owned
+preset into a new design. Applying an edit creates an immutable content snapshot
+and selects it; frozen match appearances retain their paint.
+
+The `/skins` route opens the skin collection for registered accounts and a trial
+painting workspace for guests, beside the
+shared persistent sidebar. All app pages retain this sidebar, with a compact icon
+rail below 1100 pixels and a drawer for expanded navigation.
+Brush and eraser paint every surface underneath the cursor, including hidden
+surfaces. The eyedropper samples visible geometry. Horizontal right-drag,
+Alt-drag or the Rotate tool turns the model; touch uses explicit Paint/Rotate tools and
+two-finger pinch zoom. The view menu and +/− keys also adjust inspection zoom.
 Animation starts paused and painting freezes its displayed
 pose. Each stroke and accepted pattern is one undo transaction. The toolbox,
-material swatches, model and pose strips float over the viewport; shop, saved
-skins, settings and patterns are dialogs that preserve the document.
+material swatches (one sphere per registered material, grouped as in the
+registry, shaded by the game's own material GLSL including fur shells), model
+and pose strips float over the viewport. Patterns, paint copying and shape
+selection use focused dialogs; the collection is a separate screen and the Shop
+opens from it. The workspace and dialogs use the web application’s shared Meadow
+and Night colony themes, following the device setting or saved preference. The
+sidebar's theme control preserves paint and editing state.
+Paint, building and pattern colors use an editor-owned palette that expands in
+place, with a saturation/brightness area, hue slider, preset swatches and hex
+entry. Colors update immediately without opening an operating-system dialog.
+Arrow keys adjust saturation horizontally and brightness vertically in the color
+area; Shift increases the step. The existing model eyedropper also updates the
+paint palette.
 
 Glob meshes share paint coordinates across matching front/back and top/bottom
-surfaces, including limb pairs exchanged by their flipping gait. A depth-tested
-projection excludes hidden geometry, but changing a shared texel still changes
-all matching surfaces. The closest visible contributor wins deterministically.
+surfaces, including limb pairs exchanged by their flipping gait. Brush coverage
+includes every projected contributor to a texel, applying its strongest coverage
+once. Changing a shared texel changes all matching surfaces.
+Eyedropper and projected patterns use the closest visible contributor deterministically.
 Pattern previews always render the baked atlas, including this repetition.
 Camera-projected stripes, spots, checker, chevrons, waves and speckles use the
 paused pose and chosen inspection angle. Curated solid, mirrored bands/spots and
@@ -266,7 +363,8 @@ mottled fills use per-mesh rest-space compatibility charts, with limited sizes a
 densities. Both keep the existing atlas layouts. No UV painting UI or layers are
 exposed. Copying raw paint between models is a separate action with a result preview.
 
-Paint cameras freely orbit, including above and below the model. The swarm's
+The inspection camera stays at a fixed height and angle while the model rotates
+around its upright axis; vertical drags do not tilt it. The swarm's
 separate **Choose final view** mode changes only azimuth around its standardized
 camera ring; accepting it restores the inspection camera. Unit game rendering
 continues to select animation directions normally. Building color is separate
@@ -292,19 +390,38 @@ the classic swarm. Likewise, an API that finds a stored mesh id it does not know
 (after a rollback) omits that version from skin lists and match appearances
 instead of signing it, and restores such a draft on the classic swarm.
 
-Registered active accounts can save one private working canvas with
-`PUT /api/v1/skins/draft` and restore it with `GET /api/v1/skins/draft`, without
-buying the designer unlock. Drafts carry `imageBase64` and `materialBase64` with
-the same validation as publishing; one bounded atlas and material map are stored
-per account and are never served by public image routes. A save supplies the last observed revision (null for the first save).
-Drafts may also retain an owned skin ID so edits resume as new versions of that
-design, and they keep the chosen swarm mesh and final view angle. Concurrent or stale saves return
-409 rather than overwrite another device's work. The designer also offers a separate account-scoped device draft for offline
-backup before resolving conflicts. A debounced recovery record is stored separately
-from the explicit device checkpoint, scoped by account, including the last known
-account revision. Async restore/open operations preserve any newer local edits
-instead of overwriting them. Checkout saves recovery
-before navigation and returns to the Shop dialog. Publishing and equipping remain explicit.
+Registered active accounts keep private working designs in `colony_skin_designs`,
+one mutable canvas per owned custom skin, with up to 100 active designs per account. `GET /api/v1/skins/collection` returns
+one entry per design and owned presets, together with the selected appearance
+and designer eligibility. Existing account drafts are migrated without changing
+match equipment; other existing designs initialize from their newest immutable
+snapshot when first opened through the collection. The legacy single-draft and
+publication APIs remain available for compatibility.
+
+`POST /api/v1/skins/designs` creates a design using a client-generated UUID
+(idempotent retries), optionally copying an owned design or preset.
+`PUT /api/v1/skins/designs/:id` replaces the working canvas only when the supplied
+revision matches. Saving needs no designer entitlement and never publishes a
+snapshot. `POST /api/v1/skins/designs/:id/use` checks that revision and the designer
+entitlement, creates or reuses an immutable snapshot, and selects it in one
+transaction. A failed apply leaves the previous selection intact. Edits to an
+active design remain unapplied until **Use in game** is clicked. Deleting a design
+archives its identity, removes its private working canvas, and clears equipment
+if selected; historical versions and match appearances remain available. Archive
+state is independent of moderation, which can still disable the paint.
+
+The Skins destination is a collection page, with six designs or presets per page
+to bound simultaneous WebGL previews. Each design has an editor with automatic
+account saving, a truthful save status, and **Use in game**; versions and manual
+save/restore destinations are not exposed. Saving is serialized, debounced after
+edits, and retried after connection recovery. Account-scoped browser recovery
+keeps pending changes per design across navigation and checkout. Cross-device
+conflicts preserve local work and offer **Load account changes** or **Keep mine as
+a new skin** rather than silently overwrite. Guests can paint with browser recovery
+and sign in to carry their work into a saved design. Theme remains a site control;
+building color and copying paint live in the toolbox, and toolbox layout reset
+lives in its options menu. Checkout saves the working design or browser recovery
+before navigation and returns to the Shop dialog.
 
 Match pages show their frozen colony looks and let signed-in players submit a
 reason to `POST /api/v1/skins/versions/:id/reports`. Each account reports a version
@@ -330,16 +447,16 @@ applied in order by `glob2-migrate` (`npm run migrate -- latest`); the Kysely
 types in `src/schema.ts` are checked column for column against the migrated
 database in tests.
 
-| Area | Tables |
-| --- | --- |
-| Identity | `accounts`, `identities`, `device_credentials`, `refresh_tokens`, `signin_attempts`, `web_sessions`, `auth_flows`, `entitlements`, `admin_audit_log` |
-| Infrastructure | `blobs`, `relays` (registration, load, drain, last heartbeat), `engine_agents`, `engine_jobs`, `warm_maps` (the quick-match pool over `generated_maps`) |
-| Rooms | `rooms` (settings JSON, revision), `room_members` (with relay round trips), `room_seats` (with locks), `room_chat_messages`, `room_kicks` |
-| Map sources | `map_uploads` (private uploads and their validation), `generated_maps` (one generation per descriptor and sim version) |
-| Matches | `matches` (the exact `MatchSetup`, seed, map hash, relay and placement attempts, verification, the relay's end report), `match_participants`, `match_team_stats`, `match_artifacts` |
-| Ratings | `rating_entities` (an account, or an AI at one sim version), `ratings` (OpenSkill μ/σ per ladder, ordinal generated), `rating_history` (per-match change) |
-| Quick match | `queue_tickets` (one active ticket per account), `match_proposals` and `match_proposal_seats` (groups and accept prompts), `queue_cooldowns` |
-| Maps | `maps` (owner, visibility, moderation, counters, latest version), `map_versions` (content hash, size, dimensions, team count, preview, validation), `map_likes`, `map_reports`, `map_downloads`; see [Map catalog](#map-catalog) |
+| Area           | Tables                                                                                                                                                                                                                           |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Identity       | `accounts`, `identities`, `device_credentials`, `refresh_tokens`, `signin_attempts`, `web_sessions`, `auth_flows`, `entitlements`, `admin_audit_log`                                                                             |
+| Infrastructure | `blobs`, `relays` (registration, load, drain, last heartbeat), `engine_agents`, `engine_jobs`, `warm_maps` (the quick-match pool over `generated_maps`)                                                                          |
+| Rooms          | `rooms` (settings JSON, revision), `room_members` (with relay round trips), `room_seats` (with locks), `room_chat_messages`, `room_kicks`                                                                                        |
+| Map sources    | `map_uploads` (private uploads and their validation), `generated_maps` (one generation per descriptor and sim version)                                                                                                           |
+| Matches        | `matches` (the exact `MatchSetup`, seed, map hash, relay and placement attempts, verification, the relay's end report), `match_participants`, `match_team_stats`, `match_artifacts`                                              |
+| Ratings        | `rating_entities` (an account, or an AI at one sim version), `ratings` (OpenSkill μ/σ per ladder, ordinal generated), `rating_history` (per-match change)                                                                        |
+| Quick match    | `queue_tickets` (one active ticket per account), `match_proposals` and `match_proposal_seats` (groups and accept prompts), `queue_cooldowns`                                                                                     |
+| Maps           | `maps` (owner, visibility, moderation, counters, latest version), `map_versions` (content hash, size, dimensions, team count, preview, validation), `map_likes`, `map_reports`, `map_downloads`; see [Map catalog](#map-catalog) |
 
 Hashes are lowercase hex (`sha256_hex` domain), ids are UUIDs, and enumerations
 are text with CHECK constraints so they can grow without type migrations.
@@ -435,14 +552,14 @@ engine API, with a bearer agent key (`ENGINE_AGENT_KEYS`/`ENGINE_AGENT_KEYS_FILE
 on the API, `ENGINE_AGENT_KEY_FILE` on the agent; shapes in the protocol package's
 `jobs.ts`):
 
-| Call | Purpose |
-| --- | --- |
-| `POST /internal/v1/engine/agents/heartbeat`, `DELETE …/agents/{id}` | Announce the agent's sim version and kinds (`engine_agents`). |
-| `POST /internal/v1/engine/jobs/lease` | The oldest queued job of the agent's sim version and kinds, with a lease token, or `204`. |
-| `POST …/jobs/{id}/extend`, `…/release` | Keep the lease while the engine runs; give the job back for a retry. |
-| `POST …/jobs/{id}/result` | Report the result or failure (idempotent per lease). |
-| `GET /internal/v1/engine/blobs/{sha256}` | A blob whose hash the leased job's payload contains, and no other. |
-| `PUT /internal/v1/engine/blobs?contentType=&visibility=` | Store an output blob by content (known content types only). |
+| Call                                                                | Purpose                                                                                   |
+| ------------------------------------------------------------------- | ----------------------------------------------------------------------------------------- |
+| `POST /internal/v1/engine/agents/heartbeat`, `DELETE …/agents/{id}` | Announce the agent's sim version and kinds (`engine_agents`).                             |
+| `POST /internal/v1/engine/jobs/lease`                               | The oldest queued job of the agent's sim version and kinds, with a lease token, or `204`. |
+| `POST …/jobs/{id}/extend`, `…/release`                              | Keep the lease while the engine runs; give the job back for a retry.                      |
+| `POST …/jobs/{id}/result`                                           | Report the result or failure (idempotent per lease).                                      |
+| `GET /internal/v1/engine/blobs/{sha256}`                            | A blob whose hash the leased job's payload contains, and no other.                        |
+| `PUT /internal/v1/engine/blobs?contentType=&visibility=`            | Store an output blob by content (known content types only).                               |
 
 Calls about a job carry its lease token in `X-Glob2-Lease`.
 
@@ -480,6 +597,8 @@ blob the agent stores is also registered in `blobs`.
 | `validate-map` | `--preview-map <file> --json report.json` (the game's own loader, no simulation) | `valid: true` with the decompressed hash, dimensions, team count and the file's format version, or `valid: false` with a reason |
 | `render-preview` | `--preview-map <file> --output preview.png --preview-size <px>` | PNG blob hash and pixel size |
 | `verify-match` | `--verify-match <record> --map <file> --out <dir>` | `verified`/`diverged` with the outcome, team statistics and timelines, or `unverifiable` |
+| `validate-buildings` | `--compose-buildings --package <manifest> --artwork-bundle <bundle>` | Archive and stock hashes, suite version, resolved catalog hash and snapshot, and optional artwork hash; deterministic rejection returns `valid: false` and a reason |
+
 
 Before running the generator, the agent checks the descriptor against the
 catalog. An unknown or editor-only generator, a revision this binary does not
@@ -544,17 +663,23 @@ same transaction, and stores team statistics and timelines in `match_team_stats`
 It links the record, replay and result blobs in `match_artifacts`, but only blobs
 registered in `blobs`. For a generate-map job, it marks the generated map ready or
 failed, whether a room, an on-demand queue start or the warm pool asked for it.
+Generation and validation results also carry resource experiment display metadata
+and the keys required by resources already present on the map. These are stored
+with generated maps, uploads and catalog versions, then copied into rooms and
+match setups. Required keys remain enabled when room settings change. The engine
+validates this metadata against the embedded resource catalog; the platform never
+uses display metadata as a substitute for the map's definitions.
 
 The aggregate views from migration 0004 cover verified, ended matches of the
 last 90 days:
 
-| View | Contents |
-| --- | --- |
-| `match_results_view` | One row per seat of every verified match, with queue, generator and map. |
-| `recent_win_rates_view` | Games, wins and win rate per player, by queue, map or generator. A player is an account, or an AI id at one sim version. |
-| `recent_game_lengths_view` | Mean, median, p90 and maximum length in ticks, by queue and by generator. |
-| `team_timeline_view` | The 512-tick samples of each team as rows. |
-| `account_economy_curves_view` | A player's units, buildings and prestige at each tick of each match, next to their own average at that tick. |
+| View                          | Contents                                                                                                                 |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `match_results_view`          | One row per seat of every verified match, with queue, generator and map.                                                 |
+| `recent_win_rates_view`       | Games, wins and win rate per player, by queue, map or generator. A player is an account, or an AI id at one sim version. |
+| `recent_game_lengths_view`    | Mean, median, p90 and maximum length in ticks, by queue and by generator.                                                |
+| `team_timeline_view`          | The 512-tick samples of each team as rows.                                                                               |
+| `account_economy_curves_view` | A player's units, buildings and prestige at each tick of each match, next to their own average at that tick.             |
 
 ### Warm map pool
 
@@ -648,6 +773,7 @@ version. Listings show and filter on it.
    The web app's upload form checks the file with `POST /api/v1/uploads` first and
    polls it; only a file the game loads gets a map (step 1) and a version, so a
    failed upload leaves no empty map page behind.
+
 3. The bytes become a private blob. The version row is written with two job ids,
    and only then are the jobs submitted, so a fast result always finds its row:
    - `validate-map` (format `map`);
@@ -669,12 +795,12 @@ bytes.
 **Visibility.** Moderators and administrators see every map. Every other caller
 gets `404` for a map they may not see, so its existence does not leak.
 
-| Visibility | Listed | Map, versions, file, preview, blob by hash |
-| --- | --- | --- |
-| `public` | in `GET /api/v1/maps` and the owner's public list | anyone, signed in or not |
-| `unlisted` (default) | no | anyone with the id or hash |
-| `private` | no | the owner |
-| hidden by a moderator | no | the owner (with `hiddenReason`) |
+| Visibility            | Listed                                            | Map, versions, file, preview, blob by hash |
+| --------------------- | ------------------------------------------------- | ------------------------------------------ |
+| `public`              | in `GET /api/v1/maps` and the owner's public list | anyone, signed in or not                   |
+| `unlisted` (default)  | no                                                | anyone with the id or hash                 |
+| `private`             | no                                                | the owner                                  |
+| hidden by a moderator | no                                                | the owner (with `hiddenReason`)            |
 
 Pending and invalid versions are shown only to the owner. Guests may create
 unlisted and private maps but not publish them. `GET /api/v1/blobs/maps/{hash}`
@@ -697,7 +823,7 @@ takes these filters:
 `GET /api/v1/maps/{id}` returns `MapDetail`: the map, its versions (newest first)
 and what the caller may do (`viewer.owner`, `moderator`, `liked`, `reported`).
 `GET /api/v1/maps/{id}/versions/{hash}` returns one version. `…/file` serves the
-bytes as an attachment, and `…/preview.png` serves the preview.
+bytes as an attachment, and `…/preview.webp` serves the preview.
 
 **Stats.**
 
@@ -713,12 +839,12 @@ bytes as an attachment, and `…/preview.png` serves the preview.
 open report per map; a repeat answers the open one. Each account may file 10 reports
 per hour. Moderators and administrators can then use these routes:
 
-| Route | Effect |
-| --- | --- |
-| `GET /api/v1/admin/map-reports?status=open\|resolved\|dismissed\|all&mapId=&cursor=` | Reports, newest first, with the map and reporter |
-| `POST /api/v1/admin/map-reports/{id}/resolve` | `ResolveMapReportRequest`: `resolved` or `dismissed`, an optional note, and optionally hide the map |
-| `POST /api/v1/admin/maps/{id}/hide` | Hide with a reason (`MapHideRequest`) |
-| `POST /api/v1/admin/maps/{id}/unhide` | Show again |
+| Route                                                                                | Effect                                                                                              |
+| ------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
+| `GET /api/v1/admin/map-reports?status=open\|resolved\|dismissed\|all&mapId=&cursor=` | Reports, newest first, with the map and reporter                                                    |
+| `POST /api/v1/admin/map-reports/{id}/resolve`                                        | `ResolveMapReportRequest`: `resolved` or `dismissed`, an optional note, and optionally hide the map |
+| `POST /api/v1/admin/maps/{id}/hide`                                                  | Hide with a reason (`MapHideRequest`)                                                               |
+| `POST /api/v1/admin/maps/{id}/unhide`                                                | Show again                                                                                          |
 
 Administrators may also delete any map. Every moderation action is written to
 `admin_audit_log` with `target_type` `map`.
@@ -727,6 +853,9 @@ Administrators may also delete any map. Every moderation action is written to
 
 The workspace needs Node 22.18 or newer (TypeScript runs directly through Node's
 type stripping, so there is no build step except for the web app).
+`npm run typecheck` checks server code, the web app, and browser end-to-end tests
+in separate TypeScript projects; the latter includes DOM types for code evaluated
+in the browser without adding browser globals to server checks.
 
 ```sh
 cd platform
@@ -754,24 +883,23 @@ own one-command test; see
 
 Each milestone is one or more reviewable pull requests; YOG kept working until M9.
 
-| | Milestone | Content |
-| --- | --- | --- |
-| M0 | Foundations | This workspace, protocol contracts and fixtures, data model, CI job, design docs; C++ JSON, HTTP fetch, WebSocket text mode and the `LockstepSession` interface |
-| M1 | Turn netcode core | Turn sequencer, jitter buffer, client session, match record, multi-client harness, `--verify-match` |
-| M2 | Relay and LAN | `role=relay`; LAN on the new netcode; first playtest of the new netcode's feel |
-| M3 | Identity | Accounts, guests, providers, handoff sign-in, tokens and JWKS, platform client, admin CLI, hub sign-in |
-| M4 | Rooms and matches | Rooms, uploads, generation jobs, tickets, relay registration and allocation, invite links, room screen, compose stack v2 |
-| M5 | Verification and ratings | Verify jobs, OpenSkill, AI entities, leaderboard, profile and match pages, post-game screen |
-| M6 | Quick match | Queue config, matchmaker, region probes, AI backfill, warm map pool |
-| M7 | Map catalog | Upload, browse, previews, moderation |
-| M8 | Admin and polish | Admin pages, connection HUD, phone layouts |
-| M9 | Cutover | Delete YOG, IRC and the server and router roles; update docs (done) |
+|     | Milestone                | Content                                                                                                                                                         |
+| --- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| M0  | Foundations              | This workspace, protocol contracts and fixtures, data model, CI job, design docs; C++ JSON, HTTP fetch, WebSocket text mode and the `LockstepSession` interface |
+| M1  | Turn netcode core        | Turn sequencer, jitter buffer, client session, match record, multi-client harness, `--verify-match`                                                             |
+| M2  | Relay and LAN            | `role=relay`; LAN on the new netcode; first playtest of the new netcode's feel                                                                                  |
+| M3  | Identity                 | Accounts, guests, providers, handoff sign-in, tokens and JWKS, platform client, admin CLI, hub sign-in                                                          |
+| M4  | Rooms and matches        | Rooms, uploads, generation jobs, tickets, relay registration and allocation, invite links, room screen, compose stack v2                                        |
+| M5  | Verification and ratings | Verify jobs, OpenSkill, AI entities, leaderboard, profile and match pages, post-game screen                                                                     |
+| M6  | Quick match              | Queue config, matchmaker, region probes, AI backfill, warm map pool                                                                                             |
+| M7  | Map catalog              | Upload, browse, previews, moderation                                                                                                                            |
+| M8  | Admin and polish         | Admin pages, connection HUD, phone layouts                                                                                                                      |
+| M9  | Cutover                  | Delete YOG, IRC and the server and router roles; update docs (done)                                                                                             |
 
 The original plan referred to `src/net/gateway/` for server patterns; that
 directory was removed when transport moved to native WSS, and its equivalents now
 live in `src/net/NetTransport.cpp`, `src/net/WssTransport.cpp`,
 `src/net/ServerControl.cpp` and `deploy/`.
-
 
 ## Colony skin payments
 
@@ -846,7 +974,7 @@ or key-server URL.
 
 `SkinDownloads` fetches JWKS with a 64 KiB limit, then each version's colour
 atlas (1 MiB limit) and material map (256 KiB limit), four at a time. It verifies
-the signed SHA-256 values and 512×512 PNG dimensions before image decoding. The loader stays attached to the view and refreshes the
+the signed SHA-256 values and 512×512 still WebP dimensions before image decoding. The loader stays attached to the view and refreshes the
 trusted match appearance endpoint every minute, with a 512 KiB response limit.
 A complete valid snapshot removes omitted teams immediately; additions require
 fresh signature and texture verification. Failed or malformed refreshes retain
@@ -859,9 +987,39 @@ or saved simulation data. The saved device preference **Show colony skins** is
 available in Settings > Display and the in-game Options dialog. Turning it off
 immediately restores classic units, swarms and building colors locally; verified
 appearance refreshes continue, so turning it back on uses current authorization.
-Software rendering uses classic unit and swarm sprites tinted with the skin's
-chosen building color; zoomed-out unit markers use that color too. Without an
-authorized skin, or with colony skins hidden, normal team colors apply.
+Software rendering uses the published sprite bundle for workers, warriors,
+explorers and the selected swarm mesh and angle. Other buildings and zoomed-out
+unit markers keep the signed building color. Without ready artwork, classic
+sprites remain visible with that color. Software clients download neither paint
+images nor meshes and create no OpenGL context for these skins. Unknown bundle
+formats retain this fallback; optional metadata keeps old claims compatible.
+
+The view verifies the signed descriptor, manifest hash and source identity before
+requesting pages, then verifies each page's SHA-256, byte count and static WebP
+header before decoding. Manifests are limited to 64 KiB, pages to 2 MiB compressed
+and their fixed 1024×1024 (unit) or 128×128 (swarm) dimensions. Up to four fetches
+run concurrently and at most one page decodes per view poll. Content-addressed
+pages are shared between teams, with a 64 MiB decoded LRU cache and 256 MiB disk
+cache whose bytes are revalidated on reuse. Completed offscreen requests release
+their slots without decoding; camera movement cannot block subsequent downloads.
+If disk writes fail, verified compressed buffers share the four-slot budget until
+decoding, so artwork remains available without an unbounded memory queue.
+Unused decoded pages are evicted;
+expiry or moderation removes installed appearance. Existing animation mapping,
+shadows, fog, zoom, clipping and the Show colony skins preference apply to both
+rendering paths. This is presentation state and does not alter saves, simulation
+checksums or `SIM_REVISION`.
+
+Units animate from fitted rigs rather than the baked per-frame meshes: GSB1
+blend-shape clips for workers and warriors and a GSR1 bone rig for the
+explorer, all fitted to the baked clips so they keep the original metaball
+look and paint layout. The baked GSK1 clips remain the fallback when a fitted
+asset is missing or invalid, and `GLOB2_SKIN_RIGS=0` selects them in gameplay
+for comparison. Sprite publishing always renders the rigs; its recipe digest
+covers their bytes and decoders, so a changed rig never overwrites a published
+bundle. Software clients continue using their authorized published sprites.
+See [unit rigs](../../tools/unit-animation/README.md#unit-rigs-gsb1-blend-shapes-and-gsr1-bone-rigs).
+
 Skin meshes are installed under `data/skins/colony-v1`; they share the web
 designer's UV layout, each model sampling its own `colony-v2` quadrant. The browser ships them in an on-demand `skins` package
 requested when visible paint is available. Classic rendering continues during
@@ -919,9 +1077,12 @@ buffer; both backends restore the map renderer's state after the prepass. Contex
 from retained meshes and paint. Native mobile rendering, live spectator
 attachment and full performance validation remain required
 before release.
+
 ## AI Map Studio
 
-The optional map studio lives at `/map-studio` on the online app host. The public
+The optional map studio lives at `/map-studio` on the online app host, reached
+through **Build in AI Map Studio** in the Maps library. The persistent main sidebar groups
+the studio under Maps. The public
 static website can link into it; it does not hold accounts, credits or authoring
 state. The maintained image-authoring modules were ported from the separate
 `Globulation2/glob2-ai-map-generation` prototype (GPL-3.0-or-later, originally
@@ -937,7 +1098,7 @@ job routed by simulation version. Its map, preview, categorical export and repor
 are private blobs. Provider keys never reach Python or engine subprocesses.
 
 REST under `/api/v1/map-studio` provides account state, thread creation/listing,
-messages, explicit generation, checkout, per-request progress and authorized stage
+messages, conversation turns, legacy explicit generation, checkout, per-request progress and authorized stage
 images. Thread creation accepts an optional client UUID; retrying the same owner,
 UUID and title returns the original project. Clients persist this UUID and the
 first message request ID before sending so an unknown HTTP outcome does not
@@ -955,14 +1116,30 @@ thread. Image descriptors reference owner-authorized routes, never arbitrary
 blob hashes. Older requests recover only recorded images and delivery summaries
 from a safe checkpoint allowlist; missing historical checks are not invented.
 Events and descriptors participate in account export and cascade on deletion.
-The full-screen workspace separates chat from the inspected map, supports
-following live stages or inspecting history, and displays playability checks.
+The workspace defaults the shared sidebar to a collapsed rail and gives conversation
+and canvas equal, resizable full-height panes. Settings and the accumulated brief
+live beside the anchored composer; build cards appear in the conversation. A compact
+canvas status and an expandable Build details inspector retain live stages, images,
+playability checks and history. Mobile Chat/Map tabs preserve drafts and scrolling.
+Selecting an older delivered version makes it the visible editing target; changing
+settings starts a fresh map. Preparing a failed-build retry only fills and focuses
+the composer; sending it is a new turn, never an automatic repair.
 The separate no-credit landing page preserves draft writing and access to saved
 projects; active last-credit generations open their workspace. Drafts, pending
 submission identities and revision settings survive same-tab refresh and checkout.
 Payment-return URLs trigger wallet refresh without granting credits themselves.
 Messages cost no map credits but require an available
-map credit. A Generate action reserves one credit; a successful validated
+map credit. Sending to `/threads/:id/turns` authorizes at most one build and snapshots
+text, settings and optional parent context. The worker returns a validated `discuss`
+or `build` decision with its reply and updated brief. Questions, brainstorming and
+material ambiguity remain discussion; concrete creation and edit requests can build.
+Completing a build-directed turn atomically saves the reply/brief, completes the chat,
+enqueues one generation with a persisted identity and `sourceTurnId`, and reserves
+one credit under the wallet lock. Reloads, lost responses and worker retries cannot
+enqueue another build. The browser follows events and never enqueues from them.
+Legacy `/messages` requests remain discussion-only and `/generate` stays available
+for older clients. Deploy the updated workers before the API and browser so every
+new turn is handled by a worker that understands build decisions. A generation reserves one credit; a successful validated
 delivery consumes it and failures return it. Each request snapshots the rolling
 conversation and accumulated design brief, settings, parent version and pipeline
 version. A parent revision retains its dimensions/player count; changing these
@@ -993,3 +1170,376 @@ wheat/timber, buildable ground and fertile grass. These are minimum opening chec
 not proof of competitive balance, long-term economy or human enjoyment. Qualify
 model outputs with modern-AI games, sustained growth checks and human play review
 before enabling sales. See the hosting guide for flags, credentials and recovery.
+
+## JavaScript AI library
+
+`/api/v1/ais` provides a versioned catalogue for local-play JavaScript controllers.
+The website owns publishing; the native settings library discovers, downloads and
+installs exact releases. The contracts live in `packages/protocol/src/ais.ts`.
+
+| Route                                                  | Behaviour                                                                          |
+| ------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `GET /api/v1/ais`                                      | `q`, comma-separated `tags`, `sort=likes                                           | newest | updated | downloads`, `favourites=true`, `owner=me`, keyset `cursor`and bounded`limit` |
+| `GET /api/v1/ais/{id}`                                 | AI identity, versions and historical validation evidence                           |
+| `POST /api/v1/ai-uploads`                              | Private staged UTF-8 source bytes; queues/coalesces validation                     |
+| `GET /api/v1/ai-uploads/{id}`                          | Owner-only persistent checklist and retryable failure                              |
+| `POST /api/v1/ais` / `POST /api/v1/ais/{id}/versions`  | Atomically consume a passing upload into a new AI or owned release                 |
+| `PATCH /api/v1/ais/{id}`                               | Owner edits catalogue metadata and visibility                                      |
+| `DELETE /api/v1/ais/{id}`                              | Owner removes a catalogue AI                                                       |
+| `GET /api/v1/ais/{id}/versions/{versionId}/file`       | Exact bytes, safe `.js` attachment, daily deduplicated version download accounting |
+| `PUT` / `DELETE /api/v1/ais/{id}/like` or `/favourite` | Idempotent registered-account social actions                                       |
+| `POST /api/v1/ais/{id}/reports`                        | Map-library reporting reasons and limits                                           |
+| `/api/v1/admin/ais/...`                                | Moderator report queue, resolution, hide and unhide                                |
+
+AI identities own likes and private favourites. Immutable `ai_versions` own source
+hashes, version labels, notes and download statistics. `ai_validations` bind seven
+required checks to the exact hash, simulation version and validation-suite revision.
+Publication locks the staged upload and parent AI; concurrent retries return the
+same publication, and duplicate labels or source within an AI are rejected. Public
+is the publication default; private, unlisted and moderator-hidden visibility use
+the map catalogue's access conventions. Account export and deletion include AI data.
+
+Only an active agent advertising `validate-ai` enables upload validation. Agents
+probe the real engine inside Linux namespace isolation before advertising it.
+The worker keeps historical reports and schedules validation for new supported
+engine versions. Errors never erase a previous passing report. Expired staging
+uploads and unreferenced validation blobs are reclaimed by maintenance and blob GC.
+After seven days, abandoned validations without uploads or published releases are
+collected, including queued jobs whose validator disappeared; active leases and
+reported results are allowed to finish. Published infrastructure failures can retry
+even after the original job has aged out of job history. A retry of the same source
+after infrastructure failure starts another job.
+
+Suite 1 pins two script-free fixtures (two and four players) under
+`apps/engine-agent/fixtures/ais`. Each controller runs against built-in opponents
+for at most 4,096 ticks, repeats from the same saved initial state, and continues
+from tick 2,048. Legitimate early endings restore the final save. Full per-tick
+records are compared; controller disablement is reported separately from process
+exit. Changing fixtures or validation semantics requires a new suite revision.
+
+Installation verifies the hash before startup checks and durable storage. Optional
+local provenance stores origin, AI identity, version identity and hash. Explicit
+updates preserve local IDs and roll back on persistence failure; saves and replays
+embed source exactly as before. No local gameplay telemetry, competitive ratings,
+tournament registration or multiplayer custom controllers are introduced.
+
+## AI coding Studio
+
+The opt-in `aiStudio` service provides private, single-file JavaScript projects at
+`/ai-studio`. Chat edits, restores, imports and saved manual edits retain immutable
+source revisions. Every model request names its expected revision and credit cap;
+concurrent edits are rejected while that request is active. Replies stream through
+durable, cursor-based polling events. Only a complete replacement updates code.
+The assistant has no execution tools: checks, playtests and further repair prompts
+are explicit user actions. New projects use the profile-2 starter; imported files
+retain their API profile.
+
+`apps/api/src/coding-studio` owns the shared project, request dispatch, provider
+transport and provider-result recovery implementation. The `ai-studio` exports
+preserve existing callers; explicit domain adapters provide prompts, replacement
+encoding, hashing, checks and publication.
+Each API replica dispatches one model request at a time per Studio domain.
+Its SQL tables use `ai_studio_`, including a separate wallet, ledger, calls and
+purchases. Billing shares the Hive/Map accounting implementation through an explicit
+product registry. Reservations precede dispatch; known usage settles once, even if
+generated source is invalid. Unknown outcomes retain their reservation and are
+never redispatched. A journaled provider result can finish after a process restart or a transient
+settlement/database failure without another model call. The project stays locked
+until finalization or cancellation is recorded. A late result from an expired
+request is retained as reconciliation evidence and never revives the old edit.
+An administrator reconciles unknown usage at `POST /api/v1/ai-studio/reconcile`,
+providing `requestId`, verified `usage` (`input`, `cachedInput`, `output`) and an
+`evidence` explanation. Zero usage is appropriate only after confirming no billable
+work occurred. Verified charges never exceed the original reservation; the
+operator absorbs any overrun, with full measured usage and the adjustment recorded
+in the ledger. Reconciliation does not apply an old edit to a newer draft.
+
+Run checks uses the existing isolated AI validator and source-hash-bound upload
+receipts; publishing uses the unchanged AI Library API. A saved project retains
+its source and validation blobs until deletion. Account exports include Studio
+projects, revisions, requests, events, playtests and billing. Deletion fences
+request completion, removes project content, and retains financial audit records.
+
+Live playtests use `/play/studio.html`, the browser engine's temporary-profile entry.
+A version-1, same-origin message bridge verifies the parent window, run ID, revision,
+source limits and the pinned two-player map hash. Source executes inside Glob2's
+JavaScript runtime. Tests default to seed 19 and Numbi; Nicowar is also available.
+The existing AI-only local spectator path supplies camera, pause and speed controls.
+Runtime diagnostics and results are bounded and belong to the tested revision;
+editing a draft never changes an ongoing match. Browser results cannot authorize
+publication. Closing the workspace ends its local test.
+
+The Studio parent document requires COOP/COEP headers, so crossing into or out of
+its route performs a document navigation. Only the dedicated game entry permits
+same-origin framing; ordinary game, account and admin pages remain unframeable.
+Monaco worker responses also carry the parent's COEP policy.
+Monaco and its language workers load on desktop only; narrow screens retain a plain
+text editor. Local unsaved-draft recovery is scoped to account and project.
+
+Enable only after a maintainer playthrough. Configure `aiStudio.enabled`, `model`,
+`rate` (version and integer credits per million input/cached-input/output tokens),
+`maxRequestCredits`, and `maxOutputTokens` in the instance config, plus
+`AI_STUDIO_OPENAI_API_KEY`. Credit sales additionally need `salesEnabled`, configured
+`packs`, `AI_STUDIO_STRIPE_SECRET_KEY`, and `AI_STUDIO_STRIPE_WEBHOOK_SECRET`; the
+Stripe callback is `/api/v1/ai-studio/stripe`. Keep rates and caps aligned with the
+selected model; changing a rate does not change a previously reserved call.
+
+Studio checkout submissions carry a client-generated purchase UUID. Retrying a lost
+response reuses that purchase, its captured credit pack and its Stripe idempotency
+key. Returning from checkout starts a new attempt for a subsequent purchase.
+Known open checkout sessions are retrieved; unknown outcomes older than 23 hours
+require reconciliation rather than redispatch, because Stripe may expire
+[idempotency keys after 24 hours](https://docs.stripe.com/api/idempotent_requests).
+The existing Hive and Map checkout callers retain their separate products and
+balances.
+
+Monitor `ai_studio_requests` status/lease ages, `ai_studio_calls` with `uncertain`
+status, validation queue age, and browser launch errors. Studio request failures
+are structured API logs. Playtest summaries are client-reported development data,
+not competitive ratings or trusted match results. V1 has no multiplayer custom
+controllers, remote live games, community remixing, subscriptions, or shared credits.
+
+## Generator coding Studio
+
+`/generator-studio` and `/api/v1/generator-studio` use the shared coding Studio
+lifecycle with a separate opt-in `generatorStudio` configuration and billing
+product. Migration `0058_generator_studio.sql` adds independent `generator_studio_`
+projects, immutable two-file revisions, requests, events, checks, runs and financial
+tables. Revisions persist a JSON envelope of manifest text and script text;
+invalid manifest JSON is preserved for repair. A completed `replace_generator`
+response must contain both full files and pass the expected-revision check before
+one atomic revision is applied. Incomplete, malformed or ambiguous replacements
+retain usage accounting without changing either file. Uncertain provider outcomes
+are never automatically dispatched again; journaled results recover through the
+same settlement path as AI Studio.
+
+The generator adapter supplies committed documentation, toolkit declarations,
+starter source, current files, bounded conversation and explicitly supplied
+diagnostics. The assistant has no execution tools. Separate declaration leases
+and model paths provide Monaco completion for each domain, with plain text editing
+on narrow screens. Shared recovery, conflict handling, historical inspection,
+restoration and generated-edit Undo operate on both files together.
+
+Explicit local runs retain revision, draft hash, settings and bounded client
+summaries. `/play/generator-studio.html` uses the same temporary-profile host and
+validated, same-origin, versioned run envelope as AI Studio. Native package parsing,
+control validation, generation scheduling and interpreter budgets remain
+responsible for execution. The engine reports package hash, engine/simulation
+version, generation duration, diagnostic and bounded telemetry. The frozen world
+is rendered through MapPreview, then optionally launched with Nicowar colonies
+from its serialized snapshot. Replacing a host discards late results. Serial
+browser builds retain the existing bounded synchronous generation fallback;
+threaded builds generate on a worker.
+
+Checks submit the exact saved package through isolated Generator Library validation
+and retain the upload receipt with the project revision. Publish remains the
+existing Generator Library API and requires a valid matching unexpired receipt;
+local browser reports cannot authorize it. Account export includes all private
+project files, revisions, requests, events, checks and runs. Account deletion fences
+active completion and removes private content while retaining financial audit
+records. Financial reporting and reconciliation use the separate generator product.
+
+Deploy the additive migration and backend before the web/browser entries. Keep
+`generatorStudio.enabled` false until a maintainer playthrough. Its model, rate,
+request cap, output cap, sales and pack settings follow `aiStudio` independently;
+credentials are `GENERATOR_STUDIO_OPENAI_API_KEY`,
+`GENERATOR_STUDIO_STRIPE_SECRET_KEY` and `GENERATOR_STUDIO_STRIPE_WEBHOOK_SECRET`.
+Stripe callbacks and administrator reconciliation use
+`/api/v1/generator-studio/stripe` and `/api/v1/generator-studio/reconcile`.
+Generator Studio balances are never shared with other products. V1 excludes
+multiple-module editing, automatic repair loops, ranked integration and remote
+trusted playtests.
+
+## Community music
+
+`@glob2/music` owns release views, source retention and streaming ZIP export;
+`protocol/src/music.ts` defines portable JSON schemas and generated fixtures.
+`apps/api/src/music/routes.ts` exposes `/api/v1/music` for catalogue search,
+creator drafts, uploads, inspection/conversion/publication, likes, reports and
+individual/set/bulk downloads. Browsing, playback and downloads are anonymous;
+publishing and reversible likes require registered accounts. Likes are the
+rating, with one row per account/release. Search covers title, artist, description
+and tags, with tag, licence, AI and duration filters. Pagination orders by score,
+creation time and UUID; clients retain selected UUIDs across result pages.
+
+Processing state changes and Graphile job insertion commit in one transaction.
+Transient failures retain source references for up to three attempts; terminal
+state is committed before source cleanup. The sweeper protects active draft
+references while collecting abandoned uploads after 24 hours without activity.
+
+`apps/music-worker` independently consumes `music-inspect` and `music-convert`
+Graphile jobs. It never leases simulation-version engine jobs. It stages sources
+from the private `music-uploads/` namespace, invokes `glob2music.community`, then
+stores final audio, cover, waveform summaries and ZIPs in the content-addressed
+blob store. PostgreSQL holds release metadata, processing state, likes, reports
+and `music_assets` references. Response envelopes also include waveform peaks.
+Original uploads and PCM are deleted after conversion, cancellation or terminal
+failure; the scheduler expires abandoned uploads after 24 hours and sweeps orphan
+source blobs. A release advisory lock and conditional state transitions make
+repeated job delivery safe, including cancellation during conversion.
+
+Published content and embedded tags are immutable. Creators withdraw releases;
+moderators hide/unhide them through the Music administration tab and resolve
+reports with an audit entry. Unavailable releases are removed from public lists
+and every media/download route. Their previously installed copies remain local.
+Private previews and public files pass through release visibility checks instead
+of the generic public blob endpoint. Music asset references protect retained
+files from blob garbage collection.
+
+The React catalogue and dedicated game screens share Calm/Building/Combat labels,
+waveform colors, preview controls and primary action placement. The website's
+AudioWorklet receives bounded mixed PCM from a WASM build of the native preview
+code. See [music pipeline](../assets/music-pipeline.md#community-releases) for the
+self-contained file format and [hosting](../hosting/README.md#music-worker) for
+operational limits.
+
+## AI Music Studio
+
+`/music-studio` provides CPU-only conversational soundtrack authoring, reached
+through **Build in AI Music Studio** in the Music library. The persistent main sidebar groups
+the studio under Music. REST under
+`/api/v1/music-studio` owns account state, projects, durable turns, legacy messages/generation,
+cancellation, private artifacts and checkout. `packages/music-studio` owns the
+transactional journal and delivery; `apps/ai-music-worker` owns provider calls,
+bounded agent tools and isolated Python execution. The score/rendering contracts
+are described in the [music pipeline](../assets/music-pipeline.md#online-ai-music-studio).
+Discussion and composition calls use distinct strict JSON response schemas
+through the provider's response format; the worker also validates discussion
+fields and tool actions before using them. A prompt alone does not establish
+that transport contract. Only the final answer message is consumed; commentary
+and intermediate JSON messages are not concatenated into composer actions.
+Each source write schedules trusted score validation and rendering automatically;
+the next model call receives the resulting checks to repair any failures.
+This prevents repeated source rewrites from consuming the action budget before
+a candidate is ever validated. The three-render limit still applies.
+Common project/message and credit-pack schemas live in `protocol/src/studioCommon.ts`;
+studio-specific settings, products and balances remain separate.
+
+The web client submits `MusicStudioTurn` to `POST /api/v1/music-studio/threads/:id/turns`.
+A turn freezes its UUID, text, settings and optional parent version. The strict
+provider response chooses `discuss` for questions, brainstorming and clarification,
+or `build` for an explicit creation/edit request. Completing a build turn and
+reserving/enqueueing its one generation commit in the same wallet-locked transaction.
+The generation UUID is persisted with the turn before dispatch; retries and replayed
+completions cannot create a second generation. Browser events only refresh saved
+state. Legacy `/messages` and `/generate` retain their contracts and queued work.
+Deploy migration `0053_studio_draft_history.sql`, additive API support and the
+updated workers before deploying the updated web client.
+
+Music uses its own wallets, ledger and Stripe purchases. A generation reserves one
+credit; creating its private immutable music release and consuming the credit
+commit together. Failure or cancellation returns the reservation once. Unknown
+provider outcomes keep the reservation pending for administrative reconciliation
+at `POST /api/v1/admin/music-studio/requests/:id/fail`. Provider attempts are
+journalled before dispatch and anonymous daily usage survives history deletion.
+Known rejections are replayed as failures without another provider call. Completed
+provider results survive worker recovery; only outcomes that cannot be established
+from the journal require reconciliation. Render cycles are recorded before execution,
+and completed candidates retain reports plus content-addressed score and audio references.
+A worker restart consumes an interrupted cycle or resumes a completed candidate;
+it does not silently reset the three-cycle budget.
+
+Both studios use `apps/api/src/http/studioEvents.ts` for ordered SSE replay and
+reconnect/authentication behavior, with separate notification channels. Stage,
+check, candidate and composer-progress events remain with each request. History
+snapshots omit worker-only source/configuration checkpoints; account exports
+include them without lease credentials. Account deletion fences workers and
+returns unfinished reservations before removing authoring history.
+
+Delivered revisions use existing music-library authorization and playback.
+Publishing requires confirmation of the license selected before generation; it
+exposes only that release and final check results. License and attribution are
+embedded in Opus tags before validation, preserving the native three-file ZIP
+format. Uploaded audio cannot replace generated revisions. Withdrawing a release
+uses existing library controls; it does not reveal private authoring artifacts.
+
+Deleting a Music Studio conversation removes its private source, messages, candidates
+and event history; finished releases remain independently managed in the music
+library. Free-chat usage is retained as zero-credit ledger entries and anonymous
+daily provider counters survive history/account deletion. Private pipeline source
+fingerprints cover worker tools, Python sources and dependency/asset definitions,
+and fence recovery across an incompatible worker upgrade. Successful history deletion
+also clears that conversation's browser draft and checkout-return state; other projects
+are retained.
+
+## Terrain and resource set library
+
+`sets.ts` in the protocol package defines the bounded set package and draft,
+publication and validation contracts. `asset_sets` supplies owner-controlled metadata
+and visibility; `set_drafts` stores revisions and the job/hash that owns current
+validation; `set_versions` stores immutable packages and engine previews. Likes,
+daily download counts and moderator reports use separate tables. The REST surface
+is `/api/v1/sets` and `/api/v1/set-drafts`, with report handling under
+`/api/v1/admin/sets`. Catalog pages use cursors tied to their sort order. Set listings omit release notes
+and contributor details, which are returned by the individual set endpoint. Draft
+listings return titles and identifiers with stable `updatedAt`/identifier cursor
+pagination (`limit` defaults to 100); individual draft reads include the package.
+
+The web workspace uploads PNGs into the package, maps frames to custom entries,
+and saves properties and credits. `/play/set-preview.html` runs an ephemeral browser
+engine against the current draft for an interactive preview request. It uses a
+temporary profile, validates the message origin/source/run/revision, and never
+mounts the player's persistent saves. This preview does not authorize publication.
+
+All jobs from asset-capable engines (file format 144 onward) run through a shared
+isolated launcher, including map validation, previews and match verification:
+uploaded maps can contain the same bundled PNGs as standalone sets. A failed
+launcher probe prevents the agent from starting. Server publication checks are
+`validate-set` jobs, advertised only when additionally enabled. Set `ENGINE_SET_VALIDATION=1` after validating the deployment.
+The startup probe requires Linux bubblewrap, a dedicated scratch tmpfs of at most
+4 GiB and the engine inside a namespace without networking. Installed data and
+engine/runtime libraries are read-only; the job alone gets writable scratch. The
+probe starts the engine and renders a small set before advertising the capability.
+`ENGINE_SET_LIBRARY_PATH` can supply additional runtime library directories. Standalone
+set checks are bounded to 120 seconds, 2 GiB address space and 64 MiB per output file.
+Without a successful probe the asset-capable agent cannot serve engine jobs;
+drafts can still be saved. Standalone set publication checks are disabled by
+default in engine-agent deployments.
+
+Results apply only while the draft still owns the exact job and hash. The stale-job
+sweep requires a fresh agent advertising the job kind as well as its simulation
+version; losing the set capability cannot leave an old check pending indefinitely.
+Publication locks the parent and draft and requires passing checks on the requested revision.
+A set may retain 50 releases and 100 drafts; immutable release labels and hashes
+cannot be reused. Blob collection retains draft inputs, checked previews, queued
+inputs and published packages. Account exports include owned sets, drafts, versions,
+likes, reports and download rows; account deletion removes those owned rows.
+
+Map validation also extracts bundled set attribution for shared-map version pages.
+Moderating or withdrawing a source set never invalidates a self-contained map.
+
+## JavaScript generator library
+
+`/api/v1/generators` provides catalogue, release, file, preview, social and reporting
+routes; owner-only `/api/v1/generator-uploads` stages packages and exposes validation
+results before atomic publication. Public/unlisted/private access and moderation
+follow maps. `generator_ids` permanently reserves a manifest ID at first successful
+publication, including after deletion or account deletion. Releases are immutable
+and require increasing manifest revisions. Canonical package bytes come from the
+engine parser rather than a second TypeScript canonicalizer.
+
+`validate-generator` and `generate-script-map` use the common Linux namespace
+launcher for package inspection, generation and saved-map reload. The worker probes
+the real isolated engine before advertising these capabilities. Validation evidence
+binds source and canonical hashes, example settings, simulation version and suite;
+the report includes API/toolkit versions, sampled settings, fingerprints and refusals.
+Maintenance revalidates retained releases for newly served engine versions and
+collects abandoned staging uploads without deleting historical release evidence.
+See [JavaScript generators](../map-generators/JAVASCRIPT.md#publish-and-discover-online)
+for the validation matrix, budgets and author workflow.
+
+Room selection and match setup use a separate `scripted` map source with an exact
+library/release identity, package and file hashes, namespaced ID/revision, request
+and resulting map hash/chosen seed. Native `generated` descriptors remain unchanged.
+The generation cache includes the complete descriptor and simulation version.
+Access checks run before every request or cache reuse and before match start.
+Generated blobs stay private; existing room/match membership authorizes downloads.
+Completed jobs refresh only rooms still waiting on that job. Match setup preserves
+release references and blob GC retains package/map bytes referenced by matches.
+Verified generated-map provenance is copied when those bytes become a shared map.
+
+`session.hello.client.generatorSharing` advertises support. Members without this
+capability receive `update_required` before creating/joining scripted rooms; hosts
+cannot convert rooms containing older members. Realtime delivery filters unsupported
+scripted contracts. Native browsing installs only exact releases, verifies both
+hashes and records provenance using the existing durable-storage rollback.

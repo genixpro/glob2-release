@@ -6,8 +6,11 @@
 #include "Header.h"
 #include "ExperimentalFeatures.h"
 #include <string>
+#include <cstdint>
 #include <map>
 #include "IntBuildingType.h"
+class BuildingType;
+class BuildingsTypes;
 #include "BasePlayer.h" // for the MAX_NAME_LENGTH val.
 
 class Settings
@@ -45,6 +48,9 @@ public:
 	int screenHeight;
 	//! interface scale in percent; 0 follows the desktop
 	int uiScale;
+    // Local drawing ceiling; zero is Unlimited. Never part of saves or orders.
+    int targetRenderFps = 60;
+    static constexpr int RENDER_FPS_PRESETS[] = {25, 30, 60, 90, 120, 144, 165, 240, 0};
 	Uint32 screenFlags;
 	Uint32 optionFlags;
 	bool automaticTorus; // Opt-in movement-triggered overview; local presentation only.
@@ -91,7 +97,7 @@ public:
 	/// hosts (Settings > Experiments). Saved as comma-separated keys; a key this
 	/// build no longer knows is dropped on load.
 	ExperimentSet experiments;
-	/// Simulation speed preset. Zero is the original 25 ticks/second;
+	/// Simulation speed preset. Zero is the normal 30 ticks/second;
 	/// higher values progressively reduce delays and then skip rendered frames.
 	int gameSpeed;
     std::string interfacePresentation = "automatic";
@@ -140,8 +146,10 @@ public:
 		GAME_SPEED_MAXIMUM = 10,
 	};
 
-	/// Milliseconds allotted to each simulation step for the selected preset.
+	/// Rounded milliseconds for presentation; simulation pacing uses nanoseconds.
 	int getGameSpeedStepDuration(void) const;
+	/// Fractional tick interval, accumulated before rounding host waits.
+	std::uint64_t getGameSpeedStepDurationNs() const;
 	/// Number of simulation steps between rendered frames for the selected preset.
 	int getGameSpeedRenderInterval(void) const;
 	/// Human-readable multiplier used by settings, in-game options and notifications.
@@ -151,11 +159,14 @@ public:
 
 	
 
-	///Levels are from 0 to 5, where even numbers are building
-	///under construction and odd ones are completed buildings.
-	int defaultUnitsAssigned[IntBuildingType::NB_BUILDING][6];
-	///Default radius of flags, 0 for exploration, 1 for war flag, 2 for clearing flag
-	int defaultFlagRadius[3];
+	// Preferences are isolated by complete catalog fingerprint and stable variant
+	// key: a custom catalog may reuse stock keys without changing stock defaults.
+	std::map<std::string, int> buildingAssignments;
+	std::map<std::string, int> buildingRadii;
+	int buildingAssignment(const std::string& catalog, const BuildingType& type) const;
+	int buildingRadius(const std::string& catalog, const BuildingType& type) const;
+	void setBuildingAssignment(const std::string& catalog, const BuildingType& type, int value);
+	void setBuildingRadius(const std::string& catalog, const BuildingType& type, int value);
 
 	int cloudPatchSize;//the bigger the faster the uglier
 	int cloudMaxAlpha;//the higher the nicer the clouds the harder the units are visible
@@ -172,5 +183,5 @@ public:
 	void resetDefaultFlagRadius();
 };
 
-//Version 1 - Resets default units assigned and keyboard shortcuts
-#define SETTINGS_VERSION 1
+// Version 2 imports the historical family/level preferences into catalog keys.
+#define SETTINGS_VERSION 2

@@ -42,24 +42,24 @@ struct World
             auto* inn=world.addBuilding("inn",10+offset,4+offset,0,team);
             for (auto* building : {swarm,inn})
             {
-                building->resources[WHEAT]=depleted ? 0 : building->type->maxResource[WHEAT];
+                building->materials[WHEAT]=depleted ? 0 : building->type->maxMaterial[WHEAT];
                 building->update();
             }
             for (int unit=0; unit<12; ++unit)
                 world.addUnit(unit<8 ? WORKER : WARRIOR,4+offset+unit,12+offset,team);
             if (!depleted)
                 for (int y=18+offset; y<24+offset; ++y)
-                    for (int x=4+offset; x<20+offset; ++x) world.game.map.setResource(x,y,WHEAT,1);
+                    for (int x=4+offset; x<20+offset; ++x) world.game.map.setResourceByIndex(x,y,WHEAT,1);
             if (farmAreas)
             {
                 // A lake south of the field, and a second field with its own lake
                 // east of the inn, inside the colony region Cortex scans.
                 for (int y=25+offset; y<30+offset; ++y)
-                    for (int x=4+offset; x<20+offset; ++x) world.game.map.setUMatPos(x,y,WATER,1);
+                    for (int x=4+offset; x<20+offset; ++x) world.game.map.paintVertexSquare(x,y,WATER,1);
                 for (int y=0+offset; y<15+offset; ++y)
-                    for (int x=24+offset; x<30+offset; ++x) world.game.map.setUMatPos(x,y,WATER,1);
+                    for (int x=24+offset; x<30+offset; ++x) world.game.map.paintVertexSquare(x,y,WATER,1);
                 for (int y=1+offset; y<10+offset; ++y)
-                    for (int x=16+offset; x<22+offset; ++x) world.game.map.setResource(x,y,WHEAT,1);
+                    for (int x=16+offset; x<22+offset; ++x) world.game.map.setResourceByIndex(x,y,WHEAT,1);
             }
         }
         world.game.map.setMapDiscovered();
@@ -258,8 +258,10 @@ TEST_SUITE("AIDecisionCoverage")
             World fixture(AI::ECONO,true,713);
             auto& game=fixture.world.game;
             auto* swarm=fixture.startingSwarm;
-            swarm->resources[WHEAT]=wheat;
+            swarm->materials[WHEAT]=wheat;
             AISharedRuntime::Runtime runtime(new AISharedRuntime::Econo,game.players[0]);
+            AISharedRuntime::Runtime::OwnerObservationScope observationScope(runtime);
+            MersenneTwister controllerRandom(713);runtime.setRandomEngine(controllerRandom);
             bool deletedInn=false;
             // Keep the world fixed so starvation/death and new construction cannot
             // hide the old deletion policy. Age the real trackers past its former
@@ -278,7 +280,7 @@ TEST_SUITE("AIDecisionCoverage")
             bool checkedTracker=false;
             for (int id : runtime.get_starting_buildings())
             {
-                auto tracker=runtime.get_resource_tracker(id);
+                auto tracker=runtime.get_material_tracker(id);
                 if (tracker && runtime.get_building_register().get_building(id)->gid==swarm->gid)
                 {
                     CHECK(tracker->get_age()>2500);
@@ -300,6 +302,8 @@ TEST_SUITE("AIDecisionCoverage")
             game.teams[0]->stats.step(game.teams[0]);
         REQUIRE(game.teams[0]->stats.getLatestStat()->totalUnit==24);
         AISharedRuntime::Runtime runtime(new AISharedRuntime::Econo,game.players[0]);
+        AISharedRuntime::Runtime::OwnerObservationScope observationScope(runtime);
+        MersenneTwister controllerRandom(713);runtime.setRandomEngine(controllerRandom);
         // Keep population fixed while advancing beyond the 2000-tick swarm
         // build cycle. Apply orders so new construction sites enter the map.
         for (int i=0; i<3500; ++i)

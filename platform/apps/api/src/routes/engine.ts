@@ -23,6 +23,7 @@ import {
   type EngineAgentKey,
 } from '@glob2/core';
 import {
+  AiValidationReport,
   ENGINE_LEASE_HEADER,
   EngineAgentHeartbeat,
   EngineAgentId,
@@ -44,6 +45,7 @@ const SHA256 = /^[0-9a-f]{64}$/;
 /** Content types an agent may store (engine-agent blobs.ts CONTENT_TYPES). */
 const AGENT_CONTENT_TYPES = new Set([
   'application/x-glob2-map',
+  'application/x-glob2-generator',
   'application/x-glob2-save',
   'application/x-glob2-match-record',
   'application/x-glob2-replay',
@@ -111,6 +113,27 @@ export async function engineAgentRoutes(app: FastifyInstance): Promise<void> {
 
   const internal = { config: { rateLimit: false } } as const;
 
+  app.post('/internal/v1/engine/ai-validation-progress', internal, async (request, reply) => {
+    const job = await heldJob(request, agentKey(request));
+    const report = body(AiValidationReport, request.body);
+    const payload = job.payload as { blobHash?: string; suite?: number };
+    if (
+      job.kind !== 'validate-ai' ||
+      report.valid ||
+      report.sourceHash !== payload.blobHash ||
+      report.suite !== payload.suite ||
+      report.simVersion !== job.sim_version
+    )
+      throw apiError('bad_request', 'Progress does not match the leased AI validation.');
+    await db
+      .updateTable('ai_validations')
+      .set({ report: JSON.stringify(report) })
+      .where('job_id', '=', job.id)
+      .where('status', '=', 'pending')
+      .execute();
+    return reply.status(204).send();
+  });
+
   app.post('/internal/v1/engine/agents/heartbeat', internal, async (request, reply) => {
     const key = agentKey(request);
     const beat = body(EngineAgentHeartbeat, request.body);
@@ -118,10 +141,17 @@ export async function engineAgentRoutes(app: FastifyInstance): Promise<void> {
     const version = simVersionKey(beat.simVersion);
     await db
       .insertInto('engine_agents')
-      .values({ id: beat.agentId, sim_version: version, kinds: beat.kinds, build: beat.build })
+      .values({
+        id: beat.agentId,
+        sim_version: version,
+        kinds: beat.kinds,
+        build: beat.build,
+        building_catalog_hash: beat.buildingCatalogHash ?? null,
+      })
       .onConflict((conflict) =>
         conflict.column('id').doUpdateSet({
           sim_version: version,
+          building_catalog_hash: beat.buildingCatalogHash ?? null,
           kinds: beat.kinds,
           build: beat.build,
           last_seen_at: sql<Date>`now()`,
@@ -192,7 +222,7 @@ export async function engineAgentRoutes(app: FastifyInstance): Promise<void> {
 
   app.post<{ Params: { jobId: string } }>(
     '/internal/v1/engine/jobs/:jobId/result',
-    internal,
+    { ...internal, bodyLimit: 32 * 1024 * 1024 },
     async (request, reply) => {
       const key = agentKey(request);
       const id = jobId(request);

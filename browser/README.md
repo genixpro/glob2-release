@@ -51,7 +51,8 @@ The default build packages two runtimes: the root `index.js`/`index.wasm` serial
 fallback and `threaded/index.js`/`threaded/index.wasm`. Both load the same game
 data packages from `assets/` (see below). Keep `index.html`, `loader.js`, both
 runtime directories and `assets/` together when publishing. `python3 browser/package-static.py` produces
-the versioned release package with verified gzip sidecars for both runtimes. `web-tests` additionally builds serial and
+the versioned release package with verified gzip sidecars for both runtimes, the
+independent music backend, and its Opus license notices. `web-tests` additionally builds serial and
 threaded `script-tests.js` harnesses.
 
 The loader prefers real shared-memory threads when isolation and worker startup
@@ -95,9 +96,20 @@ simulation data file, so
 the sim version and checksum traces are unchanged. Three of its files are smaller
 browser copies checked in under `browser/assets/` (`browser/derive_assets.py`):
 the font without its Chinese, Japanese and Korean outlines, the menu's still
-backdrop as a JPEG and the wordmark without the area the menu never shows. The
-build uses a copy only while it matches its source; regenerate them after
-changing the font, those images or a language's own name.
+backdrop and the wordmark without the area the menu never shows. Both images
+use the shared exporter's smallest permitted lossy/lossless WebP selection, including Q90
+WebP/method 6 with exact alpha. Target-keyed `sources.json` records source/content
+hashes and image recipe identity; old Q85 derivatives are rejected. The build
+uses a copy only while its hashes and recipe match; regenerate with
+`"$(python3 tools/package_assets.py --encoder-python)" browser/derive_assets.py`
+after changing source images, the font, language names or the encoding recipe.
+The selected filename is used to locate the derivative, while the package retains
+the runtime export's WebP lookup path.
+Package content hashes cover those selected bytes. Explicit lossless exports
+reject lossy browser substitutions. Debug browser builds also prepare lossless
+WebP artwork. Source PNGs remain untouched; PNG decoding for imports, previews
+and skin textures remains available. Lossless WebP provides the rollback profile;
+original exports are source-byte measurement baselines (see the packaging reference).
 The loading page shows megabytes, a percentage and an estimate of the time left.
 
 The rest follows in the background once the main menu is up, most needed first:
@@ -171,6 +183,10 @@ and export controls for backups. See [storage](../docs/browser/storage.md) for
 format validation, campaign backups and remaining legacy-writer limitations.
 Settings also waits for durable preferences/keyboard storage and offers Retry or
 Continue on failure; Continue does not confirm a saved copy.
+Quit Game waits for the final save, with Retry or Quit without saving on failure.
+When hosted under `/play/`, quitting then returns the current browser tab to the
+Glob2 Online home page on the same origin. Standalone browser hosts retain the
+exit message and can be restarted by reloading.
 
 ## Scope
 
@@ -213,7 +229,9 @@ real pointer and keyboard events.
 The maintained Playwright suite starts an isolated local HTTP server and uses
 fresh browser profiles for every test. It covers page startup, a custom match,
 pause over multiple observed engine frames, save persistence across reload,
-loading and audio activation. Player actions use real mouse/keyboard input;
+loading and audio activation. `render-fps.spec.js` checks desktop and compact FPS
+selection, durable persistence and update-only DOM text dispatch; `pacing.spec.js` compares per-tick execution
+with a headless reference at different rendering caps. Player actions use real mouse/keyboard input;
 assertions read `glob2Diagnostics` without changing game state.
 
 ```sh
@@ -279,8 +297,11 @@ Dedicated renderer tests exercise resize and actual context loss/restoration.
 New multiplayer features, including reconnect recovery, are outside this change.
 
 Build outputs and the SDK are ignored local files. Serve the output directory;
-opening the HTML as a `file:` URL is unsupported. The SDL audio backend still
-uses deprecated ScriptProcessorNode.
+opening the HTML as a `file:` URL is unsupported. Music uses a dedicated decoder worker and AudioWorklet in both serial and threaded
+builds, with a half-second prepared-audio target (512 ms in whole blocks). Isolated
+browsers use shared memory when supported; other browsers retain bounded MessagePort transport. Hidden tabs
+pause music. See [audio ownership](../docs/browser/implementation.md) for buffering,
+recording, and the MessagePort limitation in some WebKit builds.
 
 ### Performance investigation
 
@@ -371,7 +392,16 @@ The Emscripten ports/system-library directory and linked output are rebuilt on
 fresh runners; compiler caching does not replace the browser or determinism tests.
 The determinism test transfers its checksum file as Base64 to avoid serializing
 millions of individual byte values through Playwright. The decoded bytes still
-feed the same per-tick comparison against native platforms.
+feed the same per-tick comparison against native platforms. The full hosted matrix
+runs stock traces, match verification, and frozen runtime-resource composition
+checks in both serial and threaded builds on Chromium, Firefox and WebKit.
+Resource compositions compare the committed per-tick/RNG trace inside the native
+harness and again after browser export. Replay import and active replay reload
+also explicitly select and assert both execution modes in all three browsers;
+they check the format140 fixture header before testing loading. A runtime fallback
+is a failure in these compatibility cases, not evidence of threaded execution.
+Android APK smoke coverage remains separate from engine checksum parity.
+
 
 ## Embedded recording
 
@@ -392,3 +422,38 @@ Run `recording.spec.js` in Chromium, Firefox and WebKit for both runtime transpo
 resize segmentation, exports, missing WebCodecs and unavailable storage. Independent
 media decoding requires an external validator; recording itself does not. See
 [gameplay footage](../docs/features/gameplay-recording.md) for defaults and limits.
+
+## Embedded AI Studio tests
+
+`studio.html` shares the game runtime but uses an ephemeral in-memory profile.
+The same-origin parent launches one source revision using the versioned bridge in
+`studio.js`. The bridge bounds source/map bytes and verifies the pinned map hash;
+no JavaScript source is evaluated by the web page. The engine starts the two-AI
+local spectator path and returns bounded diagnostics and progress to the parent.
+Studio playtests do not import code into the user's persistent AI library. Readiness
+can repeat when the loader falls back to the serial runtime: the parent resends
+the same pinned launch data to the new document. Startup failures return bounded
+error messages as well as the game's runtime diagnostics.
+
+The parent document must also have COOP/COEP isolation headers for pthreads.
+`deploy/Caddyfile` permits same-origin framing only for `studio.html`, and the
+platform router reloads the document when crossing the Studio route boundary.
+During web-app development, run the browser host on port 8765; Vite proxies `/play`.
+The studio bridge unit tests run with `node --test browser/unit/studio.test.js`.
+
+Bridge messages carry `channel: "glob2-ai-studio"`, `version: 1`, the UUID `runId`,
+and the positive integer `revision`. Parent-to-child `launch` includes the UTF-8
+source (up to 128 KiB), seed, curated opponent ID, and transferred map ArrayBuffer;
+`stop` unloads the child. Child-to-parent messages are `ready`, `diagnostic`
+(bounded `text`), `progress`/`complete` (`tick`, `disabled`, `diagnostic`, `result`),
+`error` (`text`), and `stopped`. Parents must verify both `event.origin` and
+`event.source` before accepting the envelope; a readiness repeat resends the same
+run, never newer source. Each document accepts at most one launch.
+
+`browser/tests/studio.spec.js` covers live startup, cleanup, controller diagnostics,
+and both runtimes' exact native checksum reference. Regeneration instructions are
+in [the fixture guide](tests/fixtures/README.md#studio-nativebrowser-checksums).
+The deployment stack smoke test also checks isolation and framing policies for
+both Studio routes, the embedded game, the ordinary game entry, and the Monaco
+worker path policy. Firefox and WebKit explicitly include the Studio suite in
+the browser CI matrix; Chromium discovers it through the full-suite shards.

@@ -25,6 +25,7 @@ Unit::Unit(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 {
 	init(x, y, gid, typeNum, team, level);
 	scriptIdentity = owner->game->allocateScriptIdentity(false, gid);
+	entityRandom.initialize(owner->game->gameHeader.getRandomSeed(), EntityRandom::Kind::Unit, gid, scriptIdentity);
 }
 
 void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
@@ -49,6 +50,11 @@ void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 	dy=0;
 	direction=UNIT_DIRECTION_NONE;
 	insideTimeout=0;
+	serviceResourcesReserved=false;
+	constructionLevel=level;
+	terrainHealthRemainder=0;
+	areaServiceRemainders[BuildingAreaEffects::Healing]=0;
+	areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
 	speed=32;
 
 	// Custom-game "glass cannon" rule: cut HP once here, at the source,
@@ -118,7 +124,7 @@ void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 	targetBuilding=NULL;
 	ownExchangeBuilding=NULL;
 	destinationPurpose=UNIT_DEST_PURPOSE_NONE;
-	carriedResource=UNIT_CARRIED_RESOURCE_NONE;
+	carriedMaterial=UNIT_CARRIED_RESOURCE_NONE;
 	jobTimer = 0;
 
 	previousClearingArea=std::nullopt;
@@ -146,11 +152,11 @@ void Unit::setTargetBuilding(Building * b)
     targetBuilding = b;
 }
 
-void Unit::subscriptionSuccess(Building* building, bool inside)
+void Unit::subscriptionSuccess(Building* building, bool inside, bool attraction)
 {
 	Building* b=building;
 
-	if (building->type->isVirtual)
+	if (attraction && !inside)
 	{
 		destinationPurpose=UNIT_DEST_PURPOSE_NONE;
 		activity=ACT_FLAG;
@@ -162,7 +168,7 @@ void Unit::subscriptionSuccess(Building* building, bool inside)
 	else if(inside == false)
 	{
 		assert(destinationPurpose>=0);
-		assert(b->neededResource(destinationPurpose));
+		assert(b->neededMaterial(destinationPurpose));
 		activity=ACT_FILLING;
 		attachedBuilding=b;
 		setTargetBuilding(NULL);
@@ -206,7 +212,7 @@ void Unit::subscriptionSuccess(Building* building, bool inside)
 				case ACT_FILLING:
 				{
 					assert(attachedBuilding);
-					if (carriedResource==destinationPurpose)
+					if (carriedMaterial==destinationPurpose)
 					{
 						displacement=DIS_GOING_TO_BUILDING;
 						setTargetBuilding(attachedBuilding);
@@ -216,7 +222,7 @@ void Unit::subscriptionSuccess(Building* building, bool inside)
 					{
 						displacement=DIS_GOING_TO_RESOURCE;
 						targetBuilding=NULL;
-						owner->map->resourceAvailableUpdate(owner->teamNumber, destinationPurpose, swimClass(), posX, posY, &targetX, &targetY, NULL);
+						owner->map->materialAvailableUpdateSlot(owner->teamNumber, destinationPurpose, swimClass(), posX, posY, &targetX, &targetY, NULL, attachedBuilding->fetchesFromMarkets(), attachedBuilding);
 						validTarget=true;
 					}
 				}
@@ -235,8 +241,100 @@ void Unit::subscriptionSuccess(Building* building, bool inside)
 	}
 }
 
+void Unit::applyTerrainHealth()
+{
+	applyTerrainHealth(owner->map->terrainPropertiesAt(posX,posY));
+}
+
+void Unit::applyTerrainHealth(const TerrainProperties& terrain)
+{
+	// Entering positions already lie inside the building. An exiting unit is
+	// exposed as soon as an exit is found and its building attachment released.
+	if (isDead || insideTimeout < 0 || displacement == DIS_INSIDE || displacement == DIS_ENTERING_BUILDING ||
+		(displacement == DIS_EXITING_BUILDING && attachedBuilding)) return;
+	const int rate = performance[FLY] ? terrain.airHealthQ8 : terrain.groundHealthQ8;
+	applyTerrainHealthRate(rate);
+}
+
+void Unit::applyTerrainHealthRate(int rate)
+{
+	if (!rate) return;
+	// Healing at the cap cannot be banked to cancel later damage. Keep a
+	// negative fraction: subsequent healing may legitimately repay that debt.
+	if (rate > 0 && hp >= performance[HP] && terrainHealthRemainder >= 0)
+	{
+		terrainHealthRemainder = 0;
+		return;
+	}
+	terrainHealthRemainder += rate;
+	const int change = terrainHealthRemainder / 256;
+	terrainHealthRemainder %= 256;
+	if (change < 0) recordLethalDamage(-change, GameplayMeasurements::UNKNOWN);
+	hp = std::min(performance[HP], hp + change);
+	if (hp>=performance[HP] && owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
+	if (hp >= performance[HP] && terrainHealthRemainder > 0) terrainHealthRemainder = 0;
+	if (change) needToRecheckMedical = true;
+	resolveDeath();
+}
+
+void Unit::applyAreaServices()
+{
+	using namespace BuildingAreaEffects;
+	auto &game = *owner->game;
+	if (!game.areaEffects.enabled() || (game.stepCounter & (PulseTicks - 1)) ||
+		areaLastPulseTick == game.stepCounter || isDead || insideTimeout < 0 ||
+		displacement == DIS_INSIDE || displacement == DIS_ENTERING_BUILDING ||
+		(displacement == DIS_EXITING_BUILDING && attachedBuilding))
+		return;
+	const auto tile = owner->map->coordToIndex(posX, posY);
+	if (!game.areaEffects.at(Healing, owner->teamNumber, tile) &&
+		!game.areaEffects.at(Damage, owner->teamNumber, tile) &&
+		!game.areaEffects.at(Feeding, owner->teamNumber, tile))
+		return;
+	areaLastPulseTick = game.stepCounter;
+	const int beforeHp = hp, beforeHunger = hungry;
+	const auto amount = [&](Channel channel)
+	{
+		unsigned value =
+			areaServiceRemainders[channel] + game.areaEffects.at(channel, owner->teamNumber, tile);
+		areaServiceRemainders[channel] = value % 256;
+		return int(value / 256);
+	};
+	const int damage = amount(Damage);
+	if (damage)
+	{
+		recordLethalDamage(damage, GameplayMeasurements::COMBAT);
+		hp -= damage;
+	}
+	// Earlier teams may already have dealt a lethal hit this tick. Resolve it
+	// even when this unit's aura damage is zero, before allowing healing.
+	resolveDeath();
+	if (isDead)
+		return;
+	if (hp >= performance[HP])
+		areaServiceRemainders[Healing] = 0;
+	else
+	{
+		hp = std::min(performance[HP], hp + amount(Healing));
+		if (hp >= performance[HP])
+			areaServiceRemainders[Healing] = 0;
+	}
+	if (game.gameHeader.isHungerDisabled() || hungry >= HUNGRY_MAX)
+		areaServiceRemainders[Feeding] = 0;
+	else
+	{
+		hungry = std::min(int(HUNGRY_MAX), hungry + amount(Feeding));
+		if (hungry >= HUNGRY_MAX)
+			areaServiceRemainders[Feeding] = 0;
+	}
+	if (hp != beforeHp || hungry != beforeHunger)
+		needToRecheckMedical = true;
+}
+
 void Unit::syncStep(void)
 {
+	if (owner->map->hasTerrainHealthEffects()) applyTerrainHealth();
+	if (isDead) return;
 	//warrior attacks?
 	assert(speed>0);
 	if ((action==ATTACK_SPEED) && (delta>=UNIT_ATTACK_HIT_DELTA) && (delta<(UNIT_ATTACK_HIT_DELTA+speed)))
@@ -271,7 +369,7 @@ void Unit::syncStep(void)
 				int enemyID=Building::GIDtoID(enemyGBID);
 				int enemyTeam=Building::GIDtoTeam(enemyGBID);
 				Building *enemy=owner->game->teams[enemyTeam]->myBuildings[enemyID];
-				int damage=getRealAttackStrength()-enemy->type->armor;
+				int damage=getRealAttackStrength()-enemy->getEffectiveArmor();
 				if (damage<=0)
 					damage=1;
 				++owner->stats.measurements.shots[GameplayMeasurements::MELEE];
@@ -281,7 +379,7 @@ void Unit::syncStep(void)
 
 				enemy->underAttackTimer = UNDER_ATTACK_TIMER_TICKS;
 
-				enemy->owner->pushGameEvent(GameEvent::buildingUnderAttack(owner->game->stepCounter, enemy->posX, enemy->posY, enemy->shortTypeNum));
+				enemy->owner->pushGameEvent(GameEvent::buildingUnderAttack(owner->game->stepCounter, enemy->posX, enemy->posY, enemy->typeNum));
 
 				if (enemy->hp<0)
 					enemy->kill(GameplayMeasurements::DESTROYED);
@@ -306,7 +404,7 @@ void Unit::syncStep(void)
 #ifdef BURST_UNIT_MODE
 	delta=0;
 #else
-	stepSpeed=unitActionStepSpeed(speed, action, dx, dy);
+	stepSpeed=unitActionStepSpeed(speed, action, dx, dy, displacement==DIS_INSIDE);
 	if (delta<=UNIT_DELTA_MAX-stepSpeed)
 	{
 		delta+=stepSpeed;
@@ -351,6 +449,7 @@ void Unit::resetAtLevel(Sint32 newLevel)
 
 void Unit::setWorkerLevel(Sint32 newLevel)
 {
+	constructionLevel = newLevel;
 	for (int ability : {(int)BUILD, (int)HARVEST})
 	{
 		level[ability] = newLevel;
@@ -358,8 +457,32 @@ void Unit::setWorkerLevel(Sint32 newLevel)
 	}
 }
 
+bool Unit::needsTraining(const BuildingTrainingSpec& training, int ability) const
+{
+	return training.enabled && canLearn[ability] && (training.unitMask & (1u << typeNum))
+		&& (level[ability] < training.targetLevel || (typeNum == WORKER && constructionLevel < training.constructionLevel));
+}
+
+void Unit::applyTraining(const BuildingTrainingSpec& training, int ability)
+{
+	if (level[ability] < training.targetLevel)
+	{
+		level[ability] = training.targetLevel;
+		performance[ability] = race->getUnitType(typeNum, training.targetLevel)->performance[ability];
+		if (ability == HP) performance[ability] = std::max(1, performance[ability] / owner->game->gameHeader.getGlassCannonScale());
+	}
+	if (typeNum == WORKER) constructionLevel = std::max(constructionLevel, training.constructionLevel);
+}
+
 void Unit::recordLethalDamage(int damage, int cause)
 {
 	if (hp >= UNIT_HP_DEATH_THRESHOLD && hp - damage < UNIT_HP_DEATH_THRESHOLD)
 		diagnosticDeathCause = cause;
+}
+
+void Unit::receiveCarriedMaterial(int resource, MaterialPacket packet)
+{
+	if (carriedMaterial>=0) ++owner->stats.measurements.materialSpillageEvents;
+	carriedMaterial=resource;
+	carriedPacket=packet;
 }

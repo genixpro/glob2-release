@@ -1,10 +1,11 @@
 import sharp, { type OutputInfo } from 'sharp';
+import { COLONY_SKIN_MATERIALS } from '@glob2/protocol';
 import { apiError } from '../errors.ts';
 
 /** Layout colony-v2: 512x512 images of four 256x256 model quadrants. */
 export const SKIN_ATLAS_SIZE = 512;
-/** Material ids: 0 glossy, 1 matte, 2 metallic, 3 hairy. */
-export const SKIN_MATERIAL_COUNT = 4;
+/** Material ids are 0 to this exclusive bound, in COLONY_SKIN_MATERIALS order. */
+export const SKIN_MATERIAL_COUNT = COLONY_SKIN_MATERIALS.length;
 
 function decodeUpload(encoded: string, maxBytes: number, what: string): Buffer {
   const bytes = Buffer.from(encoded, 'base64');
@@ -32,7 +33,7 @@ async function openStill(bytes: Buffer) {
   return input;
 }
 
-/** The colour atlas, re-encoded as an opaque sRGB PNG. */
+/** The colour atlas, re-encoded as an opaque sRGB WebP. */
 export async function canonicalSkinImage(encoded: string): Promise<Buffer> {
   const bytes = decodeUpload(encoded, 1048576, 'image');
   try {
@@ -41,14 +42,14 @@ export async function canonicalSkinImage(encoded: string): Promise<Buffer> {
     return await input
       .flatten({ background: '#ffffff' })
       .toColourspace('srgb')
-      .png({ compressionLevel: 9 })
+      .webp({ lossless: true, effort: 4 })
       .toBuffer();
   } catch {
     throw apiError('bad_request', 'Use a valid, still 512 by 512 pixel image.');
   }
 }
 
-/** The material map, validated and re-encoded as an 8-bit greyscale PNG of material ids. */
+/** The material map, validated and re-encoded as a lossless WebP of material ids. */
 export async function canonicalMaterialMap(encoded: string): Promise<Buffer> {
   const bytes = decodeUpload(encoded, 262144, 'material map');
   const invalid = () =>
@@ -82,12 +83,12 @@ export async function canonicalMaterialMap(encoded: string): Promise<Buffer> {
     if (value >= SKIN_MATERIAL_COUNT)
       throw apiError(
         'bad_request',
-        'Material map pixels must be material ids 0 (glossy), 1 (matte), 2 (metallic) or 3 (hairy).',
+        `Material map pixels must be material ids 0 to ${SKIN_MATERIAL_COUNT - 1}.`,
       );
     ids[i] = value;
   }
   return sharp(ids, { raw: { width: info.width, height: info.height, channels: 1 } })
     .toColourspace('b-w')
-    .png({ compressionLevel: 9 })
+    .webp({ lossless: true, effort: 4 })
     .toBuffer();
 }

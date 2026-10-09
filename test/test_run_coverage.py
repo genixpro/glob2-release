@@ -1,5 +1,8 @@
 """Coverage accounting regressions; no compiler or LLVM installation required."""
 import importlib.util
+import contextlib
+import io
+import sys
 from pathlib import Path
 import tempfile
 import unittest
@@ -16,6 +19,67 @@ def entry(path, count, covered):
 
 
 class CoverageSummaryTests(unittest.TestCase):
+    def test_streaming_retains_output_and_reports_nonzero_exit_before_upload(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            released = directory / 'released'
+
+            class LiveOutput(io.StringIO):
+                def write(self, text):
+                    if text.strip() == 'ready':
+                        released.touch()
+                    return super().write(text)
+
+            output = LiveOutput()
+            command = [sys.executable, '-c',
+                       "import pathlib, sys, time; print('ready'); "
+                       "p=pathlib.Path(sys.argv[1]); deadline=time.monotonic()+5; "
+                       "exec('while not p.exists() and time.monotonic()<deadline: time.sleep(.01)'); "
+                       "print('diagnostic', file=sys.stderr); sys.exit(7 if p.exists() else 9)",
+                       str(released)]
+            with contextlib.redirect_stdout(output):
+                status = coverage.run_logged(command, directory / 'run.log', stream_logs=True)
+            self.assertEqual(status, 7)
+            self.assertEqual((directory / 'run.log').read_text(), 'ready\ndiagnostic\n')
+            self.assertIn('exit=7', output.getvalue())
+            self.assertIn('diagnostic', output.getvalue())
+
+    def test_default_logging_retains_output_without_console_streaming(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            log = Path(temporary) / 'run.log'
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                status = coverage.run_logged([sys.executable, '-c',
+                                              "print('retained'); raise SystemExit(3)"], log)
+            self.assertEqual(status, 3)
+            self.assertEqual(log.read_text(), 'retained\n')
+            self.assertEqual(output.getvalue(), '')
+
+    def test_failed_report_retains_all_raw_profiles(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            profiles = [Path(temporary) / 'first.profraw', Path(temporary) / 'second.profraw']
+            for path in profiles:
+                path.write_bytes(b'raw profile evidence')
+            self.assertEqual(coverage.compact_profiles(profiles, successful=False),
+                             {'raw_profiles_retained': True})
+            self.assertTrue(all(path.read_bytes() == b'raw profile evidence' for path in profiles))
+
+    def test_completed_report_compacts_only_selected_inputs(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            profiles = [directory / 'first.profraw', directory / 'second.profraw']
+            for path in profiles:
+                path.write_bytes(b'raw')
+            report = directory / 'coverage.profdata'
+            report.write_bytes(b'merged evidence')
+            other = directory / 'unmerged.profraw'
+            other.write_bytes(b'failed run')
+            self.assertEqual(coverage.compact_profiles(profiles, successful=True),
+                             {'raw_profiles_retained': False, 'raw_profile_bytes_removed': 6})
+            self.assertFalse(any(path.exists() for path in profiles))
+            self.assertEqual(report.read_bytes(), b'merged evidence')
+            self.assertEqual(other.read_bytes(), b'failed run')
+
     def test_counts_are_weighted_and_headers_are_not_implementation_lines(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -31,11 +31,19 @@ entity objects, pathfinding queries or direct mutation methods.
   be serializable script data and consume the conversion budget. Use the signatures
   below; unused arguments are not a versioning or extension mechanism.
 
+AI decisions use an immutable observation for `ctx.tick`. A match-wide engine delay
+of 0–8 ticks (default 0) schedules returned orders at `ctx.tick + delay`; profile 2
+actions retain their IDs while awaiting execution receipts. An accepted order may
+still have an effect that completes later. Account for outstanding intents before
+issuing duplicate commands. Map-script callbacks keep their existing cadence.
+See [engine scheduling](reference.md#ai-observations-and-delayed-orders) for
+continuation and lifecycle details.
+
 ## Context
 
 | Member | Meaning |
 | --- | --- |
-| `ctx.tick` | Current simulation step counter; not the callback count |
+| `ctx.tick` | Logical tick of the immutable decision observation; not the callback count or eventual order execution tick |
 | `ctx.myTeam` | AI team ID; `-1` for map scripts |
 | `ctx.random()` | Next private deterministic random number in `[0, 1)` |
 | `ctx.game` | Read API described below |
@@ -54,6 +62,9 @@ ctx.game.unit({id, generation})
 ctx.game.building({id, generation})
 ctx.game.buildingTypes()
 ctx.game.experiments()
+ctx.game.terrainTypes()
+ctx.game.resourceTypes()
+ctx.game.materialTypes()
 ctx.game.rules()
 ```
 
@@ -184,33 +195,48 @@ family; their presence does not imply that an order is supported.
 | `workers` | Current requested worker limit, **not** number of workers actually present |
 | `futureWorkers` | Requested worker limit after construction completes |
 | `priority` | Low `-1`, normal `0`, high `1` |
-| `range`, `minimumLevel` | Flag radius in tiles and minimum unit level |
+| `range`, `minimumLevel` | Attraction radius in tiles and minimum warrior combat level |
+| `requireBombing` | Whether attracted explorers must have the bombing ability |
+| `workerMinimumLevel` | Minimum construction qualification for attracted workers |
 | `resources` | 15-entry stock array; some types use shared team stock |
 | `wishedResources` | 15-entry engine resource demand array |
 | `production` | Three swarm ratios, indexed worker/explorer/warrior; relative weights, not percentages |
 | `productionTimeout` | Swarm production countdown in ticks |
 | `receiveMask`, `sendMask` | Market resource-ID bitmasks |
 | `bullets` | Stored tower ammunition |
-| `clearingResources` | Five booleans indexed wood/wheat/papyrus/stone/alga |
+| `clearingMaterials` | Twelve booleans indexed by fixed material ID |
+| `clearingResources` | Legacy first five material booleans |
 
 ### Building type record
 
 `buildingTypes()` returns every registered variant in registry order. It is
-static configuration available to both script capabilities.
+static configuration available to both script capabilities. An optional `{offset, limit}`
+argument pages by catalog ID, allowing large catalogs to fit callback budgets.
+Unavailable experimental variants are omitted; `offset` still refers to raw IDs.
 
 | Field | Meaning |
 | --- | --- |
-| `id`, `name`, `shortType` | Variant ID, family name, numeric family ID |
+| `id`, `key`, `name`, `shortType` | Match-local variant ID, stable authored key, authored family name, legacy numeric family metadata |
+| `capabilities` | Available semantic operations, such as `feed`, `heal`, `produceWorker`, `trainConstruction`, `trainBombing`, `projectileDefense`, or `attractWarriors`; construction sites describe their completed variant |
+| `nextType`, `previousType` | Explicit transition IDs, or -1; never infer adjacency from IDs |
+| `placeable`, `instantPlacement`, `occupiesGround`, `relocatable` | Independent placement and relocation properties |
+| `requiredWorkerLevel`, `admittedUnitMask`, `maxUnitsInside`, `maxRadius` | Construction qualification, admission bitmask, interior capacity, attraction radius limit |
+| `feeding`, `healing` | Records with `enabled`, `unitMask`, `duration`, and 15-resource `cost` |
+| `training` | Ability-indexed records: `enabled`, `unitMask`, `duration`, `targetLevel`, independent `constructionLevel` grant (-1 means none), and `cost` |
+| `production` | Unit-indexed recipe records: `enabled`, `duration`, and `cost` |
+| `repairable`, `regeneration` | Repair support and health regeneration per tick |
+| `projectileDamage`, `projectileRange`, `projectileSpeed`, `projectileRhythm`, `ammunitionResource`, `ammunitionCost` | Damage by target unit type, firing parameters, and ammunition input |
+| `suppliesStock`, `suppliesDirectStock`, `fetchesStock`, `exchangesFruit` | Effective resource-routing and exchange capabilities |
 | `level`, `site`, `virtual` | Variant level, construction-site boolean, flag boolean |
 | `width`, `height` | Footprint in tiles |
-| `maxHp`, `maxWorkers` | Configured maximum health and worker capacity |
+| `maxHp`, `maxWorkers`, `usesWorkers` | Configured health, assignment limit, and whether the building requests hauling/construction labor |
 | `resourceCapacity` | 15-entry configured resource capacity/cost array |
 
-Discover variant IDs by name/level/site instead of hardcoding registry indices:
+Discover variants by capabilities and follow explicit transition IDs. Names and legacy family numbers remain available for authored scenarios, but do not imply behavior:
 
 ```javascript
 const site = ctx.game.buildingTypes().find(
-  t => t.name === 'inn' && t.level === 0 && t.site && !t.virtual
+  t => t.placeable && t.capabilities.includes('feed')
 );
 ```
 
@@ -246,8 +272,9 @@ callback budget. For example, a 256×256 request exceeds the work budget.
 | Tile field | Presence and meaning |
 | --- | --- |
 | `x`, `y`, `visible`, `explored` | Always present; `visible` means current permission to see the tile |
-| `observedTick`, `terrain`, `resource` | Present only when explored; current data if visible, last observation otherwise |
-| `resource.type`, `.variety`, `.amount` | Numeric resource ID, visual variety and engine amount (byte counters); no resource is `{type: 255, variety: 0, amount: 0}` |
+| `observedTick`, `corners`, `resource` | Present only when explored; current data if visible, last observation otherwise |
+| `resource.type`, `.variety`, `.amount` | Map-local resource ID, visual variety and total stock; no resource is `{type: 65535, variety: 0, amount: 0}` |
+| `materialStocks` | Twelve quantities indexed by fixed material ID; current stocks if visible, remembered stocks otherwise |
 | `groundUnit`, `airUnit`, `building` | Present only when currently visible; permitted occupant ID or `65535` for empty/hidden occupant |
 | `fertility` | Map scripts only; raw `0..65535` wheat-growth fertility value |
 | `forbidden` | AI scripts only, on explored tiles; current own-team forbidden-area boolean, even if terrain is remembered |
@@ -260,11 +287,65 @@ not a request to reveal the engine's hidden current map. The history survives
 save/load and is updated during simulation independently of which tiles the
 script asks for.
 
-**`terrain` is the raw terrain graphic index, not `TerrainType`.** Pure grass
-indices are `0..15`, pure sand `128..143`, pure water `256..271`; other indices
-represent transition tiles. There is currently no normalized terrain-class or
-passability query. Do not compare `tile.terrain` to the C++ `GRASS=2` / `WATER=0`
-enum or treat a transition tile as proven traversable.
+**`corners` holds the tile's four corner terrain IDs**: top-left, top-right,
+bottom-left, bottom-right. Terrain is stored per map vertex, and vertex (x,y) is the
+top-left corner of tile (x,y). Index the immutable definitions returned by
+`ctx.game.terrainTypes()` with these IDs. When all four agree, the tile has that
+terrain's rules exactly; mixed corners are walkable when any corner is, never
+swimmable or buildable, block projectiles and count as a shoreline when any corner
+does, and are otherwise as permissive as the weakest corner. There is
+no single per-tile terrain field. `corners` follows the same visibility and
+remembered-observation rules as `resource`. The registry is static public metadata
+and does not reveal map contents.
+
+`resourceTypes()` and `materialTypes()` also return immutable public metadata in
+both profiles, including commander AIs. Resource descriptors expose `id`, `key`,
+`name`, `yields`, mobility and placement obstruction, habitat and ecology fields,
+growth/spread rates, farming/clearing behavior and experiment requirements. Each
+yield names a numeric `material`, capacity, initial stock, seed reserve, growth
+probability and consumption policy (`0` one, `1` entire deposit, `2` infinite).
+Rates use 196608 units per opportunity. Material descriptors have fixed `id` and
+canonical `key`; see [resource catalogs](../features/resource-catalogs.md).
+
+Unit `carriedMaterial`, building `materials` and `wishedMaterials`, and team
+`materials` distinguish inventory from map deposits. Historical `carriedResource`,
+`resources` and `wishedResources` names remain legacy script aliases; their numeric
+inventory positions mean materials, not resource IDs.
+
+```js
+const definitions = ctx.game.terrainTypes();
+const tile = ctx.game.map.tile(x, y);
+if (tile.explored && tile.corners.every(c => c === tile.corners[0])) {
+  // A tile with four equal corners has its terrain's exact rules.
+  const terrain = definitions[tile.corners[0]];
+  const groundSpeedMultiplier = terrain.groundSpeedQ8 / 256;
+  // Buildability is a terrain capability; occupancy and space still matter.
+  if (terrain.buildable) { /* consider a placement query */ }
+}
+```
+
+Each entry has `id`, stable `name`, `experiment` (a required experiment key or
+`null`), `editorSelectable`, and these gameplay properties:
+
+| Fields | Meaning |
+| --- | --- |
+| `walkable`, `swimmable`, `flyable` | Terrain movement permissions; swimmers may also walk |
+| `resourcesGrow`, `fertilitySource`, `nonGrowingResources` | Resource growth, nearby fertility contribution, and placement of non-growing resources |
+| `buildable`, `projectileBlocks`, `shoreline` | Building placement capability, projectile obstruction, and shoreline classification |
+| `groundSpeedQ8`, `airSpeedQ8`, `growthQ8` | Multipliers: `256` is normal, `128` half, `512` double |
+| `groundHealthQ8`, `airHealthQ8` | Signed HP per exposed tick, divided by `256`; negative damages |
+| `fertilityQ8`, `inhibitionQ8`, `shoreSupportQ8` | Nearby contribution, inhibition, and aquatic shoreline support in Q8 units |
+| `allowedResources` | Runtime resource IDs permitted by compiled habitat rules and explicit terrain whitelists; refreshed when either catalog changes |
+| `farmMaterial` | Preferred renewable farming material key, or `null` for none |
+
+The array is ID-indexed and includes experimental materials even when the current
+match has not enabled their authoring options.
+All nested registry values are read-only in both scripting profiles, including
+commander and map scripts. Existing IDs remain water `0`, sand `1`, grass `2`,
+ice `3` and Trail `4` (legacy registry name `road`); scripts should query capabilities
+instead of comparing IDs.
+`ctx.spatial.passable` additionally checks known occupancy and movement rules;
+spatial placement and connectivity use the same canonical terrain properties.
 
 Tile occupants are bare IDs, not complete references. To read an occupant,
 match its ID against the appropriate visible entity list and use that record's
@@ -329,9 +410,12 @@ generation. A returned entity record is acceptable as that reference.
 | `production` | Swarm `building`, `ratios`: exactly three integers `0..16`, in worker/explorer/warrior order |
 | `exchange` | Market `building`, `receiveMask`, `sendMask`: integers `0..32767` |
 | `range` | Virtual `building`, `range`: `0..255` |
-| `minimumLevel` | Virtual `building`, `level`: `0..3` |
+| `minimumLevel` | Warrior-attracting `building`, `level`: `0..3` |
+| `requireBombing` | Explorer-attracting `building`, `requireBombing`: boolean |
+| `workerMinimumLevel` | Worker-attracting `building`, `workerMinimumLevel`: `0..3` |
 | `moveFlag` | Virtual `building`, canonical `x`, `y` |
-| `clearingResources` | Clearing-flag `building`, `resources`: exactly five booleans; index `3` (stone) must be false |
+| `clearingMaterials` | Clearing-flag `building`, `materials`: twelve material booleans; resource clearability still controls actual clearing |
+| `clearingResources` | Legacy clearing order: `building`, `resources` accepts five or twelve material booleans |
 | `forbidden`, `guardArea`, `clearArea`, `farmArea` | Canonical `x`, `y`; `width`, `height`: `1..256`; `mode`: add `1` or remove `2`; `mask`: exactly `width * height` booleans in row-major order |
 
 Creation accepts level-zero construction sites or virtual flags. The engine
@@ -448,8 +532,11 @@ export function step(ctx) {
 
 Owned building records have native getters and setters. Repeated lookups return
 the same object within a callback. Writable properties are `workers`, `priority`,
-`production` (swarm), `receiveMask` and `sendMask` (market), flag `x`, `y`, `range`,
-`minimumLevel`, and `clearingResources` (clearing flag). Other fields and enemy
+`production` for enabled unit recipes, `receiveMask` and `sendMask` for inter-team exchange,
+`x` and `y` for relocatable buildings, and `range` for attraction providers. Warrior
+attractors support `minimumLevel`; explorer attractors support `requireBombing`;
+worker attractors support `clearingResources` and `workerMinimumLevel`. These controls apply to mixed
+buildings according to their capabilities. Other fields and enemy
 records are read-only. Assign complete arrays for production and clearing settings.
 
 Getters show pending desired values; `building.observed` shows simulation values.
@@ -486,15 +573,27 @@ seams. Coordinates use tiles; footprint distance is the gap between rectangles.
 counts for a wrapped region. Fertility is remembered under fog in profile 2.
 
 `distanceField({sources, movement, metric})` builds a reusable callback-local
-field. Sources select points, resources, permitted units, and building families.
+field. Sources select points, resources, materials, permitted units, and buildings.
+Use `{material: "food"}` (or a numeric material ID) to include all deposits carrying
+food, independent of their resource identity. `weight: "amount"` uses that
+material's stock; `harvestable: true` applies forbidden-area and visibility rules.
+Hidden cells use remembered stocks and never reveal current hidden inventory.
+Building filters
+accept `capability` (one operation from `buildingTypes().capabilities`), `buildingType`
+(an exact match-local variant ID), or `type` (an authored name/key or a legacy numeric
+family). Capability filtering includes construction sites for their completed service.
 Movement is `walk`, `swim`, or `fly`; metrics are `path`, `manhattan`, or
 `chebyshev`. Path fields use eight-neighbor movement, known obstacles and forbidden
-areas; they do not predict moving-unit congestion. Resource and building sources
+areas. Their distances are terrain-weighted travel costs rounded up to neutral
+tile equivalents. Cardinal and diagonal steps have equal base cost, preserving
+the strategic Chebyshev metric; `swim` treats
+walking and swimming as equally fast before terrain modifiers. They do not
+predict moving-unit congestion. Resource and building sources
 seed obstacle tiles so their neighbors measure distance to the target.
 `fieldValue(field,x,y)` returns `known`, `reachable`, `distance`, and
 `observedTick`. Null distance is unavailable; reachability stays null when unknown
 map regions prevent a definitive unreachable answer. Geometric fields ignore
-obstacles. `passable` and `components` expose the same movement rules.
+obstacles and terrain speed. `passable` and `components` expose the same movement rules.
 
 `hotspots` ranks regional source sums, with optional visible-unit strength weights.
 With `weight: "strength"`, `strength: {worker: 0, explorer: 0, warrior: 2}` selects
@@ -521,7 +620,8 @@ and loading a save do not change query results or decision budgets.
 rejection counts, and an ordinary creation descriptor. `ctx.actions.build(request)`
 uses the same solver and queues its best result, or returns null if none exists.
 
-Requests name a building family and may specify staffing, region, colony anchor,
+Requests specify `buildingType` (variant ID) or `building` (stable key/authored family
+name). The variant must be available and explicitly placeable. They may specify staffing, region, colony anchor,
 clearance, upgrade-footprint reservation, and reachable access. Constraints and
 preferences compose `distance`, `fertility`, `resourceDensity`, and `threat` terms.
 Constraints use integer `min`/`max`; preferences use signed integer `weight`.

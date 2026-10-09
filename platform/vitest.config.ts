@@ -1,6 +1,18 @@
+import { fileURLToPath } from 'node:url';
+import { searchForWorkspaceRoot } from 'vite';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
+  server: {
+    fs: {
+      // Web skin previews and icons use the same sources as the native game.
+      allow: [
+        searchForWorkspaceRoot(fileURLToPath(new URL('.', import.meta.url))),
+        fileURLToPath(new URL('../libgag/shaders', import.meta.url)),
+        fileURLToPath(new URL('../datasrc/icons/tabler', import.meta.url)),
+      ],
+    },
+  },
   test: {
     include: [
       'packages/*/test/**/*.test.ts',

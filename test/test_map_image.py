@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 BINARY = Path(sys.argv[1] if len(sys.argv) > 1 else native_binary()).resolve()
 OUT = ROOT / 'artifacts/map-image'
 COLORS = [(0,128,0),(240,220,140),(0,64,255),(0,64,0),(255,255,0),(128,128,128),
-          (0,255,255),(255,0,255),(255,0,0),(255,128,0),(128,0,255),(255,255,255)]
+          (0,255,255),(255,0,255),(255,0,0),(255,128,0),(128,0,255),(255,255,255),
+          (190,225,240),(176,138,98)]
 
 
 def write_png(path, w, h, cells, transparent=False):
@@ -39,13 +40,20 @@ def mark(cells,w,h,x,y):
 
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
-    env = dict(os.environ, GLOB2_USER_DIR=str(OUT/'profile'), SDL_VIDEODRIVER='invalid')
+    env = dict(os.environ, GLOB2_USER_DATA_DIR=str(OUT/'profile'), SDL_VIDEODRIVER='invalid')
     logs=[]
     def run(*args, ok=True, default_seams=False):
         if not default_seams and args and args[0]=='--import-map-image' and '--image-seam-width' not in args:
             args=(*args,'--image-seam-width',0)
         command=[str(BINARY), *map(str,args), '-d', str(ROOT)]
-        result=subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        try:
+            result=subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, timeout=90)
+        except subprocess.TimeoutExpired as error:
+            logs.append(dict(args=command,exit=None,timeout_seconds=error.timeout,
+                             stdout=(error.stdout or b'').decode('utf-8', errors='replace'),
+                             stderr=(error.stderr or b'').decode('utf-8', errors='replace')))
+            (OUT/'commands.json').write_text(json.dumps(logs,indent=2)+'\n')
+            raise
         logs.append(dict(args=command,exit=result.returncode,stdout=result.stdout,stderr=result.stderr))
         (OUT/'commands.json').write_text(json.dumps(logs,indent=2))
         assert result.returncode==(0 if ok else 1), logs[-1]
@@ -73,6 +81,34 @@ def main():
     exported=OUT/'export.png'; run('--export-map-image',dest,'--output',exported)
     ew,eh,pixels=png(exported); assert (ew,eh)==(64,64)
     for color in COLORS[3:11]: assert bytes(color) in [pixels[i:i+3] for i in range(0,len(pixels),3)],color
+    # Catalogue vertices survive authoring, save/load, and image round trips.
+    # Beaches reshape only grass/water contact: ice and road keep their vertices.
+    materials=[0]*(64*64)
+    for y in range(20,36):
+        for x in range(12,20): materials[y*64+x]=12  # ice
+        for x in range(20,28): materials[y*64+x]=13  # road
+        for x in range(28,36): materials[y*64+x]=2   # water
+    mark(materials,64,64,48,48)
+    material_image=OUT/'new-terrain.png';write_png(material_image,64,64,materials)
+    material_map=OUT/'new-terrain.map.gz';material_report=OUT/'new-terrain.json'
+    run('--import-map-image',material_image,'--width',64,'--height',64,'--teams',1,
+        '--output',material_map,'--json',material_report)
+    material_data=json.loads(material_report.read_text())
+    for name in ('ice','road'):
+        assert material_data['terrain'][name]['tiles']==128
+    material_export=OUT/'new-terrain-export.png'
+    run('--export-map-image',material_map,'--output',material_export)
+    _,_,material_pixels=png(material_export)
+    for x,y,kind in ((11,24,0),(12,24,12),(20,24,13),(27,24,13),(28,24,2)):
+        i=(y*64+x)*3
+        assert material_pixels[i:i+3]==bytes(COLORS[kind]),(x,y,kind)
+    run('--preview-map',material_map,'--json',OUT/'new-terrain-loaded.json')
+    assert json.loads((OUT/'new-terrain-loaded.json').read_text())['terrain']==material_data['terrain']
+    run('--import-map-image',material_export,'--width',64,'--height',64,'--teams',1,
+        '--output',OUT/'new-terrain-restored.map.gz','--json',OUT/'new-terrain-restored.json')
+    restored_materials=json.loads((OUT/'new-terrain-restored.json').read_text())['terrain']
+    for name in ('ice','road'):
+        assert restored_materials[name]==material_data['terrain'][name]
     # Canonical image export/import must preserve the full live team capacity.
     dense=[0]*(256*256)
     for y in range(32,256,64):
@@ -176,7 +212,7 @@ def main():
     run(*args,'--image-seam-width',8,'--output',OUT/'protected.map','--json',OUT/'protected.json')
     protected=json.loads((OUT/'protected.json').read_text())['map']['colonies'][0]['start']
     assert (protected['x'],protected['y'])==(62,62)
-    # Shore rebuilding must not undo midpoint agreement, including the four corners.
+    # Laying beaches must not undo midpoint agreement, including the four corners.
     for orientation in range(3):
         corner=[2 if ((x<32) if orientation==0 else (x>=32) if orientation==1 else (x<32 and y<32)) else 0
                 for y in range(64) for x in range(64)]

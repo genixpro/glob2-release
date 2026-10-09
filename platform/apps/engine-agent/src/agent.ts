@@ -45,7 +45,14 @@ export interface EngineRunner {
 }
 
 export const unsupportedRunner: EngineRunner = {
-  kinds: ENGINE_JOB_KINDS,
+  kinds: ENGINE_JOB_KINDS.filter(
+    (kind) =>
+      kind !== 'validate-generator' &&
+      kind !== 'generate-script-map' &&
+      kind !== 'validate-ai' &&
+      kind !== 'validate-buildings' &&
+      kind !== 'validate-set',
+  ),
   run: async (job) => {
     throw new EngineJobError(
       'unsupported',
@@ -55,6 +62,7 @@ export const unsupportedRunner: EngineRunner = {
 };
 
 export interface AgentOptions {
+  buildingCatalogHash?: string;
   id?: string;
   simVersion: SimVersion;
   build: string;
@@ -228,7 +236,15 @@ export class EngineAgent {
   /** Announces (or refreshes) this agent so the platform knows its sim version is served. */
   async heartbeat(): Promise<void> {
     const { platform, simVersion, runner, build } = this.options;
-    await platform.heartbeat({ agentId: this.id, simVersion, kinds: [...runner.kinds], build });
+    await platform.heartbeat({
+      agentId: this.id,
+      simVersion,
+      kinds: [...runner.kinds],
+      build,
+      ...(this.options.buildingCatalogHash
+        ? { buildingCatalogHash: this.options.buildingCatalogHash }
+        : {}),
+    });
   }
 
   async deregister(): Promise<void> {

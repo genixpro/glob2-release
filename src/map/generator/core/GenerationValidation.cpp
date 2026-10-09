@@ -1,3 +1,4 @@
+#include "GenerationResult.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <PerformanceTelemetry.h>
 #include "GenerationValidation.h"
@@ -39,7 +40,8 @@ std::string validateGenerationRequest(const GenerationRequest &r, const Generato
 			return "Invalid legacy resource amount";
 	if (!r.hasTerrainWeight(d.controls))
 		return "Give at least one terrain type a nonzero weight.";
-	return d.validateRequest ? d.validateRequest(r) : std::string{};
+	try { return d.validateRequest ? d.validateRequest(r) : std::string{}; }
+    catch(const ScriptGenerationFailure &error) { return error.what(); }
 }
 std::string validateGeneratedWorld(const Game &g, const GenerationRequest &r,
 								   const GeneratorDefinition &d)
@@ -51,11 +53,11 @@ std::string validateGeneratedWorld(const Game &g, const GenerationRequest &r,
 		return "Incorrect colony count";
 	// No generated map may disable resource growth. The engine's saved canResourcesGrow flag
 	// is for hand-made scenarios such as the tutorial; a generated map contains its crops with
-	// terrain, or it does not contain them. Using the flag froze farmland and hid overgrowth
-	// the design should have solved (2026-09-16).
+	// terrain, or it does not contain them. Inspect the scenario flag itself, not
+	// canResourcesGrow(), which also includes the terrain's natural growth permission.
 	for (int y = 0; y < g.map.getH(); ++y)
 		for (int x = 0; x < g.map.getW(); ++x)
-			if (!g.map.canResourcesGrow(x, y))
+			if (!g.map.getTile(x, y).canResourcesGrow)
 				return "Generated maps may not disable resource growth (no-growth zone at " +
 					   std::to_string(x) + "," + std::to_string(y) + ")";
 	// Every colony starts with the lobby's shared "Starting workers" value.
@@ -76,7 +78,7 @@ std::string validateGeneratedWorld(const Game &g, const GenerationRequest &r,
 					++workers;
 			for (int slot = 0; slot < Building::MAX_COUNT; ++slot)
 				if (const auto *building = team->myBuildings[slot];
-					building && building->type->shortTypeNum == IntBuildingType::SWARM_BUILDING)
+					building && building->typeNum == g.buildingsTypes.getStartingBuildingTypeNum())
 					swarm = true;
 			if (workers != expectedWorkers || !swarm)
 				return "Incomplete starting colony";

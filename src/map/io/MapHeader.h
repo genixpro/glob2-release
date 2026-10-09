@@ -5,6 +5,7 @@
 
 #include "BaseTeam.h"
 #include "Team.h"
+#include "ExperimentalFeatures.h"
 #include <vector>
 
 namespace GAGCore
@@ -21,6 +22,15 @@ namespace GAGCore
 class MapHeader
 {
 public:
+	ExperimentSet requiredTerrainExperiments;
+	ExperimentSet requiredResourceExperiments;
+	std::vector<CatalogExperimentDefinition> resourceExperimentDefinitions;
+	std::vector<std::string> resourceExperimentKeys() const
+	{
+		std::vector<std::string> result;
+		for (const auto& definition : resourceExperimentDefinitions) result.push_back(definition.key);
+		return result;
+	}
 	/// Gives default values to all entries
 	MapHeader();
 		
@@ -39,6 +49,11 @@ public:
 	
 	/// Returns the version minor
 	Sint32 getVersionMinor() const;
+	// Draft growth saves reused 146–148 before those numbers shipped on master.
+	// Resolve the terrain layout before reading any version-dependent game state.
+	void resolveGrowthLayout(GAGCore::InputStream *stream);
+	bool historicalGrowthLayout = false;
+	Sint32 loadingVersion() const { return historicalGrowthLayout ? 145 : versionMinor; }
 	
 	/// Returns the number of teams
 	Sint32 getNumberOfTeams() const;

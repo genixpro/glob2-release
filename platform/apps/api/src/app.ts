@@ -1,3 +1,14 @@
+import { generatorLibraryRoutes } from './generators/routes.ts';
+import { buildingLibraryRoutes } from './buildings/library.ts';
+import { buildingDraftRoutes } from './buildings/drafts.ts';
+import { buildingStudioRoutes } from './buildings/studio.ts';
+import { terrainStudioRoutes } from './terrain/studio.ts';
+import { setLibraryRoutes } from './sets/routes.ts';
+import { musicStudioRoutes } from './music/studio.ts';
+import { aiStudioRoutes } from './ai-studio/routes.ts';
+import { generatorStudioRoutes } from './generator-studio/routes.ts';
+import { aiLibraryRoutes } from './ais/routes.ts';
+import { musicRoutes } from './music/routes.ts';
 import { skinBillingRoutes } from './skins/billing/routes.ts';
 import { studioRoutes } from './maps/studio.ts';
 import { hiveRoutes } from './hive/routes.ts';
@@ -24,11 +35,20 @@ import {
   type SimVersion,
 } from '@glob2/protocol';
 import { HttpError, apiError } from './errors.ts';
-import { createIdentity, type Identity } from './identity.ts';
+import {
+  createIdentity,
+  authenticatedAccounts,
+  isAdministrativeRequest,
+  type Identity,
+} from './identity.ts';
 import type { ApiServices } from './services.ts';
 import { skinRoutes } from './skins/routes.ts';
 import { accountRoutes } from './routes/accounts.ts';
 import { adminRoutes } from './routes/admin.ts';
+import { adminConsoleRoutes } from './admin/routes.ts';
+import { operationsRoutes } from './admin/operations.ts';
+import { analyticsRoutes } from './admin/analytics.ts';
+import { financeRoutes } from './admin/finances.ts';
 import { authRoutes } from './routes/auth.ts';
 import { signinRoutes } from './routes/signin.ts';
 import { internalRoutes } from './routes/internal.ts';
@@ -111,13 +131,29 @@ export async function buildApp(
     requestIdHeader: 'x-request-id',
   });
   const identity = createIdentity(services);
+  await sql`UPDATE admin_analytics_settings SET collection=${services.config.instance.analytics?.collection !== false} WHERE id`.execute(
+    services.db,
+  );
+  app.addHook('onResponse', async (request, reply) => {
+    const account = authenticatedAccounts.get(request);
+    if (
+      account &&
+      reply.statusCode < 400 &&
+      request.url.startsWith('/api/v1/') &&
+      !isAdministrativeRequest(identity, request) &&
+      !request.url.endsWith('/reconcile')
+    )
+      await identity.activity
+        .record(account)
+        .catch((error) => services.logger.warn({ error }, 'activity collection failed'));
+  });
   app.decorate('services', services);
   app.decorate('identity', identity);
 
   app.setErrorHandler((error: FastifyError, request, reply) => {
     const { status, body } = errorBodyFor(
       error,
-      services.config.uploadMaxBytes ?? 16 * 1024 * 1024,
+      services.config.uploadMaxBytes ?? 64 * 1024 * 1024,
     );
     if (status >= 500) request.log.error({ err: error }, 'request failed');
     void reply.status(status).send(body);
@@ -147,7 +183,7 @@ export async function buildApp(
     {
       parseAs: 'buffer',
       bodyLimit: Math.max(
-        services.config.uploadMaxBytes ?? 16 * 1024 * 1024,
+        services.config.uploadMaxBytes ?? 64 * 1024 * 1024,
         services.config.recordMaxBytes ?? 64 * 1024 * 1024,
       ),
     },
@@ -223,6 +259,7 @@ export async function buildApp(
   });
   const assignments = new Assignments(
     services.db,
+    services.blobs,
     identity.keys,
     services.config.publicOrigin,
     new Map(services.config.instance.queues.map((q) => [q.id, q.name])),
@@ -243,12 +280,27 @@ export async function buildApp(
   await authRoutes(app, identity);
   await accountRoutes(app, identity, services.db);
   await hiveRoutes(app);
+  await aiStudioRoutes(app);
+  await generatorStudioRoutes(app);
   await studioRoutes(app, rooms);
+  await musicStudioRoutes(app);
+  await terrainStudioRoutes(app);
+  await buildingStudioRoutes(app);
   await adminRoutes(app, identity);
+  await adminConsoleRoutes(app, identity);
+  await operationsRoutes(app, identity);
+  await analyticsRoutes(app, identity);
+  await financeRoutes(app, identity);
   await pageAssetRoutes(app);
   await signinRoutes(app, identity);
   await playRoutes(app, identity, rooms);
   await mapCatalogRoutes(app, identity);
+  await aiLibraryRoutes(app, identity);
+  await generatorLibraryRoutes(app, identity);
+  await buildingDraftRoutes(app, identity);
+  await buildingLibraryRoutes(app, identity);
+  await setLibraryRoutes(app, identity);
+  await musicRoutes(app, identity);
   await skinRoutes(app, identity);
   await skinBillingRoutes(app, identity);
   await historyRoutes(app, identity);

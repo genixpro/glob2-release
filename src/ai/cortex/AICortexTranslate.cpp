@@ -1,17 +1,18 @@
+#include "CortexSnapshotQueries.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Globulation 2 Authors
 
 #include "AICortex.h"
 #include "AITelemetryFields.h"
 #include "CortexObservation.h"
-#include "CortexWheat.h"
+#include "CortexFoodSources.h"
 
 #include "Order.h"
 #include "Player.h"
 #include "team/Team.h"
 #include "GlobalContainer.h"
 #include "Settings.h"
-#include "IntBuildingType.h"
+#include "CortexBuildings.h"
 #include "BuildingType.h"
 #include "building/Building.h"
 #include "unit/UnitConsts.h"
@@ -87,7 +88,7 @@ void AICortex::translateActionBuild(const Cortex::CortexAction& action, const Co
 	if (!cand.valid)
 		return; // policy chose a stale/empty slot; drop rather than misbuild.
 
-	emitBuildOrder(type, cand.x, cand.y, obs.tick);
+	emitBuildOrder(type, cand.x, cand.y, obs.tick, type == Cortex::CORTEX_BUILD_SWARM ? obs.productionPlacementType : -1);
 }
 
 void AICortex::translateActionBuildForward(const Cortex::CortexAction& action, const Cortex::CortexObservation& obs)
@@ -134,24 +135,27 @@ void AICortex::translateActionBuildForward(const Cortex::CortexAction& action, c
 	}
 }
 
-bool AICortex::emitBuildOrder(int type, int x, int y, int tick)
+bool AICortex::emitBuildOrder(int type, int x, int y, int tick, int placementType)
 {
-	// Resolve the long building-site type id for a fresh (level 0)
-	// building, exactly as the GUI/Runtime build path does.
-	const std::string& name = IntBuildingType::reverseConversionMap[type];
-	Sint32 typeNum = globalContainer->buildingsTypes.getTypeNum(name, 0, true);
-	if (typeNum < 0)
-		return false; // no buildable site type (e.g. a virtual/flag type) — skip.
+	const AIEngine::AIWorldView& game = *observedWorld;
+    AIPlanning::BuildingCandidate choice;
+    if (placementType<0) choice = Cortex::selectBuilding(game, *observedTeam, type);
+    if (placementType>=0) {
+        choice.placementType=placementType;
+        choice.completedType=Cortex::finishedType(game,Cortex::catalogType(game,placementType)->key);
+    }
+    if (choice.placementType < 0) return false;
+    const int typeNum = choice.placementType;
+    const auto* placement = Cortex::catalogType(game,typeNum);
+    const auto* completed = Cortex::catalogType(game,choice.completedType);
+    const int unitWorking = std::min(4, int(placement->semantics.assignmentLimit));
+    const int unitWorkingFuture = completed->maxUnitWorking ? std::min(2, int(completed->semantics.assignmentLimit)) : 0;
 
-	// Worker counts from the engine's canonical defaults: column 0 is the
-	// construction-site assignment, column 1 the finished-building one.
-	const int unitWorking       = globalContainer->settings.defaultUnitsAssigned[type][0];
-	const int unitWorkingFuture = globalContainer->settings.defaultUnitsAssigned[type][1];
-
-	orderQueue.push(shared_ptr<Order>(new OrderCreate(
-		player->team->teamNumber, x, y, typeNum,
+	enqueueOrder(shared_ptr<Order>(new OrderCreate(
+		observedTeam->number, x, y, typeNum,
 		unitWorking, unitWorkingFuture)));
 	buildCooldownUntil[type] = tick + BUILD_COOLDOWN_TICKS;
+    rememberQueuedBuild(*orderQueue.back(),type);
 	return true;
 }
 
@@ -171,24 +175,27 @@ void AICortex::translateActionSetProduction(const Cortex::CortexAction& action, 
 	// determinism. Enqueue one OrderModifySwarm per finished swarm whose
 	// current ratio differs from the target; getOrder() drains orderQueue
 	// one order per tick, so this naturally retargets one swarm per tick.
-	Team* team = player->team;
-	for (int i = 0; i < Building::MAX_COUNT; i++)
+	const AIEngine::TeamView* team = observedTeam;
+	for (int i = 0; i < ::Building::MAX_COUNT; i++)
 	{
-		Building* b = team->myBuildings[i];
+		const AIEngine::BuildingView* b = observedWorld->buildingSlots(team->number)[i];
 		if (!b)
 			continue;
-		if (b->type->shortTypeNum != IntBuildingType::SWARM_BUILDING)
+		if (!Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_SWARM))
 			continue;
-		if (b->buildingState != Building::ALIVE || b->type->isBuildingSite)
+		if (b->buildingState != ::Building::ALIVE || Cortex::buildingType(*observedWorld,*b)->isBuildingSite)
 			continue; // finished swarm only — not a site, a swarm under upgrade, or dead.
 		                  // (mirrors executeModifySwarm's unitProductionTime guard.)
 
 		// Dedup: only emit when this swarm's current ratio differs from
 		// the target, so a steady-state policy that re-issues the same
 		// ACTION_SET_PRODUCTION every cycle doesn't spam redundant orders.
+		Sint32 supported[NB_UNIT_TYPE];
+		for (int t = 0; t < NB_UNIT_TYPE; ++t)
+			supported[t] = Cortex::buildingType(*observedWorld,*b)->semantics.production.recipes[t].enabled ? target[t] : 0;
 		bool differs = false;
 		for (int t = 0; t < NB_UNIT_TYPE; t++)
-			if (b->ratio[t] != target[t])
+			if (Cortex::plannedRatio(intents,*b,t) != supported[t])
 			{
 				differs = true;
 				break;
@@ -196,7 +203,7 @@ void AICortex::translateActionSetProduction(const Cortex::CortexAction& action, 
 		if (!differs)
 			continue;
 
-		orderQueue.push(shared_ptr<Order>(new OrderModifySwarm(b->gid, target)));
+		enqueueOrder(shared_ptr<Order>(new OrderModifySwarm(b->gid, supported)));
 	}
 }
 
@@ -210,7 +217,7 @@ void AICortex::translateActionPlaceWarFlag(const Cortex::CortexAction& action, c
 	    || !obs.flagTargets[slot].valid)
 	{
 		if (getenv("CORTEX_DUMP_POSTURE") && obs.warFlagsActive > 0)
-			std::cerr << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)player->team->teamNumber
+			diagnosticStream << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)observedTeam->number
 			          << " teardown=no-target flags=" << obs.warFlagsActive << "\n";
 		clearAllOffenseFlags();
 		flagPosture = POSTURE_NONE;
@@ -246,15 +253,15 @@ void AICortex::translateActionPlaceWarFlag(const Cortex::CortexAction& action, c
 		offenseHoldUntil = obs.tick + OFFENSE_HOLD_TICKS;
 		if (getenv("CORTEX_DUMP_POSTURE"))
 		{
-			std::cerr << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)player->team->teamNumber
+			diagnosticStream << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)observedTeam->number
 			          << " commit target=(" << target.x << "," << target.y << ")"
 			          << " warriors=" << obs.warriors
 			          << " amphibious=" << (amphibious ? 1 : 0)
 			          << " forwardRally=" << (forwardRally ? 1 : 0)
 			          << " swimWarriors=" << obs.swimWarriors;
 			if (staged)
-				std::cerr << " staging=(" << stagingX << "," << stagingY << ")";
-			std::cerr << "\n";
+				diagnosticStream << " staging=(" << stagingX << "," << stagingY << ")";
+			diagnosticStream << "\n";
 		}
 	}
 	flagPosture = POSTURE_OFFENSE;
@@ -299,8 +306,8 @@ void AICortex::translateActionPlaceDefenseFlag(const Cortex::CortexAction& actio
 		// defense flags out-recruit everything for FREE warriors, so each fills from the
 		// idle reserve without disturbing the forward army; we release the committed army
 		// only when the free pool cannot cover the combined recall (below).
-		const Building* cur = findFlagByGid(defenseFlags[i].gid);
-		const int curUnits = cur ? static_cast<int>(cur->unitsWorking.size()) : 0;
+		const AIEngine::BuildingView* cur = findFlagByGid(defenseFlags[i].gid);
+		const int curUnits = cur ? static_cast<int>(observedWorld->workers(*cur).size()) : 0;
 		if (n > curUnits)
 			totalDeficit += n - curUnits;
 	}
@@ -328,7 +335,7 @@ void AICortex::translateActionPlaceDefenseFlag(const Cortex::CortexAction& actio
 	if (totalDeficit > 0 && obs.freeWarriors < totalDeficit && seriousThreat)
 	{
 		if (getenv("CORTEX_DUMP_POSTURE") && obs.warFlagsActive > 0)
-			std::cerr << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)player->team->teamNumber
+			diagnosticStream << "CORTEX_POSTURE t=" << obs.tick << " team=" << (int)observedTeam->number
 			          << " teardown=defense-deficit flags=" << obs.warFlagsActive
 			          << " deficit=" << totalDeficit << " freeWarriors=" << obs.freeWarriors
 			          << " bldgsHit=" << obs.buildingsUnderAttack << " unitsHit=" << obs.unitsUnderAttack << "\n";
@@ -357,15 +364,17 @@ void AICortex::translateActionClearFlags()
 	// down separately by reconcileStaleDefenseFlag when nothing is under attack.
 	if (getenv("CORTEX_DUMP_POSTURE"))
 	{
-		std::cerr << "CORTEX_POSTURE t=" << (player->team->game ? (int)player->team->game->stepCounter : -1)
-		          << " team=" << (int)player->team->teamNumber << " teardown=retire";
-		for (Building* b : player->team->virtualBuildings)
-			if (b && b->type->shortTypeNum == IntBuildingType::WAR_FLAG
-			      && b->buildingState == Building::ALIVE)
-				std::cerr << " flag[gid=" << b->gid << " at=" << b->posX << "," << b->posY
-				          << " units=" << b->unitsWorking.size() << "/" << b->maxUnitWorking
+		diagnosticStream << "CORTEX_POSTURE t=" << (observedWorld ? (int)observedWorld->tick : -1)
+		          << " team=" << (int)observedTeam->number << " teardown=retire";
+		for (const auto ref : observedTeam->virtualBuildings)
+        { const auto* b=observedWorld->building(ref);
+			if (b && Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_WAR)
+			      && b->buildingState == ::Building::ALIVE)
+				diagnosticStream << " flag[gid=" << b->gid << " at=" << Cortex::plannedX(intents,*b) << "," << Cortex::plannedY(intents,*b)
+				          << " units=" << observedWorld->workers(*b).size() << "/" << Cortex::plannedWorkers(intents,*b)
 				          << " owned=" << (isOwnedGid(b->gid) ? 1 : 0) << "]";
-		std::cerr << "\n";
+        }
+		diagnosticStream << "\n";
 	}
 	clearAllOffenseFlags();
 	flagPosture = POSTURE_NONE;
@@ -398,52 +407,30 @@ void AICortex::translateActionUpgradeBuilding(const Cortex::CortexAction& action
 	if (obs.tick < buildCooldownUntil[type])
 		return;
 
-	Building* b = findUpgradeTarget(type);
+	const AIEngine::BuildingView* b = findUpgradeTarget(type);
 	if (!b)
 		return; // no instance currently passes the full Upgradable predicate.
 
-	// Worker counts from the engine's canonical defaults, mirroring the GUI
-	// upgrade path (gui/GameGUIInput.cpp:409-427). There typeNum =
-	// building->typeNum + 1 (the level-(L+1) construction SITE variant) and
-	// unitWorking = getDefaultAssignedUnits(typeNum) /
-	// unitWorkingFuture = getDefaultAssignedUnits(typeNum + 1) (the level-(L+1)
-	// FINISHED variant). Per GameGUIDefaultAssignManager.cpp:14-29, a
-	// (shortType, level, site) variant maps to defaultUnitsAssigned column
-	// level*2 and a finished variant to column level*2 + 1
-	// (Settings.h:73, defaultUnitsAssigned[NB_BUILDING][6]). With
-	// targetLevel = type->level + 1 the GUI's two lookups are therefore
-	// exactly columns [targetLevel*2] (site assign) and [targetLevel*2 + 1]
-	// (finished assign) — equivalent, so we read them directly.
-	const int targetLevel = b->type->level + 1;
-	const int siteCol     = targetLevel * 2;
-	const int finishedCol = targetLevel * 2 + 1;
-	// Guard the column indices defensively (defaultUnitsAssigned has 6 cols,
-	// levels 0..2; an upgradable building always has nextLevel so targetLevel
-	// is 1 or 2 and both columns are in range, but clamp rather than trust it).
-	if (siteCol < 0 || finishedCol < 0
-	 || siteCol >= 6 || finishedCol >= 6)
-		return;
-	const int unitWorking       = globalContainer->settings.defaultUnitsAssigned[type][siteCol];
-	// NOTE: for some types (e.g. ATTACK_BUILDING) the finished-building
-	// columns (1,3,5) are 0 in Settings::resetDefaultUnitsAssigned — that is
-	// the engine default, NOT a missing value. The GUI upgrade path passes the
-	// same 0 here; launchConstruction uses the site column (unitWorking) as the
-	// meaningful crew. Do not "fix" this to a nonzero default.
-	const int unitWorkingFuture = globalContainer->settings.defaultUnitsAssigned[type][finishedCol];
+	const auto& catalog = *observedWorld;
+    const auto* site = Cortex::catalogType(catalog,Cortex::buildingType(*observedWorld,*b)->nextLevel);
+    const auto* completed = site->isBuildingSite ? Cortex::catalogType(catalog,site->nextLevel) : site;
+    const int unitWorking = std::min(4, int(site->semantics.assignmentLimit));
+    const int unitWorkingFuture = completed->maxUnitWorking ? std::min(2, int(completed->semantics.assignmentLimit)) : 0;
 
-	orderQueue.push(shared_ptr<Order>(new OrderConstruction(b->gid, unitWorking, unitWorkingFuture)));
+	enqueueOrder(shared_ptr<Order>(new OrderConstruction(b->gid, unitWorking, unitWorkingFuture)));
 	buildCooldownUntil[type] = obs.tick + BUILD_COOLDOWN_TICKS;
 	// Mark this class's upgrade in flight until it shows up as a site (or
 	// the safety timeout), so the policy can't stack a second one meanwhile.
 	pendingUpgradeType = type;
 	pendingUpgradeUntil = obs.tick + UPGRADE_PENDING_TIMEOUT_TICKS;
+    rememberQueuedBuild(*orderQueue.back(),type);
 }
 
 template <typename Tracked, typename Accept>
 void AICortex::applyWorkerCounts(const Tracked* tracked, int count, const Sint32* desiredArr,
                                  int maxClamp, Accept accept)
 {
-	Team* team = player->team;
+	const AIEngine::TeamView* team = observedTeam;
 	for (int i = 0; i < count; i++)
 	{
 		const Tracked& tb = tracked[i];
@@ -466,9 +453,9 @@ void AICortex::applyWorkerCounts(const Tracked* tracked, int count, const Sint32
 		// array-index lookup — not a linear scan — so it is both deterministic
 		// and cheap. GIDtoID returns the per-team array slot; GIDtoTeam is not
 		// needed here because the tracked sets only contain our own buildings
-		// (filled from team->myBuildings in CortexTypes.h observe()).
-		const int bid = Building::GIDtoID(static_cast<Uint16>(tb.gid));
-		Building* b = team->myBuildings[bid];
+		// (filled from observedWorld->buildingSlots(team->number) in CortexTypes.h observe()).
+		const int bid = ::Building::GIDtoID(static_cast<Uint16>(tb.gid));
+		const AIEngine::BuildingView* b = observedWorld->buildingSlots(team->number)[bid];
 		if (!b)
 			continue;
 		// Per-set guard: confirm the decoded building is still the kind we
@@ -478,11 +465,14 @@ void AICortex::applyWorkerCounts(const Tracked* tracked, int count, const Sint32
 		if (!accept(b))
 			continue;
 
+		desired = Cortex::buildingType(*observedWorld,*b)->maxUnitWorking ? std::min(desired, int(Cortex::buildingType(*observedWorld,*b)->semantics.assignmentLimit)) : 0;
+		if (desired == Cortex::plannedWorkers(intents,*b)) continue;
+
 		// Update the AI's local view immediately (AICastor pattern) so the
 		// dedup won't re-trigger on the next cycle before the order executes.
-		b->maxUnitWorking = desired;
-		b->update();
-		orderQueue.push(shared_ptr<Order>(new OrderModifyBuilding(b->gid, desired)));
+		Cortex::intentFor(intents,*b).workers = desired;
+
+		enqueueOrder(shared_ptr<Order>(new OrderModifyBuilding(b->gid, desired)));
 	}
 }
 
@@ -490,7 +480,7 @@ template <typename Tracked, typename Accept>
 void AICortex::applyPriorities(const Tracked* tracked, int count, const Sint32* desiredArr,
                                Accept accept)
 {
-	Team* team = player->team;
+	const AIEngine::TeamView* team = observedTeam;
 	for (int i = 0; i < count; i++)
 	{
 		const Tracked& tb = tracked[i];
@@ -505,19 +495,19 @@ void AICortex::applyPriorities(const Tracked* tracked, int count, const Sint32* 
 		if (desired == tb.priority)
 			continue; // DEDUP: current state already matches; don't re-emit.
 
-		const int bid = Building::GIDtoID(static_cast<Uint16>(tb.gid));
-		Building* b = team->myBuildings[bid];
+		const int bid = ::Building::GIDtoID(static_cast<Uint16>(tb.gid));
+		const AIEngine::BuildingView* b = observedWorld->buildingSlots(team->number)[bid];
 		if (!b)
 			continue;
 		if (!accept(b))
 			continue;
 
 		// Mirror the engine executor (Game_orders.cpp:476-484 executeChangePriority:
-		// set b->priority then b->updateCallLists()) locally so the AI's view updates
+		// set Cortex::plannedPriority(intents,*b) then b->updateCallLists()) locally so the AI's view updates
 		// immediately and the dedup won't re-fire before the order executes.
-		b->priority = desired;
-		b->updateCallLists();
-		orderQueue.push(shared_ptr<Order>(new OrderChangePriority(b->gid, desired)));
+		Cortex::intentFor(intents,*b).priority = desired;
+
+		enqueueOrder(shared_ptr<Order>(new OrderChangePriority(b->gid, desired)));
 	}
 }
 
@@ -528,7 +518,7 @@ void AICortex::translateActionTuneWorkers(const Cortex::CortexAction& action, co
 	// inside a deadband — these are small, frequent adjustments. We dedup
 	// against the building's current maxUnitWorking so a steady-state policy
 	// that re-decides the same target each cycle doesn't flood the order queue.
-	// Mirror AICastor's pattern (Control.cpp:229-271): set b->maxUnitWorking
+	// Mirror AICastor's pattern (Control.cpp:229-271): set Cortex::plannedWorkers(intents,*b)
 	// locally AND emit the order so the AI's own view updates immediately and
 	// the dedup won't re-fire next cycle. This is deterministic — every client
 	// runs the identical AI and queues the identical order in the same tick.
@@ -538,16 +528,16 @@ void AICortex::translateActionTuneWorkers(const Cortex::CortexAction& action, co
 
 	// --- swarms: finished, alive SWARM_BUILDING only ---
 	applyWorkerCounts(obs.trackedSwarms, obs.swarmCount, action.swarmWorkers, /*maxClamp=*/-1,
-		[](const Building* b) {
-			return b->buildingState == Building::ALIVE && !b->type->isBuildingSite
-			    && b->type->shortTypeNum == IntBuildingType::SWARM_BUILDING;
+		[this](const AIEngine::BuildingView* b) {
+			return b->buildingState == ::Building::ALIVE && !Cortex::buildingType(*observedWorld,*b)->isBuildingSite
+			    && Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_SWARM);
 		});
 
 	// --- inns (FOOD_BUILDING): finished, alive FOOD_BUILDING only ---
 	applyWorkerCounts(obs.trackedInns, obs.innCount, action.innWorkers, /*maxClamp=*/-1,
-		[](const Building* b) {
-			return b->buildingState == Building::ALIVE && !b->type->isBuildingSite
-			    && b->type->shortTypeNum == IntBuildingType::FOOD_BUILDING;
+		[this](const AIEngine::BuildingView* b) {
+			return b->buildingState == ::Building::ALIVE && !Cortex::buildingType(*observedWorld,*b)->isBuildingSite
+			    && Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_FOOD);
 		});
 
 	// --- construction sites (pour idle workers into in-progress builds) ---
@@ -557,17 +547,17 @@ void AICortex::translateActionTuneWorkers(const Cortex::CortexAction& action, co
 	// writing a site cap onto a just-completed building).
 	applyWorkerCounts(obs.trackedSites, obs.siteCount, action.siteWorkers,
 		/*maxClamp=*/Cortex::CORTEX_MAX_BUILDING_WORKERS,
-		[](const Building* b) {
-			return b->buildingState == Building::ALIVE && b->type->isBuildingSite;
+		[this](const AIEngine::BuildingView* b) {
+			return b->buildingState == ::Building::ALIVE && Cortex::buildingType(*observedWorld,*b)->isBuildingSite;
 		});
 
 	// --- inn priority: restore finished inns to NORMAL (undo the LOW inherited
 	//     from their construction-site phase, which the engine carries over).
 	//     Finished, alive FOOD_BUILDING only. ---
 	applyPriorities(obs.trackedInns, obs.innCount, action.innPriority,
-		[](const Building* b) {
-			return b->buildingState == Building::ALIVE && !b->type->isBuildingSite
-			    && b->type->shortTypeNum == IntBuildingType::FOOD_BUILDING;
+		[this](const AIEngine::BuildingView* b) {
+			return b->buildingState == ::Building::ALIVE && !Cortex::buildingType(*observedWorld,*b)->isBuildingSite
+			    && Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_FOOD);
 		});
 
 	// --- site priority: pin construction sites to LOW so construction never
@@ -575,8 +565,8 @@ void AICortex::translateActionTuneWorkers(const Cortex::CortexAction& action, co
 	//     (a just-finished building is no longer isBuildingSite, so we naturally
 	//     stop writing a site priority onto a completed building). ---
 	applyPriorities(obs.trackedSites, obs.siteCount, action.sitePriority,
-		[](const Building* b) {
-			return b->buildingState == Building::ALIVE && b->type->isBuildingSite;
+		[this](const AIEngine::BuildingView* b) {
+			return b->buildingState == ::Building::ALIVE && Cortex::buildingType(*observedWorld,*b)->isBuildingSite;
 		});
 }
 
@@ -587,11 +577,11 @@ void AICortex::translateActionSetPriority(const Cortex::CortexAction& action, co
 	// state keeps the primary swarm HIGH so it wins worker contention; the
 	// panic defense raises every swarm to HIGH (target == rest). Dedup against
 	// each swarm's current Building::priority, and mirror the engine executor
-	// (Game_orders.cpp:476-484 executeChangePriority sets b->priority then
+	// (Game_orders.cpp:476-484 executeChangePriority sets Cortex::plannedPriority(intents,*b) then
 	// b->updateCallLists()) locally so the AI's view updates immediately and
 	// the dedup won't re-fire before the order executes. Deterministic:
 	// identical AI + identical queued order on every client.
-	Team* team = player->team;
+	const AIEngine::TeamView* team = observedTeam;
 	bool seenFirstSwarm = false;
 	for (int i = 0; i < obs.swarmCount; i++)
 	{
@@ -607,53 +597,48 @@ void AICortex::translateActionSetPriority(const Cortex::CortexAction& action, co
 		if (tb.priority == target)
 			continue; // DEDUP: already at the target priority.
 
-		const int bid = Building::GIDtoID(static_cast<Uint16>(tb.gid));
-		Building* b = team->myBuildings[bid];
+		const int bid = ::Building::GIDtoID(static_cast<Uint16>(tb.gid));
+		const AIEngine::BuildingView* b = observedWorld->buildingSlots(team->number)[bid];
 		if (!b)
 			continue;
-		if (b->buildingState != Building::ALIVE || b->type->isBuildingSite)
+		if (b->buildingState != ::Building::ALIVE || Cortex::buildingType(*observedWorld,*b)->isBuildingSite)
 			continue;
-		if (b->type->shortTypeNum != IntBuildingType::SWARM_BUILDING)
+		if (!Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*b), Cortex::CORTEX_BUILD_SWARM))
 			continue;
 
-		b->priority = target;
-		b->updateCallLists();
-		orderQueue.push(shared_ptr<Order>(new OrderChangePriority(b->gid, target)));
+		Cortex::intentFor(intents,*b).priority = target;
+
+		enqueueOrder(shared_ptr<Order>(new OrderChangePriority(b->gid, target)));
 	}
 }
 
-void AICortex::enqueueWheatForbidden(const Cortex::CortexObservation& obs, bool liftAll)
+void AICortex::enqueueFoodSourcesForbidden(const Cortex::CortexObservation& obs, bool liftAll)
 {
-	(void)obs; // reserved: the gate already ran in CortexPolicy::wantWheatProtection /
-	           // wantWheatBlitzLift; liftAll selects the wheat-blitz full-lift mode.
+	(void)obs; // reserved: the gate already ran in CortexPolicy::wantFoodSourceProtection /
+	           // wantFoodBurstLift; liftAll selects the food-blitz full-lift mode.
 
-	// Both area types use the same wheat checkerboard and upkeep. Retire legacy
-	// wheat forbidden paint when using farms, including saves from the prototype.
-	const Map* map = &player->team->game->map;
-	const bool farms = map->farmAreasEnabled() && !player->game->gameHeader.isResourceGrowthDisabled();
-	Cortex::WheatReconcile wr =
-		Cortex::reconcileWheatForbidden(player, wheatOpenMargin, /*buildMasks=*/true, liftAll, farms);
-	const Uint8 teamNumber = static_cast<Uint8>(player->team->teamNumber);
+	// Both area types use the same food checkerboard and upkeep. Retire legacy
+	// food forbidden paint when using farms, including saves from the prototype.
+	const AIEngine::AIWorldView* map = observedWorld;
+	const bool farms = map->farmAreasEnabled && !observedWorld->rules.resourceGrowthDisabled;
+	Cortex::FoodSourceReconcile wr =
+		Cortex::reconcileFoodSourcesForbiddenWorld(observedWorld,observedTeam,queryScratch,intents,&diagnosticStream, wheatOpenMargin, /*buildMasks=*/true, liftAll, farms);
+	const Uint8 teamNumber = static_cast<Uint8>(observedTeam->number);
 	if (farms)
 	{
-		Cortex::WheatReconcile legacy = Cortex::reconcileWheatForbidden(
-			player, wheatOpenMargin, /*buildMasks=*/true, /*liftAll=*/true);
+		Cortex::FoodSourceReconcile legacy = Cortex::reconcileFoodSourcesForbiddenWorld(
+			observedWorld,observedTeam,queryScratch,intents,&diagnosticStream, wheatOpenMargin, /*buildMasks=*/true, /*liftAll=*/true);
 		if (legacy.del.getApplicationCount() > 0)
-			orderQueue.push(shared_ptr<Order>(new OrderAlterForbidden(
-				teamNumber, BrushTool::MODE_DEL, &legacy.del, map)));
+			enqueueOrder(Cortex::areaOrder<OrderAlterForbidden>(teamNumber, BrushTool::MODE_DEL, &legacy.del, map));
 		if (wr.del.getApplicationCount() > 0)
-			orderQueue.push(shared_ptr<Order>(new OrderAlterFarmArea(
-				teamNumber, BrushTool::MODE_DEL, &wr.del, map)));
+			enqueueOrder(Cortex::areaOrder<OrderAlterFarmArea>(teamNumber, BrushTool::MODE_DEL, &wr.del, map));
 		if (wr.add.getApplicationCount() > 0)
-			orderQueue.push(shared_ptr<Order>(new OrderAlterFarmArea(
-				teamNumber, BrushTool::MODE_ADD, &wr.add, map)));
+			enqueueOrder(Cortex::areaOrder<OrderAlterFarmArea>(teamNumber, BrushTool::MODE_ADD, &wr.add, map));
 		return;
 	}
 	// DEL first so freeing dead tiles never races the ADD of fresh ones.
 	if (wr.del.getApplicationCount() > 0)
-		orderQueue.push(shared_ptr<Order>(new OrderAlterForbidden(
-			teamNumber, BrushTool::MODE_DEL, &wr.del, map)));
+		enqueueOrder(Cortex::areaOrder<OrderAlterForbidden>(teamNumber, BrushTool::MODE_DEL, &wr.del, map));
 	if (wr.add.getApplicationCount() > 0)
-		orderQueue.push(shared_ptr<Order>(new OrderAlterForbidden(
-			teamNumber, BrushTool::MODE_ADD, &wr.add, map)));
+		enqueueOrder(Cortex::areaOrder<OrderAlterForbidden>(teamNumber, BrushTool::MODE_ADD, &wr.add, map));
 }

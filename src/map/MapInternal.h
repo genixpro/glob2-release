@@ -25,7 +25,6 @@ inline void fill(std::vector<T>& vec, const T& value) {
 }
 
 #include "field/GradientConstants.h"
-
 // Guard-area balancing (the "guard-area-balancing" experiment). A painted guard
 // tile is seeded GUARD_CROWD_COST_PER_WARRIOR below the goal for each of the
 // team's warriors within GUARD_CROWD_RADIUS tiles (Chebyshev), scaled by
@@ -44,7 +43,7 @@ static_assert(GUARD_CROWD_COST_MAX < GRADIENT_AT_GOAL - GRADIENT_UNREACHABLE - 1
 // is worth, so it does not turn back.
 static_assert(GUARD_CROWD_RADIUS * GRADIENT_STEP > GUARD_CROWD_COST_PER_WARRIOR);
 
-// Sentinel for Map::immobileUnits[]: byte stores the team number of the immobile
+// Sentinel for Map occupancy immobileUnit: byte stores the team number of the immobile
 // unit on the tile, or IMMOBILE_UNIT_NONE if no immobile unit is present.
 // Team::MAX_COUNT is well under 255, so the team-number range never collides.
 constexpr std::uint8_t IMMOBILE_UNIT_NONE = 255;

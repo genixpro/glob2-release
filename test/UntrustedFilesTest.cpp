@@ -20,6 +20,10 @@ struct ReadCondition : AISharedRuntime::Conditions::Condition {
 struct Fields : GAGCore::BinaryOutputStream {
     std::map<std::string, std::pair<size_t, size_t>> fields;
     explicit Fields(GAGCore::MemoryStreamBackend* backend) : BinaryOutputStream(backend) {}
+    void write(const void* value, size_t size, const std::string name) override {
+        fields.try_emplace(name,getPosition(),size);
+        BinaryOutputStream::write(value,size,name);
+    }
     void writeEndianIndependent(const void* value, size_t size, const std::string name) override {
         fields.try_emplace(name, getPosition(), size);
         BinaryOutputStream::writeEndianIndependent(value, size, name);
@@ -134,14 +138,25 @@ TEST_CASE("terrain loaders reject invalid resources occupants and sector dimensi
     const auto bytes = backend->takeContents();
     auto header = world.game.mapHeader;
     // Exercise semantic validation after decoding, independent of the tile encoding.
-    const auto original=world.game.map.tiles[0];
+    const auto original=world.game.map.getTile(0);
+    const auto originalVertex=world.game.map.vertexTerrainAt(size_t(0));
+    bool corruptVertex=false;
+    auto poke=[&](const Tile& t) {
+        auto& m=world.game.map;
+        // An unregistered terrain ID stands in for a corrupt vertex.
+        m.vertexTerrain[0]=corruptVertex ? TerrainType(TERRAIN_COUNT) : originalVertex;
+        m.resourceCells[0]={t.resource,t.fertility,t.canResourcesGrow};
+        m.occupancyCells[0].building=t.building; m.occupancyCells[0].groundUnit=t.groundUnit; m.occupancyCells[0].airUnit=t.airUnit;
+    };
     for(int field=0;field<5;++field) {
-        auto& tile=world.game.map.tiles[0]; tile=original;
-        if(field==0) tile.terrain=272;
+        auto tile=original;
+        corruptVertex=field==0;
         if(field==1) tile.building=65534;
         if(field==2) tile.resource.type=254;
         if(field==3) tile.groundUnit=65534;
         if(field==4) tile.airUnit=65534;
+        // Deliberately bypass validated mutation to exercise corrupt serialized input.
+        poke(tile);
         auto* storage=new GAGCore::MemoryStreamBackend;
         GAGCore::BinaryOutputStream writer(storage);
         world.game.map.save(&writer);
@@ -149,16 +164,23 @@ TEST_CASE("terrain loaders reject invalid resources occupants and sector dimensi
         Map restored;
         CHECK_FALSE(restored.load(stream.get(),header,&world.game));
     }
-    world.game.map.tiles[0]=original;
-    auto bad=bytes; bad[12]=char(254); // Invalid packed undermap encoding.
-    auto stream=input(bad);
-    Map restored;
+    poke(original);
+	auto bad = poisoned(bytes, out, "encoding", 254); // First packed array is the vertex terrain.
+	auto stream = input(bad);
+	Map restored;
     CHECK_FALSE(restored.load(stream.get(),header,&world.game));
-    for (const char* field : {"wSector", "hSector"}) {
-        auto stream = input(poisoned(bytes, out, field, 0));
+	for (const char *field : {"chunks", "length"})
+	{
+		auto malformed = input(poisoned(bytes, out, field, 0xffffffff));
+		Map map;
+		CHECK_FALSE(map.load(malformed.get(), header, &world.game));
+	}
+	for (const char *field : {"wSector", "hSector"})
+	{
+		auto stream = input(poisoned(bytes, out, field, 0));
         Map restored;
         CHECK_FALSE(restored.load(stream.get(), header, &world.game));
-    }
+	}
 }
 TEST_CASE("compressed file size is checked before allocation") {
     glob2test::TempDir directory;
@@ -213,7 +235,7 @@ TEST_CASE("entity loaders reject malicious indices before using them [save-forma
     for (const auto& [field, value] : std::vector<std::pair<const char*, Uint32>>{
             {"typeNum", 0xffffffff}, {"typeNum", Uint32(globals->buildingsTypes.size())}, {"gid", 0xffff},
             {"unitStayRange", 0xffffffff}, {"minLevelToFlag", 0xffffffff}, {"ratio[0]", 0x7fffffff},
-            {"buildingState", 0xffffffff}, {"constructionResultState", 0xffffffff}, {"clearingRessources[3]", 1}}) {
+            {"buildingState", 0xffffffff}, {"constructionResultState", 0xffffffff}, {"clearingRessources[3]", 2}}) {
         auto stream = input(poisoned(buildingBytes, buildingOut, field, value));
         CHECK_THROWS_AS(Building(stream.get(), &globals->buildingsTypes, world.team, VERSION_MINOR), std::runtime_error);
     }

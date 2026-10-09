@@ -1,16 +1,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <iostream>
 #include "GlobalContainer.h"
 #include "Game.h"
 #include "Map.h"
+#include "MapInternal.h"
 #include "Building.h"
 #include "BuildingType.h"
 #include "IntBuildingType.h"
 #include "Player.h"
 #include "Order.h"
 #include "Brush.h"
+#include "BuildingGradientSearch.h"
+#include "BuildingGradientStats.h"
+#include <sstream>
 #include <PerformanceTelemetry.h>
 #include <memory>
 #include <vector>
@@ -38,6 +43,33 @@ void player(Fixture& f){f.game.players[0]=new Player();f.game.players[0]->setTea
 
 TEST_SUITE("MapGradientInvalidation")
 {
+ TEST_CASE("forbidden painting refreshes routes across passable resources")
+ {
+  glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.loadStrings = true});
+  for(int swim=0;swim<SWIM_CLASS_COUNT;++swim) {
+   Fixture f(0); player(f); auto& map=f.game.map;
+   auto* building=f.game.addBuilding(8,8,globals->buildingsTypes.getTypeNum("inn",0,false),0);
+   REQUIRE(building);
+   using Json=nlohmann::json;
+   const auto cottonId=*map.resourceRegistry().find("cotton");
+   auto definition=Json::parse(map.resourceRegistry().serialize())["resources"][resourceIndex(cottonId)];
+   definition["key"]="test-passable-fabric";
+   definition["properties"]["blocksGround"]=false;
+   definition["properties"]["clearable"]=true;
+   map.installResourceDefinitions(Json{{"schemaVersion",1},{"resources",Json::array({definition})}}.dump());
+   const auto cotton=*map.resourceRegistry().find("test-passable-fabric");
+   map.setResource(20,20,cotton,1);
+   REQUIRE(!map.resourceBlocksGround(map.coordToIndex(20,20)));
+   map.buildingGradient(building,swim); map.finishBuildingGradient(building,swim);
+   edit(f,20,20,true);
+   const auto* gradient=map.buildingGradient(building,swim); map.finishBuildingGradient(building,swim);
+   REQUIRE(gradient[map.coordToIndex(20,20)]==GRADIENT_FORBIDDEN);
+   const std::vector<Uint16> actual(gradient,gradient+map.getW()*map.getH());
+   map.updateGlobalGradient(building,swim); map.finishBuildingGradient(building,swim);
+   REQUIRE(std::equal(actual.begin(),actual.end(),building->globalGradient[building->routeSlot(swim,BuildingRoute::Automatic)]));
+  }
+ }
+
 	TEST_CASE("forbidden edits invalidate exactly the affected fields and preserve the rest")
 	{
 		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.loadStrings = true});
@@ -45,26 +77,26 @@ TEST_SUITE("MapGradientInvalidation")
 	 for(int swim=0;swim<SWIM_CLASS_COUNT;++swim)for(int resource:{WHEAT,WOOD,NO_RES_TYPE})for(bool selected:{false,true})for(bool mixed:{false,true})for(bool add:{false,true}) {
 	  Fixture f(1);player(f);auto& m=f.game.map;int n=m.getW()*m.getH();std::vector<Building*> bs;
 	  for(int team=0;team<2;++team)for(const char* kind:{"inn","warflag","explorationflag","clearingflag"}){
-	   int x=team?42:8,y=8+int(bs.size()%4)*10;auto* b=f.game.addBuilding(x,y,globals->buildingsTypes.getTypeNum(kind,0,false),team);REQUIRE(b);b->unitStayRange=32;b->clearingResources[WHEAT]=b->clearingResources[WOOD]=true;bs.push_back(b);
+	   int x=team?42:8,y=8+int(bs.size()%4)*10;auto* b=f.game.addBuilding(x,y,globals->buildingsTypes.getTypeNum(kind,0,false),team);REQUIRE(b);b->unitStayRange=32;b->clearingMaterials[WHEAT]=b->clearingMaterials[WOOD]=true;bs.push_back(b);
 	  }
-	  if(resource!=NO_RES_TYPE)m.setResource(20,20,resource,1);
-	  m.setResource(25,24,WHEAT,1);m.addGuardArea(26,26,0);if(selected)m.addClearArea(20,20,0);
+	  if(resource!=NO_RES_TYPE)m.setResourceByIndex(20,20,resource,1);
+	  m.setResourceByIndex(25,24,WHEAT,1);m.addGuardArea(26,26,0);if(selected)m.addClearArea(20,20,0);
 	  if(!add){m.addForbidden(20,20,0);if(mixed)m.addForbidden(21,20,0);}
 	  for(auto* b:bs){m.buildingGradient(b,swim);m.updateGlobalGradient(b,swim);m.finishBuildingGradient(b,swim);}
 	  m.getForbiddenGradient(0,swim);m.getGuardAreasGradient(0,swim);m.getClearAreasGradient(0,swim);
 	  edit(f,20,20,add,mixed);
-	  for(auto* b:bs){auto* g=m.buildingGradient(b,swim);m.finishBuildingGradient(b,swim);std::vector<Uint16> before(g,g+n);m.updateGlobalGradient(b,swim);m.finishBuildingGradient(b,swim);REQUIRE(std::equal(before.begin(),before.end(),b->globalGradient[swim]));++checks;}
+	  for(auto* b:bs){auto* g=m.buildingGradient(b,swim);m.finishBuildingGradient(b,swim);std::vector<Uint16> before(g,g+n);m.updateGlobalGradient(b,swim);m.finishBuildingGradient(b,swim);REQUIRE(std::equal(before.begin(),before.end(),b->globalGradient[b->routeSlot(swim, BuildingRoute::Automatic)]));++checks;}
 	  auto area=[&](auto get,auto update){const Uint16* g=(m.*get)(0,swim);std::vector<Uint16> before(g,g+n);(m.*update)(0,swim);REQUIRE(std::equal(before.begin(),before.end(),(m.*get)(0,swim)));++checks;};
 	  area(&Map::getForbiddenGradient,static_cast<void(Map::*)(int,int)>(&Map::updateForbiddenGradient));
 	  area(&Map::getGuardAreasGradient,static_cast<void(Map::*)(int,int)>(&Map::updateGuardAreasGradient));
 	  area(&Map::getClearAreasGradient,static_cast<void(Map::*)(int,int)>(&Map::updateClearAreasGradient));
 	 }
 	 // Already-stale walking fields must not be blessed current by an unrelated order.
-	 {Fixture f(1);player(f);auto& m=f.game.map;auto* b=f.game.addBuilding(8,8,globals->buildingsTypes.getTypeNum("inn",0,false),0);m.setResource(20,20,WHEAT,1);m.buildingGradient(b,0);auto old=b->gradientGeneration[0];m.addForbidden(30,30,1);REQUIRE(old!=m.topologyGeneration);edit(f,20,20,true);REQUIRE(b->gradientGeneration[0]==old);}
+	 {Fixture f(1);player(f);auto& m=f.game.map;auto* b=f.game.addBuilding(8,8,globals->buildingsTypes.getTypeNum("inn",0,false),0);m.setResourceByIndex(20,20,WHEAT,1);m.buildingGradient(b,0);auto old=b->gradientGeneration[0];m.addForbidden(30,30,1);REQUIRE(old!=m.topologyGeneration);edit(f,20,20,true);REQUIRE(b->gradientGeneration[0]==old);}
 	 // Irrelevant orders preserve a paused search, its frozen field and dirty status.
 	 {Fixture f(1);player(f);auto& m=f.game.map;
 	  auto* b=f.game.addBuilding(8,8,globals->buildingsTypes.getTypeNum("inn",0,false),0);
-	  m.setResource(20,20,WHEAT,1);m.buildingGradient(b,0);m.updateGlobalGradient(b,0);
+	  m.setResourceByIndex(20,20,WHEAT,1);m.buildingGradient(b,0);m.updateGlobalGradient(b,0);
 	  auto* search=b->globalGradientSearch[0].get();REQUIRE(search);
 	  auto* field=b->globalGradient[0];std::vector<Uint16> snapshot(field,field+4096);
 	  const bool dirty=b->dirtyGradient[0];edit(f,20,20,true);
@@ -74,11 +106,11 @@ TEST_SUITE("MapGradientInvalidation")
 	  REQUIRE((m.topologyGeneration==generation && b->globalGradientSearch[0].get()==search));
 	 }
 	 // Record a pre-existing stale escape field that an incidental forbidden edit used to refresh.
-	 {Fixture f(1);player(f);auto& m=f.game.map;f.game.gameHeader.setResourceGrowthDisabled(true);m.setResource(20,20,WHEAT,1);m.setResource(21,20,WHEAT,1);m.addForbidden(20,20,0);m.addForbidden(21,20,0);m.getForbiddenGradient(0,0);m.getTile(21,20).resource.clear();edit(f,20,20,false);auto* g=m.getForbiddenGradient(0,0);auto stale=g[m.coordToIndex(21,20)];const int bound=8*f.game.mapHeader.getNumberOfTeams()*SWIM_CLASS_COUNT; for(int i=0;i<=bound;++i)m.syncStep(i); auto fresh=g[m.coordToIndex(21,20)];std::cout<<"ESCAPE_STALENESS stale="<<stale<<" fresh="<<fresh<<"\n";REQUIRE(stale!=fresh);}
+	 {Fixture f(1);player(f);auto& m=f.game.map;f.game.gameHeader.setResourceGrowthDisabled(true);m.setResourceByIndex(20,20,WHEAT,1);m.setResourceByIndex(21,20,WHEAT,1);m.addForbidden(20,20,0);m.addForbidden(21,20,0);m.getForbiddenGradient(0,0);m.replaceResource(21,20, Resource{});edit(f,20,20,false);auto* g=m.getForbiddenGradient(0,0);auto stale=g[m.coordToIndex(21,20)];const int bound=8*f.game.mapHeader.getNumberOfTeams()*SWIM_CLASS_COUNT; for(int i=0;i<=bound;++i)m.syncStep(i); auto fresh=g[m.coordToIndex(21,20)];std::cout<<"ESCAPE_STALENESS stale="<<stale<<" fresh="<<fresh<<"\n";REQUIRE(stale!=fresh);}
 	 // A worker in the middle of a ring cannot use a freshly depleted exit until refresh.
 	 {Fixture f(1);player(f);auto& m=f.game.map;m.addForbidden(20,20,0);
-	 for(int y=19;y<=21;++y)for(int x=19;x<=21;++x)if(x!=20||y!=20)m.setResource(x,y,WHEAT,1);
-	 m.setResource(25,25,WHEAT,1);m.getForbiddenGradient(0,0);m.getTile(21,20).resource.clear();m.getTile(21,20).canResourcesGrow=false;edit(f,25,25,true);
+	 for(int y=19;y<=21;++y)for(int x=19;x<=21;++x)if(x!=20||y!=20)m.setResourceByIndex(x,y,WHEAT,1);
+	 m.setResourceByIndex(25,25,WHEAT,1);m.getForbiddenGradient(0,0);m.replaceResource(21,20, Resource{});m.setResourcesGrow(21,20, false);edit(f,25,25,true);
 	 int dx=0,dy=0;bool before=m.pathfindForbidden(nullptr,0,0,20,20,&dx,&dy);REQUIRE(!before);
 	 const int bound=8*f.game.mapHeader.getNumberOfTeams()*SWIM_CLASS_COUNT;
 	 for(int tick=1;tick<=bound;++tick)m.syncStep(tick);
@@ -90,31 +122,31 @@ TEST_SUITE("MapGradientInvalidation")
 	 for(int mutation=0;mutation<12;++mutation)for(int swim=0;swim<SWIM_CLASS_COUNT;++swim){
 	  Fixture f(1);player(f);f.game.gameHeader.setResourceGrowthDisabled(true);auto& m=f.game.map;
 	  for(int y=16;y<25;++y)for(int x=16;x<25;++x)m.addForbidden(x,y,0);
-	  m.setResource(20,20,WHEAT,1);m.getTile(20,20).resource.amount=3;
+	  m.setResourceByIndex(20,20,WHEAT,1);m.setResourceAmount(m.coordToIndex(20,20), 3);
 	  if(mutation==4)m.markImmobileUnit(21,20,0);
 	  if(mutation==6)m.setBuilding(21,20,1,1,42);
-	  if(mutation==8)m.setTerrain(21,20,256);
+	  if(mutation==8)m.paintCell(21, 20, WATER);
 	  auto* g=m.getForbiddenGradient(0,swim);std::vector<Uint16> old(g,g+4096);
 	  switch(mutation){
-	   case 0:m.getTile(20,20).resource.amount=1;m.decResource(20,20);break;
-	   case 1:m.incResource(21,20,WHEAT,0);break;
+	   case 0:m.setResourceAmount(m.coordToIndex(20,20), 1);m.decResource(20,20);break;
+	   case 1:m.incResourceByIndex(21,20,WHEAT,0);break;
 	   case 2:m.decResource(20,20);break; // quantity3->2 leaves blocking unchanged
 	   case 3:m.markImmobileUnit(21,20,0);break;
 	   case 4:m.clearImmobileUnit(21,20);break;
 	   case 5:m.setBuilding(21,20,1,1,42);break;
 	   case 6:m.setBuilding(21,20,1,1,NOGBID);break;
-	   case 7:m.setTerrain(21,20,256);break;
-	   case 8:m.setTerrain(21,20,0);break;
+	   case 7:m.paintCell(21, 20, WATER);break;
+	   case 8:m.paintCell(21, 20, GRASS);break;
 	   case 9:edit(f,20,20,true);break; // no-op forbidden brush
 	   case 10:edit(f,20,20,false);break; // resource-only mask edit
-	   case 11:m.getTile(20,20).resource.type=WOOD;break;
+	   case 11:{auto resource=m.getResource(20,20);resource.type=WOOD;m.replaceResource(20,20,resource);break;}
 	  }
 	  auto rebuilds=propagations();
 	  m.syncStep(swim*8); // exact scheduled team0 slot
 	  auto rebuildCount=propagations()-rebuilds;
 	  std::vector<Uint16> checked(g,g+4096);m.updateForbiddenGradient(0,swim);
 	  REQUIRE(std::equal(checked.begin(),checked.end(),g));
-	  bool unchanged=mutation==2||mutation==9||mutation==10||mutation==11
+	  bool unchanged=mutation==2||mutation==7||mutation==8||mutation==9||mutation==10||mutation==11
 	   || (swim==Map::SWIM_CLASS_EVEN && (mutation==7||mutation==8));
 	  bool uniform=swim==0||swim==Map::SWIM_CLASS_EVEN;
 	  REQUIRE(rebuildCount==(!uniform||!unchanged?1:0));
@@ -124,7 +156,7 @@ TEST_SUITE("MapGradientInvalidation")
 	 {Fixture f(3);player(f);f.game.gameHeader.setResourceGrowthDisabled(true);auto& m=f.game.map;
 	  for(int y=17;y<=23;++y)for(int x=17;x<=23;++x){
 	   for(int team=0;team<4;++team)m.addForbidden(x,y,team);
-	   if(x==17||x==23||y==17||y==23)m.setResource(x,y,WHEAT,1);
+	   if(x==17||x==23||y==17||y==23)m.setResourceByIndex(x,y,WHEAT,1);
 	  }
 	  for(int team=0;team<4;++team)for(int swim=0;swim<SWIM_CLASS_COUNT;++swim)m.getForbiddenGradient(team,swim);
 	  auto before=propagations();int lookups=0;
@@ -152,5 +184,90 @@ TEST_SUITE("MapGradientInvalidation")
 	  REQUIRE(maxGap>=cycle);
 	  std::cout<<"FOUR_TEAM_WRAP slots="<<slots<<" cycle="<<cycle<<" tested_ticks="<<4*cycle<<" maximum_gap="<<maxGap<<" strict_bound="<<2*cycle<<" builds="<<totalBuilds<<" PASS\n";
 	 }
+	}
+
+	TEST_CASE("gradient stats record field lifetimes without changing fields")
+	{
+		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.loadStrings = true});
+		using Stats = BuildingGradientStats;
+		Fixture f(1); auto& m=f.game.map;
+		m.gradientStats=std::make_unique<Stats>();
+		auto& stats=*m.gradientStats;
+		auto* b=f.game.addBuilding(8,8,globals->buildingsTypes.getTypeNum("inn",0,false),0);
+		REQUIRE(b);
+		const int n=m.getW()*m.getH();
+		// Cold build: a Null rebuild row without a previous lifetime.
+		m.buildingGradient(b,0);
+		REQUIRE(stats.rows().size()==1);
+		CHECK(stats.rows().back().reason==Stats::Reason::Null);
+		CHECK(!stats.rows().back().hasPrevious);
+		// Advance past the dirty-rebuild throttle and let the next use rebuild.
+		auto rebuildAfter=[&](auto change) {
+			change();
+			f.game.stepCounter+=200;
+			const auto before=stats.rows().size();
+			int distance=0;
+			// Prepares the field and settles only the layers up to a nearby cell.
+			m.buildingAvailable(b,0,11,11,&distance);
+			REQUIRE(stats.rows().size()==before+1);
+			CHECK(stats.rows().back().reason==Stats::Reason::Generation);
+		};
+		// The previous lifetime was the completed cold field.
+		rebuildAfter([&]{ m.addForbidden(30,30,1); });
+		CHECK(stats.rows().back().prevComplete);
+		CHECK(stats.rows().back().prevSettledCost>0);
+		CHECK(stats.rows().back().lifetimeReason==Stats::Reason::Null);
+		// The next lifetime was only settled near the building.
+		REQUIRE(!b->globalGradientSearch[0]->complete());
+		rebuildAfter([&]{ m.addForbidden(40,40,0); });
+		CHECK(!stats.rows().back().prevComplete);
+		CHECK(stats.rows().back().prevQueries>=1);
+		CHECK(stats.rows().back().prevExtensions>=1);
+		CHECK(stats.rows().back().lifetimeReason==Stats::Reason::Generation);
+		CHECK(stats.rebuilds(Stats::Reason::Generation)==2);
+
+		// The depth histogram partitions popped entries; settled cost advances.
+		m.finishBuildingGradient(b,0);
+		const auto& search=*b->globalGradientSearch[0];
+		std::uint64_t binned=0;
+		for(auto v:search.poppedAtDepth) binned+=v;
+		CHECK(binned==search.poppedEntries());
+		CHECK(search.settledCost()>0);
+
+		// Drops and evictions close lifetimes; the end of a run closes the rest.
+		b->resetPathfindGradients();
+		CHECK(stats.rows().back().event==Stats::Event::Drop);
+		m.buildingGradient(b,0);
+		f.game.stepCounter+=1000;
+		b->freeIdleGradients();
+		CHECK(stats.rows().back().event==Stats::Event::Evict);
+		m.buildingGradient(b,0);
+		stats.finish(f.game);
+		CHECK(stats.rows().back().event==Stats::Event::End);
+		std::ostringstream csv, json;
+		stats.writeCsv(csv); stats.writeJson(json);
+		const auto parsed=nlohmann::json::parse(json.str());
+		CHECK(parsed["rebuilds"]["generation"]==2);
+		CHECK(parsed["rows"]==stats.rows().size());
+		std::istringstream lines(csv.str()); std::string line; size_t rows=0, columns=0;
+		while(std::getline(lines,line)) {
+			const auto commas=size_t(std::count(line.begin(),line.end(),','));
+			if(!rows) columns=commas;
+			CHECK(commas==columns);
+			++rows;
+		}
+		CHECK(rows==stats.rows().size()+1);
+		// Owner inputs of the lifetime a row closes, captured when it started.
+		CHECK(csv.str().find(",width,height,level,is_site,construction_state,progress,team_units,team_buildings,staged,previous_hint,serving_settled\n")!=std::string::npos);
+		const auto& closed=stats.rows().back();
+		CHECK(closed.context.known);
+		CHECK(closed.context.buildings==f.game.teams[0]->liveBuildings.size());
+		CHECK((!closed.context.site && closed.context.progress==-1 && closed.context.level==0));
+
+		// Statistics never change the field itself.
+		std::vector<Uint16> withStats(b->globalGradient[0],b->globalGradient[0]+n);
+		m.gradientStats.reset();
+		m.updateGlobalGradient(b,0); m.finishBuildingGradient(b,0);
+		CHECK(std::equal(withStats.begin(),withStats.end(),b->globalGradient[0]));
 	}
 }

@@ -444,7 +444,7 @@ struct Environment
 		static const char *names[] = {"teams",    "units",     "buildings",    "unit",
 									  "building", "tile",      "region",       "objectives",
 									  "hints",    "interface", "buildingTypes", "wakeAgent",
-									  "experiments", "rules"};
+									  "experiments", "rules", "terrainTypes", "resourceTypes", "materialTypes"};
 		auto &e = *static_cast<Environment *>(JS_GetContextOpaque(ctx));
 		try
 		{
@@ -475,10 +475,9 @@ struct Environment
 				return list.release();
 			}
 			auto value = e.toJS(result);
-			// rules() is appended at index 13 in both dispatch tables below. Freeze
-			// its detached snapshot in both profiles: observing match capabilities
-			// must never offer a script a way to change authoritative game rules.
-			if ((e.host->profile == 2 || magic == 13) && JS_IsObject(value))
+			// Rules and terrain definitions are appended at indices 13 and 14.
+			// Freeze their detached snapshots in both profiles.
+			if ((e.host->profile == 2 || magic >= 13) && JS_IsObject(value))
 				e.readonly(value);
 			return value;
 		}
@@ -511,9 +510,9 @@ struct Environment
 		static const char *names[] = {"teams",    "units",     "buildings",    "unit",
 									  "building", "tile",      "region",       "objectives",
 									  "hints",    "interface", "buildingTypes", "wakeAgent",
-									  "experiments", "rules"};
+									  "experiments", "rules", "terrainTypes", "resourceTypes", "materialTypes"};
 		for (int i = 0; i < int(std::size(names)); ++i)
-			if (!host->commander || i < 7 || i == 10 || i == 12 || i == 13) set(i == 5 || i == 6 ? map.get() : game.get(), names[i],
+			if (!host->commander || i < 7 || i == 10 || i == 12 || i >= 13) set(i == 5 || i == 6 ? map.get() : game.get(), names[i],
 				JS_NewCFunctionMagic(ctx, query, names[i], 0, JS_CFUNC_generic_magic, i));
 		if (host->commander)
 			set(context.get(), "wakeAgent", JS_NewCFunctionMagic(ctx, query, "wakeAgent", 1, JS_CFUNC_generic_magic, 11));
@@ -896,8 +895,9 @@ class QuickRuntime : public Runtime
 		}
 	}
 	void discard() noexcept override { live.reset(); }
-	Metadata inspect(const std::string &source)
+	Metadata inspect(const std::string &source, std::string *stage)
 	{
+		if (stage) *stage = "startup";
 		Live temporary(source);
 		auto &e = temporary.environment;
 		JSValueOwner bindings(e.ctx, JS_Glob2ModuleBindings(e.ctx, temporary.module));
@@ -923,7 +923,9 @@ class QuickRuntime : public Runtime
 			if (JS_IsException(value.get()))
 				e.fail();
 			const auto data = e.fromJS(value.get());
+			if (stage) *stage = "file";
 			metadata.apiVersion = data.integer("apiVersion", 1, 2);
+			if (stage) *stage = "startup";
 			metadata.name = data.string("name");
 			if (metadata.name.empty() || metadata.name.size() > 128)
 				throw std::runtime_error("AI name must contain 1..128 UTF-8 bytes");
@@ -941,6 +943,7 @@ class QuickRuntime : public Runtime
 			throw std::runtime_error("Renamed callback exports require API profile 2 metadata");
 		// metadata is deliberately separate from the gameplay runtime. Validate
 		// fresh source globals as well, rather than metadata's mutated bindings.
+		if (stage) *stage = "state";
 		Live startup(source);
 		GlobalsCodec codec(startup.environment, startup.definitions->get());
 		JSValueOwner initial(startup.environment.ctx,
@@ -1095,8 +1098,8 @@ std::unique_ptr<Runtime> makeRuntime()
 {
 	return std::make_unique<QuickRuntime>();
 }
-Metadata inspectAI(const std::string &source)
+Metadata inspectAI(const std::string &source, std::string *stage)
 {
-	return QuickRuntime().inspect(source);
+	return QuickRuntime().inspect(source, stage);
 }
 } // namespace Script

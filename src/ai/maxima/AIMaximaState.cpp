@@ -4,17 +4,20 @@
 // Save/load of the resolved strategy, director, and pending execution work.
 #include "AIMaximaContinuation.h"
 #include "AIMaxima.h"
+#include "Version.h"
 #include "Game.h"
 #include "Player.h"
 #include "Map.h"
 #include "Unit.h"
 #include "FormatableString.h"
 #include "FileFormatVersions.h"
+#include "AIMaximaBuildings.h"
 
 #include <stdexcept>
 
 namespace
 {
+constexpr const char* MEAL_DEMAND_NAMES[]={"feeding_workers","feeding_explorers","feeding_warriors"};
 constexpr Uint32 MAXIMA_LEGACY_OPPONENT_COUNT = 12; // Historical wire layout, never raise with the live cap.
 static_assert(MAXIMA_LEGACY_OPPONENT_COUNT <= Team::MAX_COUNT);
 }
@@ -183,6 +186,10 @@ template<class Archive> void Maxima::executionState(Archive& a)
 	a("last_food_retirement_tick",last_food_retirement_tick);
 	a("food_supported_inns",food_supported_inns);
 	a("food_supported_swarms",food_supported_swarms);
+    if(a.version()>=FILE_FORMAT_VERSION_BUILDING_CATALOG) {
+        a("food_birth_crop_rate",food_birth_crop_rate);
+        if(food_birth_crop_rate<0)throw std::runtime_error("Invalid saved production crop budget");
+    }
 	a("food_ledger_valid",food_ledger_valid);
 
 	a("relocation_since",relocation_since);
@@ -240,7 +247,7 @@ void Maxima::loadExecutionState(GAGCore::InputStream* stream, Sint32 versionMino
         strategy.reconnaissance.force_memory_hold_ticks,
         strategy.reconnaissance.stale_contact_age_ticks,
         strategy.reconnaissance.force_memory_enabled);
-    AIMaximaContinuation::Reader archive(stream,versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE);
+    AIMaximaContinuation::Reader archive(stream,versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE,versionMinor);
     executionState(archive);
     if(offense_waves.size()>64)
         throw std::runtime_error("Too many saved Maxima offense waves");
@@ -284,20 +291,47 @@ void Maxima::loadExecutionState(GAGCore::InputStream* stream, Sint32 versionMino
 
 std::string Maxima::auditStrategyJson() const
 {
+    auto ownerObservation=context.scopeOwnerObservation();
     ResolvedStrategy actual;
     std::string error;
-    StrategyResolver::resolveForPlayer(context.player->game->gameHeader,
-        context.player->number, actual, error);
+    StrategyResolver::resolveForPlayer(*context.observation().configuration,
+        context.playerNumber(), actual, error);
     actual.values=strategy;
     return StrategyResolver::resolvedJson(actual);
 }
 
 std::shared_ptr<Order> Maxima::getOrder()
 {
-	observe_wave_delivery();
-	ensure_strategy();
-	context.telemetry = telemetry;
-	return context.getOrder(*this);
+    auto world=AIEngine::AIWorldView::capture(*context.player->game,AIEngine::AIWorldView::captureCatalog(*context.player->game));
+    const std::vector<AIEngine::ExecutionReceipt> receipts;
+    AIEngine::DecisionContext decision{*world,unsigned(context.player->number),unsigned(context.player->team->teamNumber),receipts,world};
+    decision.fieldDiagnostics=fieldDiagnostics;
+    return getOrder(decision);
+}
+std::shared_ptr<Order> Maxima::getOrder(const AIEngine::DecisionContext& decision)
+{
+    // The engine gives each job its own diagnostic sink. A missing job sink
+    // disables capture; the Session-owned sink is restored on every exit.
+    auto ownerDiagnostics=fieldDiagnostics;
+    fieldDiagnostics=decision.fieldDiagnostics;
+    const auto release=[&] {context.releaseObservation();fieldDiagnostics=ownerDiagnostics;};
+    try {
+        context.bindObservation(decision);
+        for(const auto& receipt:decision.receipts) {
+            if(receipt.command.empty())continue;
+            auto order=Order::getOrder(receipt.command.data(),receipt.command.size(),VERSION_MINOR);
+            if(order) {
+            order->aiSelectedTarget=receipt.selectedTarget;
+            orderExecutionCompleted(*order,receipt.status==AIEngine::ExecutionStatus::Accepted);
+        }
+        }
+        observe_wave_delivery();ensure_strategy();context.telemetry=telemetry;
+        auto order=context.getOrder(*this);
+        for(auto& diagnostic:context.bufferedDiagnostics)
+            bufferedDiagnostics.push_back(std::move(diagnostic));
+        context.bufferedDiagnostics.clear();
+        release();return order;
+    } catch(...) {release();throw;}
 }
 
 
@@ -309,10 +343,12 @@ void Maxima::saveDirector(GAGCore::OutputStream* stream) const
 #define WRITE_SNAPSHOT(field) stream->writeSint32(snapshot.field,#field);
 	MAXIMA_SNAPSHOT_FIELDS(WRITE_SNAPSHOT)
 #undef WRITE_SNAPSHOT
+    for(int unit=0;unit<3;++unit)stream->writeSint32(snapshot.feeding_demand[unit],MEAL_DEMAND_NAMES[unit]);
 	stream->writeLeaveSection();stream->writeEnterSection("previous_snapshot");
 #define WRITE_PREVIOUS(field) stream->writeSint32(previous_snapshot.field,#field);
 	MAXIMA_SNAPSHOT_FIELDS(WRITE_PREVIOUS)
 #undef WRITE_PREVIOUS
+    for(int unit=0;unit<3;++unit)stream->writeSint32(previous_snapshot.feeding_demand[unit],MEAL_DEMAND_NAMES[unit]);
 	stream->writeLeaveSection();
 	stream->writeEnterSection("trends");stream->writeSint32(trends.population,"population");stream->writeSint32(trends.workers,"workers");stream->writeSint32(trends.warriors,"warriors");stream->writeSint32(trends.food_pressure,"food_pressure");stream->writeSint32(trends.colony_pressure,"colony_pressure");stream->writeLeaveSection();
 #define MAXIMA_ENV_FIELDS(DO) DO(known_tiles) DO(accessible_corn) DO(accessible_wood) DO(accessible_stone) DO(accessible_algae) DO(buildable_tiles) DO(water_tiles) DO(feeding_capacity) DO(food_headroom) DO(resource_capacity) DO(space_capacity) DO(food_security) DO(abundance) DO(terrain_abundance) DO(connected_abundance) DO(mobility_opportunity) DO(economic_momentum) DO(mobility_constraint) DO(topology_complexity) DO(threat_pressure) DO(confidence)
@@ -394,10 +430,18 @@ bool Maxima::loadDirector(GAGCore::InputStream* stream,
 #define READ_SNAPSHOT(field) snapshot.field=stream->readSint32(#field);
 	MAXIMA_SNAPSHOT_FIELDS(READ_SNAPSHOT)
 #undef READ_SNAPSHOT
+    if(versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG)for(int unit=0;unit<3;++unit) {
+        snapshot.feeding_demand[unit]=stream->readSint32(MEAL_DEMAND_NAMES[unit]);
+        if(snapshot.feeding_demand[unit]<0)throw std::runtime_error("Invalid saved recurring meal demand");
+    }
 	stream->readLeaveSection();stream->readEnterSection("previous_snapshot");
 #define READ_PREVIOUS(field) previous_snapshot.field=stream->readSint32(#field);
 	MAXIMA_SNAPSHOT_FIELDS(READ_PREVIOUS)
 #undef READ_PREVIOUS
+    if(versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG)for(int unit=0;unit<3;++unit) {
+        previous_snapshot.feeding_demand[unit]=stream->readSint32(MEAL_DEMAND_NAMES[unit]);
+        if(previous_snapshot.feeding_demand[unit]<0)throw std::runtime_error("Invalid saved recurring meal demand");
+    }
 	stream->readLeaveSection();
 
 	stream->readEnterSection("trends");trends.population=stream->readSint32("population");trends.workers=stream->readSint32("workers");trends.warriors=stream->readSint32("warriors");trends.food_pressure=stream->readSint32("food_pressure");trends.colony_pressure=stream->readSint32("colony_pressure");stream->readLeaveSection();
@@ -412,7 +456,7 @@ bool Maxima::loadDirector(GAGCore::InputStream* stream,
 	const Uint32 count = versionMinor >= FILE_FORMAT_VERSION_COUNTED_TEAM_STATE
 		? stream->readCount("count") : MAXIMA_LEGACY_OPPONENT_COUNT;
 	if (count == 0 || count > Team::MAX_COUNT ||
-		(context.player && count < unsigned(context.player->game->teamsCount())))
+		count < context.observation().teams.size())
 		throw std::runtime_error("Invalid Maxima opponent record count");
 	std::fill(std::begin(opponents), std::end(opponents), OpponentAssessment{});
 	for (Uint32 i = 0; i < count; ++i)
@@ -492,6 +536,7 @@ bool Maxima::loadDirector(GAGCore::InputStream* stream,
 
 bool Maxima::load(GAGCore::InputStream *stream, Player *player, Sint32 versionMinor)
 {
+    auto ownerObservation=context.scopeOwnerObservation();
 	if(versionMinor<115)
 		throw std::runtime_error("This Maxima save uses a retired strategy format");
 	ensure_strategy();
@@ -505,6 +550,7 @@ bool Maxima::load(GAGCore::InputStream *stream, Player *player, Sint32 versionMi
 bool Maxima::loadState(GAGCore::InputStream *stream, Player *player,
 	Sint32 versionMinor)
 {
+    auto ownerObservation=context.scopeOwnerObservation();
 	if(versionMinor<115)
 		throw std::runtime_error("This Maxima save uses a retired strategy format");
 	director=StrategyDirector();
@@ -637,6 +683,22 @@ bool Maxima::loadState(GAGCore::InputStream *stream, Player *player,
 	if(player && player->map)
 		initialize_farming_cache(context);
 	loadExecutionState(stream, versionMinor);
+	if(versionMinor<FILE_FORMAT_VERSION_BUILDING_CATALOG) {
+	 // All old bytes have been read and validated. Only the obsolete family-
+	 // keyed planning projection is discarded; live jobs, clocks, entities,
+	 // staffing controllers, and already issued runtime orders remain intact.
+	 for(auto& [team,intel]:reconnaissance.mutableReport().opponents)for(auto& [gid,b]:intel.buildings){
+	  const int oldRole=b.type;b.type=-1;
+	  for(size_t id=0;id<player->game->buildingsTypes.size();++id){const auto* t=player->game->buildingsTypes.get(id);
+	   if(t->shortTypeNum==oldRole&&bool(t->isBuildingSite)==b.construction&&t->width==b.width&&t->height==b.height){b.type=int(id);break;}
+	  }
+	 }
+	 development_planner.reset();development_building_profiles.clear();development_profiles_initialized=false;configure_development_planner();
+	 development_reported_states.clear();development_cycle_pending=true;
+	 operating_colonies.clear();last_colony_accounted_action_id=0;
+	}
+	else for(const auto& [team,intel]:reconnaissance.report().opponents)for(const auto& [gid,b]:intel.buildings)
+	 if(b.type < -1 || (b.type>=0&&!player->game->buildingsTypes.get(b.type)))throw std::runtime_error("Invalid saved Maxima catalog variant");
 	stream->readLeaveSection();
 	return true;
 }
@@ -644,6 +706,7 @@ bool Maxima::loadState(GAGCore::InputStream *stream, Player *player,
 
 void Maxima::save(GAGCore::OutputStream *stream)
 {
+    auto ownerObservation=context.scopeOwnerObservation();
 	ensure_strategy();
 	stream->writeEnterSection("AIMaxima");
 	context.save(stream);
@@ -704,4 +767,11 @@ void Maxima::save(GAGCore::OutputStream *stream)
 
 
 
+}
+
+void AIMaxima::Maxima::orderExecutionCompleted(const Order& order, bool accepted)
+{
+    if(const auto* construction=dynamic_cast<const OrderConstruction*>(&order))
+        context.get_building_register().order_execution_completed(construction->gid,accepted,
+            order.aiSelectedTarget ? std::optional<Uint32>(order.aiSelectedTarget->generation) : std::nullopt);
 }

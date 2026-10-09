@@ -1,6 +1,8 @@
+#include "MaximaObservationFixture.h"
 // Link with the game objects (excluding Glob2.cpp) to exercise the real runtime.
 #include "EngineFixtures.h"
 #include <algorithm>
+#include <nlohmann/json.hpp>
 #include <utility>
 #include "GlobalContainer.h"
 #include "Version.h"
@@ -13,6 +15,7 @@
 #include "Player.h"
 #include "Utilities.h"
 #include "TeamStat.h"
+#include "AIMaximaBuildings.h"
 #include <memory>
 #include <limits>
 #include <locale>
@@ -30,7 +33,6 @@
 #include "../../src/ai/maxima/AIMaxima.h"
 #include "../../src/building/Building.h"
 #include "BuildingType.h"
-#include "../../src/building/IntBuildingType.h"
 #include "../../src/unit/Unit.h"
 #include <BinaryStream.h>
 #include <StreamBackend.h>
@@ -55,6 +57,7 @@ struct Fixture
 
     Fixture() : game(NULL)
     {
+        game.gameHeader.setRandomSeed(5489);
         // This fixture skips setGameHeader, which normally initializes the
         // player-wait state. syncStep must actually advance the simulation.
         game.setWaitingOnMask(0);
@@ -89,7 +92,7 @@ struct Fixture
     ::Building* building(int x, int y, int team, const char* type="inn", int level=0)
     {
         ::Building* result=game.addBuilding(game.map.normalizeX(x),game.map.normalizeY(y),
-            globalContainer->buildingsTypes.getTypeNum(type,level,false),team);
+            game.buildingsTypes.getTypeNum(type,level,false),team);
         REQUIRE(result);
         return result;
     }
@@ -122,7 +125,7 @@ struct Fixture
     {
         ai->reconnaissance.beginObservation(ai->timer,{building->owner->teamNumber});
         ai->reconnaissance.observeBuilding(Recon::BuildingSighting(building->gid,
-            building->owner->teamNumber,building->type->shortTypeNum,
+            building->owner->teamNumber,building->typeNum,
             building->posX,building->posY,building->type->width,
             building->type->height,false,ai->timer));
         ai->reconnaissance.finishObservation();
@@ -132,7 +135,7 @@ struct Fixture
     {
         for(int y=0; y<64; ++y) for(int x=0; x<64; ++x) {
             const bool land=y>=5 && y<=55 && ((x>=5 && x<=19) || (x>=26 && x<=45));
-            game.map.setTerrain(x,y,land ? 0 : 256);
+            game.map.paintCell(x, y, land ? GRASS : WATER);
         }
         ai->context.gradients.invalidate();
     }
@@ -199,6 +202,7 @@ static void defenseCoverage()
         int allocation=0;
         for(auto order:c.buildingOrders) {
             bool complete=false;
+            auto observation=c.scopeOwnerObservation();
             auto location=order->find_location(c,1,complete);
             REQUIRE((complete && location.found));
             flags.push_back(location.value);
@@ -226,14 +230,14 @@ static void economicRecoveryPreservesMilitaryBudget()
     a.opponents[1].score=10;
     a.opponents[1].estimated_warriors=10;
     a.strategy.emergencies.colony_enabled=false;
-    a.allocate_resources();
+    glob2test::withMaximaObservation(a.context,[&]() -> decltype(auto) {return a.allocate_resources();});
     const int reserve=a.budget.defense_reserve;
     const int attack=a.budget.attack_units;
     REQUIRE((a.budget.attack_flags==1 && attack>0));
     a.snapshot.unserved_food=50;
     a.snapshot.critical_food=50;
     a.posture=Maxima::PostureRecover;
-    a.allocate_resources();
+    glob2test::withMaximaObservation(a.context,[&]() -> decltype(auto) {return a.allocate_resources();});
     REQUIRE(a.severe_food_emergency());
     REQUIRE((a.budget.attack_flags==1 && a.budget.attack_units==attack));
     REQUIRE(a.budget.defense_reserve==reserve);
@@ -250,7 +254,7 @@ static void forbiddenDefenseZones()
     for(bool amphibious:{false,true}) {
         Fixture f;
         for(int y=0;y<64;++y) for(int x=0;x<64;++x)
-            f.game.map.setTerrain(x,y,(x>=5&&x<=50&&y>=20&&y<=27)?0:256);
+            f.game.map.paintCell(x,y,(x>=5&&x<=50&&y>=20&&y<=27)?GRASS:WATER);
         f.building(10,22,0);
         f.building(42,22,1)->seenByMask|=f.player.team->me;
         auto& a=*f.ai; auto& c=a.context; c.initialize();
@@ -339,12 +343,14 @@ static ::Building* materializeFlag(Fixture& f)
     REQUIRE(create);
     auto flag=f.game.addBuilding(create->posX,create->posY,create->typeNum,0);
     REQUIRE(flag);
-    c.buildings.tick();
+    {auto observation=c.scopeOwnerObservation();c.buildings.tick();}
     c.orders.clear();
     c.update_management_orders();
     for(auto order:c.orders) {
-        if(auto minimum=std::dynamic_pointer_cast<OrderModifyMinLevelToFlag>(order))
-            flag->minLevelToFlag=minimum->minLevelToFlag;
+        if(auto minimum=std::dynamic_pointer_cast<OrderModifyMinLevelToFlag>(order)) {
+            if(minimum->targetRole==1) flag->explorersRequireBombing=minimum->minLevelToFlag!=0;
+            else flag->minLevelToFlag=minimum->minLevelToFlag;
+        }
         if(auto size=std::dynamic_pointer_cast<OrderModifyFlag>(order))
             flag->unitStayRange=size->range;
         if(auto staffing=std::dynamic_pointer_cast<OrderModifyBuilding>(order))
@@ -419,7 +425,7 @@ static void rallyRejectsBlockedGround()
     // No room to muster must not fall through to an ungathered attack flag.
     REQUIRE(c.buildingOrders.empty());
     f.building(40,40,0);
-    c.buildings.tick();
+    {auto observation=c.scopeOwnerObservation();c.buildings.tick();}
     a.plan_offense(c);a.control_offense(c);
     REQUIRE(a.offense_waves.size()==1);
     auto* flag=materializeFlag(f);
@@ -465,7 +471,7 @@ static void rallyAssemblesByMovement()
         REQUIRE(f.game.map.getBuilding(flag->posX,flag->posY)==NOGBID);
         REQUIRE(flag->unitStayRange==4);
         for(auto* warrior:warriors) {
-            warrior->subscriptionSuccess(flag,false);
+            warrior->subscriptionSuccess(flag,false,true);
             flag->unitsWorking.push_back(warrior);
         }
         // Readiness includes the two-tile margin: crowding at the flag edge
@@ -714,13 +720,14 @@ static void streamingScalesWithArmy()
             }
         };
         for(int pass=0;pass<128;++pass) {
-            c.gradients.update(++f.game.stepCounter);
-            c.update_building_orders();drain();c.buildings.tick();
+            {auto observation=c.scopeOwnerObservation();c.gradients.update(++f.game.stepCounter);}
+            c.update_building_orders();drain();{auto observation=c.scopeOwnerObservation();c.buildings.tick();}
             c.update_management_orders();drain();
         }
         REQUIRE(c.buildingOrders.empty());
     };
     const auto allocation=[&](int total) {
+        auto observation=c.scopeOwnerObservation();
         int assigned=0;std::set<int> gids;
         for(int id:a.attack_flags) {
             auto* flag=c.buildings.get_building(id);REQUIRE(flag);
@@ -734,7 +741,7 @@ static void streamingScalesWithArmy()
     a.plan_offense(c);REQUIRE(a.budget.tactical_requested_force==45);
     a.control_offense(c);apply();REQUIRE(a.attack_flags.size()==3);allocation(45);
     const auto first=a.attack_flags;
-    for(int i=0;i<45;++i)f.attach(army[i],c.buildings.get_building(first[i/20]));
+    for(int i=0;i<45;++i)f.attach(army[i],f.game.teams[0]->myBuildings[Building::GIDtoID(c.buildings.found().at(first[i/20]).gid)]);
     a.plan_offense(c);
     REQUIRE((a.offense_diagnostics.eligibleWarriors==45 && a.budget.tactical_requested_force==45));
     a.control_offense(c);REQUIRE((a.attack_flags==first && c.buildingOrders.empty()));
@@ -747,7 +754,7 @@ static void streamingScalesWithArmy()
     a.control_offense(c);apply();REQUIRE(a.attack_flags.size()==2);allocation(25);
     REQUIRE((a.attack_flags[0]==first[0] && a.attack_flags[1]==first[1]));
     // A lost primary must promote a survivor without cancelling the mission.
-    c.buildings.get_building(first[0])->kill();c.buildings.tick();
+    f.game.teams[0]->myBuildings[Building::GIDtoID(c.buildings.found().at(first[0]).gid)]->kill();{auto observation=c.scopeOwnerObservation();c.buildings.tick();}
     a.handle_event(c,RuntimeEvent(RuntimeEvent::AttackFinished,first[0]));
     REQUIRE((a.tactical_mission.flagId==first[1] && a.campaign.state==Maxima::CampaignActive));
     a.control_offense(c);apply();REQUIRE(a.attack_flags.size()==2);allocation(25);
@@ -755,6 +762,7 @@ static void streamingScalesWithArmy()
     a.budget.tactical_target_x=40;a.budget.tactical_target_y=40;
     a.control_offense(c);apply();allocation(25);
     for(int id:a.attack_flags) {
+        auto observation=c.scopeOwnerObservation();
         auto* flag=c.buildings.get_building(id);
         REQUIRE((flag->posX==40 && flag->posY==40));
     }
@@ -771,7 +779,7 @@ static void streamingScalesWithArmy()
     for(int id:active) {
         bool cancelled=false;
         for(auto order:c.managementOrders)
-            if(auto* destroy=dynamic_cast<Management::DestroyBuilding*>(order.get()))cancelled|=destroy->id==id;
+            if(auto* destroy=dynamic_cast<Management::RetireAttraction*>(order.get()))cancelled|=destroy->id==id;
         REQUIRE(cancelled);
     }
     std::cout << "streaming: real flags, full army, growth, shrink, loss, retarget and reload PASS\n";
@@ -1034,7 +1042,7 @@ static void sealedTargetOpensRoute()
         for(int i=0;i<12;++i) f.warrior(6+i,6)->performance[SWIM]=0;
         // A ring of wood seals the target: neither walkers nor swimmers can pass.
         if(sealed) for(int y=27;y<=37;++y) for(int x=32;x<=42;++x)
-            if(x==32||x==42||y==27||y==37) f.game.map.setResource(x,y,WOOD,1);
+            if(x==32||x==42||y==27||y==37) f.game.map.setResourceByIndex(x,y,WOOD,1);
         auto& a=*f.ai; auto& c=a.context;
         c.initialize(); f.remember(survivor);
         a.strategy.tactics.dig_out_enabled=true;
@@ -1222,7 +1230,7 @@ static void offensiveControlSwitches()
         a.target=1;
         auto enemy=f.game.addUnit(35,35,1,WARRIOR,0,0,0,0);
         REQUIRE(enemy);
-        a.allocate_resources();
+        glob2test::withMaximaObservation(a.context,[&]() -> decltype(auto) {return a.allocate_resources();});
         a.finalize_director_plan(c);
         REQUIRE(a.budget.explorer_campaign_active==(enabled && eligible));
         c.buildingOrders.clear(); c.managementOrders.clear();
@@ -1237,13 +1245,13 @@ static void offensiveControlSwitches()
         a.tactical_mission.flagId=f.id(flag);
         a.strategy.tactics.enabled=false;
         a.strategy.explorer_campaign.enabled=false;
-        a.allocate_resources();
+        glob2test::withMaximaObservation(a.context,[&]() -> decltype(auto) {return a.allocate_resources();});
         a.finalize_director_plan(c);
         a.control_offense(c);
         REQUIRE(a.attack_flags.empty());
         bool removed=false;
         for(auto order:c.managementOrders)
-            removed|=dynamic_cast<Management::DestroyBuilding*>(order.get())!=nullptr;
+            removed|=dynamic_cast<Management::RetireAttraction*>(order.get())!=nullptr;
         REQUIRE(removed);
         REQUIRE(!a.budget.explorer_campaign_active);
     }
@@ -1282,6 +1290,121 @@ static void fittedForceUsesOnlyVisibleUnits()
     a.reconnaissance.configure(10000,2500,2500,false);
     a.sample_reconnaissance_forces(c);
     REQUIRE(a.reconnaissance.opponent(1)->estimatedWarriors==1);
+}
+
+static void retirementPreservesIndependentTraining()
+{
+    for(int service:{0,1,2}) {
+        Fixture f;
+        const int typeId=f.game.buildingsTypes.getTypeNum("warflag",0,false);
+        CAPTURE(service);
+        auto snapshot=nlohmann::json::parse(f.game.buildingsTypes.snapshotJson());
+        auto& variant=snapshot["variants"][typeId];
+        if(service==1) {
+            variant["properties"]["maxUnitInside"]=1;
+            variant["semantics"]["admittedUnitMask"]=1u<<WARRIOR;
+            variant["semantics"]["training"]["armor"]={{"enabled",true},{"unitMask",1u<<WARRIOR},{"targetLevel",1},{"duration",32},{"cost",nlohmann::json::object()}};
+        }
+        if(service==2) {
+            variant["semantics"]["market"]["suppliesDirectStock"]=true;
+            variant["semantics"]["market"]["suppliesDirectStockMaterials"]={"wood"};
+            variant["properties"]["maxMaterial"][WOOD]=8;
+        }
+        f.game.buildingsTypes.loadSnapshotJson(snapshot.dump());
+        f.game.configureBuildingCatalog();
+        auto* building=f.building(20,20,0,"warflag");
+        auto& context=f.ai->context;context.initialize();
+        ([&]{auto observation=context.scopeOwnerObservation();return context.cancel_or_destroy_building(f.id(building),1u<<WARRIOR);}());
+        REQUIRE(context.managementOrders.size()==1);
+        auto* retirement=dynamic_cast<Management::RetireAttraction*>(context.managementOrders.front().get());
+        REQUIRE(retirement);
+        glob2test::withMaximaObservation(context,[&]{retirement->modify(context);});
+        if(service!=0) {
+            REQUIRE(context.orders.empty());
+            REQUIRE(f.player.team->myBuildings[::Building::GIDtoID(building->gid)]==building);
+        } else {
+            REQUIRE(context.orders.size()==1);
+            REQUIRE(dynamic_cast<OrderDelete*>(context.orders.front().get()));
+        }
+    }
+}
+
+static void retainedAttractionCompletesSavedMissions()
+{
+    for(int kind:{0,1,2}) {
+        CAPTURE(kind);Fixture f;
+        const int type=f.game.buildingsTypes.getTypeNum("warflag",0,false);
+        auto snapshot=nlohmann::json::parse(f.game.buildingsTypes.snapshotJson());auto& variant=snapshot["variants"][type];
+        if(kind==0) {
+            variant["properties"]["maxUnitInside"]=1;
+            variant["semantics"]["healing"]={{"enabled",true},{"unitMask",7},{"duration",32},{"cost",nlohmann::json::object()}};
+        }
+        if(kind==1) {
+            variant["semantics"]["occupiesGround"]=true;
+            variant["properties"]["hpMax"]=100;variant["properties"]["hpInit"]=100;
+        }
+        if(kind==2) variant["properties"]["zonable"][EXPLORER]=1;
+        f.game.buildingsTypes.loadSnapshotJson(snapshot.dump());f.game.configureBuildingCatalog();
+        f.building(10,10,0);auto* target=f.building(35,30,1);auto* flag=f.building(20,20,0,"warflag");
+        for(int i=0;i<20;++i)f.warrior(2+i%5,2+i/5,3);
+        auto& a=*f.ai;auto& c=a.context;c.initialize();f.remember(target);const int id=f.id(flag);
+        a.attack_flags.push_back(id);a.defense_flags.push_back(id);a.explorer_attack_flags.push_back(id);
+        Management::RetireAttraction retire(id,1u<<WARRIOR);{auto observation=c.scopeOwnerObservation();retire.modify(c);}
+        CHECK(([&]{auto observation=c.scopeOwnerObservation();return c.attraction_retired_or_destroyed(id,1u<<WARRIOR);}()));
+        CHECK_FALSE(([&]{auto observation=c.scopeOwnerObservation();return c.attraction_retired_or_destroyed(id,1u<<EXPLORER);}()));
+        if(kind==1) {REQUIRE(c.orders.size()==1);CHECK(c.orders.front()->getOrderType()==ORDER_MODIFY_BUILDING);}
+        else CHECK(c.orders.empty());
+        for(auto event:{RuntimeEvent::AttackFinished,RuntimeEvent::GuardFlagDeleted}) {
+            auto* notify=new Management::Notify(RuntimeEvent(event,id));
+            notify->add_condition(new Conditions::AttractionRetiredOrDestroyed(id,1u<<WARRIOR));c.add_management_order(notify);
+        }
+        auto* explorer=new Management::Notify(RuntimeEvent(RuntimeEvent::ExplorerAttackFlagDeleted,id));
+        explorer->add_condition(new Conditions::AttractionRetiredOrDestroyed(id,1u<<EXPLORER));c.add_management_order(explorer);
+        auto* memory=new GAGCore::MemoryStreamBackend;GAGCore::BinaryOutputStream output(memory);a.save(&output);output.flush();const auto bytes=memory->takeContents();
+        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));input.seekFromStart(0);
+        Maxima restored(&f.player);REQUIRE(restored.load(&input,&f.player,VERSION_MINOR));
+        struct EventForwarder : RuntimeAI {
+            Maxima& ai;explicit EventForwarder(Maxima& ai):ai(ai) {}
+            void tick(Context&) override {}
+            void handle_event(Context& context,const RuntimeEvent& event) override {ai.handle_event(context,event);}
+        } events(restored);
+        auto& resumed=restored.context;resumed.activeAI=&events;
+        CHECK(([&]{auto observation=resumed.scopeOwnerObservation();return resumed.attraction_retired_or_destroyed(id,1u<<WARRIOR);}()));resumed.update_management_orders();
+        CHECK(restored.attack_flags.empty());CHECK(restored.defense_flags.empty());CHECK(restored.explorer_attack_flags.size()==1);
+        REQUIRE(flag->buildingState==::Building::ALIVE);
+        restored.plan_offense(resumed);restored.control_offense(resumed);
+        REQUIRE_FALSE(resumed.buildingOrders.empty());
+        CHECK(resumed.buildingOrders.front()->id!=id);
+        CHECK(resumed.begin_attraction(id,1u<<WARRIOR));
+        CHECK_FALSE(([&]{auto observation=resumed.scopeOwnerObservation();return resumed.attraction_retired_or_destroyed(id,1u<<WARRIOR);}()));
+        {
+            auto* again=new GAGCore::MemoryStreamBackend;GAGCore::BinaryOutputStream savedAgain(again);resumed.save(&savedAgain);savedAgain.flush();const auto state=again->takeContents();
+            GAGCore::BinaryInputStream reloaded(new GAGCore::MemoryStreamBackend(state.data(),state.size()));reloaded.seekFromStart(0);REQUIRE(resumed.load(&reloaded,VERSION_MINOR));
+            CHECK_FALSE(([&]{auto observation=resumed.scopeOwnerObservation();return resumed.attraction_retired_or_destroyed(id,1u<<WARRIOR);}()));
+        }
+        Management::RetireAttraction secondRetirement(id,1u<<WARRIOR);glob2test::withMaximaObservation(resumed,[&]{secondRetirement.modify(resumed);});
+        CHECK(([&]{auto observation=resumed.scopeOwnerObservation();return resumed.attraction_retired_or_destroyed(id,1u<<WARRIOR);}()));
+        if(kind==2) {
+            Management::RetireAttraction explorerRetirement(id,1u<<EXPLORER);glob2test::withMaximaObservation(resumed,[&]{explorerRetirement.modify(resumed);});resumed.update_management_orders();
+            CHECK(restored.explorer_attack_flags.empty());
+        }
+    }
+}
+
+static void unavailableAttractionHasNoPlacement()
+{
+    Fixture f;
+    auto snapshot=nlohmann::json::parse(f.game.buildingsTypes.snapshotJson());
+    for(auto& variant:snapshot["variants"]) variant["properties"]["zonable"][WARRIOR]=0;
+    f.game.buildingsTypes.loadSnapshotJson(snapshot.dump());
+    f.game.configureBuildingCatalog();
+    Construction::BuildingOrder order(AIMaximaBuildings::WarriorAttraction,4);
+    bool complete=false;
+    const auto result=glob2test::withMaximaObservation(f.ai->context,[&]{return order.find_location(f.ai->context,1,complete);});
+    REQUIRE(complete);
+    REQUIRE_FALSE(result.found);
+    REQUIRE(glob2test::withMaximaObservation(f.ai->context,[&]{return f.ai->context.issue_building_at(-1,4,20,20);})==-1);
+    REQUIRE(f.ai->context.orders.empty());
 }
 
 static void fittedHistorySurvivesSave()
@@ -1337,6 +1460,9 @@ static void fittedPowerControlsAttackGate()
 
 TEST_SUITE("Maxima.Combat")
 {
+	TEST_CASE("retained attraction completes saved missions") { glob2test::HeadlessGlobals globals; combat_regressions::retainedAttractionCompletesSavedMissions(); }
+	TEST_CASE("retirement preserves independent training") { glob2test::HeadlessGlobals globals; combat_regressions::retirementPreservesIndependentTraining(); }
+	TEST_CASE("unavailable attraction has no placement") { glob2test::HeadlessGlobals globals; combat_regressions::unavailableAttractionHasNoPlacement(); }
 	TEST_CASE("fitted force uses only visible units") { glob2test::HeadlessGlobals globals; combat_regressions::fittedForceUsesOnlyVisibleUnits(); }
 	TEST_CASE("fitted power controls attack gate") { glob2test::HeadlessGlobals globals; combat_regressions::fittedPowerControlsAttackGate(); }
 	TEST_CASE("fitted history survives save") { glob2test::HeadlessGlobals globals; combat_regressions::fittedHistorySurvivesSave(); }

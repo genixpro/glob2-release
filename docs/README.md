@@ -15,7 +15,7 @@ dated reports and pull-request artifacts do not belong here.
   and multiplayer app use [app.glob2online.com](https://app.glob2online.com/).
 - **AI:** [telemetry](ai/telemetry.md), [gameplay measurements](ai/gameplay-statistics.md),
   [Cortex mechanics](ai/cortex-upgrade-expand-mechanics.md), and [Maxima](ai/maxima/README.md).
-- **Assets:** [third-party attribution](assets/source-attribution.md),
+- **Assets:** [terrain materials](assets/terrain-materials.md), [third-party attribution](assets/source-attribution.md),
   [soundtrack style guide](assets/music-style-guide.md), [music pipeline](assets/music-pipeline.md) and
   [high-resolution artwork provenance](assets/high-resolution/README.md).
 - **Development:** [build and coding reference](development/reference.md),
@@ -32,9 +32,11 @@ dated reports and pull-request artifacts do not belong here.
   [save continuation](development/savegame-continuation.md), and the
   [historical architecture overview](development/legacy-architecture.txt).
 - **Features:** [gameplay footage and automatic chapters](features/gameplay-recording.md), [custom-game setup](features/custom-game-setup/README.md),
-  [experimental features](features/experimental-features.md) and the
+  [experimental features](features/experimental-features.md),
+  [building catalogs](features/building-catalogs.md),
+  [resource catalogs and materials](features/resource-catalogs.md) and the
   [guard-area balancing](features/guard-area-balancing.md) and
-  [farm areas](features/farm-areas.md) experiments,
+  [farm areas](features/farm-areas.md) and [Markets V2](features/markets-v2.md) experiments,
   [map previews](features/pre-game-map-preview.md),
   [window resizing](features/window-resizing.md), and the
   [toroidal view](features/torus-experiment.md).
@@ -81,3 +83,4 @@ change merges, and add those conclusions to the appropriate durable guide above.
 - [AI ratings](ai/ratings.md): measured opponent strength and interpretation.
 
 - [Win probability model](win-probability-model.md): fitted live-state predictions, calibration limits and optional early victory.
+- [Building-field depth model](building-gradient-depth-model.md): how deep scheduled building fields are settled, fitted from tournament field statistics.

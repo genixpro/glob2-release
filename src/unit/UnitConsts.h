@@ -63,7 +63,7 @@ static constexpr int UNIT_DELTA_QUANTUM = 256;
 // directions plus a "no direction" sentinel. The encoding numerically
 // collides with COUNT (8 == UNIT_DIRECTION_NONE) — both names are kept so
 // each call site reads in its intended meaning. See UnitGeometry.cpp /
-// UnitMovement.cpp / MapStep.cpp (`syncRand()&7`).
+// UnitMovement.cpp / MapStep.cpp (private unit/world random direction draws).
 
 //! Number of compass directions a unit can face.
 static constexpr int UNIT_DIRECTION_COUNT = 8;
@@ -99,7 +99,7 @@ static constexpr int BULLET_MIN_DAMAGE = 1;
 
 //! `Unit::destinationPurpose` sentinel meaning "no destination chosen yet".
 static constexpr int UNIT_DEST_PURPOSE_NONE = -1;
-//! `Unit::carriedResource` sentinel meaning "not carrying anything".
+//! `Unit::carriedMaterial` sentinel meaning "not carrying anything".
 static constexpr int UNIT_CARRIED_RESOURCE_NONE = -1;
 //! Free-slot search sentinel: starting `targetID = -1` means "no free slot
 //! found yet" (UnitActivity.cpp conversion code).

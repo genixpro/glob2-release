@@ -1,5 +1,8 @@
+#include "GenerationWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "PowerOfTwo.h"
 #include "BalancedStarts.h"
+#include "StartingLayout.h"
 #include "Game.h"
 #include "GenerationContext.h"
 #include "GlobalContainer.h"
@@ -25,19 +28,23 @@ SeparatedSites selectSeparatedSites(const Torus &t, const std::vector<int> &cand
 	}
 	for (size_t first = 0; first < std::min<size_t>(maximumAttempts, candidates.size()); ++first)
 	{
+		::MapGeneration::generationCheckpoint();
 		++result.attempts;
 		std::vector<int> chosen{int(first)};
 		while (chosen.size() < size_t(count))
 		{
+			::MapGeneration::generationCheckpoint();
 			int winner = -1, score = -1;
 			for (size_t i = 0; i < candidates.size(); ++i)
 			{
-				const int p = candidates[i];
+				::MapGeneration::generationCheckpoint();
+				const int p = candidates.at(i);
 				int nearest = INT_MAX;
 				for (int index : chosen)
 				{
-					const int h = candidates[index];
-					nearest = std::min(nearest, t.chebyshev(p % t.w, p / t.w, h % t.w, h / t.w));
+					::MapGeneration::generationCheckpoint();
+					const int h = candidates.at(index);
+					nearest = std::min(nearest, t.chebyshev(t.remainderX(p), p / t.w, t.remainderX(h), h / t.w));
 				}
 				if (nearest >= minimumSeparation && nearest > score)
 				{
@@ -64,7 +71,7 @@ namespace
 // every call in this file: canSwim and the team mask are always the same two constants, no
 // forbidden-area bit survives a `& 0`, and nothing places a building before chooseBalancedStarts
 // runs (placeStarts(), the only thing that does, runs after boot tiles are already chosen). So
-// the answer never changes across the two distanceToResource() floods and the up-to-900 calls
+// the answer never changes across the two distanceToMaterial() floods and the up-to-900 calls
 // to scoreAsBuilt() below; computing it once into a flat byte per tile turns what used to be a
 // branchy, multi-array accessor call at every visited tile into a single sequential array read.
 std::vector<std::uint8_t> buildHardSpaceGrid(Map &map)
@@ -72,34 +79,45 @@ std::vector<std::uint8_t> buildHardSpaceGrid(Map &map)
 	return groundUnitTiles(map);
 }
 
-// Walking distance from every tile to the nearest deposit of one resource. Workers stand
-// beside a deposit rather than on it (a resource tile is not walkable), so the sources are the
+// Walking distance from every tile to the nearest source of one material. Workers stand
+// beside a deposit rather than on it (a deposit may block walking), so the sources are the
 // walkable tiles touching one. One flood answers the question for every tile on the map, which
 // is what makes scoring a few hundred candidate sites cheap enough to do exhaustively. Distances
 // on any map this engine supports fit comfortably in 16 bits, halving the footprint of an array
 // every scoreAsBuilt call after it touches over and over.
-std::vector<std::int16_t> distanceToResource(Map &map, const std::vector<std::uint8_t> &hard,
-											 int resourceType)
+std::vector<std::int16_t> distanceToMaterial(Map &map, const std::vector<std::uint8_t> &hard,
+											 MaterialId material)
 {
 	const Torus t(map);
 	std::vector<unsigned char> beside(size_t(t.size()), 0);
 	for (int y = 0; y < t.h; ++y)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int x = 0; x < t.w; ++x)
 		{
-			if (map.getResource(x, y).type != resourceType)
+			::MapGeneration::generationCheckpoint();
+			if (!map.materialAmountAt(map.coordToIndex(x,y),material))
 				continue;
 			for (int dy = -1; dy <= 1; ++dy)
+			{
+				::MapGeneration::generationCheckpoint();
 				for (int dx = -1; dx <= 1; ++dx)
 				{
+					::MapGeneration::generationCheckpoint();
 					const int np = t.at(x + dx, y + dy);
-					if (hard[np])
-						beside[np] = 1;
+					if (hard.at(np))
+						beside.at(np) = 1;
 				}
+			}
 		}
+	}
 	const std::vector<int> steps = stepsFrom(t, beside, hard);
 	std::vector<std::int16_t> dist(steps.size());
 	for (size_t i = 0; i < steps.size(); ++i)
-		dist[i] = std::int16_t(steps[i]);
+	{
+		::MapGeneration::generationCheckpoint();
+		dist.at(i) = std::int16_t(steps.at(i));
+	}
 	return dist;
 }
 } // namespace
@@ -117,17 +135,18 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 	};
 	if (nbTeams <= 0 || minDistSquare <= 0)
 		return fail("invalid search parameters");
-	const int typeNum = globalContainer->buildingsTypes.getTypeNum("swarm", 0, false);
-	const BuildingType *swarm = globalContainer->buildingsTypes.get(typeNum);
-	if (!swarm)
-		return fail("missing swarm type");
+	const int typeNum = game.buildingsTypes.getStartingBuildingTypeNum();
+	const BuildingType *swarm = typeNum>=0 ? game.buildingsTypes.get(typeNum) : nullptr;
+	if (!swarm || !swarm->runtimeAvailable)
+		return fail("catalog has no available starting building");
 
+	const StartingLayout layout(swarm->width,swarm->height,context.request.nbWorkers);
 	const std::vector<std::uint8_t> hard = buildHardSpaceGrid(map);
-	const std::vector<std::int16_t> woodDist = distanceToResource(map, hard, WOOD);
-	const std::vector<std::int16_t> wheatDist = distanceToResource(map, hard, WHEAT);
+	const std::vector<std::int16_t> woodDist = distanceToMaterial(map, hard, MaterialId::Wood);
+	const std::vector<std::int16_t> foodSourceDistance = distanceToMaterial(map, hard, MaterialId::Food);
 
 	// A site is worth exactly what its *worse* resource costs to reach: a colony next to wood
-	// but a long walk from wheat is not a good start, however good the wood is.
+	// but a long walk from food is not a good start, however good the wood is.
 	// A colony changes its own surroundings the moment it is built: placeStarts() clears a
 	// five by seven box of resources to make room, the swarm itself becomes four by four tiles
 	// of obstacle, and the workers appear on the row above it rather than on the boot tile. A
@@ -152,7 +171,7 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 				ox -= w;
 			if (oy >= h / 2)
 				oy -= h;
-			return ox >= 0 && ox <= 4 && oy >= -2 && oy <= 4;
+			return layout.clears(ox,oy);
 		};
 		auto blocked = [&](int tx, int ty)
 		{
@@ -161,7 +180,7 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 				ox -= w;
 			if (oy >= h / 2)
 				oy -= h;
-			return ox >= 0 && ox < swarm->width && oy >= 0 && oy < swarm->height;
+			return swarm->semantics.occupiesGround && ox >= 0 && ox < swarm->width && oy >= 0 && oy < swarm->height;
 		};
 		++visitStamp;
 		size_t qHead = 0, qTail = 0;
@@ -169,42 +188,50 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 		{
 			int nx = map.normalizeX(tx), ny = map.normalizeY(ty);
 			int np = ny * w + nx;
-			if (visited[np] == visitStamp)
+			if (visited.at(np) == visitStamp)
 				return;
-			visited[np] = visitStamp;
-			queueTile[qTail] = np;
-			queueDist[qTail] = d;
+			visited.at(np) = visitStamp;
+			queueTile.at(qTail) = np;
+			queueDist.at(qTail) = d;
 			++qTail;
 		};
 		// Workers spawn on the row above the swarm, so that is where a gathering trip starts.
 		for (int i = 0; i < std::max(1, context.request.nbWorkers); ++i)
-			push(bx + (i % 4), by - 1 - (i / 4), 0);
+		{
+			::MapGeneration::generationCheckpoint();
+			push(bx + layout.workerX(i), by + layout.workerY(i), 0);
+		}
 		int wood = -1, wheat = -1;
 		while (qHead < qTail && (wood < 0 || wheat < 0))
 		{
-			int p = queueTile[qHead];
-			int d = queueDist[qHead];
+			::MapGeneration::generationCheckpoint();
+			int p = queueTile.at(qHead);
+			int d = queueDist.at(qHead);
 			++qHead;
 			if (d >= limit)
 				continue;
-			int x = p % w, y = p / w;
+			int x = powerOfTwoRemainder(p, w), y = p / w;
 			for (int dy = -1; dy <= 1; ++dy)
+			{
+				::MapGeneration::generationCheckpoint();
 				for (int dx = -1; dx <= 1; ++dx)
 				{
+					::MapGeneration::generationCheckpoint();
 					if (dx == 0 && dy == 0)
 						continue;
 					int nx = map.normalizeX(x + dx), ny = map.normalizeY(y + dy);
-					int type = map.getResource(nx, ny).type;
+					const auto index = map.coordToIndex(nx, ny);
 					if (!cleared(nx, ny))
 					{
-						if (type == WOOD && wood < 0)
+						if (wood < 0 && map.materialAmountAt(index,MaterialId::Wood)>0)
 							wood = d + 1;
-						if (type == WHEAT && wheat < 0)
+						if (wheat < 0 && map.materialAmountAt(index,MaterialId::Food)>0)
 							wheat = d + 1;
 					}
-					if (!blocked(nx, ny) && hard[ny * w + nx])
+					if (!blocked(nx, ny) && hard.at(ny * w + nx))
 						push(nx, ny, d + 1);
 				}
+			}
 		}
 		if (wood < 0 || wheat < 0)
 			return -1;
@@ -213,17 +240,21 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 
 	std::vector<std::pair<int, int>> sites; // (score, tile index)
 	for (int y = 0; y < h; ++y)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int x = 0; x < w; ++x)
 		{
+			::MapGeneration::generationCheckpoint();
 			if (!map.isFreeForBuilding(x, y, swarm->width, swarm->height))
 				continue;
 			const int p = y * w + x;
-			if (woodDist[p] < 0 || wheatDist[p] < 0)
+			if (woodDist.at(p) < 0 || foodSourceDistance.at(p) < 0)
 				continue;
 			// The bare-map distance can only understate what the built colony will walk, so it
 			// is a sound cheap filter: it shortlists sites worth the exact simulation above.
-			sites.push_back({std::max(woodDist[p], wheatDist[p]), p});
+			sites.push_back({std::max(woodDist.at(p), foodSourceDistance.at(p)), p});
 		}
+	}
 	context.telemetry.measure("starts.balanced.candidate_sites", int(sites.size()));
 	if ((int)sites.size() < nbTeams)
 		return fail("insufficient resource reachable sites");
@@ -237,7 +268,10 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 		std::vector<std::pair<int, int>> thinned;
 		thinned.reserve(cap);
 		for (size_t i = 0; i < cap; ++i)
-			thinned.push_back(sites[i * sites.size() / cap]);
+		{
+			::MapGeneration::generationCheckpoint();
+			thinned.push_back(sites.at(i * sites.size() / cap));
+		}
 		sites.swap(thinned);
 	}
 
@@ -249,9 +283,10 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 		exact.reserve(sites.size());
 		for (const auto &s : sites)
 		{
+			::MapGeneration::generationCheckpoint();
 			// 32 steps: the wood range of the start guarantee, the farthest a start's resources are
 			// allowed to be.
-			const int built = scoreAsBuilt(s.second % w, s.second / w, 32);
+			const int built = scoreAsBuilt(powerOfTwoRemainder(s.second, w), s.second / w, 32);
 			if (built >= 0)
 				exact.push_back({built, s.second});
 		}
@@ -270,27 +305,32 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 	int bestSpread = -1;
 	for (size_t i = 0; i < sites.size(); ++i)
 	{
+		::MapGeneration::generationCheckpoint();
 		if (bestSpread == 0)
 			break;
 		std::vector<int> picked;
 		for (size_t j = i; j < sites.size(); ++j)
 		{
-			if (bestSpread >= 0 && sites[j].first - sites[i].first >= bestSpread)
+			::MapGeneration::generationCheckpoint();
+			if (bestSpread >= 0 && sites.at(j).first - sites.at(i).first >= bestSpread)
 				break; // this window is already no better than what we hold
-			const int px = sites[j].second % w, py = sites[j].second / w;
+			const int px = powerOfTwoRemainder(sites.at(j).second, w), py = sites.at(j).second / w;
 			bool farEnough = true;
 			for (int q : picked)
-				if (map.warpDistSquare(px, py, q % w, q / w) < minDistSquare)
+			{
+				::MapGeneration::generationCheckpoint();
+				if (map.warpDistSquare(px, py, powerOfTwoRemainder(q, w), q / w) < minDistSquare)
 				{
 					farEnough = false;
 					break;
 				}
+			}
 			if (!farEnough)
 				continue;
-			picked.push_back(sites[j].second);
+			picked.push_back(sites.at(j).second);
 			if ((int)picked.size() == nbTeams)
 			{
-				bestSpread = sites[j].first - sites[i].first;
+				bestSpread = sites.at(j).first - sites.at(i).first;
 				best = picked;
 				break;
 			}
@@ -303,8 +343,9 @@ bool chooseBalancedStarts(Game &game, GenerationContext &context, int minDistSqu
 	context.telemetry.choice("starts.balanced.outcome", "selected");
 	for (int team = 0; team < nbTeams; ++team)
 	{
-		context.bootX[team] = best[team] % w;
-		context.bootY[team] = best[team] / w;
+		::MapGeneration::generationCheckpoint();
+		context.bootX[team] = powerOfTwoRemainder(best.at(team), w);
+		context.bootY[team] = best.at(team) / w;
 	}
 	return true;
 }

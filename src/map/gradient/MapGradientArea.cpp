@@ -11,6 +11,8 @@
 #include "MapInternal.h"
 
 #include <algorithm>
+#include <array>
+#include "SeedCells.h"
 #include <atomic>
 
 
@@ -57,6 +59,9 @@ void Map::updateForbiddenGradient(int teamNumber, int swimClass)
 	assert(gradient);
 	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
 	bool canSwim = swimClass > 0;
+	std::array<Uint8, ResourceRegistry::Capacity> blocksGround;
+	const auto& properties=resourceRegistry().propertyTable();
+	for(size_t id=0;id<properties.size();++id) blocksGround[id]=properties[id].blocksGround;
 
 	// Seed: free cells are goals, forbidden interiors are placeholders (promoted
 	// to GRADIENT_FORBIDDEN_BORDER in the second pass if they border a free cell),
@@ -64,16 +69,15 @@ void Map::updateForbiddenGradient(int teamNumber, int swimClass)
 	initializeGradientCells([&](size_t begin, size_t end) {
 	for (size_t i=begin; i<end; i++)
 	{
-		const Tile& c=tiles[i];
-		if (c.resource.type!=NO_RES_TYPE)
+		if (resourceCells[i].resource.type!=NO_RES_TYPE && blocksGround[resourceCells[i].resource.type])
 			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.building!=NOGBID)
+		else if (occupancyCells[i].building!=NOGBID)
 			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (!canSwim && isWater(i))
+		else if (!terrainPropertiesAt(i).walkable && !(canSwim && terrainPropertiesAt(i).swimmable))
 			gradient[i] = GRADIENT_FORBIDDEN;
-		else if(immobileUnits[i] != IMMOBILE_UNIT_NONE)
+		else if(occupancyCells[i].immobileUnit != IMMOBILE_UNIT_NONE)
 			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.forbidden&teamMask)
+		else if (areaCells[i].forbidden&teamMask)
 			gradient[i] = GRADIENT_UNREACHABLE;
 		else
 			gradient[i] = GRADIENT_AT_GOAL;
@@ -99,7 +103,10 @@ void Map::updateForbiddenGradient(int teamNumber, int swimClass)
 		}
 	}
 
-	propagateGradient(gradient, swimClass);
+	{
+		PERF_SCOPE_TIME(PropagationArea);
+		propagateGradient(gradient, swimClass);
+	}
 }
 
 void Map::updateForbiddenGradient(int teamNumber)
@@ -156,46 +163,7 @@ bool Map::computeWarriorCrowding(int teamNumber, Uint16 *out) const
 // powers of two, so the window wraps by masking the index, with no edge cases.
 void Map::boxSumInPlace(Uint16 *grid) const
 {
-	// A window wider than the map would count a cell twice.
-	const int r = std::min<int>(GUARD_CROWD_RADIUS, std::min((int)w - 1, (int)h - 1) / 2);
-	auto &scratch = gradientRuntime->workspaces[compute.slot()].crowding;
-	auto &crowdRows = scratch.rows;
-	auto &crowdColumnSums = scratch.columnSums;
-	crowdRows.resize(size); // every cell is written below
-	// Rows: window [x-r, x+r] slides right; entering x+r+1, leaving x-r.
-	for (int y = 0; y < (int)h; y++)
-	{
-		const size_t row = (size_t)y << wDec;
-		int sum = 0;
-		for (int dx = -r; dx <= r; dx++)
-			sum += grid[row | (size_t)(dx & (int)wMask)];
-		for (int x = 0; x < (int)w; x++)
-		{
-			crowdRows[row | (size_t)x] = (Uint16)sum;
-			sum += grid[row | (size_t)((x + r + 1) & (int)wMask)] - grid[row | (size_t)((x - r) & (int)wMask)];
-		}
-	}
-	// Columns, the same way over the row sums: crowdColumnSums[x] is the running
-	// window sum of column x, advanced one whole row at a time so the sweep
-	// stays row-major and the inner loops vectorise.
-	crowdColumnSums.assign(w, 0);
-	for (int dy = -r; dy <= r; dy++)
-	{
-		const Uint16 *in = &crowdRows[(size_t)(dy & (int)hMask) << wDec];
-		for (int x = 0; x < (int)w; x++)
-			crowdColumnSums[x] += in[x];
-	}
-	for (int y = 0; y < (int)h; y++)
-	{
-		Uint16 *o = grid + ((size_t)y << wDec);
-		const Uint16 *entering = &crowdRows[(size_t)((y + r + 1) & (int)hMask) << wDec];
-		const Uint16 *leaving = &crowdRows[(size_t)((y - r) & (int)hMask) << wDec];
-		for (int x = 0; x < (int)w; x++)
-		{
-			o[x] = (Uint16)crowdColumnSums[x];
-			crowdColumnSums[x] += entering[x] - leaving[x];
-		}
-	}
+	gradient_preparation::boxSum(grid, w, h, gradientRuntime->workspaces[compute.slot()].crowding);
 }
 
 // Guard-area balancing: painted tiles are the seeds, but not at cost zero. Each
@@ -243,45 +211,17 @@ void Map::updateGuardAreasGradient(int teamNumber, int swimClass)
 	gradientRuntime->pipeline.invalidate(&guardAreasGradient[teamNumber][swimClass]);
 	Uint16 *gradient = guardAreasGradient[teamNumber][swimClass];
 	seedGuardAreasGradient(teamNumber, swimClass, gradient);
-	propagateGradient(gradient, swimClass);
+	{
+		PERF_SCOPE_TIME(PropagationArea);
+		propagateGradient(gradient, swimClass);
+	}
 }
 
 void Map::seedGuardAreasGradient(int teamNumber, int swimClass, Uint16 *gradient)
 {
-	assert(gradient);
-	bool canSwim = swimClass > 0;
-
-	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
-	std::atomic<size_t> painted{0};
-	initializeGradientCells([&](size_t begin, size_t end) {
-	size_t paintedHere = 0;
-	for (size_t i=begin; i<end; i++)
-	{
-		const Tile& c=tiles[i];
-		if (c.forbidden & teamMask)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if(immobileUnits[i] != IMMOBILE_UNIT_NONE)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.resource.type != NO_RES_TYPE)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.building != NOGBID && (1<<Building::GIDtoTeam(c.building)) & (game->teams[teamNumber]->allies))
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (!canSwim && isWater(i))
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.guardArea & teamMask)
-		{
-			gradient[i] = GRADIENT_AT_GOAL;
-			++paintedHere;
-		}
-		else
-			gradient[i] = GRADIENT_UNREACHABLE;
-	}
-	painted += paintedHere;
-	});
-
-	// A team that painted nothing (most teams) pays nothing more than this pass.
-	if (painted && game->gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing))
-		seedGuardAreaCrowding(teamNumber, gradient);
+    const bool painted=gradient_preparation::guardCells(liveCells, game->teams[teamNumber]->allies, teamNumber, swimClass, gradient,
+        [this](auto fn) { initializeGradientCells(fn); });
+    if (painted && game->gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing)) seedGuardAreaCrowding(teamNumber, gradient);
 }
 
 void Map::updateGuardAreasGradient(int teamNumber)
@@ -306,37 +246,16 @@ void Map::updateClearAreasGradient(int teamNumber, int swimClass)
 	gradientRuntime->pipeline.invalidate(&clearAreasGradient[teamNumber][swimClass]);
 	Uint16 *gradient = clearAreasGradient[teamNumber][swimClass];
 	seedClearAreasGradient(teamNumber, swimClass, gradient);
-	propagateGradient(gradient, swimClass);
+	{
+		PERF_SCOPE_TIME(PropagationArea);
+		propagateGradient(gradient, swimClass);
+	}
 }
 
 void Map::seedClearAreasGradient(int teamNumber, int swimClass, Uint16 *gradient)
 {
-	assert(gradient);
-	bool canSwim = swimClass > 0;
-
-	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
-	const bool farmAreas = farmAreasEnabled();
-	initializeGradientCells([&](size_t begin, size_t end) {
-	for (size_t i=begin; i<end; i++)
-	{
-		const Tile& c=tiles[i];
-		if (c.forbidden & teamMask)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if(isClearingTarget(i, teamMask, farmAreas))
-			gradient[i] = GRADIENT_AT_GOAL;
-		else if(immobileUnits[i] != IMMOBILE_UNIT_NONE)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.resource.type != NO_RES_TYPE)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (c.building != NOGBID)
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else if (!canSwim && isWater(i))
-			gradient[i] = GRADIENT_FORBIDDEN;
-		else
-			gradient[i] = GRADIENT_UNREACHABLE;
-	}
-	});
-
+    gradient_preparation::clearCells(liveCells, farmAreasEnabled(), teamNumber, swimClass, gradient,
+        [this](auto fn) { initializeGradientCells(fn); });
 }
 
 void Map::updateClearAreasGradient(int teamNumber)
@@ -354,29 +273,9 @@ void Map::updateClearAreasGradient()
 		updateClearAreasGradient(i);
 }
 
-// These refreshes already share a simulation boundary. Only allocated fields
-// participate; no worker changes cache ownership or refresh scheduling.
 void Map::updateTeamAreaGradients(int teamNumber)
 {
-	if (!computeEnabled(ComputeAreas))
-	{
-		updateForbiddenGradient(teamNumber);
-		updateGuardAreasGradient(teamNumber);
-		updateClearAreasGradient(teamNumber);
-		return;
-	}
-	std::vector<std::pair<int, int>> jobs;
-	for (int kind = 0; kind < 3; ++kind)
-		for (int swim = 0; swim < SWIM_CLASS_COUNT; ++swim)
-		{
-			const auto field = kind == 0 ? forbiddenGradient[teamNumber][swim]
-				: kind == 1 ? guardAreasGradient[teamNumber][swim] : clearAreasGradient[teamNumber][swim];
-			if (field) jobs.emplace_back(kind, swim);
-		}
-	computeExecutor().run(jobs.size(), [&](size_t i) {
-		const auto [kind, swim] = jobs[i];
-		if (kind == 0) updateForbiddenGradient(teamNumber, swim);
-		else if (kind == 1) updateGuardAreasGradient(teamNumber, swim);
-		else updateClearAreasGradient(teamNumber, swim);
-	});
+	updateForbiddenGradient(teamNumber);
+	updateGuardAreasGradient(teamNumber);
+	updateClearAreasGradient(teamNumber);
 }

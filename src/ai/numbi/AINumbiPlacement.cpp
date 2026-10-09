@@ -3,61 +3,32 @@
 
 #include "AITelemetryFields.h"
 #include "AINumbi.h"
+#include "NumbiQueries.h"
+#include "ai/engine/AIDecision.h"
 #include "Game.h"
-#include "GlobalContainer.h"
 #include "Order.h"
 #include "Player.h"
 #include "Utilities.h"
 #include "Unit.h"
+#include <array>
 
 using std::shared_ptr;
 
-void AINumbi::nextMainBuilding(const int buildingType)
+void AINumbi::nextMainBuilding(Intent intent)
 {
-	//printf("AI: nextMainBuilding(%d)\n", buildingType);
-	Building **myBuildings=team->myBuildings;
-	Building *b=myBuildings[mainBuilding[buildingType]];
-	if (b==NULL)
+	int& anchor = mainBuilding[static_cast<unsigned>(intent)];
+	for (int offset = 1; offset <= Building::MAX_COUNT; ++offset)
 	{
-		for (int i=1; i<Building::MAX_COUNT; i++)
-			if ((myBuildings[i])/*&&((myBuildings[i]->type->shortTypeNum==buildingType)||(myBuildings[i]->type->shortTypeNum==0))*/)
-			{
-				b=myBuildings[i];
-				break;
-			}
-		if (b==NULL)
-		{
-			mainBuilding[buildingType]=0;
-			//printf("AI: no more building !.\n");
-		}
-		else
-			mainBuilding[buildingType]=Building::GIDtoID(b->gid);
+		const int id = (anchor + offset) % Building::MAX_COUNT;
+		if (observation->buildingSlots(teamNumber)[id]) { anchor = id; return; }
 	}
-	else
-	{
-		//printf("AI: nextMainBuilding uid=%d\n", b->UID);
-		int id=Building::GIDtoID(b->gid);
-		// [POSSIBLE BUG H1] The mask AI_NUMBI_BUILDING_INDEX_MASK (=0xFF, i.e. 255)
-		// is hardcoded but the loop bound is Building::MAX_COUNT (=1024). When
-		// (i+id) exceeds 255 the index wraps within the first 256 building slots,
-		// missing buildings 256..1023. The constant intentionally does NOT alias
-		// `Building::MAX_COUNT - 1` — renaming would change behavior. Preserved
-		// verbatim; flagged for fix-time review (do not "fix" here).
-		for (int i=1; i<Building::MAX_COUNT; i++)
-			if ((myBuildings[(i+id)&AI_NUMBI_BUILDING_INDEX_MASK])/*&&((myBuildings[(i+id)&AI_NUMBI_BUILDING_INDEX_MASK]->type->shortTypeNum==buildingType)||(myBuildings[(i+id)&AI_NUMBI_BUILDING_INDEX_MASK]->type->shortTypeNum==0))*/)
-			{
-				b=myBuildings[(i+id)&AI_NUMBI_BUILDING_INDEX_MASK];
-				break;
-			}
-		mainBuilding[buildingType]=Building::GIDtoID(b->gid);
-		//printf("AI: nextMainBuilding newuid=%d\n", b->UID);
-	}
+	anchor = 0;
 }
 
-int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width, int height)
+int AINumbi::nbFreeAround(int posX, int posY, int width, int height)
 {
-	int px=posX+map->getW();
-	int py=posY+map->getH();
+	int px=posX+observation->width;
+	int py=posY+observation->height;
 	int x, y;
 
 	int valid=AI_NUMBI_PLACEMENT_SCORE_INIT;
@@ -67,14 +38,14 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 		y=py-r;
 		int ew=1;
 		for (x=px-ew; x<px+width+ew; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_OUTER_EDGE_PENALTY+(r-AI_NUMBI_OUTER_MARGIN_R_MIN)*AI_NUMBI_OUTER_EDGE_PENALTY;
 				break;
 			}
 		y=py+height-1+r;
 		for (x=px-ew; x<px+width+ew; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_OUTER_EDGE_PENALTY+(r-AI_NUMBI_OUTER_MARGIN_R_MIN)*AI_NUMBI_OUTER_EDGE_PENALTY;
 				break;
@@ -82,14 +53,14 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 
 		x=px-r;
 		for (y=py-ew; y<py+height+ew; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_OUTER_EDGE_PENALTY+(r-AI_NUMBI_OUTER_MARGIN_R_MIN)*AI_NUMBI_OUTER_EDGE_PENALTY;
 				break;
 			}
 		x=px+width-1+r;
 		for (y=py-ew; y<py+height+ew; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_OUTER_EDGE_PENALTY+(r-AI_NUMBI_OUTER_MARGIN_R_MIN)*AI_NUMBI_OUTER_EDGE_PENALTY;
 				break;
@@ -99,14 +70,14 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 	{
 		y=py-r;
 		for (x=px; x<px+width; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_INNER_EDGE_PENALTY;
 				break;
 			}
 		y=py+height-1+r;
 		for (x=px; x<px+width; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_INNER_EDGE_PENALTY;
 				break;
@@ -114,14 +85,14 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 
 		x=px-r;
 		for (y=py; y<py+height; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_INNER_EDGE_PENALTY;
 				break;
 			}
 		x=px+width-1+r;
 		for (y=py; y<py+height; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				valid-=AI_NUMBI_INNER_EDGE_PENALTY;
 				break;
@@ -133,7 +104,7 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 		y=py-r;
 		bool anyBuild=false;
 		for (x=px; x<px+width; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				anyBuild=true;
 				break;
@@ -147,7 +118,7 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 		y=py+height-1+r;
 		bool anyBuild=false;
 		for (x=px; x<px+width; x++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				anyBuild=true;
 				break;
@@ -161,7 +132,7 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 		bool anyBuild=false;
 		x=px-r;
 		for (y=py; y<py+height; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				anyBuild=true;
 				break;
@@ -175,7 +146,7 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 		bool anyBuild=false;
 		x=px+width-1+r;
 		for (y=py; y<py+height; y++)
-			if (!map->isFreeForBuilding(x, y))
+			if (!queries->isFreeForBuilding(x, y))
 			{
 				anyBuild=true;
 				break;
@@ -188,15 +159,6 @@ int AINumbi::nbFreeAround(const int buildingType, int posX, int posY, int width,
 	valid-=(wu)*(hu);
 
 	return valid;
-}
-
-bool AINumbi::parseBuildingType(const int buildingType)
-{
-	telemetry.set(AITrace::AI1::AINumbi_parseBuildingType_input_buildingType, buildingType);
-	telemetry.count(AITrace::AI1::AINumbi_parseBuildingType_calls);
-	return telemetry.returnedBool(AITrace::AI1::AINumbi_parseBuildingType_result,
-								  AITrace::AI1::AINumbi_parseBuildingType_true,
-								  (buildingType == IntBuildingType::DEFENSE_BUILDING));
 }
 
 void AINumbi::squareCircleScan(int &dx, int &dy, int &sx, int &sy, int &x, int &y, int &mx, int &my)
@@ -229,128 +191,61 @@ void AINumbi::squareCircleScan(int &dx, int &dy, int &sx, int &sy, int &x, int &
 	y+=dy;
 }
 
-bool AINumbi::findNewEmplacement(const int buildingType, int *posX, int *posY)
+bool AINumbi::findNewEmplacement(Intent intent, int typeNum, int *posX, int *posY)
 {
-	telemetry.set(AITrace::AI1::AINumbi_findNewEmplacement_input_buildingType, buildingType);
+	telemetry.set(AITrace::AI1::AINumbi_findNewEmplacement_input_buildingType, static_cast<int>(intent));
 	telemetry.count(AITrace::AI1::AINumbi_findNewEmplacement_calls);
-	Building **myBuildings=team->myBuildings;
-	Building *b=myBuildings[mainBuilding[buildingType]];
-	if (b==NULL)
-	{
-		nextMainBuilding(buildingType);
-		b=myBuildings[mainBuilding[buildingType]];
-	}
-	if (b==NULL)
-	{
-		for (int i=0; i<IntBuildingType::NB_BUILDING; i++)
-		{
-			if (myBuildings[mainBuilding[i]])
-			{
-				b=myBuildings[mainBuilding[i]];
-				break;
-			}
-		}
-	}
-	if (b==NULL)
-	{
-		// TODO : scan the units and find a resourceful place.
+	const auto result = [&](bool found) {
 		return telemetry.returnedBool(AITrace::AI1::AINumbi_findNewEmplacement_result,
-									  AITrace::AI1::AINumbi_findNewEmplacement_true, false);
-	}
-	int typeNum=globalContainer->buildingsTypes.getTypeNum(IntBuildingType::typeFromShortNumber(buildingType), 0, true);
-	BuildingType *bt=globalContainer->buildingsTypes.get(typeNum);
-	int width=bt->width;
-	int height=bt->height;
-
-	int valid=nbFreeAround(buildingType, b->posX, b->posY, width, height);
-	//printf("AI: findNewEmplacement(%d) valid=(%d), uid=(%d), s=(%d, %d).\n", buildingType, valid, b->UID, width, height);
-	if (valid>AI_NUMBI_PLACEMENT_SCORE_MIN)
+			AITrace::AI1::AINumbi_findNewEmplacement_true, found);
+	};
+	int& anchor = mainBuilding[static_cast<unsigned>(intent)];
+	const AIEngine::BuildingView* origin = observation->buildingSlots(teamNumber)[anchor];
+	if (!origin) { nextMainBuilding(intent); origin = observation->buildingSlots(teamNumber)[anchor]; }
+	if (!origin) return result(false);
+	const auto* placement = &queries->kind(typeNum);
+	const auto* completed = placement->site
+		? &queries->kind(placement->next) : placement;
+	const int width = placement->width, height = placement->height;
+	// Compile the relevant operating inputs once, outside the placement scan.
+	std::array<bool, MaterialSlotCount> needs{};
+	for (int resource = 0; resource < MaterialSlotCount; ++resource)
 	{
-		// [POSSIBLE BUG L9] `maxr` is computed below but never read — the spiral
-		// scan further down uses AI_NUMBI_SCAN_ITERATIONS (=4096) directly.
-		// Preserved verbatim for replay determinism; do not "fix".
-		[[maybe_unused]] int maxr;
-		if (b->type->shortTypeNum==0)
-			maxr=AI_NUMBI_SWARM_SEARCH_RADIUS;
-		else
-			maxr=AI_NUMBI_NONSWARM_SEARCH_RADIUS;
-
-		int dx, dy, sx, sy, px, py, mx, my;
-		int margin;
-		if (b->type->shortTypeNum)
-			margin=0;
-		else
-			margin=AI_NUMBI_SWARM_MARGIN;
-
-		int bposX=b->posX+map->getW();
-		int bposY=b->posY+map->getH();
-
-		sx=bposX-width-margin;
-		sy=bposY-height-margin;
-
-		px=sx;
-		py=sy;
-
-		mx=bposX+b->type->width+margin;
-		my=bposY+b->type->height+margin;
-
-		sy--;
-		px++;
-		dx=1;
-		dy=0;
-
-		int bestValid=-1;
-		// Note: AI_NUMBI_SCAN_ITERATIONS is intentionally NOT derived from `maxr`
-		// above (see L9 comment); it is the original literal preserved as-is.
-		for (int i=0; i<AI_NUMBI_SCAN_ITERATIONS; i++)
-		{
-			squareCircleScan(dx, dy, sx, sy, px, py, mx, my);
-
-			if (map->isFreeForBuilding(px, py, width, height))
-			{
-				int valid=nbFreeAround(buildingType, px, py, width, height);
-				if ((valid>AI_NUMBI_PLACEMENT_SCORE_MIN)&&(game->checkRoomForBuilding(px, py, bt, player->team->teamNumber)))
-				{
-					int rx, ry, dist;
-					bool nr=map->resourceAvailableUpdate(team->teamNumber, WHEAT, 0, px, py, &rx, &ry, &dist);
-					if (nr)
-					{
-						if (((dist<=(AI_NUMBI_WHEAT_DISTANCE_BIAS+width*height))&&(buildingType<=AI_NUMBI_NEAR_WHEAT_TYPE_CUTOFF))||((dist>=(AI_NUMBI_WHEAT_DISTANCE_BIAS+width*height))&&(buildingType>AI_NUMBI_NEAR_WHEAT_TYPE_CUTOFF)))
-						{
-							//printf("AI: findNewEmplacement d=%d valid=%d.\n", d, valid);
-							if (valid>bestValid)
-							{
-								*posX=px;
-								*posY=py;
-								bestValid=valid;
-								if ((b->type->shortTypeNum==0)||(parseBuildingType(buildingType)))
-									nextMainBuilding(buildingType);
-							}
-						}
-					}
-					else if (buildingType!=AI_NUMBI_NEAR_WHEAT_TYPE_CUTOFF)
-					{
-						//printf("AI: findNewEmplacement d=%d valid=%d.\n", d, valid);
-						if (valid>bestValid)
-						{
-							*posX=px;
-							*posY=py;
-							bestValid=valid;
-							if ((b->type->shortTypeNum==0)||(parseBuildingType(buildingType)))
-								nextMainBuilding(buildingType);
-						}
-					}
-				}
-			}
-		}
-		if (bestValid>-1)
-			return telemetry.returnedBool(AITrace::AI1::AINumbi_findNewEmplacement_result,
-										  AITrace::AI1::AINumbi_findNewEmplacement_true, true);
-		nextMainBuilding(buildingType);
-		return telemetry.returnedBool(AITrace::AI1::AINumbi_findNewEmplacement_result,
-									  AITrace::AI1::AINumbi_findNewEmplacement_true, false);
+		const auto& p = completed->semantics;
+		needs[resource] = (p.feeding.enabled && p.feeding.cost[resource] > 0)
+			|| (p.healing.enabled && p.healing.cost[resource] > 0);
+		for (const auto& recipe : p.production.recipes)
+			needs[resource] = needs[resource] || (recipe.enabled && recipe.cost[resource] > 0);
 	}
-	nextMainBuilding(buildingType);
-	return telemetry.returnedBool(AITrace::AI1::AINumbi_findNewEmplacement_result,
-								  AITrace::AI1::AINumbi_findNewEmplacement_true, false);
+	const int initial = nbFreeAround(origin->posX, origin->posY, width, height);
+	if (initial <= AI_NUMBI_PLACEMENT_SCORE_MIN && placement->semantics.occupiesGround)
+	{ nextMainBuilding(intent); return result(false); }
+	const int margin = provides(*origin, Intent::ProduceWorker) ? AI_NUMBI_SWARM_MARGIN : 0;
+	const int bx = origin->posX + observation->width, by = origin->posY + observation->height;
+	int sx = bx-width-margin, sy = by-height-margin;
+	int px = sx+1, py = sy, mx = bx+queries->kind(*origin).width+margin;
+	int my = by+queries->kind(*origin).height+margin, dx = 1, dy = 0;
+	--sy;
+	int best = -1;
+	for (int i = 0; i < AI_NUMBI_SCAN_ITERATIONS; ++i)
+	{
+		squareCircleScan(dx, dy, sx, sy, px, py, mx, my);
+		if (placement->semantics.occupiesGround && !queries->isFreeForBuilding(px, py, width, height)) continue;
+		const int score = placement->semantics.occupiesGround
+			? nbFreeAround(px, py, width, height) : AI_NUMBI_PLACEMENT_SCORE_INIT;
+		if (score <= AI_NUMBI_PLACEMENT_SCORE_MIN || score <= best
+			|| !queries->checkRoomForBuilding(px, py, typeNum, teamNumber)) continue;
+		bool supplied = true;
+		for (int resource = 0; resource < MaterialSlotCount && supplied; ++resource)
+			if (needs[resource])
+			{
+				int rx, ry, distance;
+				supplied = queries->resourceAvailableUpdate(teamNumber, resource, 0, px, py, &rx, &ry, &distance)
+					&& distance <= AI_NUMBI_WHEAT_DISTANCE_BIAS + width*height;
+			}
+		if (!supplied) continue;
+		*posX = px; *posY = py; best = score;
+	}
+	nextMainBuilding(intent);
+	return result(best >= 0);
 }

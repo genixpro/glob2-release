@@ -200,7 +200,7 @@ void blockWalls(Layout &L, int cell, int reach, GenerationContext &context)
 	{
 		if (L.cell[i] != cell || L.canal[i] || L.pads.plot[i])
 			return false;
-		const int x = i % t.w, y = i / t.w;
+		const int x = t.remainderX(i), y = i / t.w;
 		for (int dy = -1; dy <= 2; ++dy)
 			for (int dx = -1; dx <= 2; ++dx)
 			{
@@ -264,7 +264,7 @@ void blockWalls(Layout &L, int cell, int reach, GenerationContext &context)
 	std::vector<unsigned char> walk(n, 0);
 	for (int i = 0; i < n; ++i)
 	{
-		const int x = i % t.w, y = i / t.w;
+		const int x = t.remainderX(i), y = i / t.w;
 		const bool water = L.sketch[i] == WATER && L.sketch[t.at(x + 1, y)] == WATER &&
 						   L.sketch[t.at(x, y + 1)] == WATER &&
 						   L.sketch[t.at(x + 1, y + 1)] == WATER;
@@ -512,7 +512,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	const auto stampPad = [&](int cell, int u, int v)
 	{
 		const int i = localTile(L, cell, u, v);
-		stampFarmPlot(L.sketch, t, L.pads, i % t.w - kPadSize / 2, i / t.w - kPadSize / 2, pad);
+		stampFarmPlot(L.sketch, t, L.pads, t.remainderX(i) - kPadSize / 2, i / t.w - kPadSize / 2, pad);
 	};
 	for (int cell = 0; cell < L.g.cellCount(); ++cell)
 		switch (L.kind[cell])
@@ -572,14 +572,14 @@ TowerPlan planTowers(const Map &map, const Layout &L, const GenerationContext &c
 	std::vector<unsigned char> buildable(n, 0), target(n, 0);
 	for (int i = 0; i < n; ++i)
 	{
-		const int x = i % t.w, y = i / t.w;
-		if (map.isWater(x, y))
+		const int x = t.remainderX(i), y = i / t.w;
+		if (!map.terrainPropertiesAt(x, y).walkable)
 			continue;
 		// Land on other blocks belongs to "everyone else": worth shooting at from any colony's bank.
 		owner[i] = L.homeOf[i] >= 0 ? L.homeOf[i] : teams;
 		target[i] = 1;
 		buildable[i] =
-			L.homeOf[i] >= 0 && map.isGrass(x, y) && !reserved[i] && !map.isResource(x, y);
+			L.homeOf[i] >= 0 && map.terrainPropertiesAt(x, y).buildable && !reserved[i] && !map.isResource(x, y);
 	}
 	TowerRequest request = startingTowerRequest(o.towers, o.towerCount, kTowerPads, kTowerSpacing);
 	request.otherWeight = 1;
@@ -611,12 +611,12 @@ bool generate(Game &game, GenerationContext &context)
 	for (int i = 0; i < n; ++i)
 		if (L.bridge[i] && L.canal[i])
 			terrain[i] = SAND;
-	writeUndermap(map, terrain);
+	writeVertices(map, terrain);
 	// The built kinds' walls: stone on every designed wall tile (all pure grass, by the design's own
 	// check), before anything else is placed.
 	for (int i = 0; i < n; ++i)
-		if (L.stone[i] && map.isGrass(i % t.w, i / t.w))
-			map.setResource(i % t.w, i / t.w, STONE, 1);
+		if (L.stone[i] && map.terrainSupportsResourceAtByIndex(t.remainderX(i), i / t.w, STONE))
+			map.setResourceByIndex(t.remainderX(i), i / t.w, STONE, 1);
 
 	context.stage = "canals colonies";
 	if (!settleRoundColonies(game, context, "canals-starts", L.homeOf, L.homes, L.homeRadius))
@@ -630,7 +630,7 @@ bool generate(Game &game, GenerationContext &context)
 	std::vector<unsigned char> bridges(n, 0);
 	bool anyBridge = false;
 	for (int i = 0; i < n; ++i)
-		if (L.bridge[i] && L.canal[i] && !map.isWater(i % t.w, i / t.w))
+		if (L.bridge[i] && L.canal[i] && map.terrainPropertiesAt(t.remainderX(i), i / t.w).walkable)
 			bridges[i] = anyBridge = true;
 	if (!settleStartingTowers(game, context, towers, o.towers, o.towers > 0 && o.towerCount > 0,
 							  anyBridge ? &bridges : nullptr))
@@ -645,7 +645,7 @@ bool generate(Game &game, GenerationContext &context)
 						 [&](int i)
 						 {
 							 return L.homeOf[i] == k && !reserved[i] && !pads[i] &&
-									clearGround(map, i % t.w, i / t.w);
+									clearGround(map, t.remainderX(i), i / t.w);
 						 });
 	// Every block is fertile (its canal is within the growth probe's reach of all of it), so the
 	// ambient farmland is a share of every block but the kinds that carry their own cover (orchard,
@@ -662,7 +662,7 @@ bool generate(Game &game, GenerationContext &context)
 	const auto open = [&](int i)
 	{
 		return L.land[i] && !reserved[i] && !pads[i] && !landings[i] && !L.pads.plot[i] &&
-			   clearGround(map, i % t.w, i / t.w);
+			   clearGround(map, t.remainderX(i), i / t.w);
 	};
 	const auto eligible = [&](int i)
 	{
@@ -672,7 +672,7 @@ bool generate(Game &game, GenerationContext &context)
 	};
 	int fertile = 0;
 	for (int i = 0; i < n; ++i)
-		fertile += eligible(i) && fertility.at(i % t.w, i / t.w) > 0;
+		fertile += eligible(i) && fertility.at(t.remainderX(i), i / t.w) > 0;
 	furnishGround(
 		map, t, context, fertility, eligible, [&](int i) { return float(patch[i]); },
 		[&](int i) { return split[i]; },
@@ -708,7 +708,7 @@ bool generate(Game &game, GenerationContext &context)
 			if (scaledCount(1, o.stone) > 0)
 				if (const int seed = seedNear(t, int(centre.x), int(centre.y), 3, inBlock);
 					seed >= 0)
-					placeResourceClump(map, context, MapGeneratorPoint(seed % t.w, seed / t.w),
+					placeResourceClump(map, context, MapGeneratorPoint(t.remainderX(seed), seed / t.w),
 									   STONE, kQuarryRadius);
 			break;
 		case Homestead:
@@ -754,10 +754,10 @@ bool generate(Game &game, GenerationContext &context)
 				if (scaledCount(1, spot.type == WHEAT ? o.wheat : o.wood) <= 0)
 					continue;
 				const int at = localTile(L, cell, spot.u, spot.v);
-				if (const int seed = seedNear(t, at % t.w, at / t.w, 3,
+				if (const int seed = seedNear(t, t.remainderX(at), at / t.w, 3,
 											  [&](int i) { return inBlock(i) && !wallMargin[i]; });
 					seed >= 0)
-					placeResourceClump(map, context, MapGeneratorPoint(seed % t.w, seed / t.w),
+					placeResourceClump(map, context, MapGeneratorPoint(t.remainderX(seed), seed / t.w),
 									   spot.type, spot.radius);
 			}
 			break;
@@ -801,16 +801,16 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 	const int n = t.size();
 	// Every built kind's wall stands, and every moat holds its water round a dry islet.
 	for (int i = 0; i < n; ++i)
-		if (L.stone[i] && map.getResource(i % t.w, i / t.w).type != STONE)
-			return "A wall's stone is missing at (" + std::to_string(i % t.w) + ", " +
+		if (L.stone[i] && map.getResource(t.remainderX(i), i / t.w).type != STONE)
+			return "A wall's stone is missing at (" + std::to_string(t.remainderX(i)) + ", " +
 				   std::to_string(i / t.w) + ").";
 	for (int cell = 0; cell < L.g.cellCount(); ++cell)
 		if (L.kind[cell] == Moat)
 		{
 			const int ring = localTile(L, cell, 0, -int(kMoatOuter - 1.5));
 			const int middle = localTile(L, cell, 0, 0);
-			if (!map.isWater(ring % t.w, ring / t.w) || map.isWater(middle % t.w, middle / t.w))
-				return "A moat block has lost its moat at (" + std::to_string(middle % t.w) + ", " +
+			if (!map.isWater(t.remainderX(ring), ring / t.w) || map.isWater(t.remainderX(middle), middle / t.w))
+				return "A moat block has lost its moat at (" + std::to_string(t.remainderX(middle)) + ", " +
 					   std::to_string(middle / t.w) + ").";
 		}
 	// Home blocks are dry by design (first play); every lake block keeps its lake.

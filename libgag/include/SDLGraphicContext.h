@@ -6,8 +6,12 @@
 
 #include "GAGSys.h"
 #include "CursorManager.h"
+#include "RenderFramePacer.h"
 #include "SkinAtlasCache.h"
+#include <AssetLoader.h>
+#include <array>
 #include <map>
+#include <utility>
 #include <vector>
 #include <string>
 #include <iostream>
@@ -27,6 +31,7 @@
 namespace GAGCore
 {
     class RenderBatch;
+    class SpriteLoad;
     struct SkinMesh;
     struct SkinMeshRequest;
 
@@ -172,6 +177,7 @@ namespace GAGCore
 		friend struct Color;
 		friend class GraphicContext;
 		friend class Sprite;
+        friend class SpriteLoad;
 		//! the underlying software SDL surface
 		SDL_Surface *sdlsurface;
 		// Texture dimensions
@@ -180,6 +186,9 @@ namespace GAGCore
 		SDL_Rect clipRect;
 		// Content revisions are never consumed by drawing. Each backend remembers
 		// its own uploaded revision; raw pixel writes must call markPixelsChanged().
+		std::vector<unsigned char> preparedUploadPixels;
+        std::vector<AssetImage::Mip> preparedMips;
+        std::uint64_t preparedUploadRevision = 0;
 		std::uint64_t glUploadedRevision = 0; // Revision uploaded to this surface's legacy GL texture.
         std::uint64_t pixelRevision = 1, opacityRevision = 0;
         static std::uint64_t nextSurfaceIdentity();
@@ -219,6 +228,15 @@ namespace GAGCore
 		DrawableSurface(const std::string &imageFileName);
 		DrawableSurface(int w, int h);
 		DrawableSurface(const SDL_Surface *sourceSurface);
+        //! Adopt CPU-prepared ARGB8888 pixels on the renderer thread.
+        struct AdoptPixels {};
+        DrawableSurface(SDL_Surface *prepared, AdoptPixels, bool allocateGPU = true);
+        //! Create an owned renderer surface from prepared CPU data. Exclusive
+        //! callers must own the image payload; other callers receive a pixel copy.
+        static std::unique_ptr<DrawableSurface> fromAssetImage(const AssetImage& image,
+            bool exclusive = false, bool allocateGPU = true);
+        void adoptUploadPreparation(const AssetImage& image, bool exclusive = false);
+        void prepareTexture();
 		DrawableSurface *clone(void);
         DrawableSurface(const DrawableSurface&) = delete;
         DrawableSurface& operator=(const DrawableSurface&) = delete;
@@ -337,8 +355,16 @@ namespace GAGCore
 	//! A GraphicContext is a DrawableSurface that represent the main screen of the application.
 	class GraphicContext:public DrawableSurface
 	{
+		RenderFramePacer renderPacer;
 		static const bool verbose = false;
 	public:
+		// Interactive hosts reserve drawing before painting; exports and benchmarks
+		// leave the context's default uncapped. Zero means Unlimited.
+		void setTargetRenderFps(int fps) { renderPacer.configure(fps); }
+		void resetRenderPacing() { renderPacer.reset(); }
+		bool beginRenderFrame() { return renderPacer.begin(SDL_GetTicksNS()); }
+		Uint32 renderFrameWait() const { return renderPacer.waitMilliseconds(SDL_GetTicksNS()); }
+
 		//! The cursor manager, public to be able to set custom cursors
 		CursorManager cursorManager;
 		
@@ -352,6 +378,7 @@ namespace GAGCore
 			RESIZABLE = 8,
 			CUSTOMCURSOR = 16,
 			PORTABLEGPU = 32,
+            NOAUDIO = 128, // Offline artwork export creates only the video context.
             //! Opt out of high-density backing pixels for fixed-pixel profiling.
             LOWPIXELDENSITY = 64,
 		};
@@ -451,18 +478,42 @@ namespace GAGCore
 		std::unique_ptr<RenderBatch> renderBatch;
         bool renderBatchEnabled=true;
 		// Experimental live mesh renderer, owned by the GL context.
-        struct SkinResources
-        {
-            unsigned program = 0, framebuffer = 0, depth = 0;
-            std::vector<unsigned> colors;
-            using Key = SkinAtlasCache::Key;
-            SkinAtlasCache slots;
-            unsigned poses = 0, uv = 0, indices = 0, vao = 0;
-            std::uint64_t meshIdentity = 0;
-            unsigned frame = ~0u;
-            bool attempted = false;
-        } skinResources;
-        void destroySkinRenderer();
+		struct SkinResources
+		{
+			unsigned program = 0, rigProgram = 0, fragment = 0, framebuffer = 0, depth = 0;
+			struct RigBuffers
+			{
+				unsigned vertices = 0, indices = 0, vao = 0;
+			};
+			struct Uniforms
+			{
+				int region = -1, bones = -1, view = -1, normalView = -1, shell = -1;
+				void initialize(unsigned program);
+			} uniforms, rigUniforms;
+			void prepareRigShader();
+			const RigBuffers &restBuffers(const SkinMesh &mesh);
+			static void bindRigGeometry(const RigBuffers &buffers);
+			static void finishRigGeometry();
+			void uploadRigPalette(const SkinMesh &mesh, unsigned sample);
+			void bindCpuGeometry(const SkinMesh &mesh, unsigned sample);
+			// Geometry cache is bounded separately from the pose atlas. Rebuilt
+			// from immutable models after context restoration.
+			std::map<std::uint64_t, RigBuffers> rigs;
+			std::vector<float> cpuPose, uploadScratch;
+			std::vector<unsigned> colors;
+			using Key = SkinAtlasCache::Key;
+			SkinAtlasCache slots;
+			unsigned poses = 0, uv = 0, indices = 0, vao = 0;
+			std::uint64_t meshIdentity = 0;
+			unsigned frame = ~0u;
+			// Uniform values survive program switches and atlas batches.
+			std::uint64_t paletteIdentity = 0;
+			unsigned paletteFrame = ~0u;
+			bool attempted = false, rigAttempted = false;
+			// Fur support is cached by material-map identity and revision.
+			std::map<std::pair<std::uint64_t, std::uint64_t>, std::array<bool, 4>> shellRegions;
+		} skinResources;
+		void destroySkinRenderer();
         unsigned unitShaderProgram = 0;
 		int unitShaderLocBase = -1, unitShaderLocTeam = -1;
 		int unitShaderLocHasBase = -1, unitShaderLocHasTeam = -1;
@@ -556,14 +607,14 @@ namespace GAGCore
         //! Axis-aligned world rectangle with edges snapped to target pixels, so
         //! translucent neighbours tile without seams or doubled edges at any zoom.
         void drawMapFill(int x1, int y1, int x2, int y2, const Color& color);
-        //! A whole-tile fill that must meet neighbouring sprites exactly. The
-        //! software rasteriser truncates coordinates, so there it snaps like
-        //! drawMapFill; accelerated renderers place sprites at exact fractions,
-        //! and a snapped fill beside them would leave a hairline seam.
+        //! A whole-tile fill that must meet neighbouring sprites exactly. Both
+        //! software backends snap shared edges to target pixels; native software
+        //! draws there directly to avoid DPI geometry rounding. Accelerated
+        //! renderers retain exact fractions to match their neighbouring sprites.
         void drawMapTileFill(int x1, int y1, int x2, int y2, const Color& color);
         //! A sprite frame covering the `size`-pixel map square at (x, y), meeting
-        //! its neighbours and drawMapTileFill exactly. In the software rasteriser
-        //! its edges snap to the same pixels as theirs; elsewhere it is drawSprite.
+        //! its neighbours and drawMapTileFill exactly. Both software backends snap
+        //! its edges in target pixels; elsewhere it is drawSprite.
         void drawMapTileSprite(int x, int y, int size, Sprite *sprite, unsigned index, Uint8 alpha = Color::ALPHA_OPAQUE);
         // Repeat a presentation-only pass. Its primary invocation advances visual
         // state once; subsequent invocations must only draw.
@@ -591,6 +642,9 @@ namespace GAGCore
         static void translateMouseCoordinates(float &x, float &y);
 		//! rewrite a polled event's mouse coordinates from window pixels to logical coordinates
 		static void translateMouseEvent(SDL_Event *event);
+		//! Counts render device/target resets seen by translateMouseEvent, so caches of
+		//! composed surfaces (editor swatches) can drop themselves without an event hook.
+		static std::uint64_t renderResetGeneration();
 		//! Pump events at a frame boundary; modal expose callbacks only present a cached frame.
 		static int pollEvent(SDL_Event *event);
 		virtual void setClipRect(int x, int y, int w, int h);
@@ -647,12 +701,17 @@ namespace GAGCore
 		//! shader is unavailable so the caller can fall back to two ordinary
 		//! drawSurface calls (base, then the CPU-recoloured team layer).
 		bool drawTeamColoredQuad(DrawableSurface *base, DrawableSurface *team, float x, float y, float w, float h, Uint8 alpha, float hueShift);
+		//! Maximum supported texture dimension, or zero when no limit is reported.
+		int maximumTextureSize() const;
 		RenderBatch* getRenderBatch() const { return renderBatchEnabled?renderBatch.get():nullptr; }
         void countRenderBatchDraw() { ++drawCalls; }
         // Diagnostic comparison switches use the same context and assets.
         void setRenderBatchEnabled(bool enabled);
         bool hasUnitShader() const { return unitShaderProgram != 0; }
         // Render distinct visible poses before painting the map; composites retain painter order.
+        void drawSkinSprite(float x,float y,float w,float h,DrawableSurface *surface,int sx,int sy,int sw,int sh,Uint8 alpha);
+        // Production FBO tile, top-down straight RGBA; no shadows or window readback.
+        bool readSkinMesh(const SkinMeshRequest &request, std::vector<std::uint8_t> &rgba);
         void prepareSkinMeshes(const std::vector<SkinMeshRequest> &requests);
         // Returns false without drawing when the backend or assets are unavailable.
         // texture is the team's colour atlas and material its material-id map;
@@ -691,6 +750,10 @@ namespace GAGCore
 	//! A sprite is a collection of images (frames) that can be displayed one after another to make an animation
 	class Sprite
 	{
+        friend class SpriteLoad;
+        void registerLoaded();
+        static std::vector<AssetLoader::Handle<AssetImage>> prefetchHighResolution(const std::string&, size_t frames);
+        void adoptLoaded(Sprite& prepared);
 	protected:
 		struct RotatedImage
 		{
@@ -768,10 +831,7 @@ namespace GAGCore
 
 		friend class DrawableSurface;
 		// Support functions
-		//! Load every frame from the sheets listed in <filename>.sheet, return false and load nothing if there is no usable index
-		bool loadSheets(const std::string &filename);
-		//! Load a frame from two file pointers
-		void loadFrame(SDL_IOStream *frameStream, SDL_IOStream *rotatedStream);
+
 		//! Check if index is within bound and return true, assert false and return false otherwise
 		bool checkBound(int index);
 		//! Return a rotated drawable surface for actColor, create it if necessary
@@ -793,15 +853,14 @@ namespace GAGCore
 
     protected:
 		virtual DrawableSurface *getRotatedSurface(int index);
-		void reloadHighResolution();
 		//! One bit per 32-phase block, recomputed whenever the HD layer arrays
-		//! change (load(), reloadHighResolution()); backs blockHasCompleteHD.
+		//! change (load and atomic HD publication); backs blockHasCompleteHD.
 		std::vector<bool> blockCompleteHD;
 		void recomputeBlockCompleteHD();
 		void applyTeamHueShift(DrawableSurface &surface);
 		DrawableSurface *getColoredSurface(int index, bool experiment);
 		DrawableSurface *prepareDrawSurface(unsigned index, bool teamColor, bool experiment);
-		void loadExperimentFrame(const std::string &frameName, const std::string &rotatedName);
+        void appendHighResolutionFrame(size_t index, Sprite& target);
 
 	public:
 		//! Opt into batching variable-size frames; callers must finishDrawingSprite.
@@ -809,6 +868,9 @@ namespace GAGCore
 		struct HighResolutionStats {size_t cpuBytes=0, coloredFrames=0;};
 		static HighResolutionStats highResolutionStats();
 		static void setHighResolution(bool enabled);
+        static void requestHighResolution(bool enabled);
+        static bool pollHighResolution(unsigned budgetMs = 2);
+        static bool pollHighResolutionUntil(std::chrono::steady_clock::time_point deadline);
 		static void flushBatches(GraphicContext *gc);
 		//! Constructor
 		Sprite() : fileName("not loaded yet") { }

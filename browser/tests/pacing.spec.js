@@ -3,7 +3,7 @@ const {test, expect} = require('@playwright/test');
 const fs = require('node:fs');
 const path = require('node:path');
 const {openRuntimeHost} = require('./runtime-host');
-const {gameURL, clickMainMenu, clickControl, clickListRow} = require('./main-menu');
+const {gameURL, clickMainMenu, clickControl, clickListRow, clickSettingsDone} = require('./main-menu');
 const state = (page) => page.evaluate(() => glob2Diagnostics.snapshot());
 const root = path.resolve(__dirname, '../..');
 const fixture = path.join(root, 'games/cross-replay.game.gz');
@@ -18,7 +18,7 @@ async function referenceTrace(page) {
       preRun:[()=>{ENV.GLOB2_REPLAY_PATH='/tmp/reference.replay';ENV.GLOB2_CHECKSUM_SIDECAR='1';
         FS.writeFile('/tmp/initial.game.gz',Uint8Array.from(atob('${fs.readFileSync(fixture).toString('base64')}'),c=>c.charCodeAt(0)));}],
       async onRuntimeInitialized(){
-        const code=await Module.start(['--nox','/tmp/initial.game.gz','1500','1','--ai-threads','1']);
+        const code=await Module.start(['--nox','/tmp/initial.game.gz','1500','1','--compute-threads','1']);
         if(code!==0)throw new Error('Reference engine exited: '+code);
         const bytes=FS.readFile('/tmp/reference.replay.checksums');let binary='';
         for(let i=0;i<bytes.length;i+=32768)binary+=String.fromCharCode(...bytes.subarray(i,i+32768));
@@ -49,6 +49,13 @@ for (const variant of ['serial', 'threaded']) {
     await openRuntimeHost(page, shell, url.search);
     await expect.poll(async () => (await state(page)).screen).toContain('MainMenuScreen');
     expect((await state(page)).executionMode).toBe(variant);
+    // Exercise different drawing ceilings against the same reference tick trace.
+    await clickMainMenu(page, 'settings');
+    await expect.poll(async () => (await state(page)).screen).toContain('SettingsScreen');
+    await clickControl(page, 'graphics.fps');
+    await clickControl(page, variant === 'serial' ? 'popup/0' : 'popup/4');
+    await clickSettingsDone(page);
+    await expect.poll(async () => (await state(page)).screen).toContain('MainMenuScreen');
     await clickMainMenu(page, 'load');
     const chooser = page.waitForEvent('filechooser');
     await clickControl(page, 'import');
@@ -66,6 +73,16 @@ for (const variant of ['serial', 'threaded']) {
     // independent of the renderer's speed or the machine's refresh rate.
     await expect.poll(async () => (await state(page)).frames).toBeGreaterThan(paused.frames + 5);
     expect((await state(page)).tick).toBe(paused.tick);
+    const cadence = await page.evaluate(async () => {
+      const start = performance.now(), frames = glob2Diagnostics.snapshot().frames;
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      return {milliseconds:performance.now() - start, frames:glob2Diagnostics.snapshot().frames - frames};
+    });
+    const target = variant === 'serial' ? 25 : 120;
+    fs.mkdirSync(info.outputDir, {recursive:true});
+    fs.writeFileSync(info.outputPath('drawing-cadence.json'), JSON.stringify({target, ...cadence}, null, 2));
+    expect(cadence.frames).toBeGreaterThan(0);
+    expect(cadence.frames).toBeLessThanOrEqual(Math.ceil(target * cadence.milliseconds / 1000) + 2);
     await page.locator('#canvas').press('Escape');
     await clickControl(page, 'quit');
     await expect.poll(async () => (await state(page)).screen).toContain('EndGameScreen');

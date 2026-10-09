@@ -42,12 +42,6 @@
   font-family: var(--font-display);
   font-size: var(--text-lg);
 }
-.ai-mark {
-  width: 30px;
-  height: 30px;
-  flex: none;
-}
-
 .pager {
   display: flex;
   gap: var(--sp-2);
@@ -142,7 +136,6 @@
   border-radius: var(--r-lg);
   border: 1px solid var(--line);
   box-shadow: var(--shadow-md);
-  transform: rotate(-0.6deg);
 }
 @media (max-width: 760px) {
   .map-hero {

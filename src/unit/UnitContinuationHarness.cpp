@@ -64,23 +64,28 @@ static std::vector<Uint32> state(Game& game)
     return result;
 }
 
-static void checkContinuation(int checkpoint)
+static void checkContinuation(int checkpoint, bool hazards = false)
 {
     setSyncRandSeed(731);
     GameGUI original;
     Game& game = original.game;
+    game.gameHeader.setRandomSeed(731);
     glob2test::BoundGameRandom bound(game);
     game.map.setSize(5, 5, GRASS);
     game.map.setGame(&game);
     game.addTeam();
     game.teams[0]->race.loadDefault();
     game.setWaitingOnMask(0);
+    if (hazards) {
+        auto edit=game.map.editTerrain();
+        for (int y=8;y<18;++y) for(int x=6;x<15;++x) game.map.paintCell(x,y,ICE);
+    }
     for (int y = 0; y < 32; ++y)
         for (int x = 0; x < 32; ++x) game.map.clearImmobileUnit(x, y);
     for (int x = 12; x < 15; ++x)
     {
-        game.map.setResource(x, 12, WOOD, 1);
-        game.map.getTile(x, 12).clearArea = game.teams[0]->me;
+        game.map.setResourceByIndex(x, 12, WOOD, 1);
+        game.map.setAreaMask(game.map.coordToIndex(x, 12), &Tile::clearArea, game.teams[0]->me);
     }
     auto* first = game.addUnit(7, 12, 0, WORKER, 0, 0, 0, 0);
     auto* second = game.addUnit(7, 14, 0, WORKER, 0, 0, 0, 0);
@@ -90,9 +95,9 @@ static void checkContinuation(int checkpoint)
     auto* secondInn = game.addBuilding(20, 4, innType, 0);
     REQUIRE((firstInn && secondInn));
     // Availability order deliberately differs from building-id order.
-    secondInn->resources[WHEAT] = 10;
+    secondInn->materials[WHEAT] = 10;
     secondInn->update();
-    firstInn->resources[WHEAT] = 10;
+    firstInn->materials[WHEAT] = 10;
     firstInn->update();
     auto* flyer = game.addUnit(12, 4, 0, EXPLORER, 0, 0, 0, 0);
     REQUIRE((flyer && game.teams[0]->findNearestFood(flyer) == firstInn));
@@ -138,6 +143,12 @@ static void checkContinuation(int checkpoint)
 
 TEST_SUITE("UnitContinuation")
 {
+    TEST_CASE("hazard routes and idle escape preserve per-tick state across save load")
+    {
+        glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.loadStrings = true});
+        for (int checkpoint : {0,31,127}) checkContinuation(checkpoint,true);
+    }
+
 	TEST_CASE("five checkpoints replay 256 ticks with matching state and RNG")
 	{
 		glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.loadStrings = true});

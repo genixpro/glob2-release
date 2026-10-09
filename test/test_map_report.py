@@ -83,6 +83,17 @@ def contract_rejections(report):
 
     rejected('unexpected root property', lambda j: j.update(unexpected=True))
     rejected('map width type', lambda j: j['map'].update(width='128'))
+    credited = json.loads(json.dumps(report))
+    credited['map']['setCredits'] = [{
+        'setId': '11111111-1111-4111-8111-111111111111',
+        'versionId': '22222222-2222-4222-8222-222222222222',
+        'title': 'Example', 'license': 'CC-BY-4.0',
+        'authors': [{'author': 'Artist', 'license': 'CC-BY-4.0'}],
+        'sourceHash': 'a'*64, 'entries': ['terrain/example'],
+    }]
+    contract(credited)
+    rejected('credits array type', lambda j: j['map'].update(setCredits={}))
+    rejected('incomplete credit', lambda j: j['map'].update(setCredits=[{'title':'Example'}]))
     rejected('telemetry kind enum', lambda j: telemetry(j)['records'][0].update(kind='unknown'))
     rejected('telemetry value type', lambda j: telemetry(j)['records'][0].update(value={}))
     rejected('negative subject', lambda j: telemetry(j)['records'][0].update(subject=-1))
@@ -237,17 +248,40 @@ def main():
         assert fixtures['invalid-1']['generation']['raw_request']['options'] == {}
         assert fixtures['invalid-2']['generation']['raw_request']['width_exponent'] == -100
         assert fixtures['invalid-3']['generation']['raw_request']['options']['unknown-option'] == 7
+        compound = fixtures['compound']
+        assert compound['resources']['definitions']['wood']['stored_amount'] == 5
+        assert compound['resources']['types']['wood']['stored_amount'] == 5
+        assert compound['resources']['types']['trees']['stored_amount'] == 0
+        assert 'wood' not in compound['resources']['legacy_type_aliases']
+        access = compound['movement']['walking']['colonies'][0]
+        assert access['materials']['food'] == access['resources']['wheat']
+        assert access['materials']['wood'] == access['resources']['wood']
         grass=fixtures['grass']
         assert grass['map']['name'] == 'A "quoted" map\né'
         assert grass['terrain']['grass'] == {'tiles':4096,'percent':100}
         assert grass['resources']['occupied']['tiles'] == 2
+        assert grass['resources']['definitions']['trees'] == grass['resources']['types']['wood']
+        assert grass['resources']['legacy_type_aliases']['wood'] == 'trees'
         assert grass['resources']['types']['wood']['stored_amount'] == 3
-        assert grass['resources']['types']['wheat']['stored_amount'] == 7
+        assert grass['resources']['types']['wheat']['stored_amount'] == 5
         assert grass['space']['buildable']['tiles'] == 4092
         assert grass['space']['build_sites_4x4'] == 4052
         assert grass['movement']['walking']['between_colonies'] == [[0,1],[1,0]]
         assert grass['start_position_euclidean_distances'] == [[0,1],[1,0]]
         assert grass['movement']['walking']['colonies'][0]['resources']['wood']['nearest_gather_cost'] == 5
+        # Terrain composition counts vertices. Walking/buildability come from the
+        # cell rules; each lone vertex makes four mixed, unbuildable cells.
+        materials=fixtures['materials']
+        assert materials['terrain']['grass']['tiles']==4092
+        for name in ('ice','road','sand','water'):
+            assert materials['terrain'][name]['tiles']==1
+        assert 'grass_sand_border' not in materials['terrain']
+        assert materials['space']['buildable']['tiles']==4076
+        assert materials['space']['growth_disabled']['tiles']==0
+        assert materials['space']['land_regions']['passable']['tiles']==4096
+        legacy=json.loads(json.dumps(grass))
+        del legacy['terrain']['ice'],legacy['terrain']['road']
+        contract(legacy)
         islands=fixtures['islands']
         assert islands['terrain']['water']['tiles'] == 4094
         assert islands['movement']['walking']['between_colonies'] == [[0,None],[None,0]]

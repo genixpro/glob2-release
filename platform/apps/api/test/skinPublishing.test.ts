@@ -4,6 +4,7 @@ import { afterAll, beforeAll, expect, it } from 'vitest';
 import { createHarness, type Harness, type Instance } from './support.ts';
 import { registeredPlayer, type Player } from './playSupport.ts';
 import { colourAtlas, materialMap } from './skinImages.ts';
+import { SKIN_MATERIAL_COUNT } from '../src/skins/images.ts';
 let harness: Harness;
 let instance: Instance;
 let player: Player;
@@ -110,7 +111,8 @@ it('publishes canonical paint, retains old versions, equips and serves verified 
       ...payload,
       name: 'Renamed design',
       skinId: version.skinId,
-      materialBase64: (await materialMap({ id: () => 3 })).toString('base64'),
+      // The highest registered id: every catalogue entry publishes.
+      materialBase64: (await materialMap({ id: () => SKIN_MATERIAL_COUNT - 1 })).toString('base64'),
     },
   });
   expect(rematerialed.statusCode, rematerialed.body).toBe(200);
@@ -181,24 +183,24 @@ it('publishes canonical paint, retains old versions, equips and serves verified 
 
   const texture = await app.inject({
     method: 'GET',
-    url: `/api/v1/skins/versions/${version.id}/texture`,
+    url: `/api/v1/skins/versions/${version.id}/texture?sha256=${version.textureSha256}`,
   });
   expect(texture.statusCode).toBe(200);
   const metadata = await sharp(texture.rawPayload).metadata();
   expect(metadata.hasAlpha).toBe(false);
   expect(metadata.width).toBe(512);
   expect(texture.headers['etag']).toBe(`"${version.textureSha256}"`);
-  const materialUrl = `/api/v1/skins/versions/${version.id}/material`;
+  const materialUrl = `/api/v1/skins/versions/${version.id}/material?sha256=${version.materialSha256}`;
   const served = await app.inject({ method: 'GET', url: materialUrl });
   expect(served.statusCode).toBe(200);
-  expect(served.headers['content-type']).toBe('image/png');
+  expect(served.headers['content-type']).toBe('image/webp');
   expect(served.headers['etag']).toBe(`"${version.materialSha256}"`);
   expect(served.headers['cache-control']).toBe('public, max-age=300');
   expect(createHash('sha256').update(served.rawPayload).digest('hex')).toBe(version.materialSha256);
   expect(await sharp(served.rawPayload).metadata()).toMatchObject({
     width: 512,
     height: 512,
-    channels: 1,
+    channels: 3,
   });
   const decoded = await sharp(served.rawPayload)
     .extractChannel(0)
@@ -255,7 +257,11 @@ it('validates and canonicalizes material maps', async () => {
     });
   const rejected: [string, Buffer, RegExp][] = [
     ['non-grey', await materialMap({ pixel: { x: 10, y: 10, value: [1, 2, 1] } }), /grey/],
-    ['out of range', await materialMap({ pixel: { x: 300, y: 5, value: [4, 4, 4] } }), /ids/],
+    [
+      'out of range',
+      await materialMap({ pixel: { x: 300, y: 5, value: [255, 255, 255] } }),
+      /ids 0 to \d+/,
+    ],
     [
       'transparent',
       await materialMap({ channels: 4, pixel: { x: 0, y: 0, value: [0, 0, 0, 128] } }),
@@ -294,15 +300,14 @@ it('validates and canonicalizes material maps', async () => {
   expect(blob).toMatchObject({
     visibility: 'private',
     owner_account_id: painter.accountId,
-    content_type: 'image/png',
+    content_type: 'image/webp',
   });
   const stored = (await harness.blobs.get(blob.storage_key))!;
   const chunks: Buffer[] = [];
   for await (const chunk of stored) chunks.push(Buffer.from(chunk as Uint8Array));
   const png = Buffer.concat(chunks);
-  // IHDR: bit depth 8, colour type 0 (greyscale).
-  expect([png[24], png[25]]).toEqual([8, 0]);
-  expect((await sharp(png).metadata()).channels).toBe(1);
+  expect((await sharp(png).metadata()).format).toBe('webp');
+  expect((await sharp(png).metadata()).channels).toBe(3);
   const decoded = await sharp(png).extractChannel(0).raw().toBuffer({ resolveWithObject: true });
   expect([0, 1, 2, 3, 512].map((i) => decoded.data[i])).toEqual([0, 1, 2, 3, 1]);
   painter.client.close();
@@ -355,4 +360,140 @@ it('publishes paint per swarm mesh, leaving swarmMesh out of classic manifests',
       .map((item: { swarmMesh: string }) => item.swarmMesh)
       .sort(),
   ).toEqual(['classic', 'crown']);
+});
+
+it('exposes pending status immediately and only serves ready enabled sprite bundle assets', async () => {
+  const db = harness.database.db,
+    revision = '9'.repeat(64);
+  await db.insertInto('skin_render_revisions').values({ revision }).execute();
+  const headers = { authorization: `Bearer ${player.accessToken}` };
+  const response = await instance.app.inject({
+    method: 'POST',
+    url: '/api/v1/skins/publish',
+    headers,
+    payload: {
+      name: 'Sprites',
+      imageBase64: (await colourAtlas()).toString('base64'),
+      materialBase64: (await materialMap()).toString('base64'),
+      buildingColor: 321,
+    },
+  });
+  expect(response.statusCode, response.body).toBe(200);
+  const version = response.json();
+  expect(version.softwareStatus).toBe('pending');
+  const derivative = await db
+    .selectFrom('colony_skin_sprites')
+    .selectAll()
+    .where('version_id', '=', version.id)
+    .where('render_revision', '=', revision)
+    .executeTakeFirstOrThrow();
+  const { putContent } = await import('@glob2/core');
+  const page = await putContent(harness.blobs, Buffer.from('page fixture')),
+    manifest = await putContent(harness.blobs, Buffer.from('manifest fixture'));
+  for (const blob of [page, manifest])
+    await db
+      .insertInto('blobs')
+      .values({
+        sha256: blob.sha256,
+        size: blob.size,
+        storage_key: blob.key,
+        content_type: blob === page ? 'image/webp' : 'application/json',
+      })
+      .execute();
+  const url = `/api/v1/skins/versions/${version.id}/sprites/${manifest.sha256}`;
+  expect((await instance.app.inject({ url: url + '/manifest' })).statusCode).toBe(404);
+  await db
+    .insertInto('colony_skin_sprite_pages')
+    .values({ sprites_id: derivative.id, sha256: page.sha256 })
+    .execute();
+  await db
+    .updateTable('colony_skin_sprites')
+    .set({ status: 'ready', manifest_sha256: manifest.sha256 })
+    .where('id', '=', derivative.id)
+    .execute();
+  const delivered = await instance.app.inject({ url: url + '/pages/' + page.sha256 });
+  expect(delivered.statusCode).toBe(200);
+  expect(delivered.headers['content-type']).toContain('image/webp');
+  expect(delivered.body).toBe('page fixture');
+  expect(
+    (await instance.app.inject({ url: url + '/pages/' + version.textureSha256 })).statusCode,
+  ).toBe(404);
+  expect((await instance.app.inject({ url: url + '/manifest' })).body).toBe('manifest fixture');
+  const catalog = (await instance.app.inject({ url: '/api/v1/skins', headers })).json();
+  expect(catalog.items.find((s: { id: string }) => s.id === version.id).softwareStatus).toBe(
+    'ready',
+  );
+  await db
+    .updateTable('colony_skins')
+    .set({ disabled_at: new Date() })
+    .where('id', '=', version.skinId)
+    .execute();
+  expect((await instance.app.inject({ url: url + '/manifest' })).statusCode).toBe(404);
+  expect((await instance.app.inject({ url: url + '/pages/' + page.sha256 })).statusCode).toBe(404);
+});
+
+it('retains prior render-revision sprite bundles when a newer revision becomes ready', async () => {
+  const db = harness.database.db;
+  const { enqueueSkinSprites, putContent } = await import('@glob2/core');
+  const revisions = ['b'.repeat(64), 'c'.repeat(64)];
+  const headers = { authorization: `Bearer ${player.accessToken}` };
+  const published = await instance.app.inject({
+    method: 'POST',
+    url: '/api/v1/skins/publish',
+    headers,
+    payload: {
+      name: 'Rig migration',
+      imageBase64: (await colourAtlas()).toString('base64'),
+      materialBase64: (await materialMap()).toString('base64'),
+      buildingColor: 456,
+    },
+  });
+  expect(published.statusCode, published.body).toBe(200);
+  const version = published.json() as { id: string };
+  const retained: { url: string; page: string; revision: string }[] = [];
+  for (const revision of revisions) {
+    await db.insertInto('skin_render_revisions').values({ revision }).execute();
+    await enqueueSkinSprites(db, version.id, revision);
+    const derivative = await db
+      .selectFrom('colony_skin_sprites')
+      .selectAll()
+      .where('version_id', '=', version.id)
+      .where('render_revision', '=', revision)
+      .executeTakeFirstOrThrow();
+    const page = await putContent(harness.blobs, Buffer.from(`page ${revision}`));
+    const manifest = await putContent(harness.blobs, Buffer.from(`manifest ${revision}`));
+    for (const blob of [page, manifest])
+      await db
+        .insertInto('blobs')
+        .values({
+          sha256: blob.sha256,
+          size: blob.size,
+          storage_key: blob.key,
+          content_type: blob === page ? 'image/webp' : 'application/json',
+        })
+        .execute();
+    await db
+      .insertInto('colony_skin_sprite_pages')
+      .values({ sprites_id: derivative.id, sha256: page.sha256 })
+      .execute();
+    await db
+      .updateTable('colony_skin_sprites')
+      .set({ status: 'ready', manifest_sha256: manifest.sha256 })
+      .where('id', '=', derivative.id)
+      .execute();
+    retained.push({
+      url: `/api/v1/skins/versions/${version.id}/sprites/${manifest.sha256}`,
+      page: page.sha256,
+      revision,
+    });
+    for (const bundle of retained) {
+      const response = await instance.app.inject({ url: bundle.url + '/manifest' });
+      expect(response.statusCode).toBe(200);
+      expect(response.body).toBe(`manifest ${bundle.revision}`);
+      const image = await instance.app.inject({ url: bundle.url + '/pages/' + bundle.page });
+      expect(image.statusCode).toBe(200);
+      expect(image.body).toBe(`page ${bundle.revision}`);
+    }
+  }
+  expect(retained[0]?.url).not.toBe(retained[1]?.url);
 });

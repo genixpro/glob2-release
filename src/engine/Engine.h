@@ -24,6 +24,8 @@
 
 
 class SimulationRunner;
+class ScenePreparation;
+struct SceneInputs;
 namespace PerformanceTelemetry { struct Collector; }
 class NetGame;
 namespace Turn { class TurnLockstepSession; }
@@ -43,7 +45,7 @@ class Engine
 	friend struct MatchVerifier;
 	friend struct TurnClient;
 	std::shared_ptr<GameDiagnostics::Session> diagnostics;
-	bool diagnosticsPending() const;
+	bool headlessDiagnosticsPending() const;
 	std::string headlessOutput;
 	std::string initializationDiagnostic;
 	int headlessSaveInterval = 0;
@@ -196,9 +198,6 @@ public:
     //! Main-thread GUI step with the simulation parked; rethrows simulation
     //! failures. Returns false once the session has ended.
     bool threadedClientFrame(Uint64 now, const std::vector<SDL_Event>& events);
-    //! Milliseconds to wait after a threaded frame that took `elapsed` ms, capping
-    //! drawing at about 120 frames per second without adding to vsync pacing.
-    static Uint32 threadedFrameWait(Uint64 elapsed) { return elapsed >= 8 ? 0 : Uint32(8 - elapsed); }
     //! Keep the simulation parked while the host is in the background.
     void suspendSimulation();
     void resumeSimulation(Uint64 now);
@@ -207,7 +206,6 @@ public:
     //! in the background: the latest clock the host passed in, advanced by real time.
     Uint64 sessionClock() const;
     bool simulationStep(Uint64 now);
-    void extractScene(Scene& scene);
     // Called on the main thread with the simulation parked. GUI timing uses
     // the SDL clock, independently of the host/session simulation clock.
     void clientStep(const std::vector<SDL_Event>& events);
@@ -304,9 +302,10 @@ private:
 
 	struct MainLoopState
 	{
-		int speed;
+		int speed;           ///< Rounded presentation interval, in ms
+		Uint64 speedNs;       ///< Simulation tick interval, in ns
 		int nextGuiStep;      ///< Fast-forward draw countdown
-		Sint64 needToBeTime;  ///< Expected elapsed time for pacing, in ms
+		Sint64 needToBeTime;  ///< Expected elapsed time for pacing, in ns
 		Uint64 startTime;
 		bool wasReadyLastTick;
 		bool adjustableGameSpeed; ///< Speed presets apply; live network games stay at GAME_TICK_MS
@@ -329,7 +328,7 @@ private:
 	/// game.syncStep. Called only from inside the !hardPause branch.
 	void executeOrdersAndStep(bool readyNow);
 
-	void drawFrame(MainLoopState& st, bool everyFrame = false, const Scene* scene = nullptr);
+	void drawFrame(MainLoopState& st, bool everyFrame = false, const PresentationFrame* scene = nullptr);
 
 	/// Turn games: pumps the session each frame and handles its requests (reload,
 	/// desync flag). Called first in stepSessionImpl.
@@ -350,17 +349,27 @@ private:
 	void saveVideoshot(MainLoopState& st);
 	void configureSessionTelemetry(MainLoopState& st, PerformanceTelemetry::Collector& perf);
 	//! Threaded: fold the simulation thread's measurements into the session collector
-	//! (called with the simulation parked).
+	//! through a bounded locked mailbox without parking the simulation.
 	void absorbSimulationTelemetry();
     std::optional<MainLoopState> session;
     /// A turn game draws only after a step: polls between steps change nothing visible.
     bool turnDrawPending = true;
     std::unique_ptr<SimulationRunner> runner;
+    std::unique_ptr<ScenePreparation> serialPresentation;
+    std::shared_ptr<const SceneInputs> retainedPresentation;
+    bool readBoundaryOpened = false;
+    std::vector<unsigned> observationPlayers(bool wasReadyLastTick) const;
+    SimulationSnapshot::Handle openReadBoundary(std::span<const unsigned> players, bool paused, bool present);
+    void refreshRetainedPresentation();
+    std::optional<SceneRequest> admitPresentation();
+    void publishPresentation(const SimulationSnapshot::Handle& world,SceneRequest request);
+    SimulationSnapshot::Requirements presentationRequirements(const SceneRequest& request) const;
     //! Host clock minus SDL_GetTicks(), published by the main thread for sessionClock.
     std::atomic<Sint64> sessionClockOffset{0};
     void publishSessionClock(Uint64 now);
-    // Live while a session runs: synchronized draws must use the game's bound stream.
-    std::optional<SyncRandRequirement> randomRequirement;
+    // Private setup draws never consume a simulation owner's stream.
+    EntityRandom mapSelectionRandom;
+    bool mapSelectionInitialized = false;
     int sessionEndingTarget = 0;
     GAGCore::EventQueue sessionInput;
 

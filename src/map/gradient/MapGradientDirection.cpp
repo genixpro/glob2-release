@@ -5,7 +5,7 @@
 #include "Map.h"
 #include "MapInternal.h"
 #include "Utilities.h"
-#include "field/GradientCosts.h"
+#include "field/TerrainMovementCosts.h"
 
 #include <cstdlib>
 
@@ -28,24 +28,18 @@ int Map::swimClass(int walkSpeed, int swimSpeed)
 	return best;
 }
 
-int Map::minStepCost(int swimClass)
+int Map::minStepCost(int swimClass) const
 {
-	if (swimClass > 0 && WATER_STEP[swimClass] < GRADIENT_STEP)
-		return WATER_STEP[swimClass];
-	return GRADIENT_STEP;
+	return terrainMinimumGround[swimClass];
 }
 
 int Map::stepCost(int dx, int dy, size_t targetIndex, int swimClass) const
 {
-	int step = GRADIENT_STEP;
-	if (swimClass > 0 && isWater((unsigned)targetIndex))
-		step = WATER_STEP[swimClass];
-	if (dx != 0 && dy != 0)
-		step = step * GRADIENT_DIAGONAL_STEP / GRADIENT_STEP;
-	return step;
+	const auto cost = cellRule(targetIndex).ground[swimClass];
+	return dx != 0 && dy != 0 ? cost.diagonal : cost.cardinal;
 }
 
-bool Map::directionByGradient(Uint32 teamMask, int swimClass, int x, int y, const Uint16 *gradient, int *dx, int *dy, bool strict, Uint32 guardAreaMask) const
+bool Map::directionByGradient(EntityRandom& random, Uint32 teamMask, int swimClass, int x, int y, const Uint16 *gradient, int *dx, int *dy, bool strict, Uint32 guardAreaMask) const
 {
 	PERF_SCOPE_TIME(PathDirection);
 	const bool canSwim = swimClass > 0;
@@ -72,7 +66,7 @@ bool Map::directionByGradient(Uint32 teamMask, int swimClass, int x, int y, cons
 		Uint16 g = gradient[n];
 		if (g <= GRADIENT_UNREACHABLE || !isFreeForGroundUnit(x + ddx, y + ddy, canSwim, teamMask))
 			continue;
-		if (guardAreaMask && !(tiles[n].guardArea & guardAreaMask))
+		if (guardAreaMask && !(areaCells[n].guard & guardAreaMask))
 			continue;
 		if (g > here)
 		{
@@ -96,9 +90,9 @@ bool Map::directionByGradient(Uint32 teamMask, int swimClass, int x, int y, cons
 	if (strict || sidestepCount == 0)
 		return false;
 	// Blocked: sidestep to a random neighbour no farther from the goal, so two
-	// units blocking each other do not mirror each other forever. syncRand
+	// units blocking each other do not mirror each other forever. The caller's private stream
 	// keeps the choice deterministic.
-	int pick = sidesteps[syncRand() % sidestepCount];
+	int pick = sidesteps[random.nextU32() % sidestepCount];
 	*dx = tabClose[pick][0];
 	*dy = tabClose[pick][1];
 	return true;

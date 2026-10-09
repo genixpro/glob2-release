@@ -3,6 +3,7 @@
 
 #include "shared_runtime/Runtime.h"
 #include "Order.h"
+#include <algorithm>
 
 using namespace AISharedRuntime;
 using namespace AISharedRuntime::Management;
@@ -85,7 +86,16 @@ AssignWorkers::AssignWorkers(int number_of_workers, int building_id) : number_of
 
 void AssignWorkers::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderModifyBuilding(runtime.get_building_register().get_building(building_id)->gid, number_of_workers)));
+	auto* building=runtime.get_building_register().get_building(building_id);
+ int requested=number_of_workers;
+ const auto& spec=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics;
+ int services=spec.feeding.enabled+spec.healing.enabled+(AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).shootingRange>0);
+ services+=std::any_of(spec.production.recipes.begin(),spec.production.recipes.end(),[](const auto& recipe){return recipe.enabled;});
+ services+=std::any_of(spec.training.begin(),spec.training.end(),[](const auto& training){return training.enabled;});
+ services+=spec.market.interTeamFruitExchange || spec.market.suppliesStock || spec.market.suppliesDirectStock;
+ services+=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[WORKER] || AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[WARRIOR] || AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).zonable[EXPLORER];
+ if(services>1 && !AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).isBuildingSite) requested=std::max(requested,building->maxUnitWorking);
+ runtime.push_order(std::make_shared<OrderModifyBuilding>(building->gid,std::clamp(requested,0,AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.assignmentLimit)));
 }
 
 
@@ -132,7 +142,10 @@ void ChangeSwarm::modify(Runtime& runtime)
 	ratio[0]=worker_ratio;
 	ratio[1]=explorer_ratio;
 	ratio[2]=warrior_ratio;
-	runtime.push_order(shared_ptr<Order>(new OrderModifySwarm(runtime.get_building_register().get_building(building_id)->gid, ratio)));
+	auto* building=runtime.get_building_register().get_building(building_id);
+ for(int unit=0;unit<NB_UNIT_TYPE;++unit)
+  if(!AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.production.recipes[unit].enabled || (unit==WARRIOR && runtime.observation().configuration->isPeacefulModeEnabled())) ratio[unit]=0;
+ runtime.push_order(std::make_shared<OrderModifySwarm>(building->gid,ratio));
 }
 
 
@@ -181,7 +194,45 @@ DestroyBuilding::DestroyBuilding(int building_id) : building_id(building_id)
 
 void DestroyBuilding::modify(Runtime& runtime)
 {
-	runtime.push_order(shared_ptr<Order>(new OrderDelete(runtime.get_building_register().get_building(building_id)->gid)));
+    if(auto* building=runtime.get_building_register().get_building(building_id))
+        runtime.push_order(std::make_shared<OrderDelete>(building->gid));
+}
+
+void RetireAttraction::modify(Runtime& runtime)
+{
+    auto* building=runtime.get_building_register().get_building(building_id);
+    if(!building) return;
+    const unsigned completedMask=runtime.complete_attraction_retirement(building_id,retiringUnitMask);
+    const auto& spec=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics;
+    if(AIPlanning::hasIndependentAttractionUse(AIEngine::ObservationQueries::buildingType(runtime.observation(),*building),completedMask)) return;
+    if(spec.instantPlacement && !spec.occupiesGround) DestroyBuilding::modify(runtime);
+    else runtime.push_order(std::make_shared<OrderModifyBuilding>(building->gid,0));
+}
+
+bool RetireAttraction::load(GAGCore::InputStream* stream,Player* player,Sint32 versionMinor)
+{
+    if(!DestroyBuilding::load(stream,player,versionMinor)) return false;
+    retiringUnitMask=stream->readUint8("retiringUnitMask");
+    return retiringUnitMask && !(retiringUnitMask&~((1u<<NB_UNIT_TYPE)-1));
+}
+
+void RetireAttraction::save(GAGCore::OutputStream* stream)
+{
+    DestroyBuilding::save(stream);
+    stream->writeUint8(retiringUnitMask,"retiringUnitMask");
+}
+
+void RetireFeeding::modify(Runtime& runtime)
+{
+    auto* building=runtime.get_building_register().get_building(building_id);
+    if(!building) return;
+    const auto& index=runtime.observation().capabilities();
+    constexpr auto feeding=AIPlanning::BuildingIntent::Feed;
+    // A free feeding service cannot be starved of input, and a mixed provider
+    // must remain available to its other strategic consumers.
+    if(!index.matches(building->typeNum,feeding) || !AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.feeding.costMask
+        || (index.intentMask(building->typeNum)&~(std::uint64_t(1)<<static_cast<unsigned>(feeding)))) return;
+    DestroyBuilding::modify(runtime);
 }
 
 

@@ -18,6 +18,12 @@ programs and the map generator study tools). The per-harness
 aliases documented below are kept as `LEGACY_ALIASES` for one release; they build
 the binary that now contains the test.
 
+The `RenderFramePacer` unit suite checks drawing deadlines, frame-cost accounting,
+live changes, resume and Unlimited with explicit timestamps. `SettingsGraphics`
+checks FPS preference migration and validation; `Settings` covers the native and
+compact dropdown, persistence and screenshots. `ScreenExecution` checks that
+update-only callbacks and capped drawing retain input and screen lifecycle behavior.
+
 ## Build and run
 
 ```sh
@@ -31,6 +37,25 @@ python3 test/run_tests.py --binary engine --shard 2/4 --junit artifacts/tests/ju
 python3 test/run_tests.py --binary engine --in-process     # fast local loop, no isolation
 python3 test/run_tests.py --update-fixtures --filter 'WinningConditions/*'
 ```
+
+`ColonySkinPreview` checks shared image preparation with independent appearance
+authorization, refresh, expiry and cancellation across preview owners.
+
+`SkinShapeModel` and `SkinModel` check the GSB1 blend-shape and GSR1 bone-rig
+contracts against the analytic fixtures shared with the Studio decoders
+(`test/fixtures/skins/`). `SkinModelRender` checks native GPU/CPU agreement for
+the rig shader, mixed baked/rig rendering, GL state restoration and CPU fallback,
+and the browser conformance suite checks the same shader in Chromium, Firefox and
+WebKit; `tools/skins/test_fit_shapes.py` and `test_explorer_rig.py` regenerate
+the installed assets and check their fit to the baked clips. See
+[unit rigs](../tools/unit-animation/README.md#contract-and-conformance-tests).
+
+Asset pipeline checks live in `AssetLoader` and `SpriteLoad`, including independent
+continuation cancellation, cache metadata cleanup and variable atlas admission.
+`SpriteSheets` also checks renderer readiness and atomic HD reload publication. Build the
+`asset-loading-benchmark` target to compare worker configurations against the same
+runtime assets. See [asset loading](../docs/development/reference.md#release-asset-and-bundle-sizes)
+for worker controls, scratch accounting and measurement limits.
 
 `test/run_tests.py` lists the cases with doctest's `-ltc`, applies `--filter`
 (suite/name globs), `--tag`, `--exclude-tag`, `--quick` and `--shard K/N`
@@ -189,7 +214,13 @@ Switches the online and LAN tests use:
 resource-growth attribution, full-array enemy iteration, indexed text alliances,
 dense-map request boundaries, malformed script-generation counts, and
 deterministic sixteen-team save/load continuation. `Maxima.Economy` covers counted opponents,
-legacy twelve-record loading and malformed counts. Replay and network boundaries
+legacy twelve-record loading and malformed counts. Its producer-retirement case
+also distinguishes a feeding-priority allocation shortfall from an unreachable
+site, checks that viable capacity is retained, and verifies unchanged birth
+funding. `Maxima.FoodLedger` checks that the corresponding uncontested coverage
+signal never doubles resource claims, including mixed-service providers and
+zero-demand consumers, and that non-producing services retain their allocation-based
+signal. Replay and network boundaries
 remain covered by `JavaScriptCompatibility` and `TeamStatsSave`.
 
 `fixtures/team-limit/pre-v127-maxima.game.gz` is an actual format-126 tick-zero
@@ -226,7 +257,10 @@ private selection API without exposing it to game callers.
 `ClientChannelsTest.cpp` covers the `src/engine/sim/` channels: team events reaching the
 GUI once, in order and aged like `Team::updateEvents`; script presentation going
 through `ClientCommandSink`; the SGSL Space acknowledgement in `ClientRequests`;
-and order effects such as pause arriving as events.
+and order effects such as pause arriving as events. Concurrent delivery checks
+FIFO completeness and coherent pulses; reentrant publication waits for the next
+batch. Script-channel cases check immediate enablement queries before the client
+drains commands, including ordered alias matching.
 
 Run as the `GameGUISelection` and `ClientChannels` suites of `glob2-engine-tests`:
 
@@ -264,7 +298,7 @@ normal build. This is a direct method regression, not an interactive replay test
 ## Terrain resource regression
 
 The `TerrainResources` suite (`python3 test/run_tests.py --filter 'TerrainResources/*'`)
-links the actual client objects and exercises terrain regeneration and resource clearing for all eight
+links the actual client objects and exercises terrain edits and resource clearing for all eight
 resource types, all three base terrains, overlapping strokes, and all four
 wrapped map corners. A whole-map oracle checks both removal and preservation.
 These are headless map-operation tests; they do not drive editor mouse events.
@@ -278,10 +312,15 @@ to compare this platform's rows of `test/map-generator-golden.txt` against fresh
 `--sweep` to roll every playable landscape at the lobby's colony counts and sizes. A platform
 with no rows reports and passes, so a new machine can run the check before its rows exist;
 `--require-rows` makes that a failure instead, which is what CI runs, so the table must carry
-rows for every platform CI builds on (`linux-x86_64` today, next to the maintainers'
-`macos-arm64`). Rows for a platform you cannot build on come from the `--print` output in its
-CI log, which the workflow prints before the check. The framework reference under
-`docs/map-generators/` describes the rules it enforces.
+rows for every platform running that check in CI (`linux-x86_64` today). The current
+table records vertex terrain (save format 146): every generated map changed when terrain
+moved to map vertices, without individual generator recipe revisions. The complete
+pre-resource-epoch table, including historical `macos-arm64` rows, is retained in
+`test/fixtures/map-generators/pre-resource-epoch-golden.txt`. The table has no macOS rows;
+they must be measured on macOS before `--require-rows` can pass there; do not copy Linux
+hashes. The five separately verified explicit-design topology comparisons below do
+not establish topology equivalence for every changed golden. The framework reference under
+`docs/map-generators/` describes the remaining rules it enforces.
 
 `MapGeneratorGoldenTest <profile> --telemetry` compares telemetry enabled/disabled and repeated
 attempts for all registered generators at three seeds, including complete serialized worlds and
@@ -358,7 +397,13 @@ struct GrassMap : Map {
         wDec = 3; hDec = 3; w = 8; h = 8;  // 8x8 map
         wMask = 7; hMask = 7;
         size = 64;
-        cases.assign(64, Case{});           // default: terrain=0 (grass), no bldg/unit
+        resourceCells.assign(size, {});    // no resource, no building, no unit
+        occupancyCells.assign(size, {});
+        areaCells.assign(size, {});
+        scriptAreaCells.assign(size, 0);
+        vertexTerrain.assign(size, GRASS); // one terrain per vertex
+        bindBootstrappedArrays();
+        rebuildTerrainCounts();            // compile the cell rules
         // No Sector or auxiliary arrays are allocated.
     }
     ~GrassMap() {
@@ -369,7 +414,7 @@ struct GrassMap : Map {
 };
 ```
 
-`cases`, `w` / `h` / `wMask` / `hMask` / `wDec` / `hDec` are all public on `Map`. `arraysBuilt` is also public. Default-constructed `Case` is "grass tile, no occupant, terrain=0, ressource.type=NO_RES_TYPE".
+`w` / `h` / `wMask` / `hMask` / `wDec` / `hDec` and `arraysBuilt` are public on `Map`; the cell arrays are private, so `MapQueryTest.cpp` (the complete fixture, which also loads a resource registry) builds with test-only private access.
 
 ### Stubs for `Sector`
 
@@ -381,7 +426,13 @@ Add the translation unit to `UNIT_TESTS` in `test/tests.py`. The production sour
 
 ### Terrain encoding for tests
 
-To poke `cases[i].terrain` directly (`regenerateMap` is protected): grass < 16, sand 128–143, water 256–271. See `Map.h:336-361`.
+Terrain is stored per vertex: vertex (x,y) is the top-left corner of cell (x,y), and a
+cell is wholly one terrain only when all four of its corners are. Use
+`Map::setVertexTerrain(x, y, type)` for one vertex, `paintVertices(vertices, type, false)`
+for a set without beaches, and `assignVertexTerrain` or `fillTerrain` for a whole map.
+A lone vertex makes the four cells around it mixed. Batch larger edits with
+`auto batch = map.editTerrain()` to invalidate derived fields once. Test gameplay with
+`terrainPropertiesAt`, not with terrain IDs.
 
 ### When to use this pattern
 
@@ -614,6 +665,20 @@ elapse before it can judge a field, and takes the constant from that header rath
 than copying it — when the interval was raised from 25 to 100, a local copy here
 silently stopped covering it and the regression passed stale fields.
 
+The scheduled cases run the suite's worlds with the default scheduled building
+pipeline: worker kernels match the synchronous seeding and search for every route,
+swim class and terrain-cost branch; fields publish at fixed deadlines across workers
+0/1/2/4/8 and delays 1/4/8; requests are captured at the observation boundary;
+partial fields resume from transferred buckets with every depth setting; synchronous
+rebuilds, resets, evictions and reused destinations supersede; pending results
+survive saves at every phase; access metadata follows the newest capture, in request
+order within one tick; area and team-wide resets keep stale fields serving; a
+team-local forbidden edit carries pending generations forward; and slow or failing
+workers never move publication. `GradientPipeline/*` covers the pipeline template
+alone, and `python3 test/check_gradient_pipeline.py BINARY` adds a building pass
+forked with `--fork-rule buildingGradientDelay=N` (delays 1/4/8, workers 0/1/2/4/8,
+save/resume at every phase, full/table/lazy depth, rejected delays 0 and 9).
+
 To see the harness fail, drop `gradientGeneration[swimClass] != topologyGeneration`
 from `Map::buildingGradient`: `ring-after`, `ring-other-team` and `ring-flag` all
 fail. `ring-before` passes either way by construction — nothing is cached before
@@ -626,6 +691,13 @@ The `MapGradientInvalidation` suite (`python3 test/run_tests.py --filter
 brushes, including resource-only edits, clearing goals, other teams and previously
 stale caches. It also checks resource, terrain, building and immobility transitions,
 a depleted escape exit, unreachable pockets and the refresh budget across tick wrap.
+Its gradient-stats case checks the lifetime rows of `BuildingGradientStats` (cold,
+generation, drop, eviction and end rows with their previous-search figures), the CSV
+and JSON exports, and that the statistics leave fields unchanged. `python3 test/test_gradient_depth_fit.py` checks the
+[depth model](../docs/building-gradient-depth-model.md) fitter on synthetic rows,
+that regenerating `BuildingGradientDepthPolicy.h` from the committed summary is a
+no-op, and, when a C++ compiler is present, that the header's lookup agrees with the
+fitter.
 
 Forbidden edits preserve unaffected walking fields and pending searches; own-team
 harvest round trips and clearing destinations still invalidate. Escape fields have
@@ -775,7 +847,19 @@ The real-engine movement-method fixture checks every swim class: a valid resourc
 target remains unchanged, and a depleted target is refreshed after its resource
 gradient is rebuilt. It invokes the movement method directly, rather than running
 an entire match. The runner isolates the profile and working directory and checks that preferences
-remain unchanged. Linux CI runs this regression.
+remain unchanged. Linux CI runs this regression. Fetching is greedy: the unit
+heads for the resource nearest to itself, even when another is a cheaper carry.
+
+`FetchHiringScore/*` checks hiring a fetcher: the hunger check measures the walk
+to the resource rather than the whole trip, and the score estimates the walk out
+plus the carry home.
+
+`LegacyRoundTripSave/*` loads
+[`greedy-fetching/round-trip-143.game.gz`](fixtures/greedy-fetching/README.md), a
+mid-game save written when fetching still routed by round trip, with round-trip
+fields live. The loader discards those fields; the game plays 1,000 more ticks
+against a golden per-tick trace and continues identically after a binary or text
+save in the current format.
 
 ## Hiring bucket iteration
 
@@ -857,11 +941,8 @@ Older saves do not carry it and load leaves the member at `-1`, the sentinel
 The fixture checks the version-96 round trip, that an unregistered order's `-1`
 survives the `Uint32` on the wire rather than returning as a huge positive key,
 and that a pre-96 stream leaves the sentinel with every following field still
-decoding from the right offset. `test/unit/stubs/RuntimeStubs.cpp` satisfies the
-`find_location` / `passes_conditions` link surface (`BuildingsTypes`, `FlagMap`,
-`GradientManager`, and the `Constraint` / `Condition` factories) that a
-constraint-free order never reaches at runtime. It is the `RuntimeBuildingOrderSaveLoad`
-suite of `glob2-unit-tests`.
+decoding from the right offset. The `RuntimeBuildingOrderSaveLoad` suite runs in
+`glob2-engine-tests`, linking the real catalog, placement and runtime components.
 
 ### Native main Settings redesign
 
@@ -1040,6 +1121,37 @@ write timing counts and completed/failed/superseded accounting. See
 off/on (serialized worlds, outcomes, RNG, and generation telemetry) and emits generation
 timing records, including site assignment. Use a disposable HOME and run from the repository.
 
+Scene extraction has an opt-in paired diagnostic in the engine harness:
+
+```sh
+GLOB2_SCENE_BENCH=1 build/linux/client/release/test/glob2-engine-tests --test-suite=ScenePerformance
+```
+
+It compares synchronous extraction with owner capture and pure preparation on the
+same seeded state at 128, 512 and 1024 tiles per side, with 512 units. Five warmups
+precede 40 samples for unchanged and changed terrain. CSV rows report median and
+p95 microseconds plus snapshot pool capacity, leased payload bytes and cumulative
+copied bytes. Three retained Scenes model consumer leases. These are extraction
+microbenchmarks, not frame-rate or whole-game speedup measurements; pool payload
+accounting excludes registry heaps and allocator overhead. No timing threshold is
+used as a test assertion.
+
+The end-to-end client diagnostic compares a forced frame-wide simulation boundary
+with routine snapshot input in the same executable:
+
+```sh
+python3 test/run_tests.py --binary engine --tag benchmark --filter 'EngineSession/snapshot client frame latency*' --artifacts artifacts/client-latency
+```
+
+Each arm runs five seconds on `balanced.map`, seed 123, maximum simulation speed,
+two compute threads and an 800×600 portable graphics context. The CSV records
+completed frames, ticks, input and whole-frame median/p95 duration, and p95 Scene
+age. Whole-frame duration includes drawing; input duration excludes it. These are
+host processing times, not event-to-photon latency. The forced boundary isolates
+parking cost within this implementation, not the performance of an older binary.
+Repeat runs with recorded CPU affinity and system load; throughput and frame age
+can trade off under contention, and no performance threshold is asserted.
+
 ### Distributed gameplay, AI and performance telemetry
 
 `python3 test/test_distributed_game_telemetry.py` tests typed streaming extraction,
@@ -1091,7 +1203,9 @@ because it includes the save header/version. Run the retained late-game regressi
 with `python3 test/maxima/check_save_continuation_fixture.py build/native-tests/src/glob2`.
 
 The retained Maxima format-115 checkpoint compares all 512 ticks from 30000
-through 30511 against uninterrupted execution. Its compressed save, expected
+through 30511 against the current terrain simulation's complete-record hashes.
+Its midpoint reload also compares complete records, adjusting only the known
+save-format contribution to the aggregate checksum. Its compressed save, expected
 per-tick hashes, and reproduction commands are in
 [maxima/fixtures/save-continuation](maxima/fixtures/save-continuation/README.md).
 
@@ -1169,12 +1283,23 @@ sizing behavior. With adaptive zoom detail the game fades these outlines out as
 the map zooms out and fills zones with `drawMapFill` instead; see
 [Adaptive zoom detail](../docs/development/reference.md#adaptive-zoom-detail).
 `ZoomDetail/*` in the unit tests covers the curves that decide when.
+`MapRenderResize/building sprites fade out*` reads rendered building pixels across
+the fade in software, SDL portable and OpenGL backends, and checks the complementary
+icon opacity. It catches an opaque building disappearing abruptly at the fade's end.
 
 ## Parallel compute prototype
 
 Build `scons release=1 server=0 unit-tests path-gradient-test
 building-gradient-invalidation-test`. The `ComputeExecutor` unit suite checks exclusive
 slots, barriers, nested batches, exception propagation, reuse and reconfiguration.
+For deferred batches it checks earliest-due ordering (ties and lane order by
+submission), that the owner only waits at a join whenever a worker exists, that an
+executor with no workers runs the jobs due no later than the join inline, and that
+with one worker shared with presentation a join waits out the running chunk and then
+completes in due order with no owner jobs. Producers that opt out of sharing compute
+inline at submission (`GradientPipeline` owner-only case). It also gates presentation
+work while simulation batches and deadline joins finish, and verifies pending
+replacement, cancellation, serial pumping and capture release.
 The path oracle also exercises independent eager/lazy searches at 1/2/4/8 threads;
 the building invalidation harness compares real area/building seed fields and
 frozen hiring advancement. Linux/Windows CI run the executor and path oracle.
@@ -1337,6 +1462,14 @@ compares their numeric/data results, complete traces and decoded saves against
 the Linux and Windows corpus runs. The separate released replay comparison
 selects only its baseline traces, so scripting fixture traces cannot be mistaken
 for the released replay.
+The same evidence comparison requires the frozen 150-row custom-resource
+composition trace from every selected native platform and both serial and
+threaded runtimes in Chromium, Firefox and WebKit. Native collection uses
+`test/run-browser-determinism.py BINARY OUTPUT --engine-binary ENGINE_TEST_BINARY`;
+its fresh `resources/native` directory retains the command, embedded build
+provenance, JUnit result and complete trace. The comparison rejects missing or
+repeated browser identities, dirty or mismatched source producers, failed runs,
+and truncated or changed traces against the preserved committed fixture.
 
 `python3 test/check_javascript_evidence.py REFERENCE CANDIDATE --output artifacts/js-comparison.json`
 compares shared numeric/data values, complete traces and decoded save payloads,
@@ -1349,9 +1482,11 @@ simulator, an owned `--simulator-set` to install, run and retrieve the separate 
 To retain released simulation compatibility traces, replays, commands, and logs,
 pass `--output artifacts/released-compatibility` to
 `test/check_telemetry_simulation.py`. Fresh-load traces compare complete bytes;
-the legacy checkpoint comparison excludes the version-dependent aggregate and
-compares every stored team/entity record. The evidence manifest records this
-exception. CI retains these artifacts even when verification fails.
+the legacy checkpoint comparison also checks complete bytes, including the
+aggregate checksum and every stored team/entity record. The current references
+record simulation revision 34's delayed resource growth, scheduled building gradients
+and greedy fetching;
+historical version-123 references remain separate. CI retains these artifacts even when verification fails.
 
 The shared evidence comparator requires successful runs of the same clean source
 revision. `--allow-development` permits diagnostic comparisons while recording
@@ -1433,6 +1568,16 @@ Versioned Linux tools can be selected with `--cc clang-18 --cxx clang++-18
 Each run gets a fresh directory under ignored `artifacts/native-coverage/`, with
 build/test logs, JUnit, compiler/tool versions, source revision, selection,
 profiles, full coverage JSON, weighted implementation summaries and HTML.
+CI gives the instrumented suite a 90-minute job budget while retaining the
+900-second per-case timeout. It passes `--stream-logs` so command progress and
+diagnostics remain visible in the job log even when artifact upload cannot finish.
+Local runs keep file-only output unless this option is requested.
+
+CI passes `--discard-merged-profiles` to remove redundant raw profiles only after
+the binary's tests, profile merge, JSON export and HTML generation succeed. The
+merged profile and all reports and test evidence remain; failed runs retain raw
+profiles for diagnosis. Local runs keep raw profiles by default. The manifest
+records profile retention and the bytes removed for each completed report.
 Engine and unit profiles are merged and exported separately: the engine report
 is the implementation baseline, and the unit report supplements it. Never
 average their percentages or merge independently linked copies of the same
@@ -1452,6 +1597,8 @@ The added behavior coverage focuses on the following native boundaries:
 | `LegacyScriptCoverage`, `USLCoverage` | Parsing failures, legacy and painted area waits, counts, flags and suspension, summons and alliances, recursion, thread yields, garbage collection and runtime errors |
 | `GUIOrderCoverage`, `GUIInteractionCoverage` | Queued requests, clamps, deduplication, field reconciliation, replay input, desktop menu interactions and unit information |
 | `EditorActionCoverage` | Action dispatch, unit/building editing, matching controls and save/load persistence |
+| `BrushCatalog` | Editor brush catalogue contents, imported terrain order, experiment locks and map-header enabling, resource placement validity, catalogue action round trips, imported-name collisions and opaque map-matching swatches |
+| `EditorDockLayout` | The editor dock at 1024x480, 1024x600, 1280x720 and 1920x1080: controls inside the dock without overlap, unique keys, the last card reachable by scrolling, clicks at the dock edge, live cards after definition imports, locked experiments enabled from the dock, palette navigation, search and the object inspector |
 | `SurfaceCoverage` | Alpha grids, cropped/scaled blits, clip boundaries and progress-bar pixels |
 
 Use uncovered functions and branch annotations to choose the next scenario by
@@ -1468,7 +1615,8 @@ and logs; a timeout must identify its case rather than hide the whole catalog.
 
 Use `python3 test/test_cli_smoke.py --binary <client> --artifacts artifacts/cli --junit artifacts/cli.xml`
 for real executable contracts: argument validation, map image/report workflows,
-headless worker parity and saved continuation. `test/run_coverage.py --with-cli`
+headless worker parity, experimental catalog generation, embedded-catalog reopening
+without installed definitions, and saved continuation. `test/run_coverage.py --with-cli`
 builds the instrumented client and exports these profiles separately under `client/`;
 never merge its counts with independently linked engine or unit reports.
 
@@ -1636,3 +1784,230 @@ Audio selector and captures its layout. The mixer selection regression suite is
 `SoundMixerTrackSelection/*`. These display cases run in isolated runner processes.
 Only Original ships, so `MusicSet/*` builds its extra valid and broken sets from copies
 of the shipped Oggs in the disposable profile.
+
+### Audio buffering and CPU contention
+
+`MusicProducer/*` compares file/memory decoding and PCM, trimmed loops, atomic
+replacement, queued moods, and preview ownership. `MusicBuffer/*` covers bounded
+capacity, concurrent wraparound, 100/250/400 ms producer stalls, generation
+invalidation and starvation recovery. `SoundMixerTrackSelection/*` retains the
+fade/selection regressions and exercises muted startup, ordinary-priority production,
+preview session rejection, pause/resume sample continuity, paused seek, operation
+without a running device, and native worker shutdown.
+Run these together with `MusicSet/*`, `CommunityMusic*/*`, and `GameplayRecording*/*`:
+
+```sh
+python3 test/run_tests.py --filter 'Music*/*' --filter 'SoundMixer*/*' --filter 'CommunityMusic*/*' --filter 'GameplayRecording*/*'
+node --test browser/unit/*.test.js
+(cd browser && npx playwright test tests/music-audio.spec.js tests/music-game.spec.js tests/recording.spec.js)
+```
+
+The browser suite uses the production Wasm producer and worklet at 44.1 and 48 kHz,
+checks visibility/resume, and blocks the host for two seconds with shared transport
+or 400 ms with MessagePort transport. A browser build without SharedArrayBuffer
+reports the shared cases as unavailable; its MessagePort cases still run. Unit tests
+also exercise pause/resume and reset command ordering. Shared cases use real server
+isolation headers: WebKit does not expose SharedArrayBuffer for a
+Playwright-synthesized response, even when it reports cross-origin isolation.
+`music-game.spec.js` checks the application bridge and mute in both game runtimes.
+Set `GLOB2_MUSIC_TEST_ARCHIVE` to a valid release ZIP to also test imported preview
+controls; without that fixture those preview cases are explicitly skipped.
+`recording.spec.js` unmutes music and checks that consumed nonzero PCM reaches the
+recorder in each runtime, then exports completed MP4s. File existence alone does
+not establish that an audio track contains music. Use distinct Playwright
+`--output` directories for concurrent runs.
+
+For a native ten-minute supply run, use the benchmark directly (the ordinary test
+runner excludes `[benchmark]` cases). `GLOB2_AUDIO_THREAD_PRIORITY=0` disables the
+best-effort priority promotion. The test chooses moods every two seconds and emits
+`AUDIO_STRESS` queue, starvation, render, callback and response measurements:
+
+```sh
+GLOB2_AUDIO_THREAD_PRIORITY=0 GLOB2_AUDIO_STRESS_SECONDS=600 build/linux/client/release/test/glob2-engine-tests --test-case='native music supply*'
+```
+
+The harness defaults to dummy SDL audio; set `SDL_AUDIODRIVER` explicitly for a
+real output device. Apply CPU affinity and independent CPU/memory competitors as
+appropriate, recording those settings with the result.
+
+For browser ten-minute contention runs, serve the unversioned build directory
+`build/emscripten/client/release`, then run:
+
+```sh
+node browser/benchmarks/audio.cjs http://127.0.0.1:8770 allcore 600
+node browser/benchmarks/audio.cjs http://127.0.0.1:8770 memory 600
+taskset -c 0 node browser/benchmarks/audio.cjs http://127.0.0.1:8770 singlecore 600
+```
+
+Choose an allowed CPU for `taskset`. The single-core run shares that CPU with two
+busy workers; memory mode uses four 128 MiB arrays; all-core mode uses the allowed
+CPU count. Each run emits JSON diagnostics and fails on new application starvation.
+Record browser/OS versions, priority, affinity, concurrent workloads, exact source
+revision and device conditions with the result. These tests do not measure hardware
+underruns or replace loopback capture/listening. Keep logs in `artifacts/` and link
+review evidence externally when preparing a PR.
+
+## Market fetching
+
+`MarketFetch` covers hiring and arrival at stocked markets, preference for a
+nearer natural resource, stock exhaustion, a retained worker's next delivery, and binary/text preservation of market
+fields and pending gradient publications. Non-market buildings use these fields;
+markets themselves fetch from natural resources. The market fields participate
+in the existing one-field-per-tick round robin and optional fixed-delay gradient
+pipeline. Stock transitions invalidate pending market snapshots and request a
+refresh. Format 135 saves these fields and their scheduling flags; older saves
+load without them and allocate them on first use. Run
+`python3 test/run_tests.py --filter 'MarketFetch/*'`.
+
+`MarketFetch` also checks the three market levels: existing type IDs 49–50
+remain stable, higher-level sites and buildings append as IDs 51–54, and their
+stock and type IDs survive binary/text game saves. Level 2 accepts wood and
+wheat in addition to fruit; level 3 accepts all eight resource types. Costs and
+reuse of the level-1 artwork remain provisional while the feature is draft.
+
+`MarketsV2` checks both sides of the `markets-v2` experiment: disabled fetch
+entry points and construction gates, per-tick legacy market deliveries against
+master, all level/resource/swim-class combinations, upgrade cancellation and
+completion and repair with shared stock, legacy travelling workers, forbidden
+routes, and binary/text continuation. Simulation traces compare every checksum
+part except the MapHeader part, which includes the deliberately changed file-format
+version. The benchmark cases report identical market delivery workloads (including
+heavy checksums and save/load) and isolated resource-gradient refresh CPU/time and
+field memory. `browser/tests/determinism.spec.js` runs the same Markets V2 cases
+and frozen traces in serial and threaded Wasm builds.
+
+## Runtime terrain
+
+`TerrainRegistry/*` validates JSON, immutable imports, deterministic IDs, bounded
+cost profiles, maximum registry size, canonical serialization, snapshot string
+lifetimes and visual-profile deduplication. Scalar/SIMD queue results are compared
+against a heap oracle; invalid or undersized queue requests must fail before
+changing the field, while unused slow definitions must remain harmless. `TerrainRuntime/*` covers map isolation, match immutability,
+capability summaries, custom movement, resumed/worker gradients and embedded save
+continuation. The production pipeline case dispatches through `Map::syncStep` with
+serial and worker execution, checks both binary water and weighted profile capture,
+and reimports before publication to reject a pending field from the old registry. Run these with `python3 test/run_tests.py --filter 'TerrainRegistry/*'`
+and `python3 test/run_tests.py --filter 'TerrainRuntime/*'`. Also run existing
+terrain, gradient, save, replay, scene and editor suites when changing this boundary.
+The scalar kernel can be compiled explicitly with `GLOB2_GRADIENT_SCALAR`; NEON
+requires an ARM build. Native success alone does not establish cross-platform
+checksum equivalence or performance qualification.
+
+The custom-map cases in `TurnEngineHarness` and `LanMatchHarness` exercise shared-map
+loading, content-hash transfer, per-tick agreement and match verification without
+local authoring files. `EditorActionCoverage` exercises file selection, failed import and retry, palette
+scrolling/selection, cancellation and save/load without author JSON on both layouts,
+and captures screenshots. `TerrainPresentation` covers software and GPU
+registry/asset invalidation, plus explicit edge-mask expectations for custom aliases
+at wrapped map boundaries. Cache-versus-direct pixel equality alone is insufficient:
+both paths can share the same wrong layer description.
+
+### Building catalog composition and performance
+
+`BuildingCatalogFixtures` loads retained manifests under
+`test/fixtures/building-catalog/composition/`; it never regenerates definitions at
+runtime. The seeded combinations exercise mixed services, split recipes, shared
+stock, rectangular overlays and missing capabilities. Per-tick save continuation,
+resource conservation and retained custom-rule traces complement the focused
+`BuildingCatalog`, `BuildingServices` and `BuildingProductionCombat` suites.
+`BuildingAreaEffects` compares cached coverage with an independent evaluator and
+covers pulse services, combat, lifecycle transitions, growth snapshots and save
+continuation. `BuildingAreaEffectsBenchmark` is opt-in (`--tag benchmark --filter
+'BuildingAreaEffectsBenchmark/*'`); it separates stationary coverage, funding
+pulses, dirty rebuilds and memory across map/team sizes. Its populated-match
+fixture measures one team with healthy, nonhungry workers and walls, rather than
+combat or active resource growth.
+`AICustomCatalog` checks actual replacement-provider selection and split-production
+orders across the native controllers. These custom traces do not establish stock
+behavior parity.
+
+`BuildingGradientBenchmark` is opt-in (`--tag benchmark --filter
+'BuildingGradientBenchmark/*'`). It measures actual building/resource field
+preparation and a fixed stock simulation without AI decisions. The source compiles
+unchanged against the pre-catalog engine for paired measurements. Kernel rows
+include input dimensions, repetitions, iteration counts and output digests;
+simulation rows retain endpoint unit/building counts, health and inventory.
+Run matched release toolchains one process at a time on an otherwise idle host.
+Timing thresholds are evaluated from retained interleaved runs, not asserted in CI.
+
+`BuildingCatalogBenchmark` separates catalog setup from steady simulation with
+55, 256 and 1,024 definitions, keeping live entities fixed. Its private supply
+routing workload reports cold, warm and depletion passes below, at and above the
+cache budget, including retained cell bytes. These custom-catalog measurements
+complement the unchanged-source stock comparison; they have no historical
+baseline equivalent.
+
+### Runtime resource stress components
+
+`ResourceRuntimeBenchmark` is opt-in (`--tag benchmark --filter
+'ResourceRuntimeBenchmark/*'`). It holds map geometry fixed at 256² and 512² with
+eight teams, comparing one resource definition against 512 equivalent definitions
+and a 512-definition variant whose deposits yield three materials. Sparse material
+coverage must allocate fields only for materials present; equivalent definitions
+must preserve the query/field digest. No building recipes are changed.
+
+The `GLOB2_RESOURCE_STRESS` JSON rows separate definition installation, placement,
+field requests, source scans, mutations, seed refresh and growth. Growth uses a
+configured nonzero uniform rate in three batches of 16 passes, after the matched
+query phases, with stock digests verifying equivalent-definition behavior. They include allocated
+material fields, shared absent fields, preparation and consumer cache bytes, and
+stock index/sidecar/free-list capacities. Set `GLOB2_RESOURCE_STRESS_OUTPUT` to an
+ignored artifact directory to save `report.json` and six binary games with eight
+small colonies for additional CLI continuation. Colony creation and serialization
+occur after the measured phases. This is a bounded component benchmark, not a
+statistical gameplay comparison or proof of no regression against the old engine.
+Run it on an otherwise idle host, separately from builds and tournaments.
+
+The five explicit-design generator regressions use
+`test/map-generator-resource-epoch.json` to separate topology from initial stock.
+Resource epoch 1 removes resource-sprite draws from the simulation RNG; historical
+full hashes are retained, while new full hashes include the resulting stock
+quantities. Topology hashes still cover every underlying/render terrain tile,
+resource identity/location, and colony start. A stock-only change cannot silently
+approve a changed route or deposit layout.
+
+To record an epoch row, first generate the five historical explicit designs with
+the archived engine (256², four teams, seed 1: maze `cell-shape=0`, fingerprint
+`pattern=0,barrier=0`, canals `block-shape=0`, caravanserai `desert=1`, honeycomb-isle
+`block-shape=1`). Keep their `.map.gz` files under their generator names in an
+ignored artifact directory. Set `GLOB2_RECORD_RESOURCE_DESIGN_GOLDENS` to that
+absolute directory and run the `MapGeneratorDefaults/Explicit designs*` test.
+Recording verifies the historical full hashes and compares topology before writing
+an `epoch1-<platform>.json` artifact. Review every comparison before copying rows
+into the fixture. Record other platform/compiler variants on those actual builds;
+unavailable full hashes produce an explicit unverified warning. The four designs
+whose historical full hashes matched across platforms retain portable topology
+checks; Fingerprint's known platform variant requires its own recorded topology.
+
+### Generator fingerprint verification and observations
+
+`python3 test/collect_generator_evidence.py collect BINARY OUTPUT --platform macos-arm64`
+reads `MapGeneratorGoldenTest --inventory` and runs `--print` twice in fresh profiles.
+The request enumeration is shared with generation, including extended team counts
+without accepted fingerprints. Collection requires every committed Linux reference
+key to remain in that inventory and every requested row to be observed exactly once;
+it rejects missing or extra rows and changed revisions. It retains
+raw logs, normalized rows, checkout provenance, host compiler, stable binary hash, and unchanged
+current/historical fixture hashes. Collection does not update expected output or
+replace the strict `--require-rows` gate. The macOS validation job runs that gate
+against its accepted platform rows before collecting observations; both checks
+and the five explicit-design checks are attempted even if another fails. Missing
+rows and full fingerprint changes fail verification. It uploads these
+observations as `generator-observations-macos`. The collector cannot infer the
+binary's build inputs from the checkout; its manifest marks that association
+unverified. Retain the producing build job and compiler/flags/dependencies when
+reviewing the observation.
+
+Two processes on one host establish repeatability only. Compare artifacts from
+independent jobs at the same source with
+`python3 test/collect_generator_evidence.py compare FIRST SECOND`; differences
+require investigation before acceptance. Agreement still does not establish
+historical topology preservation: independently verify against archived pre-epoch
+maps before adding new expected rows or the resource-epoch design hashes.
+
+The macOS job also runs the five explicit-design resource-epoch checks separately
+and retains `resource-design-observations.json` with every actual full and topology
+hash. Existing accepted-platform and portable-topology assertions still run;
+unverified full hashes are marked as observations, and the record distinguishes
+which references exist. The existing `GLOB2_RECORD_RESOURCE_DESIGN_GOLDENS`
+archived-map comparison remains available for independent historical validation.

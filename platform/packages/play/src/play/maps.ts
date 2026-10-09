@@ -6,7 +6,13 @@ import { createHash } from 'node:crypto';
 import { sql, type Kysely } from 'kysely';
 import { contentKey, submitEngineJob, type JobQueue, type MapPoolEntry } from '@glob2/core';
 import type { Database } from '@glob2/db';
-import { parseSimVersionKey, type GeneratorDescriptor } from '@glob2/protocol';
+import {
+  parseSimVersionKey,
+  type ResourceExperimentDefinitions,
+  type BuildingCatalog,
+  type GeneratorDescriptor,
+  type ScriptGeneratorDescriptor,
+} from '@glob2/protocol';
 import {
   STORED_GENERATE_MAP_RESULT,
   STORED_RENDER_PREVIEW_RESULT,
@@ -33,7 +39,7 @@ export function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
-export function descriptorHash(generator: GeneratorDescriptor): string {
+export function descriptorHash(generator: GeneratorDescriptor | ScriptGeneratorDescriptor): string {
   return createHash('sha256').update(canonicalJson(generator)).digest('hex');
 }
 
@@ -41,18 +47,40 @@ export function descriptorHash(generator: GeneratorDescriptor): string {
 
 export type GeneratedMapState =
   | { status: 'pending'; jobId: string | null }
-  | { status: 'ready'; mapHash: string; teamCount: number | null; jobId: string | null }
+  | {
+      status: 'ready';
+      mapHash: string;
+      chosenSeed?: number;
+      teamCount: number | null;
+      jobId: string | null;
+      buildingCatalog?: BuildingCatalog;
+      resourceExperiments: ResourceExperimentDefinitions;
+      requiredResourceExperiments: string[];
+    }
   | { status: 'failed'; failure: string; jobId: string | null };
 
 function stateOf(row: {
   status: 'pending' | 'ready' | 'failed';
   map_hash: string | null;
+  chosen_seed: number | null;
   team_count: number | null;
   failure: string | null;
   job_id: string | null;
+  building_catalog: unknown;
+  resource_experiments: ResourceExperimentDefinitions;
+  required_resource_experiments: string[];
 }): GeneratedMapState {
   if (row.status === 'ready' && row.map_hash) {
-    return { status: 'ready', mapHash: row.map_hash, teamCount: row.team_count, jobId: row.job_id };
+    return {
+      status: 'ready',
+      mapHash: row.map_hash,
+      ...(row.chosen_seed !== null ? { chosenSeed: Number(row.chosen_seed) } : {}),
+      teamCount: row.team_count,
+      resourceExperiments: row.resource_experiments,
+      requiredResourceExperiments: row.required_resource_experiments,
+      jobId: row.job_id,
+      ...(row.building_catalog ? { buildingCatalog: row.building_catalog as BuildingCatalog } : {}),
+    };
   }
   if (row.status === 'failed') {
     return { status: 'failed', failure: row.failure ?? 'generation failed', jobId: row.job_id };
@@ -62,12 +90,22 @@ function stateOf(row: {
 
 export async function generatedMapState(
   db: Db,
-  generator: GeneratorDescriptor,
+  generator: GeneratorDescriptor | ScriptGeneratorDescriptor,
   simVersion: string,
 ): Promise<GeneratedMapState | undefined> {
   const row = await db
     .selectFrom('generated_maps')
-    .select(['status', 'map_hash', 'team_count', 'failure', 'job_id'])
+    .select([
+      'status',
+      'map_hash',
+      'chosen_seed',
+      'team_count',
+      'failure',
+      'job_id',
+      'building_catalog',
+      'resource_experiments',
+      'required_resource_experiments',
+    ])
     .where('descriptor_hash', '=', descriptorHash(generator))
     .where('sim_version', '=', simVersion)
     .executeTakeFirst();
@@ -85,7 +123,7 @@ const GENERATION_RETRY_SECONDS = 60;
 export async function requestGeneratedMap(
   db: Db,
   _jobs: JobQueue,
-  generator: GeneratorDescriptor,
+  generator: GeneratorDescriptor | ScriptGeneratorDescriptor,
   simVersion: string,
 ): Promise<GeneratedMapState> {
   return requestGeneration(db, generator, simVersion);
@@ -98,7 +136,7 @@ export async function requestGeneratedMap(
  */
 export async function requestGeneration(
   db: Db,
-  generator: GeneratorDescriptor,
+  generator: GeneratorDescriptor | ScriptGeneratorDescriptor,
   simVersion: string,
 ): Promise<GeneratedMapState> {
   const version = parseSimVersionKey(simVersion);
@@ -130,11 +168,18 @@ export async function requestGeneration(
       .executeTakeFirst());
   if (claimed) {
     try {
-      const jobId = await submitEngineJob(db, {
-        kind: 'generate-map',
-        simVersion: version,
-        payload: { generator },
-      });
+      const jobId =
+        'packageHash' in generator
+          ? await submitEngineJob(db, {
+              kind: 'generate-script-map',
+              simVersion: version,
+              payload: { generator },
+            })
+          : await submitEngineJob(db, {
+              kind: 'generate-map',
+              simVersion: version,
+              payload: { generator },
+            });
       // The job may already have finished; only fill in the id.
       await db
         .updateTable('generated_maps')
@@ -161,7 +206,7 @@ export async function requestGeneration(
 /** Waits until a requested generated map is ready or failed. */
 export async function waitForGeneratedMap(
   db: Db,
-  generator: GeneratorDescriptor,
+  generator: GeneratorDescriptor | ScriptGeneratorDescriptor,
   simVersion: string,
   options: { timeoutMs: number; pollMs?: number; signal?: AbortSignal },
 ): Promise<GeneratedMapState> {
@@ -217,23 +262,44 @@ export async function applyMapJobResult(db: Db, jobId: string): Promise<boolean>
   if (!job || job.status === 'queued') return false;
   const failure = job.status === 'failed' ? errorText(job.error) : undefined;
 
-  if (job.kind === 'generate-map') {
-    const generator = (job.payload as { generator: GeneratorDescriptor }).generator;
+  if (job.kind === 'generate-map' || job.kind === 'generate-script-map') {
+    const generator = (
+      job.payload as { generator: GeneratorDescriptor | ScriptGeneratorDescriptor }
+    ).generator;
     const result = readStoredOrNull(STORED_GENERATE_MAP_RESULT, job.result);
     const where = {
       descriptor_hash: descriptorHash(generator),
       sim_version: job.sim_version,
     };
-    if (failure === undefined && result) {
-      await insertBlob(db, result.mapHash, result.size, MAP_CONTENT_TYPE, 'public');
+    const identityMatches =
+      job.kind !== 'generate-script-map' ||
+      ('packageHash' in generator &&
+        (job.result as { packageHash?: string } | null)?.packageHash === generator.packageHash &&
+        result?.map.teamCount === generator.params.teams);
+    if (failure === undefined && result && identityMatches) {
+      await insertBlob(
+        db,
+        result.mapHash,
+        result.size,
+        MAP_CONTENT_TYPE,
+        job.kind === 'generate-script-map' ? 'private' : 'public',
+      );
       await db
         .updateTable('generated_maps')
         .set({
           status: 'ready',
           map_hash: result.mapHash,
+          chosen_seed: result.chosenSeed,
           width: result.map.width,
           height: result.map.height,
           team_count: result.map.teamCount,
+          resource_experiments: JSON.stringify(result.map.resourceExperiments ?? []),
+          required_resource_experiments: JSON.stringify(
+            result.map.requiredResourceExperiments ?? [],
+          ),
+          building_catalog: result.map.buildingCatalog
+            ? JSON.stringify(result.map.buildingCatalog)
+            : null,
           job_id: jobId,
           completed_at: sql<Date>`now()`,
         })
@@ -245,7 +311,8 @@ export async function applyMapJobResult(db: Db, jobId: string): Promise<boolean>
         .updateTable('generated_maps')
         .set({
           status: 'failed',
-          failure: failure ?? 'no result',
+          failure:
+            failure ?? (identityMatches ? 'no result' : 'Generator output identity mismatch'),
           job_id: jobId,
           completed_at: sql<Date>`now()`,
         })
@@ -274,6 +341,13 @@ export async function applyMapJobResult(db: Db, jobId: string): Promise<boolean>
           width: result.map.width,
           height: result.map.height,
           team_count: result.map.teamCount,
+          resource_experiments: JSON.stringify(result.map.resourceExperiments ?? []),
+          required_resource_experiments: JSON.stringify(
+            result.map.requiredResourceExperiments ?? [],
+          ),
+          building_catalog: result.map.buildingCatalog
+            ? JSON.stringify(result.map.buildingCatalog)
+            : null,
           version_minor: result.versionMinor,
           title: result.title ?? null,
           players: result.players ? JSON.stringify(result.players) : null,

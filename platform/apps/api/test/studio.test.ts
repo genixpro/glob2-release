@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 import { randomUUID } from 'node:crypto';
 import { beforeAll, afterAll, it, expect, vi } from 'vitest';
 import { createHarness, postJson, type Harness, type Instance } from './support.ts';
@@ -123,7 +124,12 @@ it('keeps studio history and previews private while supporting owner download, r
     );
     const row = (await studio.request(generation.id))!;
     const mapHash = await blobs.write(fakeMapBytes(4, 791), 'application/x-glob2-map');
-    const previewHash = await blobs.write(Buffer.from('private-preview'), 'image/png');
+    const previewHash = await blobs.write(
+      await sharp({ create: { width: 512, height: 256, channels: 3, background: '#214355' } })
+        .png()
+        .toBuffer(),
+      'image/png',
+    );
     await studio.finish(row, {
       mapHash,
       previewHash,
@@ -141,9 +147,9 @@ it('keeps studio history and previews private while supporting owner download, r
     expect(
       (await call('GET', `/api/v1/map-studio/threads/${thread}`, other.accessToken)).status,
     ).toBe(404);
-    expect((await call('GET', path + '/preview.png')).status).toBe(404);
-    expect((await call('GET', path + '/preview.png', other.accessToken)).status).toBe(404);
-    expect((await call('GET', path + '/preview.png', owner.accessToken)).status).toBe(200);
+    expect((await call('GET', path + '/preview.webp')).status).toBe(404);
+    expect((await call('GET', path + '/preview.webp', other.accessToken)).status).toBe(404);
+    expect((await call('GET', path + '/preview.webp', owner.accessToken)).status).toBe(200);
     expect((await call('GET', path + '/file', owner.accessToken)).status).toBe(200);
     expect((await call('GET', `/api/v1/blobs/maps/${mapHash}`, other.accessToken)).status).toBe(
       404,
@@ -174,7 +180,7 @@ it('keeps studio history and previews private while supporting owner download, r
         })
       ).status,
     ).toBe(200);
-    expect((await call('GET', path + '/preview.png')).status).toBe(200);
+    expect((await call('GET', path + '/preview.webp')).status).toBe(200);
     expect((await call('GET', `/api/v1/blobs/maps/${mapHash}`)).status).toBe(200);
     expect(
       (await call('GET', `/api/v1/map-studio/threads/${thread}`, other.accessToken)).status,
@@ -337,5 +343,56 @@ it('streams durable progress, resumes by event id and closes after authorization
     resumedController.abort();
     owner.client.close();
     other.client.close();
+  }
+});
+
+it('accepts idempotent conversation turns with fixed settings while enforcing ownership and schema', async () => {
+  const { Studio } = await import('@glob2/map-studio');
+  const { registeredPlayer } = await import('./playSupport.ts');
+  const enabled = await harness.start({
+    instance: {
+      auth: { providers: [], local: { enabled: true } },
+      mapStudio: {
+        enabled: true,
+        salesEnabled: false,
+        textModel: 'mock',
+        imageModel: 'mock',
+        pipelineVersion: 'v1',
+        providerCallsPerDay: 20,
+      },
+    },
+  });
+  try {
+    const owner = await registeredPlayer(enabled, 'TurnOwner');
+    const other = await registeredPlayer(enabled, 'TurnOther');
+    const studio = new Studio(harness.database.db);
+    await studio.credits.adjust(owner.accountId, randomUUID(), 1, 'grant');
+    const thread = (await studio.create(owner.accountId, 'Turn test')).id;
+    const payload = {
+      id: randomUUID(),
+      text: 'Create islands',
+      settings: { width: 128, height: 256, players: 2 },
+    };
+    const call = (token: string, value: unknown) =>
+      fetch(`${enabled.url}/api/v1/map-studio/threads/${thread}/turns`, {
+        method: 'POST',
+        headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+        body: JSON.stringify(value),
+      });
+    expect((await call(other.accessToken, payload)).status).toBe(404);
+    expect((await call(owner.accessToken, { ...payload, settings: undefined })).status).toBe(400);
+    expect((await call(owner.accessToken, { ...payload, parent: randomUUID() })).status).toBe(400);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const response = await call(owner.accessToken, payload);
+      expect(response.status).toBe(200);
+      expect(await response.json()).toEqual({ id: payload.id });
+    }
+    expect((await studio.request(payload.id))?.input).toMatchObject({
+      turn: true,
+      settings: payload.settings,
+    });
+    expect((await studio.credits.balance(owner.accountId)).reserved).toBe(0);
+  } finally {
+    await enabled.close();
   }
 });

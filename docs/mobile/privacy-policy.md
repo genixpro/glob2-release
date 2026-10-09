@@ -11,7 +11,7 @@ Boom Drive, Unit 346, Oakville, Ontario L6H 7X5, Canada ("we"). For privacy
 questions and requests, contact **bradley.allen.arsenault@gmail.com**
 or write to that address.
 
-Last updated: 3 October 2026.
+Last updated: 8 October 2026.
 
 ## In short
 
@@ -23,8 +23,9 @@ Last updated: 3 October 2026.
   room chat, maps you upload, and technical data that protects the service.
 - Your display name, ratings, match history, match replays and the maps you publish are
   public.
-- The apps contain no advertising, analytics or crash-reporting services, nothing
-  tracks you across other apps or sites, and we do not sell your data.
+- We record minimal first-party activity for online accounts, described below. The
+  apps contain no advertising or third-party analytics or crash-reporting services;
+  nothing tracks you across other apps or sites, and we do not sell your data.
 - The game has no minimum age. Playing online as a guest needs no e-mail address,
   no real name and no account details at all.
 - You can download a copy of your data and delete your account yourself: in the
@@ -72,6 +73,7 @@ match on their devices. LAN games do not use an account and do not contact us.
 | **Connection quality:** per player in a match, the match server's measurements of round trip, how far the player's game ran behind, disconnects, time offline and order counts. These contain no address. | To show connection quality on the match page and investigate network problems. |
 | **Maps:** maps and saves you upload, catalog entries you publish (title, description, versions, previews), likes, and reports you file (reason and details). Map downloads are counted once per day per map, by account, or by IP address when you download without signing in. | To run the map catalog and moderate it. |
 | **Technical data:** your IP address, the time and the address of each request, kept in server logs and in rate-limit counters. Logs leave out passwords, tokens, cookies and credentials. | To keep the service secure and working, and to stop abuse. |
+| **Community music:** uploaded mood tracks and cover art, release titles, descriptions, artist/attribution details, licence, source links, tags, AI disclosure, likes and reports. Published files embed this metadata. | To convert, share and moderate music sets. |
 | **Moderation records:** actions moderators take on accounts, maps and reports | To keep moderation accountable. |
 
 The game also tells the service its version and platform when it connects, so the
@@ -110,6 +112,8 @@ Public leaderboard data is also published on the website
 | --- | --- |
 | Account, display name, matches, ratings, rating history, replays, catalog maps, map reports, moderation records | Until you delete the account (see below for what deletion keeps) |
 | Guest accounts | Deleted after 90 days without use if they never played a match, host no open room and own no catalog map |
+| Music source uploads and processing files | Deleted after conversion, cancellation or failure; abandoned/orphan uploads expire within 24 hours |
+| Community music releases, likes and reports | Until account deletion; withdrawing or hiding a release stops public access but retains it for administration |
 | Room chat | 30 days |
 | Matchmaking requests, including server-region round trips | 30 days |
 | Refresh tokens | 7 days after they are replaced or revoked, otherwise 30 days after they expire |
@@ -132,7 +136,7 @@ by typing your display name. Deletion takes effect at once and cannot be undone.
 - replaces your name with "Deleted player" in your past matches, in stored match
   setups, in other players' chat in your rooms, in the names of rooms you hosted and in
   moderation records;
-- deletes your room chat messages, your catalog maps, likes and uploads, and your
+- deletes your room chat messages, your catalog maps, music releases, music reports, likes and uploads, and your
   matchmaking requests;
 - deletes your AI Map Studio projects, conversations and generation history, and
   cancels unfinished generation without charging its reserved credit;
@@ -144,7 +148,7 @@ moderation records about the account. Credit purchases and ledger entries remain
 as financial records; anonymous daily AI call counts remain for service capacity
 accounting. Match records and replays are kept unchanged
 because they are the verified record of games other people played too, so they still
-contain the name you had in that game and your in-game text chat. Files you uploaded
+contain the name you had in that game and your in-game text chat. Previously downloaded music remains on other players’ devices. Files you uploaded
 stay stored only while matches played on them refer to them.
 
 #### Backups
@@ -218,7 +222,7 @@ service are built to collect as little as possible from anyone, children include
   birthday and no account details: the game makes up a name such as `Guest-1234`.
   An account with a username and password needs no e-mail address either. Signing
   in with Google is optional.
-- There is no advertising, no analytics, no tracking across apps or sites, no
+- There is no advertising, no browser tracking, no tracking across apps or sites, no
   in-app purchases, and we never sell data or use it for marketing.
 - Online play does include room chat and in-game text chat with other players,
   and a registered account chooses its own display name, which is public. Parents
@@ -234,6 +238,29 @@ which kind of device it was used; we may ask for more to make sure the account i
 the child's before we delete it or send a copy. Uninstalling the app also removes
 the guest sign-in from the device, and an unused guest account that never played a
 match is deleted automatically after 90 days.
+
+## Online activity and operational reporting
+
+For an online account, we retain at most one activity marker per UTC day when a
+successful authenticated request or realtime action occurs. Each marker contains
+only the account ID, day and whether the account is a guest or registered.
+Anonymous visits, health checks, service credentials and admin dashboard polling
+are excluded. There are no browser trackers or acquisition funnels.
+
+Identifiable activity markers are retained for 90 days. Account data exports
+include retained markers; deleting an account removes them. Anonymous daily
+operational totals are retained for 24 months and cannot be traced back to an
+account. Administrators use these totals to understand signups, online activity,
+matches, library publication/download counts and studio reliability. Downloads
+follow each library's existing counting rules and are not unique visitors.
+
+Administrators also see verified payment and refund amounts, currencies and
+payment mode, product credit flows, and provider usage with estimated costs when
+usage and monetary rates are available. These records contain no card details,
+credentials, private studio prompts or generated source. Financial records
+already retained for purchase reconciliation remain subject to the retention
+rules in the payment sections above. Uncertain or unavailable facts are labeled;
+we do not infer historical activity from last-seen timestamps.
 
 ## Your rights
 

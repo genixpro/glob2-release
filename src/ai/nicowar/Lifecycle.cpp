@@ -19,7 +19,7 @@ using namespace AISharedRuntime::SearchTools;
 
 
 
-NewNicowar::NewNicowar()
+NewNicowar::NewNicowar() : strategyDefinitions(std::make_shared<NicowarStrategyLoader>())
 {
 	timer=0;
 	buildings_under_construction=0;
@@ -272,7 +272,7 @@ void NewNicowar::tick(Runtime& runtime)
 	timer++;
 	if(timer==AI_NICOWAR_INIT_TICK)
 	{
-		selectStrategy();
+		selectStrategy(runtime);
 		check_phases(runtime);
 		initialize(runtime);
 	}
@@ -290,7 +290,7 @@ void NewNicowar::tick(Runtime& runtime)
 	}
 	if(timer%AI_NICOWAR_DECISION_CYCLE_TICKS == AI_NICOWAR_UPGRADE_PHASE)
 	{
-		if (!runtime.player->game->gameHeader.isUnitUpgradesDisabled()) upgrade_buildings(runtime);
+		if (!runtime.observation().configuration->isUnitUpgradesDisabled()) upgrade_buildings(runtime);
 	}
 	if(timer%AI_NICOWAR_DECISION_CYCLE_TICKS == AI_NICOWAR_CONTROL_ATTACKS_PHASE)
 	{
@@ -298,7 +298,7 @@ void NewNicowar::tick(Runtime& runtime)
 	}
 	if(timer%AI_NICOWAR_DECISION_CYCLE_TICKS == AI_NICOWAR_DEFENSE_FLAG_PHASE)
 	{
-		if (!runtime.player->game->gameHeader.isPeacefulModeEnabled()) compute_defense_flag_positioning(runtime);
+		if (!runtime.observation().configuration->isPeacefulModeEnabled()) compute_defense_flag_positioning(runtime);
 	}
 	if(timer%AI_NICOWAR_FARMING_INTERVAL_TICKS == 0)
 	{
@@ -310,7 +310,7 @@ void NewNicowar::tick(Runtime& runtime)
 	}
 	if(timer%AI_NICOWAR_EXPLORER_ATTACK_INTERVAL_TICKS == AI_NICOWAR_EXPLORER_ATTACK_OFFSET)
 	{
-		if (!runtime.player->game->gameHeader.isPeacefulModeEnabled()) compute_explorer_flag_attack_positioning(runtime);
+		if (!runtime.observation().configuration->isPeacefulModeEnabled()) compute_explorer_flag_attack_positioning(runtime);
 	}
 
 	order_buildings(runtime);
@@ -329,13 +329,13 @@ void NewNicowar::handle_message(Runtime& runtime, const std::string& message)
 	{
 		MapInfo mi(runtime);
 		int id=std::stoi(message.substr(22, message.size()-1));
-		Building* b = runtime.get_building_register().get_building(id);
+		const AIEngine::BuildingView* b = runtime.get_building_register().get_building(id);
 		AddArea* mo_clearing=new AddArea(ClearingArea);
 		RemoveArea* mo_remove_clearing=new RemoveArea(ClearingArea);
 		mo_remove_clearing->add_condition(new BuildingDestroyed(id));
-		for(int nx=-1; nx<b->type->width+1; ++nx)
+		for(int nx=-1; nx<AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).width+1; ++nx)
 		{
-			for(int ny=-1; ny<b->type->height+1; ++ny)
+			for(int ny=-1; ny<AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).height+1; ++ny)
 			{
 				if(!mi.is_forbidden_area(b->posX+nx, b->posY+ny))
 				{
@@ -351,13 +351,13 @@ void NewNicowar::handle_message(Runtime& runtime, const std::string& message)
 	{
 		MapInfo mi(runtime);
 		int id=std::stoi(message.substr(22, message.size()-1));
-		Building* b = runtime.get_building_register().get_building(id);
+		const AIEngine::BuildingView* b = runtime.get_building_register().get_building(id);
 		AddArea* mo_clearing=new AddArea(ClearingArea);
 		RemoveArea* mo_remove_clearing=new RemoveArea(ClearingArea);
 		mo_remove_clearing->add_condition(new BuildingDestroyed(id));
-		for(int nx=-1; nx<b->type->width+1; ++nx)
+		for(int nx=-1; nx<AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).width+1; ++nx)
 		{
-			for(int ny=-1; ny<b->type->height+1; ++ny)
+			for(int ny=-1; ny<AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).height+1; ++ny)
 			{
 				mo_clearing->add_location(b->posX+nx, b->posY+ny);
 				mo_remove_clearing->add_location(b->posX+nx, b->posY+ny);
@@ -366,6 +366,11 @@ void NewNicowar::handle_message(Runtime& runtime, const std::string& message)
 		runtime.add_management_order(mo_clearing);
 		runtime.add_management_order(mo_remove_clearing);
 	}
+ if(message.starts_with("update services ")) {
+  const int id=std::stoi(message.substr(16));
+  if((runtime.get_building_register().provides(id,BuildingDemand::ProduceWorker) || runtime.get_building_register().provides(id,static_cast<int>(AIPlanning::BuildingIntent::ProduceExplorer)) || runtime.get_building_register().provides(id,static_cast<int>(AIPlanning::BuildingIntent::ProduceWarrior)))) manage_swarm(runtime,id);
+  if(runtime.get_building_register().provides(id,BuildingDemand::Feed)) manage_inn(runtime,id);
+ }
 	if(message.substr(0,13) == "update swarm ")
 	{
 		int id=std::stoi(message.substr(13, message.size()-1));
@@ -379,17 +384,17 @@ void NewNicowar::handle_message(Runtime& runtime, const std::string& message)
 	if(message.substr(0,16)  == "attack finished ")
 	{
 		int id=std::stoi(message.substr(16, message.size()-1));
-		attack_flags.erase(std::find(attack_flags.begin(), attack_flags.end(), id));
+		if(auto found=std::find(attack_flags.begin(),attack_flags.end(),id);found!=attack_flags.end()) attack_flags.erase(found);
 	}
 	if(message.substr(0,19)  == "guard flag deleted ")
 	{
 		int id=std::stoi(message.substr(19, message.size()-1));
-		defense_flags.erase(std::find(defense_flags.begin(), defense_flags.end(), id));
+		if(auto found=std::find(defense_flags.begin(),defense_flags.end(),id);found!=defense_flags.end()) defense_flags.erase(found);
 	}
 	if(message.substr(0,29)  == "explorer attack flag deleted ")
 	{
 		int id=std::stoi(message.substr(29, message.size()-1));
-		explorer_attack_flags.erase(std::find(explorer_attack_flags.begin(), explorer_attack_flags.end(), id));
+		if(auto found=std::find(explorer_attack_flags.begin(),explorer_attack_flags.end(),id);found!=explorer_attack_flags.end()) explorer_attack_flags.erase(found);
 	}
 	if(message == "finished digging out")
 	{
@@ -403,10 +408,9 @@ void NewNicowar::handle_message(Runtime& runtime, const std::string& message)
 
 
 
-void NewNicowar::selectStrategy()
+void NewNicowar::selectStrategy(AISharedRuntime::Runtime& runtime)
 {
-	NicowarStrategyLoader loader;
-	strategy = loader.chooseRandomStrategy();
+	strategy = strategyDefinitions->chooseRandomStrategy(runtime.privateRandomEngine());
 	//strategy = loader.getParticularStrategy("default");
 }
 
@@ -417,15 +421,15 @@ void NewNicowar::initialize(Runtime& runtime)
 	BuildingSearch bs(runtime);
 	for(building_search_iterator i = bs.begin(); i!=bs.end(); ++i)
 	{
-		if(runtime.get_building_register().get_type(*i)==IntBuildingType::SWARM_BUILDING)
+		if((runtime.get_building_register().provides(*i,BuildingDemand::ProduceWorker) || runtime.get_building_register().provides(*i,static_cast<int>(AIPlanning::BuildingIntent::ProduceExplorer)) || runtime.get_building_register().provides(*i,static_cast<int>(AIPlanning::BuildingIntent::ProduceWarrior))))
 		{
-			ManagementOrder* mo_tracker=new AddResourceTracker(AI_NICOWAR_RESOURCE_TRACKER_DEPTH, WHEAT, *i);
+			ManagementOrder* mo_tracker=new AddMaterialTracker(AI_NICOWAR_RESOURCE_TRACKER_DEPTH, RecurringInputStock, *i);
 			mo_tracker->add_condition(new ParticularBuilding(new NotUnderConstruction, *i));
 			runtime.add_management_order(mo_tracker);
 		}
-		if(runtime.get_building_register().get_type(*i)==IntBuildingType::FOOD_BUILDING)
+		if(runtime.get_building_register().provides(*i,BuildingDemand::Feed))
 		{
-			ManagementOrder* mo_tracker=new AddResourceTracker(AI_NICOWAR_RESOURCE_TRACKER_DEPTH, WHEAT, *i);
+			ManagementOrder* mo_tracker=new AddMaterialTracker(AI_NICOWAR_RESOURCE_TRACKER_DEPTH, RecurringInputStock, *i);
 			mo_tracker->add_condition(new ParticularBuilding(new NotUnderConstruction, *i));
 			runtime.add_management_order(mo_tracker);
 		}

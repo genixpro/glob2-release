@@ -67,7 +67,7 @@ static void run(int width,int height,bool gl,bool expanded)
     glob2test::ScopedEnvironment desktop("GLOB2_MOBILE_UI", "0");
     if(expanded)writeExpandedStrings();
     glob2test::GlobalsOptions options{.display=true,.loadStrings=true,.width=width,.height=height,.screenFlags=gl?Uint32(GraphicContext::USEGPU):0u};
-    options.beforeLoad=[](GlobalContainer& globals){globals.settings.language="en";globals.settings.defaultFlagRadius[0]=0;};
+    options.beforeLoad=[](GlobalContainer& globals){globals.settings.language="en";};
     glob2test::HeadlessGlobals globals(options);
     auto& s=globalContainer->settings;
     REQUIRE(NET_Init());
@@ -100,6 +100,22 @@ static void run(int width,int height,bool gl,bool expanded)
             screen.capture(output+"/category-"+std::to_string(int(category))+".bmp");
         }
         screen.selectCategory(SettingsScreen::Category::Display);
+        REQUIRE(screen.row("graphics.fps").label.starts_with("Target render FPS"));
+        REQUIRE(screen.row("graphics.fps").choices.back() == "Unlimited");
+        REQUIRE(screen.row("graphics.fps").value == "60 FPS");
+        REQUIRE(screen.changeSetting("graphics.fps", 0));
+        REQUIRE(s.targetRenderFps == 25);
+        Settings fpsLoaded; fpsLoaded.load();
+        REQUIRE(fpsLoaded.targetRenderFps == 25);
+        screen.host().scrollIntoView("graphics.fps");
+        screen.activateSetting("graphics.fps");
+        screen.capture(output+"/target-render-fps.bmp");
+        screen.key(SDLK_ESCAPE);
+        screen.host().state("settings/0").scroll = 0;
+        REQUIRE(screen.changeSetting("graphics.fps", 8));
+        REQUIRE(s.targetRenderFps == 0);
+        REQUIRE(screen.changeSetting("graphics.fps", 2));
+        REQUIRE_FALSE(screen.restartRequired());
         const auto windowMode=screen.row("display.mode").number;
         screen.activateSetting("display.mode");
         REQUIRE(screen.row("graphics.torus").kind==SettingsScreen::Kind::Toggle);
@@ -110,13 +126,17 @@ static void run(int width,int height,bool gl,bool expanded)
         screen.selectCategory(SettingsScreen::Category::Gameplay);
         for(const auto& row:screen.rows())REQUIRE((row.id!="graphics.torus" && row.id!="gameplay.torus"));
         screen.selectCategory(SettingsScreen::Category::Buildings);
-        const auto defaults=s.defaultUnitsAssigned[IntBuildingType::FOOD_BUILDING][1];
+        const auto fingerprint=globalContainer->buildingsTypes.fingerprint();
+        const auto& inn=*globalContainer->buildingsTypes.getByType("inn",0,false);
+        const auto& exploration=*globalContainer->buildingsTypes.getByType("explorationflag",0,false);
+        const auto& war=*globalContainer->buildingsTypes.getByType("warflag",0,false);
+        const auto defaults=s.buildingAssignment(fingerprint,inn);
         for(int tab=0;tab<4;++tab){screen.activateSetting("buildings.tab."+std::to_string(tab));screen.capture(output+"/buildings-"+std::to_string(tab)+".bmp");}
-        REQUIRE(s.defaultUnitsAssigned[IntBuildingType::FOOD_BUILDING][1]==defaults);
-        REQUIRE(s.defaultFlagRadius[0]==0);
-        REQUIRE(screen.row("radius.0").value=="Default");
-        REQUIRE(screen.changeSetting("radius.0",3));
-        REQUIRE((s.defaultFlagRadius[0]==3 && s.defaultFlagRadius[1]==4));
+        REQUIRE(s.buildingAssignment(fingerprint,inn)==defaults);
+        const auto warRadius=s.buildingRadius(fingerprint,war);
+        REQUIRE(screen.changeSetting("radius."+exploration.key,3));
+        REQUIRE(s.buildingRadius(fingerprint,exploration)==3);
+        REQUIRE(s.buildingRadius(fingerprint,war)==warRadius);
         screen.selectCategory(SettingsScreen::Category::Audio);
         REQUIRE(!screen.row("audio.music").enabled);
         CHECK(screen.row("audio.set").label == "Music set");
@@ -332,10 +352,252 @@ static void run(int width,int height,bool gl,bool expanded)
 // sizes, one software renderer and the expanded English wording.
 TEST_SUITE("Settings")
 {
+    TEST_CASE("catalog building defaults in compact layout [display][artifacts][writes-preferences]")
+    {
+        glob2test::ScopedEnvironment compact("GLOB2_MOBILE_UI","1");
+        glob2test::GlobalsOptions options{.display=true,.loadStrings=true,.width=480,.height=800};
+        options.beforeLoad=[](GlobalContainer& globals){globals.settings.language="en";};
+        glob2test::HeadlessGlobals globals(options);
+        FrontendTheme theme;FrontendScope frontend;NativeSettings screen;
+        screen.selectCategory(SettingsScreen::Category::Buildings);
+        screen.capture((glob2test::artifactDir()/"building-defaults-compact-list.bmp").string());
+        REQUIRE(screen.row("buildings.open.inn.0.site").enabled);
+        screen.activateSetting("buildings.open.inn.0.site");
+        const auto& type=*globalContainer->buildingsTypes.getByType("inn",2,false);
+        const auto control="units."+type.key;
+        CHECK(screen.row(control).maximum==type.semantics.assignmentLimit);
+        REQUIRE(screen.changeSetting(control,6));
+        const auto fingerprint=globalContainer->buildingsTypes.fingerprint();
+        CHECK(globalContainer->settings.buildingAssignment(fingerprint,type)==6);
+        Settings loaded;loaded.load();CHECK(loaded.buildingAssignment(fingerprint,type)==6);
+        screen.host().scrollIntoView(control);
+        screen.capture((glob2test::artifactDir()/"building-defaults-compact-detail.bmp").string());
+        screen.done();
+    }
+
+    TEST_CASE("render FPS dropdown in compact layout [display][artifacts][writes-preferences]")
+    {
+        glob2test::ScopedEnvironment compact("GLOB2_MOBILE_UI", "1");
+        glob2test::GlobalsOptions options{.display=true,.loadStrings=true,.width=640,.height=480};
+        options.beforeLoad=[](GlobalContainer &g) { g.settings.language="en"; };
+        glob2test::HeadlessGlobals globals(options);
+        FrontendTheme theme;
+        FrontendScope frontend;
+        NativeSettings screen;
+        screen.selectCategory(SettingsScreen::Category::Display);
+        REQUIRE(screen.row("graphics.fps").kind == SettingsScreen::Kind::Choice);
+        REQUIRE(screen.row("graphics.fps").label.starts_with("Target render FPS"));
+        REQUIRE(screen.row("graphics.fps").choices.back() == "Unlimited");
+        REQUIRE(screen.row("graphics.fps").value == "60 FPS");
+        REQUIRE(screen.changeSetting("graphics.fps", 8));
+        REQUIRE(globalContainer->settings.targetRenderFps == 0);
+        Settings loaded; loaded.load();
+        REQUIRE(loaded.targetRenderFps == 0);
+        REQUIRE(screen.changeSetting("graphics.fps", 2));
+        screen.host().scrollIntoView("graphics.fps");
+        screen.activateSetting("graphics.fps");
+        screen.capture((glob2test::artifactDir()/"target-render-fps-compact.bmp").string());
+        screen.key(SDLK_ESCAPE);
+        screen.done();
+    }
+
 	TEST_CASE("layout; persistence; live display changes; bindings and localization at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, false); }
 	TEST_CASE("layout; persistence; live display changes; bindings and localization at 800x600 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(800, 600, true, false); }
 	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1000x700 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, true, false); }
 	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1280x900 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(1280, 900, true, false); }
 	TEST_CASE("layout; persistence; live display changes; bindings and localization at 1000x700 in software rendering [display:1600x1400][artifacts][writes-preferences]") { run(1000, 700, false, false); }
 	TEST_CASE("layout; persistence; live display changes; bindings and localization with expanded wording at 640x480 in OpenGL [display:1600x1400][artifacts][writes-preferences]") { run(640, 480, true, true); }
+}
+
+#include "OnlineServices.h"
+#include "OnlineFakes.h"
+#include "SimVersion.h"
+#include "Sha256.h"
+#include "ScriptLibrary.h"
+namespace
+{
+void aiLibraryPresentation(int width, int height, const char *themeName)
+{
+	glob2test::ScopedEnvironment desktop("GLOB2_MOBILE_UI", width < 700 ? "1" : "0");
+	glob2test::GlobalsOptions options{
+		.display = true, .loadStrings = true, .width = width, .height = height, .screenFlags = 0u};
+	options.beforeLoad = [themeName](GlobalContainer &g)
+	{
+		g.settings.language = "en";
+		g.settings.menuTheme = themeName;
+	};
+	glob2test::HeadlessGlobals globals(options);
+	Online::ServicesOwner services;
+	OnlineFakes::World world;
+	auto &client = services.get().client;
+	client.replaceEnvironment(world.environment());
+	client.start("https://play.example.org");
+	auto account = OnlineFakes::account();
+	account["kind"] = "registered";
+	world.http.pending("/api/v1/auth/guest")
+		->reply(200, {{"account", account},
+					  {"tokens", OnlineFakes::tokens("r1", 1790000000, 600)},
+					  {"deviceCredential", std::string(43, 'c')}});
+	client.update();
+	Glob2UI::applyThemes(themeName, "dark");
+	FrontendTheme theme;
+	FrontendScope frontend;
+	NativeSettings screen;
+	auto draw = [&]
+	{
+		client.update();
+		screen.onTimer(SDL_GetTicks());
+		screen.paintFrame(SDL_GetTicks());
+	};
+	auto tap = [&](const std::string &key)
+	{
+		draw();
+		REQUIRE(screen.host().find(key));
+		screen.host().scrollIntoView(key);
+		draw();
+		const auto b = screen.host().bounds(key);
+		screen.host().tapAt({b.x + b.w / 2, b.y + b.h / 2});
+		draw();
+	};
+	auto answer = [&](const std::string &path, const Online::Json &json)
+	{
+		INFO(path);
+		auto request = world.http.pending(path);
+		REQUIRE(request);
+		request->reply(200, json);
+		draw();
+	};
+	auto selectedVersion = [&]
+	{
+		REQUIRE(screen.host().find("ais/version"));
+		return screen.host().find("ais/version")->accessibleText();
+	};
+	const std::string source = "function step(){}", hash = Online::Sha256::hex(source),
+					  id = "ai-one", release = "release-one";
+	Online::Json checks = Online::Json::array();
+	for (const char *check :
+		 {"file", "syntax", "startup", "state", "gameplay", "determinism", "continuation"})
+		checks.push_back({{"id", check}, {"status", "passed"}});
+	Online::Json report = {{"sourceHash", hash},
+						   {"simVersion", Online::SimVersion::local().key()},
+						   {"suite", 1},
+						   {"valid", true},
+						   {"checks", checks}};
+	Online::Json version = {{"id", release},   {"hash", hash},
+							{"label", "1.2"},  {"notes", "A patient colony builder."},
+							{"downloads", 25}, {"validations", Online::Json::array({report})}};
+	auto older = version;
+	older["id"] = "release-old";
+	older["label"] = "1.1";
+	auto newest = version;
+	newest["id"] = "release-new";
+	newest["label"] = "1.3";
+	newest["validations"] = Online::Json::array();
+	Online::Json ai = {{"id", id},
+					   {"name", "Patient Gardener"},
+					   {"description", "A thoughtful economy opponent for local games."},
+					   {"owner", {{"id", "author"}, {"displayName", "Colony Keeper"}}},
+					   {"tags", Online::Json::array({"Economy", "Defensive"})},
+					   {"likes", 8},
+					   {"downloads", 25},
+					   {"liked", false},
+					   {"favourited", false},
+					   {"latestVersion", newest}};
+	Online::Json detail = {{"ai", ai}, {"versions", Online::Json::array({newest, version, older})}};
+	Online::Json catalogue = Online::Json::array();
+	for (int i = 0; i < 23; ++i)
+	{
+		auto item = ai;
+		item["id"] = "ai-" + std::to_string(i);
+		item["name"] = "Colony controller " + std::to_string(i + 1);
+		catalogue.push_back(item);
+	}
+	catalogue.push_back(ai);
+	const std::string cataloguePath = "/api/v1/ais?limit=24&sort=likes&q=&tags=";
+	screen.selectCategory(SettingsScreen::Category::CustomAIs);
+	screen.activateSetting("ai.browse");
+	draw();
+	answer(cataloguePath, {{"items", catalogue}});
+	tap("ais/gotit");
+	tap("ais/item/" + id);
+	answer("/api/v1/ais/" + id, detail);
+	CHECK(selectedVersion().find("1.2") != std::string::npos); // newest compatible release
+	if (width >= 700)
+	{
+		// Selecting the last of a full page leaves the detail pane visible, even
+		// while the independently scrolling catalogue is far down the list.
+		REQUIRE(screen.host().find("ais/results-list"));
+		CHECK(screen.host().find("ais/results-list")->scrollOffset() > 0);
+		CHECK(screen.host()
+				  .bounds("ais/details/" + id)
+				  .contains(screen.host().bounds("ais/version").center()));
+	}
+	screen.capture((glob2test::artifactDir() /
+					(std::string("ai-library-") + themeName + "-" + std::to_string(width) + ".bmp"))
+					   .string());
+	screen.host().find("ais/version")->activate(screen.host(), 1);
+	draw();
+	CHECK(selectedVersion().find("1.1") != std::string::npos);
+	tap("ais/favourite");
+	CHECK_FALSE(screen.host().find("ais/like")->enabled());
+	answer("/api/v1/ais/" + id + "/favourite", {{"active", true}, {"likes", 8}});
+	CHECK(selectedVersion().find("1.1") != std::string::npos);
+	CHECK_FALSE(world.http.pending("/api/v1/ais/" + id));
+
+	// An outstanding action for A must not navigate back to A after choosing B.
+	tap("ais/like");
+	if (width < 700)
+		tap("ais/results");
+	tap("ais/item/ai-0");
+	auto otherDetail = detail;
+	otherDetail["ai"] = catalogue[0];
+	answer("/api/v1/ais/ai-0", otherDetail);
+	answer("/api/v1/ais/" + id + "/like", {{"active", true}, {"likes", 9}});
+	CHECK_FALSE(world.http.pending("/api/v1/ais/" + id));
+	CHECK(screen.host().find("ais/like")->accessibleText() == "Like");
+	if (width < 700)
+		tap("ais/results");
+	tap("ais/item/" + id);
+	detail["ai"]["favourited"] = true;
+	detail["ai"]["liked"] = true;
+	detail["ai"]["likes"] = 9;
+	answer("/api/v1/ais/" + id, detail);
+	screen.host().find("ais/version")->activate(screen.host(), 1);
+	draw();
+	tap("ais/install");
+	auto download = world.http.pending("/api/v1/ais/" + id + "/versions/release-old/file");
+	REQUIRE(download);
+	download->replyRaw(200, source);
+	draw();
+	draw();
+	auto storage = Online::makeUserDirectoryStorage();
+	Script::Library library(*storage);
+	REQUIRE(library.entries().size() == 1);
+	CHECK(library.entries()[0].online->hash == hash);
+	CHECK(library.entries()[0].online->versionId == "release-old");
+	tap("ais/tab/2");
+	answer("/api/v1/ais/" + id, detail);
+	REQUIRE(screen.host().find("ai.remove." + library.entries()[0].id));
+	tap("ai.online." + library.entries()[0].id);
+	answer("/api/v1/ais/" + id, detail);
+	CHECK(selectedVersion().find("1.1") != std::string::npos);
+	CHECK(selectedVersion().find("Installed") != std::string::npos);
+	tap("ais/tab/0");
+	answer(cataloguePath, {{"items", Online::Json::array({{{"name", false}}})}});
+	CHECK_FALSE(screen.host().find("ais/item/" + id));
+	tap("ais/close");
+	CHECK(screen.host().find("ai.browse"));
+}
+} // namespace
+TEST_CASE("AI library desktop discovery, favourite, installation and malformed responses "
+		  "[display:1280x900][artifacts]" *
+		  doctest::test_suite("SettingsAILibrary"))
+{
+	aiLibraryPresentation(1280, 900, "light");
+}
+TEST_CASE("AI library compact discovery, favourite, installation and malformed responses "
+		  "[display:1280x900][artifacts]" *
+		  doctest::test_suite("SettingsAILibrary"))
+{
+	aiLibraryPresentation(640, 800, "dark");
 }

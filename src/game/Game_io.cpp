@@ -24,9 +24,13 @@
 #include <ChunkedStreamBackend.h>
 
 #include "BuildingType.h"
+#include "BuildingArtwork.h"
+#include <Toolkit.h>
+#include <AssetLoader.h>
 #include "DatasetWriter.h"
 #include "FileFormatVersions.h"
 #include "Game.h"
+#include "EntityRandomIO.h"
 #include <DeferredStream.h>
 #include "GameUtilities.h"
 #include "GlobalContainer.h"
@@ -88,7 +92,7 @@ void Game::loadBuildProjects(GAGCore::InputStream* stream)
         if (project.posX < 0 || project.posX >= map.getW()
             || project.posY < 0 || project.posY >= map.getH()
             || project.teamNumber < 0 || project.teamNumber >= mapHeader.getNumberOfTeams()
-            || project.typeNum < 0 || static_cast<size_t>(project.typeNum) >= globalContainer->buildingsTypes.size()
+            || project.typeNum < 0 || static_cast<size_t>(project.typeNum) >= buildingsTypes.size()
             || project.unitWorking < 0 || project.unitWorking > Unit::MAX_COUNT
             || project.unitWorkingFuture < 0 || project.unitWorkingFuture > Unit::MAX_COUNT)
             throw std::runtime_error("Invalid pending construction project");
@@ -174,16 +178,27 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 	if (!tempMapHeader.load(stream))
 		co_return false;
 	mapHeader=tempMapHeader;
-	Sint32 versionMinor=mapHeader.getVersionMinor();
+	mapHeader.resolveGrowthLayout(stream);
+	Sint32 versionMinor=mapHeader.loadingVersion();
 
 
 	// We load the game header
 	GameHeader tempGameHeader;
 	if (verbose)
 		printf("Loading game header\n");
-	if (!tempGameHeader.load(stream, versionMinor))
+	if (!tempGameHeader.load(stream, versionMinor, mapHeader.historicalGrowthLayout ? mapHeader.getVersionMinor() : 0))
 		co_return false;
 	gameHeader=tempGameHeader;
+	// Resolve before any entity takes a descriptor pointer. Older files must
+	// never inherit edited repository definitions.
+	if (gameHeader.getBuildingCatalogSnapshot().empty()) buildingsTypes.initLegacy();
+	else buildingsTypes.loadSnapshotJson(gameHeader.getBuildingCatalogSnapshot());
+	if (!globalContainer->runNoX) {
+        Toolkit::assets().setCommunityFiles(gameHeader.getBuildingArtwork() ? gameHeader.getBuildingArtwork()->files() : GAGCore::AssetLoader::CommunityFiles{});
+        buildingsTypes.loadSprites();
+    }
+	gameHeader.setBuildingCatalogSnapshot(buildingsTypes.snapshotJson());
+	configureBuildingCatalog();
 
 	if (!readMatchingSignature(stream, FILE_SIG_GAME_BEGIN, "signatureStart"))
 		co_return false;
@@ -214,9 +229,11 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		stream->readEnterSection(i);
         co_await GAGCore::CooperativeTask::checkpoint("[Loading teams]");
 		teams[i]=new Team(this);
-        if (!(co_await teams[i]->loadTask(stream, &globalContainer->buildingsTypes, versionMinor)))
+        if (!(co_await teams[i]->loadTask(stream, &buildingsTypes, versionMinor)))
             co_return false;
 		if (teams[i]->teamNumber != i) co_return false;
+		for (int slot = 0; slot < Building::MAX_COUNT; ++slot)
+			if (const Building *b = teams[i]->myBuildings[slot]; b && !isBuildingTypeAvailable(b->typeNum)) co_return false;
 		stream->readLeaveSection();
 	}
 	stream->readLeaveSection();
@@ -227,6 +244,25 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 	// Load the map. Team has to be saved and loaded first.
 	if(!(co_await map.loadTask(stream, mapHeader, this)))
 		co_return false;
+
+	if (versionMinor >= FILE_FORMAT_VERSION_TERRAIN_PROPERTIES && map.requiredTerrainExperiments() != mapHeader.requiredTerrainExperiments)
+		co_return false;
+	if (versionMinor >= FILE_FORMAT_VERSION_RUNTIME_RESOURCES &&
+		(map.requiredResourceExperiments() != mapHeader.requiredResourceExperiments ||
+		 map.resourceRegistry().experiments() != mapHeader.resourceExperimentDefinitions ||
+		 gameHeader.resourceExperiments() != mapHeader.resourceExperimentDefinitions)) co_return false;
+	gameHeader.setResourceExperiments(map.resourceRegistry().experiments());
+	for (const auto& key : map.requiredResourceExperiments().keys())
+	{
+		if (mapHeader.getIsSavedGame() && !gameHeader.getExperiments().has(key)) co_return false;
+		gameHeader.getExperiments().set(key, true, gameHeader.catalogExperimentKeys());
+	}
+	for (const auto& definition : experimentDefinitions())
+		if (mapHeader.requiredTerrainExperiments.has(definition.id))
+		{
+			if (mapHeader.getIsSavedGame() && !gameHeader.hasExperiment(definition.id)) co_return false;
+			gameHeader.getExperiments().set(definition.id);
+		}
 
 	if (!readMatchingSignature(stream, FILE_SIG_GAME_MAP, "signatureAfterMap"))
 		co_return false;
@@ -245,6 +281,8 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 
 	if (!readMatchingSignature(stream, FILE_SIG_GAME_PLAYER, "signatureAfterPlayers"))
 		co_return false;
+	if (versionMinor >= FILE_FORMAT_VERSION_AI_PIPELINE && mapHeader.getIsSavedGame())
+		if (!loadAI(stream)) co_return false;
 
 	// Legacy saves reconstruct service lists by running building updates. That
 	// changes tie-breaking order and can even advance construction. New saved
@@ -265,7 +303,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 	if(versionMinor >= FILE_FORMAT_VERSION_USL_MAPSCRIPT)
 	{
 		// This is the new map script system
-		if (!mapscript.decodeData(stream, mapHeader.getVersionMinor()))
+		if (!mapscript.decodeData(stream, versionMinor))
 			co_return false;
 	}
 
@@ -288,6 +326,20 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 	}
 
 	if (versionMinor >= FILE_FORMAT_VERSION_PENDING_CONSTRUCTION) loadBuildProjects(stream);
+	if (versionMinor >= FILE_FORMAT_VERSION_PRIVATE_RANDOM)
+	{
+		stream->readEnterSection("worldRandom");
+		for (unsigned i = 0; i < WorldRandomStreams::Count; ++i)
+		{
+			stream->readEnterSection(i);
+			loadEntityRandom(stream, map.worldRandom.streams[i]);
+			stream->readLeaveSection();
+		}
+		stream->readLeaveSection();
+		map.worldRandom.initialized = true;
+	}
+	else
+		map.worldRandom.initialize(gameHeader.getRandomSeed());
 	MersenneTwister savedRandom;
 	if (versionMinor >= FILE_FORMAT_VERSION_CONTINUATION_STATE && mapHeader.getIsSavedGame())
 	{
@@ -404,6 +456,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		hasSavedRandomState = true;
 	}
 
+	areaEffects.beginTick(*this,false);
 	co_return true;
 }
 
@@ -453,7 +506,9 @@ bool Game::checkBuildingsDoNotOverlapAndHealMissing() {
 							<< " building " << bi
 							<< " (" << building->type->type << "), healing!"
 							<< std::endl;
-						map.getTile(xi, yi).building = gid;
+						auto cell = map.getTile(xi, yi);
+						cell.building = gid;
+						map.replaceTile(xi, yi, cell);
 					}
 				}
 		}
@@ -474,7 +529,7 @@ bool Game::integrity(void)
 	for (int y=0; y<map.getH(); y++)
 		for (int x=0; x<map.getW(); x++)
 		{
-			Tile& c = map.getTile(x, y);
+			const Tile& c = map.getTile(x, y);
 			if (c.building != NOGBID)
 			{
 				int tid = Building::GIDtoTeam(c.building);
@@ -497,7 +552,9 @@ bool Game::integrity(void)
 							<< " with " << coordName
 							<< " span [" << posValue << ":" << endValue << "[, healing!"
 							<< std::endl;
-						map.getTile(x, y).building = NOGBID;
+						auto cell = map.getTile(x, y);
+						cell.building = NOGBID;
+						map.replaceTile(x, y, cell);
 					}
 				};
 
@@ -577,6 +634,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 {
 	PERF_SCOPE_TIME(Serialize);
 	assert(stream);
+	drainAI(); // Freeze submissions and finish private state, without delivering future orders.
 	for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
 		if (teams[t])
 			AITelemetry::capture(teams[t], false, false);
@@ -625,6 +683,12 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	Uint32 mapHeaderOffset = stream->getPosition();
 	mapHeader.setMapName(name);
 	mapHeader.setIsSavedGame(!fileIsAMap);
+	mapHeader.requiredTerrainExperiments = map.requiredTerrainExperiments();
+	mapHeader.requiredResourceExperiments = map.requiredResourceExperiments();
+	mapHeader.resourceExperimentDefinitions = map.resourceRegistry().experiments();
+	gameHeader.setResourceExperiments(map.resourceRegistry().experiments());
+	for (const auto& key : mapHeader.requiredResourceExperiments.keys())
+		gameHeader.getExperiments().set(key, true, gameHeader.catalogExperimentKeys());
 	mapHeader.resetGameSHA1();
 
 	for (int i=0; i<mapHeader.getNumberOfTeams(); ++i)
@@ -653,6 +717,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	}
 	else
 		mapHeader.save(stream);
+	gameHeader.setBuildingCatalogSnapshot(buildingsTypes.snapshotJson());
 	gameHeader.save(stream);
 
 	///Save basic informations
@@ -688,6 +753,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	}
 	stream->writeLeaveSection();
 	stream->write(FILE_SIG_GAME_PLAYER, FILE_SIG_LEN, "signatureAfterPlayers");
+	if (!fileIsAMap) saveAI(stream);
 
 	// Save the old map script state
 	sgslScript.save(stream, this);
@@ -701,6 +767,15 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	gameHints.encodeData(stream);
 
 	saveBuildProjects(stream);
+	privateRandom(RandomDomain::GrowthJobs); // Initialize without drawing.
+	stream->writeEnterSection("worldRandom");
+	for (unsigned i = 0; i < WorldRandomStreams::Count; ++i)
+	{
+		stream->writeEnterSection(i);
+		saveEntityRandom(stream, map.worldRandom.streams[i]);
+		stream->writeLeaveSection();
+	}
+	stream->writeLeaveSection();
 	if (!fileIsAMap)
 	{
 		std::ostringstream randomState;
@@ -772,6 +847,9 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 
 Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> *checkSumsVectorForBuildings, std::vector<Uint32> *checkSumsVectorForUnits, bool heavy)
 {
+    // Explicit verification may join future work. Network checksums retain
+    // their full live-map coverage without shortening worker deadlines.
+    const bool includePending = heavy;
 	Uint32 cs=0;
 
 	Uint32 headerCs=mapHeader.checkSum();
@@ -815,7 +893,7 @@ Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 			break;
 		}
 	}
-	Uint32 mapCs=map.checkSum(heavy);
+	Uint32 mapCs=map.checkSum(heavy, includePending);
 	cs^=mapCs;
 	if (checkSumsVector)
 		checkSumsVector->push_back(mapCs);// [3+t*20+p*2]

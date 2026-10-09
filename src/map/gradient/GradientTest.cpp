@@ -50,7 +50,15 @@ namespace
 			wMask = w - 1;
 			hMask = h - 1;
 			size = static_cast<size_t>(w * h);
-			tiles.assign(size, Tile());
+			// Test-only private access bootstraps this partial map.
+			resourceCells.assign(size, {});
+			for (auto &cell : resourceCells) cell.mayGrow = 1;
+			occupancyCells.assign(size, {});
+			areaCells.assign(size, {});
+			scriptAreaCells.assign(size, 0);
+			vertexTerrain.assign(size, GRASS);
+			bindBootstrappedArrays();
+            rebuildTerrainCounts();
 		}
 		~GrassMap()
 		{
@@ -60,8 +68,8 @@ namespace
 			size = 0;
 		}
 		size_t cells() const { return size; }
-		void putWater(int x, int y) { tiles[coordToIndex(x, y)].terrain = 256; }
-		void putWaterAt(size_t i) { tiles[i].terrain = 256; }
+		void putWater(int x, int y) { paintCell(x,y,WATER); }
+		void putWaterAt(size_t i) { paintCell(i,WATER); }
 
 		// The kernel before the low-level rewrite, kept verbatim as a differential oracle.
 		void legacyPropagateGradient(Uint16 *gradient, int swimClass, int maxCost = GRADIENT_COST_LIMIT) const
@@ -153,7 +161,7 @@ namespace
 			else
 				sweep([&](int i) { return isWater((unsigned)i) ? WATER_STEP[swimClass] : GRADIENT_STEP; });
 		}
-		void putGroundUnit(int x, int y) { tiles[coordToIndex(x, y)].groundUnit = 0; }
+		void putGroundUnit(int x, int y) { setGroundUnit(x, y, 0); }
 	};
 
 	// Shortest wrapped axis distance on a torus of extent n.
@@ -282,8 +290,8 @@ void GradientTest::testSeedBelowGoalPropagates()
 
 void GradientTest::testSeedsBeyondBucketWindow()
 {
-	// Seeds may start at any cost, as the round-trip gradients seed resource
-	// tiles with their distance to a building. Walls along x=2 and y=2 cut
+	// Seeds may start at any cost, as resource gradients seed a market with
+	// its pickup penalty. Walls along x=2 and y=2 cut
 	// the torus into one 7x7 rectangle with the goal in the corner (3,3) and
 	// a seed at cost 60 in the opposite corner (1,1), 84 from the goal.
 	GrassMap map;
@@ -320,21 +328,23 @@ void GradientTest::testMaxCostStopsPropagation()
 
 void GradientTest::testDirectionPrefersCheapestTotal()
 {
+	EntityRandom random;
+	random.seed(42, 54);
 	GrassMap map;
 	std::vector<Uint16> g = blank(map);
 	g[map.coordToIndex(0, 0)] = GRADIENT_AT_GOAL;
 	map.propagateGradient(g.data(), 0);
 	int dx = 9, dy = 9;
 	// From (3,3) the cheapest neighbour is the diagonal (2,2).
-	CHECK(map.directionByGradient(1, 0, 3, 3, g.data(), &dx, &dy, true));
+	CHECK(map.directionByGradient(random, 1, 0, 3, 3, g.data(), &dx, &dy, true));
 	CHECK_EQ(-1, dx);
 	CHECK_EQ(-1, dy);
 	// From (3,0) it is straight west.
-	CHECK(map.directionByGradient(1, 0, 3, 0, g.data(), &dx, &dy, true));
+	CHECK(map.directionByGradient(random, 1, 0, 3, 0, g.data(), &dx, &dy, true));
 	CHECK_EQ(-1, dx);
 	CHECK_EQ(0, dy);
 	// At the goal: stay.
-	CHECK(map.directionByGradient(1, 0, 0, 0, g.data(), &dx, &dy, true));
+	CHECK(map.directionByGradient(random, 1, 0, 0, 0, g.data(), &dx, &dy, true));
 	CHECK_EQ(0, dx);
 	CHECK_EQ(0, dy);
 
@@ -349,13 +359,15 @@ void GradientTest::testDirectionPrefersCheapestTotal()
 	water.propagateGradient(f.data(), 5);
 	CHECK_EQ(28, cost(f, water, 2, 0));
 	CHECK_EQ(24, cost(f, water, 2, 1));
-	CHECK(water.directionByGradient(1, 5, 3, 0, f.data(), &dx, &dy, true));
+	CHECK(water.directionByGradient(random, 1, 5, 3, 0, f.data(), &dx, &dy, true));
 	CHECK_EQ(-1, dx);
 	CHECK(dy != 0); // never straight into the water
 }
 
 void GradientTest::testDirectionBlockedNeighbour()
 {
+	EntityRandom random;
+	random.seed(42, 54);
 	GrassMap map;
 	std::vector<Uint16> g = blank(map);
 	g[map.coordToIndex(0, 0)] = GRADIENT_AT_GOAL;
@@ -364,15 +376,15 @@ void GradientTest::testDirectionBlockedNeighbour()
 	// progress through (2,3) or (3,2), never the occupied diagonal.
 	map.putGroundUnit(2, 2);
 	int dx = 9, dy = 9;
-	CHECK(map.directionByGradient(1, 0, 3, 3, g.data(), &dx, &dy, true));
+	CHECK(map.directionByGradient(random, 1, 0, 3, 3, g.data(), &dx, &dy, true));
 	CHECK(((dx == -1 && dy == 0) || (dx == 0 && dy == -1)));
 	// Fully surrounded by units: strict fails, and so does the sidestep (no free cell).
 	for (int ddy = -1; ddy <= 1; ddy++)
 		for (int ddx = -1; ddx <= 1; ddx++)
 			if (ddx || ddy)
 				map.putGroundUnit(3 + ddx, 3 + ddy);
-	CHECK(!map.directionByGradient(1, 0, 3, 3, g.data(), &dx, &dy, true));
-	CHECK(!map.directionByGradient(1, 0, 3, 3, g.data(), &dx, &dy, false));
+	CHECK(!map.directionByGradient(random, 1, 0, 3, 3, g.data(), &dx, &dy, true));
+	CHECK(!map.directionByGradient(random, 1, 0, 3, 3, g.data(), &dx, &dy, false));
 }
 
 void GradientTest::testSwimClassFromSpeeds()
@@ -398,11 +410,15 @@ void GradientTest::testRandomFieldsAgainstReference()
 		const int swimClass = trial % SWIM_CLASS_COUNT;
 		GrassMap map(trial % 6, (trial / 6) % 6);
 		auto input = blank(map);
+		for (size_t i = 0; i < map.cells(); ++i)
+			if (random() % 3 == 0) map.putWater(i % width, i / width);
+		// A painted cell spreads its corners to its neighbours: read back which
+		// cells actually swim.
 		std::vector<bool> water(map.cells());
 		for (size_t i = 0; i < map.cells(); ++i)
+			water[i] = map.terrainPropertiesAt(i).swimmable;
+		for (size_t i = 0; i < map.cells(); ++i)
 		{
-			water[i] = random() % 3 == 0;
-			if (water[i]) map.putWater(i % width, i / width);
 			if (random() % 4 == 0 || (water[i] && swimClass == 0))
 				input[i] = GRADIENT_FORBIDDEN;
 			else if (trial % 10 != 0 && random() % 12 == 0)

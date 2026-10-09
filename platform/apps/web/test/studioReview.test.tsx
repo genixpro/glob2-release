@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+vi.mock('../src/state.tsx', () => ({ useSession: () => ({ account: { id: 'owner' } }) }));
 import { act, cleanup, fireEvent, render, renderHook, screen } from '@testing-library/react';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { StudioProgress, StudioRequest } from '@glob2/protocol';
@@ -102,7 +103,6 @@ it('compares delivered previews and keeps both versions pinned when a newer gene
     draft: '',
     setDraft: vi.fn(),
     send: vi.fn(),
-    generate: vi.fn(),
     settings,
     changeSettings: vi.fn(),
     revise: vi.fn(),
@@ -111,6 +111,7 @@ it('compares delivered previews and keeps both versions pinned when a newer gene
     versionAction: vi.fn(),
   };
   const view = render(<StudioWorkspace {...props} />);
+  fireEvent.click(screen.getByText('Build details', { selector: 'summary' }));
   fireEvent.click(screen.getByRole('button', { name: 'Prepare the design' }));
   expect(screen.getByRole('img', { name: 'Reference' })).toBeTruthy();
   fireEvent.change(screen.getByRole('combobox', { name: 'Compare with version' }), {
@@ -150,6 +151,7 @@ it('anchors the visible conversation when earlier messages are prepended', () =>
     loadEarlier: vi.fn(),
     busy: false,
     choose: vi.fn(),
+    inspect: vi.fn(),
   };
   const view = render(<Conversation {...props} />);
   const log = screen.getByRole('log');
@@ -180,7 +182,6 @@ function inspectingProps() {
     draft: '',
     setDraft: vi.fn(),
     send: vi.fn(),
-    generate: vi.fn(),
     settings,
     changeSettings: vi.fn(),
     revise: vi.fn(),
@@ -283,6 +284,7 @@ it('waits for the final preview to decode before starting the completion reveal'
   expect(view.container.querySelector('.ms-celebrate')).toBeTruthy();
   act(() => vi.advanceTimersByTime(700));
   expect(view.container.querySelector('.ms-celebrate')).toBeNull();
+  fireEvent.click(screen.getByText('Build details', { selector: 'summary' }));
   fireEvent.click(screen.getByRole('button', { name: 'Prepare the design' }));
   fireEvent.click(screen.getByRole('button', { name: 'Ready' }));
   fireEvent.load(screen.getByRole('img', { name: 'Version 1' }));

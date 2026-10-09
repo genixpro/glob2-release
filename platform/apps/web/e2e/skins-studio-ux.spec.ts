@@ -51,11 +51,13 @@ test('studio retains usable canvas and reachable controls at every supported lay
     if (compact) await page.getByRole('button', { name: 'Expand toolbox' }).click();
     await page.getByLabel('Pen pressure').check();
     await expect(page.getByLabel('Pen pressure')).toBeChecked();
-    await toolbox.locator('summary').click();
+    await toolbox.getByText('Paint repeats on matching surfaces', { exact: true }).click();
     await expect(
       toolbox.getByText(/Some front\/back and top\/bottom surfaces share paint/),
     ).toBeVisible();
-    const help = await boxFor(toolbox.locator('summary'));
+    const help = await boxFor(
+      toolbox.getByText('Paint repeats on matching surfaces', { exact: true }),
+    );
     expect(help.y + help.height).toBeLessThanOrEqual(size.height);
     await page.getByRole('button', { name: 'Collapse toolbox' }).click();
     await expect(page.getByRole('button', { name: 'Patterns', exact: true })).toBeVisible();
@@ -95,4 +97,95 @@ test('pattern modal keeps Apply visible on short phones and exposes effective co
   await page.screenshot({ path: info.outputPath('studio-short-phone-patterns.png') });
   await dialog.getByRole('button', { name: 'Cancel', exact: true }).click();
   await expect(page.getByRole('button', { name: 'Undo', exact: true })).toBeDisabled();
+});
+
+test('studio follows the shared system and saved themes, including open dialogs', async ({
+  page,
+}, info) => {
+  const palettes = {
+    light: { bg: 'rgb(241, 241, 225)', surface: 'rgb(251, 251, 243)', ink: 'rgb(29, 69, 48)' },
+    dark: { bg: 'rgb(27, 18, 41)', surface: 'rgb(43, 28, 66)', ink: 'rgb(249, 232, 187)' },
+  };
+  async function expectTheme(theme: 'light' | 'dark') {
+    const palette = palettes[theme];
+    await expect(page.locator('.skin-studio')).toHaveCSS('background-color', palette.bg);
+    await expect(page.locator('.skin-studio')).toHaveCSS('color', palette.ink);
+    await expect(page.locator('.skin-studio')).toHaveCSS('color-scheme', theme);
+    await expect(page.locator('.skin-topbar')).toHaveCSS('background-color', palette.surface);
+    await expect(page.locator('.skin-stage')).toHaveCSS(
+      'background-image',
+      new RegExp(palette.bg.replace(/[()]/g, '\\$&')),
+    );
+    await expect(page.getByLabel('Paint color')).toHaveValue('#ed9252');
+    await expect(page.getByLabel('Skin name')).toHaveValue('Shared theme design');
+    const dialog = page.getByRole('dialog');
+    if (await dialog.count()) {
+      await expect(dialog).toHaveCSS('background-color', palette.surface);
+      await expect(dialog).toHaveCSS('color', palette.ink);
+      await expect(dialog).toHaveCSS('color-scheme', theme);
+    }
+  }
+  await page.emulateMedia({ colorScheme: 'light' });
+  await page.goto('/skins');
+  await expect(page.getByLabel('Skin name')).toBeEnabled();
+  await page.getByLabel('Skin name').fill('Shared theme design');
+  await expectTheme('light');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expectTheme('dark');
+  const toggle = page.getByTestId('theme-toggle');
+  await toggle.click(); // System → light, overriding the dark device setting.
+  await expectTheme('light');
+  await page.screenshot({
+    path: info.outputPath('studio-light-settings.png'),
+    animations: 'disabled',
+  });
+  await toggle.click(); // Light → dark.
+  await expectTheme('dark');
+  await page.screenshot({
+    path: info.outputPath('studio-dark-settings.png'),
+    animations: 'disabled',
+  });
+  await page.reload();
+  await expectTheme('dark');
+  await toggle.click(); // Dark → system.
+  await page.emulateMedia({ colorScheme: 'light' });
+  await expectTheme('light');
+  await page.getByRole('button', { name: 'Patterns', exact: true }).click();
+  await expectTheme('light');
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expectTheme('dark');
+  await page.screenshot({
+    path: info.outputPath('studio-dark-patterns.png'),
+    animations: 'disabled',
+  });
+});
+
+test('color palette stays in the toolbox and supports drag, keyboard and hex entry', async ({
+  page,
+}, info) => {
+  await page.goto('/skins');
+  await expect(page.getByLabel('Skin name')).toBeEnabled();
+  const expand = page.getByRole('button', { name: 'Expand toolbox' });
+  if (await expand.isVisible()) await expand.click();
+  await page.getByLabel('Choose paint color', { exact: true }).click();
+  const palette = page.locator('.skin-toolbox .skin-color-picker').first();
+  const plane = palette.getByRole('slider', { name: 'Paint color saturation and brightness' });
+  const hex = palette.getByLabel('Paint color', { exact: true });
+  await plane.scrollIntoViewIfNeeded();
+  const box = await boxFor(plane);
+  await page.mouse.move(box.x + box.width * 0.1, box.y + box.height * 0.2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width * 0.8, box.y + box.height * 0.4, { steps: 5 });
+  await page.mouse.up();
+  await expect(hex).not.toHaveValue('#ed9252');
+  await hex.fill('#8e52cc');
+  await hex.press('Tab');
+  await expect(hex).toHaveValue('#8e52cc');
+  await plane.focus();
+  await plane.press('ArrowDown');
+  await expect(hex).not.toHaveValue('#8e52cc');
+  await expect(page.locator('input[type="color"]')).toHaveCount(0);
+  expect(await palette.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+  await plane.scrollIntoViewIfNeeded();
+  await page.screenshot({ path: info.outputPath('studio-color-picker.png') });
 });

@@ -8,6 +8,7 @@
 #include "Building.h"
 
 #include "Utilities.h"
+#include "UnitTiming.h"
 
 namespace
 {
@@ -56,7 +57,9 @@ void Unit::handleActionRandomGround()
 	owner->map->pathfindRandom(this);
 	wrapPosition();
 	selectPreferredGroundMovement();
-	speed=performance[action];
+	speed=unitTerrainMovementSpeed(performance[action], action == FLY
+        ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
+        : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
 	claimOccupiedMapSlot();
 }
 
@@ -64,18 +67,29 @@ void Unit::handleActionRandomFly()
 {
 	assert(performance[FLY]);
 	clearOccupiedMapSlot();
-	for(int q = 0; q < RANDOM_FLY_TOWER_AVOIDANCE_ATTEMPTS; ++q)
+	if (owner->map->terrainPropertiesAt(posX,posY).airHealthQ8 < 0)
+		owner->map->pathfindTerrainSafety(this);
+	else
 	{
-		dx=-1+syncRand()%3;
-		dy=-1+syncRand()%3;
-		if(!locationIsInEnemyGuardTowerRange(posX + dx, posY + dy))
-			break;
+		for(int q = 0; q < RANDOM_FLY_TOWER_AVOIDANCE_ATTEMPTS; ++q)
+		{
+			dx=-1+entityRandom.nextU32()%3;
+			dy=-1+entityRandom.nextU32()%3;
+			if(!locationIsInEnemyGuardTowerRange(posX + dx, posY + dy))
+				break;
+		}
+		directionFromDxDy();
+		setNewValidDirectionAir();
+		// Direction repair can rotate onto a hazard, so check the final step.
+		if (owner->map->terrainPropertiesAt(posX+dx,posY+dy).airHealthQ8 < 0) {
+			dx=dy=0;
+			directionFromDxDy();
+		}
 	}
-	directionFromDxDy();
-	setNewValidDirectionAir();
+
 	wrapPosition();
 	action=FLY;
-	speed=performance[FLY];
+	speed=unitTerrainMovementSpeed(performance[FLY], owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8, dx != 0 || dy != 0);
 	claimOccupiedMapSlot();
 }
 
@@ -91,7 +105,9 @@ void Unit::handleActionGoingTarget()
 		owner->map->markImmobileUnit(posX, posY, owner->teamNumber);
 
 	selectPreferredGroundMovement();
-	speed=performance[action];
+	speed=unitTerrainMovementSpeed(performance[action], action == FLY
+        ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
+        : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
 	claimOccupiedMapSlot();
 }
 
@@ -107,7 +123,7 @@ void Unit::handleActionFlyingTarget()
 	wrapPosition();
 
 	action=FLY;
-	speed=performance[FLY];
+	speed=unitTerrainMovementSpeed(performance[FLY], owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8, dx != 0 || dy != 0);
 
 	owner->map->setAirUnit(posX, posY, gid);
 }
@@ -124,7 +140,9 @@ void Unit::handleActionGoingDxDy()
 		owner->map->markImmobileUnit(posX, posY, owner->teamNumber);
 
 	selectPreferredMovement();
-	speed=performance[action];
+	speed=unitTerrainMovementSpeed(performance[action], action == FLY
+        ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
+        : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
 
 	claimOccupiedMapSlot();
 
@@ -139,14 +157,18 @@ void Unit::handleActionEnteringBuilding()
 	wrapPosition();
 	directionFromDxDy();
 	selectPreferredMovement();
-	speed=performance[action];
+	speed=unitTerrainMovementSpeed(performance[action], action == FLY
+        ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
+        : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
 }
 
 void Unit::handleActionExitingBuilding()
 {
 	directionFromDxDy();
 	selectPreferredMovement();
-	speed=performance[action];
+	speed=unitTerrainMovementSpeed(performance[action], action == FLY
+        ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
+        : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
 	claimOccupiedMapSlot();
 }
 

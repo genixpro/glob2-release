@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "EngineTiming.h"
 #include <FormatableString.h>
 #include <GUIStyle.h>
 #include <StringTable.h>
@@ -14,6 +15,7 @@
 #include "ReplayReader.h"
 #include "Team.h"
 #include "TeamDisplay.h"
+#include "render/ResourceSprites.h"
 
 void GameGUI::drawResourceInfos(void)
 {
@@ -27,28 +29,32 @@ void GameGUI::drawResourceInfos(void)
 	int ypos = YPOS_BASE_RESOURCE;
 
 	// Draw resource name
-	const std::string &resourceName = getResourceName(r.type);
+	const auto id = static_cast<ResourceId>(r.type);
+	const auto& catalog = drawnScene().map.resourceRegistry();
+	const std::string resourceName = getResourceDisplayName(catalog.presentation(id).name);
 	int titleLen = globalContainer->littleFont->getStringWidth(resourceName.c_str());
 	int titlePos = globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+((RIGHT_MENU_WIDTH-titleLen)>>1);
 	globalContainer->gfx->drawString(titlePos, ypos+(YOFFSET_TEXT_PARA>>1), globalContainer->littleFont, resourceName.c_str());
 	ypos += 2*YOFFSET_TEXT_PARA;
 
-	// Draw resource image
-	const ResourceType* rt = globalContainer->resourcesTypes.get(r.type);
-	unsigned resImg = rt->gfxId + r.variety*rt->sizesCount + r.amount;
-	if (!rt->eternal)
-		resImg--;
-	globalContainer->gfx->drawSprite(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+16, ypos, globalContainer->resources, resImg);
-	globalContainer->gfx->finishDrawingSprite(globalContainer->resources, 255);
-
-	// Draw resource count
-	if (rt->granular)
+	const auto& sprites = ResourceSprites::resolve(drawnScene().map.frozenResourceRegistry());
+	auto* sprite = sprites.sprites[r.type];
+	const int img = catalog.presentation(id).frame(r.amount, 0, 0);
+	if (sprite && img < sprite->getFrameCount())
 	{
-		int sizesCount=rt->sizesCount;
-		int amount=r.amount;
-		const std::string amountS = FormattableString("%0/%1").arg(amount).arg(sizesCount);
-		int amountSH = globalContainer->littleFont->getStringHeight(amountS.c_str());
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-64, ypos+((32-amountSH)>>1), globalContainer->littleFont, amountS.c_str());
+		globalContainer->gfx->drawSprite(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+16, ypos, sprite, img);
+		globalContainer->gfx->finishDrawingSprite(sprite, 255);
+	}
+	ypos += 40;
+	for (unsigned m=0; m<MaterialCount; ++m)
+	{
+		const auto& yield = catalog.yields(id)[m];
+		if (!yield.capacity) continue;
+		const auto amount = drawnScene().map.materialAmountAt(size_t(selectionResource()),m);
+		const std::string line = getMaterialName(m) + ": " +
+			(yield.consumption == ResourceConsumption::Infinite && amount > 0 ? std::string("∞") : std::to_string(amount)+"/"+std::to_string(yield.capacity));
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+16, ypos, globalContainer->littleFont, line.c_str());
+		ypos += YOFFSET_TEXT_PARA;
 	}
 }
 
@@ -124,15 +130,15 @@ void GameGUI::drawReplayProgressBar(bool drawBackground)
 	globalContainer->gfx->drawSprite( x - inc*1, y, globalContainer->gamegui, (!gamePaused && globalContainer->replayFastForward ? REPLAY_BAR_FAST_FORWARD_BUTTON_ACTIVE_SPRITE : REPLAY_BAR_FAST_FORWARD_BUTTON_SPRITE));
 
 	// Calculate the time
-	// This is based on default speed 25 fps, not the actual Engine's speed
+	// This is based on normal simulation tick rate, not the actual Engine's speed
 	// because if we fast-forward we still want to see the old time
-	unsigned int time1_sec = (globalContainer->replayReader->getCurrentStep()/25)%60;
-	unsigned int time1_min = (globalContainer->replayReader->getCurrentStep()/(25*60))%60;
-	unsigned int time1_hour = (globalContainer->replayReader->getCurrentStep()/(25*3600));
+	unsigned int time1_sec = (globalContainer->replayReader->getCurrentStep()/GAME_TICKS_PER_SECOND)%60;
+	unsigned int time1_min = (globalContainer->replayReader->getCurrentStep()/(GAME_TICKS_PER_SECOND*60))%60;
+	unsigned int time1_hour = (globalContainer->replayReader->getCurrentStep()/(GAME_TICKS_PER_SECOND*3600));
 
-	unsigned int time2_sec = (globalContainer->replayReader->getNumStepsTotal()/25)%60;
-	unsigned int time2_min = (globalContainer->replayReader->getNumStepsTotal()/(25*60))%60;
-	unsigned int time2_hour = (globalContainer->replayReader->getNumStepsTotal()/(25*3600));
+	unsigned int time2_sec = (globalContainer->replayReader->getNumStepsTotal()/GAME_TICKS_PER_SECOND)%60;
+	unsigned int time2_min = (globalContainer->replayReader->getNumStepsTotal()/(GAME_TICKS_PER_SECOND*60))%60;
+	unsigned int time2_hour = (globalContainer->replayReader->getNumStepsTotal()/(GAME_TICKS_PER_SECOND*3600));
 
 	// Draw the time
 	if (time2_hour <= 99)

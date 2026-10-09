@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "MapRender.h"
 #include "Game.h"
+#include "BuildingType.h"
 #include "GlobalContainer.h"
 #include "render/scene/Scene.h"
 #include <SDL3_image/SDL_image.h>
@@ -47,7 +48,7 @@ unsigned char alpha(std::int64_t value, std::int64_t maximum)
 	// input range without signed overflow. Saturate before the byte conversion.
 	return static_cast<unsigned char>(std::min(220.0L, 220.0L * (static_cast<long double>(value) / maximum)));
 }
-void toPng(const Scene& scene, const std::string& path, int maximumPixels, const Field* field)
+void toPng(const PresentationFrame& scene, const std::string& path, int maximumPixels, const Field* field)
 {
 	if (maximumPixels <= 0 || maximumPixels > MaximumPixels)
 		throw std::invalid_argument("Render limit must be 1..8192 pixels");
@@ -63,10 +64,24 @@ void toPng(const Scene& scene, const std::string& path, int maximumPixels, const
 	Surface canvas(SDL_CreateSurface(width, height, SDL_PIXELFORMAT_RGBA32), SDL_DestroySurface);
 	if (!canvas) throw std::runtime_error(SDL_GetError());
 	globalContainer->loadOffscreenGraphics();
+	// Captures may predate graphics initialization, or outlive a graphics context.
+	// Bind fresh artwork on an export-owned copy, never on immutable sim storage.
+	PresentationFrame rendered=scene;
+	if (scene.buildingTypes)
+	{
+		auto types=std::make_shared<std::vector<BuildingType>>(*scene.buildingTypes);
+		BuildingsTypes::loadSpritesForTypes(*types);
+		const auto remap=[&](const BuildingType* type) -> const BuildingType* {
+			return type ? &types->at(type-scene.buildingTypes->data()) : nullptr;
+		};
+		rendered.entities.typeDefinitions=types;
+		rendered.panels.building.type=remap(rendered.panels.building.type);
+		rendered.buildingTypes=std::move(types);
+	}
 	globalContainer->gfx->drawToSurface(canvas.get(), float(std::min(extent, maximumPixels))/extent, [&] {
 		Game::ViewState view;
-		view.scene = &scene;
-		Game::drawSceneMap(scene, 0, 0, fullW, fullH, 0, 0, 0, 0, 0, view,
+		view.scene = &rendered;
+		Game::drawSceneMap(rendered, 0, 0, fullW, fullH, 0, 0, 0, 0, 0, view,
 			Game::DRAW_WHOLE_MAP | Game::DRAW_HEALTH_FOOD_BAR | Game::DRAW_BUILDING_RECT,
 			nullptr, nullptr, true, 64);
 		if (field)

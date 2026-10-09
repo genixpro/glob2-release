@@ -89,9 +89,9 @@ bool Unit::tryClaimClearingAreaForHarvesting()
 			recordLethalDamage(race->getUnitType(typeNum, level[HARVEST])->harvestDamage,
 							   GameplayMeasurements::CLEARING);
 			map->decResource(posX + dx, posY + dy);
-			if (clearedBefore.type < MAX_NB_RESOURCES &&
-				clearedBefore.getUint32() != map->getResource(posX + dx, posY + dy).getUint32())
-				++owner->stats.measurements.cleared[clearedBefore.type];
+			if (clearedBefore != map->getResource(posX + dx, posY + dy))
+				++owner->stats.measurements.cleared[materialIndex(
+					map->resourcePropertiesByIndex(clearedBefore.type).primaryMaterial)];
 			hp -= race->getUnitType(typeNum, level[HARVEST])->harvestDamage;
 		}
 		const bool farmAreas = map->farmAreasEnabled();
@@ -102,7 +102,7 @@ bool Unit::tryClaimClearingAreaForHarvesting()
 				int y = (posY + tdy) & map->hMask;
 				const size_t index = (y << map->wDec) + x;
 				if (map->isClearingTarget(index, owner->me, farmAreas)
-					&& !(map->tiles[index].forbidden & owner->me))
+					&& !(map->areaState()[index].forbidden & owner->me))
 				{
 					owner->map->setClearingAreaClaimed(posX+tdx, posY+tdy, owner->teamNumber, gid);
 					previousClearingArea = ClearingAreaClaim{
@@ -141,7 +141,7 @@ void Unit::handleMovementRemovingBlackAround()
 			dy=cdy;
 		}
 	}
-	else if ((movement!=MOV_GOING_DX_DY)||((syncRand()&0xFF)<0xEF))
+	else if ((movement!=MOV_GOING_DX_DY)||((entityRandom.nextU32()&0xFF)<0xEF))
 	{
 		// "c" is the center of the unit, "x" are the sample spots:
 		// oxoooxo
@@ -211,7 +211,7 @@ void Unit::handleMovementRemovingBlackAround()
 			}
 		}
 	}
-	if (movement!=MOV_GOING_DX_DY || owner->map->getAirUnit(posX+dx, posY+dy)!=NOGUID)
+	if (movement!=MOV_GOING_DX_DY || !owner->map->isFreeForAirUnit(posX+dx, posY+dy))
 		movement=MOV_RANDOM_FLY;
 }
 
@@ -253,8 +253,7 @@ void Unit::handleMovementAttackingAround()
 							int id=Building::GIDtoID(gid);
 							int newQuality=((x*x+y*y)<<Q8_FIXED_POINT_SHIFT);
 							Building *b=owner->game->teams[team]->myBuildings[id];
-							BuildingType *bt=b->type;
-							int shootDamage=bt->shootDamage;
+							int shootDamage=b->runtime->projectileDamage[typeNum];
 							newQuality/=(1+shootDamage);
 							tryAcquireAttackTarget(x, y, newQuality, quality);
 						}
@@ -293,7 +292,7 @@ void Unit::handleMovementAttackingAround()
 				return owner->map->isGuardArea(x, y, owner->me);
 			return owner->map->getGuardAreasGradient(owner->teamNumber, swimClass())[owner->map->coordToIndex(x, y)] == GRADIENT_AT_GOAL;
 		};
-		if (!attachedBuilding && owner->map->pathfindArea(Map::AreaKind::Guard, owner->teamNumber, swimClass(), posX, posY, &dx, &dy))
+		if (!attachedBuilding && owner->map->pathfindArea(entityRandom, Map::AreaKind::Guard, owner->teamNumber, swimClass(), posX, posY, &dx, &dy))
 		{
 			directionFromDxDy();
 			movement = MOV_GOING_DX_DY;
@@ -387,9 +386,9 @@ void Unit::handleMovementClearingResources()
 		recordLethalDamage(race->getUnitType(typeNum, level[HARVEST])->harvestDamage,
 						   GameplayMeasurements::CLEARING);
 		map->decResource(posX + dx, posY + dy);
-		if (clearedBefore.type < MAX_NB_RESOURCES &&
-			clearedBefore.getUint32() != map->getResource(posX + dx, posY + dy).getUint32())
-			++owner->stats.measurements.cleared[clearedBefore.type];
+		if (clearedBefore != map->getResource(posX + dx, posY + dy))
+			++owner->stats.measurements.cleared[materialIndex(
+				map->resourcePropertiesByIndex(clearedBefore.type).primaryMaterial)];
 		hp -= race->getUnitType(typeNum, level[HARVEST])->harvestDamage;
 	}
 
@@ -402,7 +401,7 @@ void Unit::handleMovementClearingResources()
 		{
 			int x=posX+tdx;
 			int y=posY+tdy;
-			if (map->warpDistSquare(x, y, bx, by)<=usr2 && map->isResourceTakeable(x, y, attachedBuilding->clearingResources) && !(owner->map->isForbidden(x, y, owner->me)))
+			if (map->warpDistSquare(x, y, bx, by)<=usr2 && map->isClearableResourceForMaterials(x, y, attachedBuilding->clearingMaterials) && !(owner->map->isForbidden(x, y, owner->me)))
 			{
 				dx=tdx;
 				dy=tdy;
@@ -412,7 +411,7 @@ void Unit::handleMovementClearingResources()
 		}
 	bool canSwim=performance[SWIM];
 	assert(attachedBuilding);
-	if (map->pathfindBuilding(attachedBuilding, swimClass(), posX, posY, &dx, &dy))
+	if (map->pathfindBuilding(entityRandom, attachedBuilding, swimClass(), posX, posY, &dx, &dy, BuildingRoute::Clearing))
 	{
 		directionFromDxDy();
 		movement=MOV_GOING_DX_DY;
@@ -475,7 +474,7 @@ void Unit::handleMovementRandom()
 			{
 				dx=0;
 				dy=0;
-				owner->map->pathfindArea(Map::AreaKind::Clear, owner->teamNumber, swimClass(), posX, posY, &dx, &dy);
+				owner->map->pathfindArea(entityRandom, Map::AreaKind::Clear, owner->teamNumber, swimClass(), posX, posY, &dx, &dy);
 
 				targetX = tempTargetX;
 				targetY = tempTargetY;
@@ -528,7 +527,8 @@ void Unit::handleMovementGoingToFlagOrBuilding()
 	{
 		movement=MOV_FLYING_TARGET;
 	}
-	else if (map->pathfindBuilding(targetBuilding, swimClass(), posX, posY, &dx, &dy))
+	else if (map->pathfindBuilding(entityRandom, targetBuilding, swimClass(), posX, posY, &dx, &dy,
+		activity == ACT_FLAG ? (typeNum == WORKER ? BuildingRoute::Clearing : BuildingRoute::Combat) : BuildingRoute::Footprint))
 	{
 		movement=MOV_GOING_DX_DY;
 	}
@@ -579,23 +579,19 @@ void Unit::handleMovementGoingToResource()
 	int teamNumber=owner->teamNumber;
 	int swim=swimClass();
 	bool stopWork;
-	if (map->pathfindResource(teamNumber, destinationPurpose, swim, posX, posY, &dx, &dy, &stopWork, attachedBuilding))
+	const bool withMarkets=attachedBuilding && attachedBuilding->fetchesFromMarkets();
+	if (map->pathfindMaterial(entityRandom, teamNumber, destinationPurpose, swim, posX, posY, &dx, &dy, &stopWork, attachedBuilding, withMarkets))
 	{
 		directionFromDxDy();
 		movement=MOV_GOING_DX_DY;
 		// targetX/Y (also the debug path line, hotkey T) were set once, by
-		// ascending a gradient, when the fetch task started. pathfindResource
-		// above re-reads whichever gradient actually governs the step fresh
-		// every action -- the round-trip field when attachedBuilding has one
-		// and it is valid here, the plain resource gradient otherwise -- and
-		// either field can be rebuilt, or the preference between them can
-		// flip, while the unit is still walking. Re-ascend from here whenever
-		// the stored target has stopped being a peak of that same gradient;
-		// isGradientPeak is a cheap check to run every action, the ascent
-		// itself only when it actually goes stale.
-		const Uint16 *roundTrip = attachedBuilding ? map->roundTripGradient(attachedBuilding, destinationPurpose, swim) : NULL;
-		const Uint16 *gradient = (roundTrip && roundTrip[map->coordToIndex(posX, posY)]>GRADIENT_UNREACHABLE)
-			? roundTrip : map->getResourceGradient(teamNumber, destinationPurpose, swim);
+		// ascending a gradient, when the fetch task started. pathfindMaterial
+		// above re-reads the resource gradient that governs the step fresh
+		// every action, and that field can be rebuilt while the unit is still
+		// walking. Re-ascend from here whenever the stored target has stopped
+		// being a peak of that same gradient; isGradientPeak is a cheap check
+		// to run every action, the ascent itself only when it actually goes stale.
+		const Uint16 *gradient = map->getMaterialGradientSlot(teamNumber, destinationPurpose, swim, withMarkets, attachedBuilding);
 		if (!map->isGradientPeak(gradient, targetX, targetY))
 			map->getGlobalGradientDestination(gradient, posX, posY, &targetX, &targetY);
 	}

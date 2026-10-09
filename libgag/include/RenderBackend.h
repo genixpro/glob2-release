@@ -19,8 +19,15 @@ class RenderBackend
   public:
 	virtual void blit(const void *key, SDL_Surface *source, std::uint64_t revision, bool opaque,
 					  const SDL_Rect &sourceRect, const SDL_FRect &destination, Uint8 alpha) = 0;
+    virtual void blitLinear(const void *key, SDL_Surface *source, std::uint64_t revision,
+                           const SDL_Rect &src, const SDL_FRect &dst, Uint8 alpha) {
+        blit(key,source,revision,false,src,dst,alpha);
+    }
 	virtual void fill(const SDL_FRect &rect, SDL_Color color) = 0;
+    virtual void prepareTexture(const void*, SDL_Surface*, std::uint64_t) {}
 	virtual RenderOperations operations() const { return {}; }
+	// Zero means the backend does not impose or report a texture limit.
+	virtual int maximumTextureSize() const { return 0; }
 	// Only software backends borrow a target; binding flushes old queued work.
 	virtual void bindTarget(SDL_Surface *) {}
 	virtual ~RenderBackend() = default;
@@ -41,6 +48,10 @@ class RenderBackend
 	virtual void nativeLogicalSize(int width, int height) { logicalSize(width, height); }
 	virtual SDL_Surface *capture() = 0;
 	virtual void outputSize(int &width, int &height) = 0;
+    // Optional CPU path for tile edges already snapped to backing pixels.
+    // Retains the current clip and ordering without a logical-coordinate round trip.
+    virtual bool blitPixels(SDL_Surface*, const SDL_Rect&, const SDL_Rect&, Uint8) { return false; }
+    virtual bool fillPixels(const SDL_Rect&, SDL_Color) { return false; }
 };
 std::unique_ptr<RenderBackend> makeSoftwareRenderBackend(SDL_Surface *surface);
 std::unique_ptr<RenderBackend> makeSDLRenderBackend(SDL_Window *window, int width, int height);

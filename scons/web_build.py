@@ -6,10 +6,11 @@ import re
 import subprocess
 from SCons.Script import Environment, Default, Value, GetOption, Action, COMMAND_LINE_TARGETS
 from build_layout import write_if_changed, prepare_directory, PACKAGE_VERSION
-from javascript import javascript_objects, numeric_guard
+from javascript import javascript_objects, numeric_guard, strict_numeric_source, guarded_numeric_source
 import official_instance
 from sources import CLIENT_SOURCES, GAG_SOURCES, USL_SOURCES, INCLUDE_DIRECTORIES
 import web_assets
+import skin_materials
 
 PORTS = ['--use-port=zlib']
 
@@ -58,17 +59,14 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
                       ENV=build_environment, CC=command_path(emscripten / 'emcc'), CXX=command_path(compiler),
                       LINK=command_path(compiler), AR=command_path(emscripten / 'emar'), RANLIB=command_path(emscripten / 'emranlib'))
     env['PROGSUFFIX'] = '.js'
+    env.Append(LINKFLAGS=['--js-library', 'browser/canvas-size.js'])
     if threaded:
         env.Append(CCFLAGS=['-pthread'], LINKFLAGS=['-pthread', '-sOFFSCREENCANVAS_SUPPORT=1',
             '-sDEFAULT_PTHREAD_STACK_SIZE=8388608',
             '-sPTHREAD_POOL_SIZE_STRICT=0',
-            "'-sPTHREAD_POOL_SIZE=Math.min(navigator.hardwareConcurrency||1,4)'",
+            "'-sPTHREAD_POOL_SIZE=Math.max(navigator.hardwareConcurrency||1,1)'",
             '-sALLOW_BLOCKING_ON_MAIN_THREAD=0',
             '--js-library', 'browser/threaded-egl.js'])
-    if threaded:
-        env.Append(LINKFLAGS=['-Wl,--wrap=' + name for name in
-            ('SDL_OpenAudioDeviceStream', 'SDL_DestroyAudioStream', 'SDL_PutAudioStreamData',
-             'SDL_LockAudioStream', 'SDL_UnlockAudioStream', 'SDL_PauseAudioDevice', 'SDL_ResumeAudioDevice')])
     config = output / 'include/glob2/BuildConfig.h'
     write_if_changed(config, f'''#pragma once
 #define HAVE_OPENGL 1
@@ -80,6 +78,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
 #define PACKAGE_SOURCE_DIR "/"
 #define PRIMARY_FONT "sans.ttf"
 ''')
+    skin_materials.generate(Path(__file__).resolve().parents[1], output)
     include_paths = [str(output / 'include'), str(sdl_prefix / 'include')] + list(INCLUDE_DIRECTORIES)
     env.Append(CPPPATH=include_paths + [str(opus_prefix / 'include'), str(opus_prefix / 'include/opus'), "#third_party/quickjs-ng"], CPPDEFINES=['HAVE_CONFIG_H'] + official_instance.cppdefines(official_instance.origin(arguments)),
                CXXFLAGS=['-std=gnu++20', '-fwasm-exceptions', '-g2', '-O2' if identity['mode']=='release' else '-O0'] + PORTS)
@@ -88,6 +87,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
         '-sALLOW_MEMORY_GROWTH',
         '-sINITIAL_MEMORY=134217728', '-sSTACK_SIZE=8388608', '-sASSERTIONS=1',
         '-sFORCE_FILESYSTEM', '-lidbfs.js', '-lwebsocket.js',
+        "'-sEXPORTED_FUNCTIONS=[\"_main\",\"_malloc\",\"_free\"]'",
         "'-sEXPORTED_RUNTIME_METHODS=[\"callMain\",\"FS\"]'",
         '--pre-js', 'browser/storage.js', '--pre-js', 'browser/file-selection.js', '--pre-js', 'browser/audio.js', '--pre-js', 'browser/recording.js', '--pre-js', 'browser/runtime.js',
         '--post-js', 'browser/webgl-shaders.js'] + PORTS)
@@ -107,21 +107,24 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
         asset_root = output / 'runtime-assets'
         asset_stamp = asset_root.with_suffix('.json')
         def prepare_assets(target, source, env):
-            export_assets(root, asset_root, platform='web', optimized=identity['mode']=='release')
+            export_assets(root, asset_root, platform='web', optimized=True, lossy=identity['mode']=='release')
             return 0
         asset_inputs = list(source_files(root, 'web'))
         exported = env.Command(str(asset_stamp), [str(p) for p in asset_inputs] +
-            ['tools/package_assets.py', 'tools/asset-requirements.txt', Value([identity['mode'], [str(p) for p in asset_inputs]])],
+            ['tools/package_assets.py', 'tools/terrain_tileset.py', 'tools/asset-requirements.txt', 'tools/image_encoding.json', Value([identity['mode'], [str(p) for p in asset_inputs]])],
             Action(prepare_assets, 'Exporting verified browser assets'))
         env.Precious(exported)  # Keep the ownership audit while an export is rebuilt.
         if not (asset_root / 'data').is_dir():
             env.AlwaysBuild(exported)
         asset_manifest = output / 'asset-manifest.js'
         # The plan also reads the browser copies (browser/derive_assets.py) and the game
-        # sprite names in GlobalContainer::loadGameGraphics and the building tables.
-        plan_inputs = ['scons/web_assets.py', 'deploy/sim_version.py', 'browser/derive_assets.py', 'src/app/GlobalContainer.cpp']
+        # sprite names in GlobalContainer::loadGameGraphics, terrain and building tables.
+        plan_inputs = ['scons/web_assets.py', 'deploy/sim_version.py', 'browser/derive_assets.py',
+                       'src/app/GlobalContainer.cpp', 'src/map/TerrainPresentation.h', 'data/terrain/tileset.json', 'data/resources/registry.json']
         plan_inputs += [str(p) for p in Path('browser/assets').glob('*') if p.is_file()]
         plan_inputs += [str(p) for p in Path('src/building/types').glob('BuildingTypes*.cpp')]
+        plan_inputs += [str(p) for p in Path('data/buildings').rglob('*.json')]
+        plan_inputs += [str(p) for p in Path('data/resources').rglob('*.json')]
         assets = env.Command(str(asset_manifest), [exported] + plan_inputs,
             Action(lambda target, source, env: web_assets.build(root, output, target[0].abspath, asset_root) and 0,
                    'Packaging browser game data'))
@@ -147,8 +150,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
     files += ['libgag/src/' + s for s in GAG_SOURCES if s not in ('ApplicationHost.cpp', 'RecordingEncoder.cpp', 'RecordingSession.cpp')]
     files += ['libusl/src/' + s for s in USL_SOURCES]
     files += ['browser/HiveBrowserHost.cpp', 'browser/VoiceRecorder.cpp', 'browser/ApplicationHost.cpp', 'browser/RecordingPlatform.cpp', 'browser/NetTransport.cpp', 'browser/Launcher.cpp', 'browser/HttpFetch.cpp']
-    if threaded:
-        files += ['browser/Audio.cpp']
+    files += ['browser/Audio.cpp']
     if any(target in COMMAND_LINE_TARGETS for target in ('android-tests', 'ios-tests', 'web-tests')):
         from test_provenance import register_test_provenance
         provenance_header = register_test_provenance(env, output)
@@ -156,12 +158,12 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
     strict.Append(CXXFLAGS=['-fno-fast-math', '-ffp-contract=off'])
     objects = []
     for f in files:
-        local = strict if f.startswith('src/scripting/javascript/') or f == 'src/ai/javascript/AIJavaScript.cpp' else env
+        local = strict if strict_numeric_source(f) else env
         if f == 'src/app/Glob2.cpp':
             local = local.Clone()
             local.Append(CPPDEFINES=['SDL_MAIN_HANDLED', ('main', 'glob2ApplicationMain')])
         objects.append(local.Object(str(output / 'obj' / (f + '.o')), f))
-    numeric_guard(strict, [obj for name, obj in zip(files, objects) if name.startswith('src/scripting/javascript/') or name == 'src/ai/javascript/AIJavaScript.cpp'])
+    numeric_guard(strict, [obj for name, obj in zip(files, objects) if guarded_numeric_source(name)])
     objects += javascript_objects(env, output / "obj/third_party", identity["mode"] == "release")
     env.Requires(objects, ports)
     env.Depends(objects, str(config))
@@ -184,11 +186,25 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
             tests.Append(LINKFLAGS=['--preload-file', str(asset_root / asset_directory) + '@/' + asset_directory])
         tests.Append(CPPPATH=['test', 'test/support', 'libgag/src'])
         tests.Append(LINKFLAGS=['--preload-file', 'test/fixtures@/test/fixtures',
+                               '--preload-file', 'examples/javascript@/examples/javascript',
                                '--preload-file', 'games@/games', '-sEXIT_RUNTIME=0'])
         test_objects = []
-        for entry in registry.SUPPORT + registry.ENGINE_SUPPORT + registry.scripting_entries() + ['#src/common/ComputeExecutorHarness.cpp', '#src/map/gradient/GradientPipelineHarness.cpp',
+        for entry in registry.SUPPORT + registry.ENGINE_SUPPORT + registry.scripting_entries() + ['#src/common/EntityRandomTest.cpp', '#src/unit/EntityRandomLifecycleTest.cpp', ('#src/scripting/sgsl/LegacyScriptCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])), '#src/common/ComputeExecutorHarness.cpp', '#src/map/gradient/GradientPipelineHarness.cpp',
                 '#src/game/SharedWorkerLifecycleTest.cpp', '#src/map/gradient/BuildingGradientInvalidationHarness.cpp',
-                '#src/map/gradient/PathGradientHarness.cpp']:
+                ('#src/engine/sim/snapshot/WorldSnapshotTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                '#src/render/scene/SceneExtractTest.cpp', '#src/render/scene/SceneBufferTest.cpp',
+                '#src/render/overlay/OverlayFillTest.cpp',
+                ('#src/map/gradient/PathGradientHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+                ('#src/map/gradient/GradientPreparationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                ('#src/ai/cortex/CortexActionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                ('#src/map/MapQueryTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                ('#src/hud/GUIInteractionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                '#src/resource/ResourceRegistryTest.cpp', '#src/map/TerrainResourcesHarness.cpp',
+                '#src/building/types/BuildingCatalogTest.cpp', '#src/building/BuildingCatalogFixtureHarness.cpp',
+                '#src/building/BuildingServicesTest.cpp', '#src/building/BuildingProductionCombatTest.cpp',
+                '#src/ai/shared_runtime/RuntimeContinuationTest.cpp',
+                ('#src/ai/AICustomCatalogTest.cpp', dict(cxxflags=['-fno-access-control'])),
+                ('#src/unit/MarketsV2Test.cpp', dict(cxxflags=['-fno-access-control']))]:
             source, options = (entry, {}) if isinstance(entry, str) else entry
             local = tests.Clone()
             local.Append(CXXFLAGS=options.get('cxxflags', []))
@@ -205,9 +221,9 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
         production += objects[len(files):]
         harness = tests.Program(str(output / 'script-tests.js'), production + test_objects)
         tests.Depends(harness, ['browser/storage.js', 'browser/file-selection.js',
-                               'browser/audio.js', 'browser/runtime.js', 'browser/webgl-shaders.js'])
+                               'browser/audio.js', 'browser/runtime.js', 'browser/webgl-shaders.js', 'browser/canvas-size.js'])
         env.Depends(harness, assets)
-        tests.Depends(harness, [str(p) for directory in ('data', 'maps', 'campaigns', 'scripts', 'test/fixtures', 'games')
+        tests.Depends(harness, [str(p) for directory in ('data', 'maps', 'campaigns', 'scripts', 'test/fixtures', 'examples/javascript', 'games')
                                for p in Path(directory).rglob('*') if p.is_file()])
         tests.SideEffect([str(output / ('script-tests.' + extension)) for extension in ('wasm', 'data')], harness)
         if threaded:
@@ -215,7 +231,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
         env.Alias('web-tests', harness)
 
     env.Depends(program, ['browser/storage.js', 'browser/file-selection.js', 'browser/audio.js', 'browser/recording.js', 'browser/runtime.js', 'browser/webgl-shaders.js',
-                          'browser/asset-loader.js', 'browser/toolchain.json', assets])
+                          'browser/asset-loader.js', 'browser/canvas-size.js', 'browser/toolchain.json', assets])
     if threaded:
         env.Depends(program, 'browser/threaded-egl.js')
     env.SideEffect([str(output / 'index.wasm')], program)
@@ -231,7 +247,7 @@ def build_web(directory, identity, arguments):
     env, serial, database, packaged = _build_variant(directory, identity, arguments)
     _, threaded, _, _ = _build_variant(Path(directory) / 'threaded', identity, arguments, True, packaged)
     def shell(target, source, env):
-        page = Path('browser/shell.html').read_text().replace('{{{ SCRIPT }}}', '<script src="loader.js"></script>')
+        page = Path('browser/shell.html').read_text().replace('/* AI_STUDIO_BRIDGE */', Path('browser/studio-envelope.js').read_text() + '\n' + Path('browser/generator-studio.js').read_text() + '\n' + Path('browser/studio.js').read_text() + '\n' + Path('browser/set-preview.js').read_text()).replace('{{{ SCRIPT }}}', '<script src="loader.js"></script>')
         # The page shows WebAssembly download progress against these sizes.
         sizes = {'index.wasm': Path(directory) / 'index.wasm', 'threaded/index.wasm': Path(directory) / 'threaded/index.wasm'}
         sizes = json.dumps({name: path.stat().st_size for name, path in sizes.items()}, separators=(',', ':'), sort_keys=True)
@@ -239,9 +255,27 @@ def build_web(directory, identity, arguments):
         if count != 1:
             raise ValueError('browser/shell.html lacks the data-wasm-bytes placeholder')
         write_if_changed(str(target[0]), page)
+        write_if_changed(str(target[1]), page)
+        write_if_changed(str(target[2]), page)
+        write_if_changed(str(target[3]), page)
         return 0
-    page = env.Command(str(Path(directory) / 'index.html'),
-        ['browser/shell.html', 'browser/loader.js', serial, threaded], Action(shell, 'Packaging browser runtimes'))
+    page = env.Command([str(Path(directory) / 'index.html'), str(Path(directory) / 'studio.html'), str(Path(directory) / 'set-preview.html'), str(Path(directory) / 'generator-studio.html')],
+        ['browser/shell.html', 'browser/studio-envelope.js', 'browser/generator-studio.js', 'browser/studio.js', 'browser/set-preview.js', 'browser/loader.js', serial, threaded], Action(shell, 'Packaging browser runtimes'))
+    # The music decoder has independent Wasm memory in both browser variants.
+    music = env.Clone()
+    music['LIBS'] = [music.File(str(Path(directory).resolve() / 'opus/prefix/lib' / ('lib' + name + '.a')))
+                     for name in ('opusfile', 'opus', 'ogg')]
+    music['LINKFLAGS'] = ['-O2', '-fwasm-exceptions', '--no-entry',
+        '-sMODULARIZE=1', '-sEXPORT_NAME=createMusicRuntime', '-sENVIRONMENT=worker',
+        '-sALLOW_MEMORY_GROWTH=1', '-sMAXIMUM_MEMORY=268435456',
+        '-sEXPORTED_FUNCTIONS=["_malloc","_free"]',
+        '-sEXPORTED_RUNTIME_METHODS=["UTF8ToString","HEAPU8","HEAP16"]']
+    music_objects = [music.Object(str(Path(directory) / 'music-obj' / (source + '.o')), source)
+        for source in ('browser/MusicWorker.cpp', 'src/audio/MusicProducer.cpp', 'src/audio/MusicStream.cpp')]
+    music_program = music.Program(str(Path(directory) / 'music-runtime.js'), music_objects)
+    music.SideEffect(str(Path(directory) / 'music-runtime.wasm'), music_program)
+    music_scripts = env.Install(directory, ['browser/music-worker.js', 'browser/music-output.js'])
+    env.Depends(page, [music_program, music_scripts])
     # One recording module serves both game runtimes, and is fetched only on use.
     from recording_dependencies import build as build_recording, attach as attach_recording
     recording_prefix = Path(directory) / 'recording/prefix'

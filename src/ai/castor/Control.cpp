@@ -1,10 +1,14 @@
+#include "Material.h"
+#include "AIRuleOrders.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "AITelemetryFields.h"
 #include "AICastor.h"
+#include "ai/observation/WorldQueries.h"
 #include "Game.h"
-#include "AIRules.h"
+#include <algorithm>
+#include <span>
 #include "GlobalContainer.h"
 #include "Order.h"
 #include "Player.h"
@@ -15,29 +19,37 @@
 #define AI_FILE_VERSION 2
 
 using std::shared_ptr;
+namespace {
+// Preserve this simple strategy's bounded progression preferences while
+// following the catalog's actual transition lineage, independent of labels.
+int strategicStage(const AIEngine::AIWorldView& world,const AIEngine::BuildingView& building)
+{
+    return std::clamp(world.catalog->at(building.typeNum).lineagePosition-1,0,NB_UNIT_LEVELS-1);
+}
+}
 
 std::shared_ptr<Order>AICastor::controlSwarms()
 {
 	telemetry.count(AITrace::AI2::AICastor_controlSwarms_calls);
-	Sint32 warriorGoal=game->gameHeader.isPeacefulModeEnabled() ? 0 : warLevel;
+	Sint32 warriorGoal=observation->rules.peaceful ? 0 : warLevel;
 	
 	int unitSum[NB_UNIT_TYPE];
 	for (int i=0; i<NB_UNIT_TYPE; i++)
 		unitSum[i]=0;
-	Unit **myUnits=team->myUnits;
+	const auto myUnits=observation->unitSlots(observedTeam->number);
 	for (int i=0; i<Unit::MAX_COUNT; i++)
 	{
-		Unit *u=myUnits[i];
+		const AIEngine::UnitView *u=myUnits[i];
 		if (u)
 			unitSum[u->typeNum]++;
 	}
 	int foodSum=0;
-	Building **myBuildings=team->myBuildings;
+	const auto myBuildings=observation->buildingSlots(observedTeam->number);
 	for (int i=0; i<Building::MAX_COUNT; i++)
 	{
-		Building *b=myBuildings[i];
-		if (b && b->maxUnitWorking && b->type->canFeedUnit)
-			foodSum+=b->type->maxUnitInside;
+		const AIEngine::BuildingView *b=myBuildings[i];
+		if (b && requestedWorkers(*b) && queries->kind(*b).resolvedType.canFeedUnit)
+			foodSum+=queries->kind(*b).resolvedType.maxUnitInside;
 	}
 	
 	int unitSumAll=unitSum[0]+unitSum[1]+unitSum[2];
@@ -45,14 +57,14 @@ std::shared_ptr<Order>AICastor::controlSwarms()
 	foodWarning=((unitSumAll+AI_CASTOR_FOODWARN_OFFSET)>=(foodSum<<1));
 	foodLock=((unitSumAll+AI_CASTOR_FOODLOCK_OFFSET)>=(foodSum<<1));
 	// No hunger removes feeding pressure, but swarms still need wheat to produce.
-	if (game->gameHeader.isHungerDisabled())
+	if (observation->rules.hungerDisabled)
 	{ foodLock=false; foodWarning=false; }
 	foodLockStats[foodLock]++;
 
-	foodSurplus=game->gameHeader.isHungerDisabled() || (unitSumAll+AI_CASTOR_FOODSURPLUS_OFFSET<foodSum);
+	foodSurplus=observation->rules.hungerDisabled || (unitSumAll+AI_CASTOR_FOODSURPLUS_OFFSET<foodSum);
 
-	starvingWarning=(((unitSumAll>>AI_CASTOR_STARVING_RATIO_SHIFT)+AI_CASTOR_STARVING_OFFSET)<team->stats.getStarvingUnits());
-	if (game->gameHeader.isHungerDisabled()) starvingWarning=false;
+	starvingWarning=(((unitSumAll>>AI_CASTOR_STARVING_RATIO_SHIFT)+AI_CASTOR_STARVING_OFFSET)<observedTeam->starving);
+	if (observation->rules.hungerDisabled) starvingWarning=false;
 	starvingWarningStats[starvingWarning]++;
 
 	bool realFoodLock;
@@ -62,31 +74,26 @@ std::shared_ptr<Order>AICastor::controlSwarms()
 	else
 		realFoodLock=((unitSumAll)>=(foodSum*AI_CASTOR_REAL_FOODLOCK_MULT_PEACE));
 
-	if (!game->gameHeader.isHungerDisabled() && (timer>AI_CASTOR_FOODLOCK_GRACE_TICKS) && (realFoodLock || starvingWarning || starvingWarningStats[1]>starvingWarningStats[0]))
+	if (!observation->rules.hungerDisabled && (timer>AI_CASTOR_FOODLOCK_GRACE_TICKS) && (realFoodLock || starvingWarning || starvingWarningStats[1]>starvingWarningStats[0]))
 	{
 		// Stop making any units!
-		Building **myBuildings=team->myBuildings;
+		const auto myBuildings=observation->buildingSlots(observedTeam->number);
 		for (int bi=0; bi<Building::MAX_COUNT; bi++)
 		{
-			Building *b=myBuildings[bi];
-			if (b && b->type->unitProductionTime)
+			const AIEngine::BuildingView *b=myBuildings[bi];
+			if (b && std::any_of(std::begin(queries->kind(*b).resolvedType.semantics.production.recipes), std::end(queries->kind(*b).resolvedType.semantics.production.recipes), [](const auto& r) { return r.enabled; }))
 				for (int ri=0; ri<NB_UNIT_TYPE; ri++)
-					if (b->ratio[ri]!=0)
+					if (requestedRatio(*b,ri)!=0)
 					{
-						// Zero out the authoritative ratios; build a stack
-						// buffer for the order payload. The per-viewer GUI
-						// shadow that used to live as b->ratioLocal is now
-						// in BuildingGuiState and off-limits to AI code.
+						// Keep production intent private until the engine applies it.
 						Sint32 newRatio[NB_UNIT_TYPE];
 						for (int rj=0; rj<NB_UNIT_TYPE; rj++)
 						{
-							b->ratio[rj]=0;
 							newRatio[rj]=0;
 						}
-						b->update();
 						return telemetry.returnedOrder(
 							AITrace::AI2::AICastor_controlSwarms_result,
-							shared_ptr<Order>(new OrderModifySwarm(b->gid, newRatio)));
+							requestRatios(*b, newRatio));
 					}
 		}
 
@@ -94,17 +101,18 @@ std::shared_ptr<Order>AICastor::controlSwarms()
 									   shared_ptr<Order>());
 	}
 	
-	size_t size=map->w*map->h;
+	size_t size=observation->width*observation->height;
 	int discovered=0;
 	int seeable=0;
-	Uint32 *mapDiscovered=&(map->mapDiscovered[0]);
-	Uint32 *fogOfWar=&map->fogOfWar[0];
-	Uint32 me=team->me;
+
+
+	Uint32 me=observedTeam->mask;
 	for (size_t i=0; i<size; i++)
 	{
-		if (((mapDiscovered[i]) & me)!=0)
+		const auto visibility=observation->visibilityAt(i);
+		if ((visibility.discovered & me)!=0)
 			discovered++;
-		if (((fogOfWar[i]) & me)!=0)
+		if ((visibility.visible & me)!=0)
 			seeable++;
 	}
 	Sint32 explorerGoal;
@@ -125,29 +133,21 @@ std::shared_ptr<Order>AICastor::controlSwarms()
 	else
 		workerGoal=AI_CASTOR_WORKER_GOAL_HIGH;
 
+    if(auto order=queries->missingProductionOrder({workerGoal,explorerGoal,warriorGoal},4,4)) return order;
+
 	for (int bi=0; bi<Building::MAX_COUNT; bi++)
 	{
-		Building *b=myBuildings[bi];
-		if (b && b->type->unitProductionTime)
+		const AIEngine::BuildingView *b=myBuildings[bi];
+		if (b && std::any_of(std::begin(queries->kind(*b).resolvedType.semantics.production.recipes), std::end(queries->kind(*b).resolvedType.semantics.production.recipes), [](const auto& r) { return r.enabled; }))
 		{
-			if (b->ratio[EXPLORER]!=explorerGoal
-				|| b->ratio[WORKER]!=workerGoal
-				|| b->ratio[WARRIOR]!=warriorGoal)
-			{
-				b->ratio[EXPLORER]=explorerGoal;
-				b->ratio[WORKER]=workerGoal;
-				b->ratio[WARRIOR]=warriorGoal;
-				// Stack buffer for the order payload — see also the foodlock
-				// branch above. AI must not touch BuildingGuiState.
-				Sint32 newRatio[NB_UNIT_TYPE];
-				newRatio[EXPLORER]=explorerGoal;
-				newRatio[WORKER]=workerGoal;
-				newRatio[WARRIOR]=warriorGoal;
-				b->update();
-				return telemetry.returnedOrder(
-					AITrace::AI2::AICastor_controlSwarms_result,
-					shared_ptr<Order>(new OrderModifySwarm(b->gid, newRatio)));
-			}
+   Sint32 desired[NB_UNIT_TYPE] = {workerGoal,explorerGoal,warriorGoal};
+   bool differs = false;
+   for (int unit=0; unit<NB_UNIT_TYPE; ++unit) {
+    if (!queries->kind(*b).resolvedType.semantics.production.recipes[unit].enabled) desired[unit]=0;
+    differs |= requestedRatio(*b,unit) != desired[unit];
+   }
+   if (differs) return telemetry.returnedOrder(AITrace::AI2::AICastor_controlSwarms_result,
+    requestRatios(*b,desired));
 		}
 	}
 
@@ -158,22 +158,23 @@ std::shared_ptr<Order>AICastor::controlSwarms()
 std::shared_ptr<Order>AICastor::expandFood()
 {
 	// Feeding capacity cannot constrain production when units never need meals.
-	if (game->gameHeader.isHungerDisabled()) return {};
+	if (observation->rules.hungerDisabled) return {};
 	telemetry.count(AITrace::AI2::AICastor_expandFood_calls);
 	if (foodSurplus
 		|| (!foodWarning && !enoughFreeWorkers())
-		|| buildingSum[IntBuildingType::FOOD_BUILDING][1]>buildingSum[IntBuildingType::FOOD_BUILDING][0]+1)
+		|| buildingSum[AICastor::FeedUnits][1]>buildingSum[AICastor::FeedUnits][0]+1)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_expandFood_result,
 									   shared_ptr<Order>());
 
-	Sint32 typeNum=globalContainer->buildingsTypes.getTypeNum("inn", 0, true);
-	int bw=globalContainer->buildingsTypes.get(typeNum)->width;
-	int bh=globalContainer->buildingsTypes.get(typeNum)->height;
-	assert(bw==bh);
+	Sint32 typeNum=selectBuilding(FeedUnits);
+ if (typeNum < 0) return {};
+	int bw=(&queries->kind(typeNum).resolvedType)->width;
+	int bh=(&queries->kind(typeNum).resolvedType)->height;
+
 	
 	computeCanSwim();
 	computeObstacleBuildingMap();
-	computeSpaceForBuildingMap(bw);
+	computeSpaceForBuildingMap(std::max(bw,bh));
 	computeBuildingNeighbourMap(bw, bh);
 	computeObstacleUnitMap();
 	computeWheatGrowthMap();
@@ -189,15 +190,15 @@ std::shared_ptr<Order>AICastor::expandFood()
 std::shared_ptr<Order>AICastor::controlFood()
 {
 	// Feeding capacity cannot constrain production when units never need meals.
-	if (game->gameHeader.isHungerDisabled()) return {};
+	if (observation->rules.hungerDisabled) return {};
 	telemetry.count(AITrace::AI2::AICastor_controlFood_calls);
-	int wMask=map->wMask;
-	int hMask=map->hMask;
-	int wDec=map->wDec;
+	int wMask=(observation->width-1);
+	int hMask=(observation->height-1);
+	int wDec=std::countr_zero(unsigned(observation->width));
 	
 	int bi=(controlFoodTimer++)&(Building::MAX_COUNT-1);
-	Building **myBuildings=team->myBuildings;
-	Building *b=myBuildings[bi];
+	const auto myBuildings=observation->buildingSlots(observedTeam->number);
+	const AIEngine::BuildingView *b=myBuildings[bi];
 	for (int i=0; i<AI_CASTOR_CONTROL_FOOD_RETRIES; i++)
 		if (b==NULL)
 		{
@@ -207,14 +208,27 @@ std::shared_ptr<Order>AICastor::controlFood()
 	if (b==NULL)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlFood_result,
 									   shared_ptr<Order>());
-	if (b->type->shortTypeNum!=IntBuildingType::FOOD_BUILDING && b->type->shortTypeNum!=IntBuildingType::SWARM_BUILDING)
+	if (!provides(*b, AICastor::FeedUnits) && !(queries->rawIntentMask(queries->kind(*b).resolvedType.isBuildingSite ? queries->kind(*b).resolvedType.nextLevel : b->typeNum)&7u))
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlFood_result,
 									   shared_ptr<Order>());
 
+ const auto& semantics = queries->kind(*b).resolvedType.semantics;
+ bool usesWheat = semantics.feeding.enabled && semantics.feeding.cost[materialIndex(MaterialId::Food)] > 0;
+ bool otherService = semantics.healing.enabled || queries->kind(*b).resolvedType.shootingRange > 0;
+ for (const auto& training : semantics.training) otherService |= training.enabled;
+ for (int resource=0; resource<MaterialSlotCount; ++resource) {
+  if (semantics.feeding.enabled && resource != materialIndex(MaterialId::Food) && semantics.feeding.cost[resource] > 0) otherService=true;
+  for (const auto& recipe : semantics.production.recipes) if (recipe.enabled) {
+   usesWheat |= recipe.cost[materialIndex(MaterialId::Food)] > 0;
+   otherService |= resource != materialIndex(MaterialId::Food) && recipe.cost[resource] > 0;
+  }
+ }
+ if (!usesWheat || otherService) return {};
+
 	int bx=b->posX;
 	int by=b->posY;
-	int bw=b->type->width;
-	int bh=b->type->height;
+	int bw=queries->kind(*b).resolvedType.width;
+	int bh=queries->kind(*b).resolvedType.height;
 	
 	Uint8 worstCare=0;
 	for (int xi=bx-1; xi<bx+bw; xi++)
@@ -240,57 +254,51 @@ std::shared_ptr<Order>AICastor::controlFood()
 	
 	// Sparse wheat normally needs a recovery pause. With no regrowth, waiting
 	// cannot improve this catchment; keep harvesting its remaining finite stock.
-	if (!game->gameHeader.isResourceGrowthDisabled() && worstCare>AI_CASTOR_WHEATCARE_STOP_THRESHOLD)
+	if (!observation->rules.resourceGrowthDisabled && worstCare>AI_CASTOR_WHEATCARE_STOP_THRESHOLD)
 	{
-		if (b->maxUnitWorking!=0)
+		if (requestedWorkers(*b)!=0)
 		{
-			b->maxUnitWorking=0;
-			b->update();
 			if (verbose)
-				printf("controlFood(), worstCare=%d\n", worstCare);
+				bufferedDiagnostics.push_back({"", "", "controlFood(), worstCare=" + std::to_string(worstCare) + "\n"});
 			return telemetry.returnedOrder(AITrace::AI2::AICastor_controlFood_result,
-										   shared_ptr<Order>(new OrderModifyBuilding(b->gid, 0)));
+										   requestWorkers(*b, 0));
 		}
 	}
-	else if (!game->gameHeader.isResourceGrowthDisabled() && worstCare>AI_CASTOR_WHEATCARE_LIMIT_THRESHOLD)
+	else if (!observation->rules.resourceGrowthDisabled && worstCare>AI_CASTOR_WHEATCARE_LIMIT_THRESHOLD)
 	{
-		if (b->maxUnitWorking>1)
+		if (requestedWorkers(*b)>1)
 		{
-			b->maxUnitWorking=1;
-			b->update();
 			if (verbose)
-				printf("controlFood(), beta, worstCare=%d\n", worstCare);
+				bufferedDiagnostics.push_back({"", "", "controlFood(), beta, worstCare=" + std::to_string(worstCare) + "\n"});
 			return telemetry.returnedOrder(AITrace::AI2::AICastor_controlFood_result,
-										   shared_ptr<Order>(new OrderModifyBuilding(b->gid, 1)));
+										   requestWorkers(*b, 1));
 		}
 	}
 	else
 	{
-		if (b->type->shortTypeNum==IntBuildingType::FOOD_BUILDING)
+		if (provides(*b, AICastor::FeedUnits))
 		{
 			Sint32 workers;
-			if (foodWarning && b->type->isBuildingSite)
-				workers=AI_CASTOR_FOODWARN_INN_SITE_WORKERS+b->type->level; //TODO: random 2 or 3
+			if (foodWarning && queries->kind(*b).resolvedType.isBuildingSite)
+				workers=AI_CASTOR_FOODWARN_INN_SITE_WORKERS+strategicStage(*observation,*b); //TODO: random 2 or 3
 			else
-				workers=AI_CASTOR_INN_WORKERS_BASE+b->type->level;
-			b->maxUnitWorking=workers;
-			b->update();
+				workers=AI_CASTOR_INN_WORKERS_BASE+strategicStage(*observation,*b);
+			workers=desiredWorkers(*b,workers);
 			return telemetry.returnedOrder(
 				AITrace::AI2::AICastor_controlFood_result,
-				shared_ptr<Order>(new OrderModifyBuilding(b->gid, workers)));
+				requestWorkers(*b, workers));
 		}
-		else if (b->type->shortTypeNum==IntBuildingType::SWARM_BUILDING)
+		else if (queries->rawIntentMask(queries->kind(*b).resolvedType.isBuildingSite ? queries->kind(*b).resolvedType.nextLevel : b->typeNum)&7u)
 		{
 			Sint32 workers;
 			if (foodWarning)
 				workers=AI_CASTOR_SWARM_WORKERS_FOODWARN;
 			else
 				workers=AI_CASTOR_SWARM_WORKERS_NORMAL;
-			b->maxUnitWorking=workers;
-			b->update();
+			workers=desiredWorkers(*b,workers);
 			return telemetry.returnedOrder(
 				AITrace::AI2::AICastor_controlFood_result,
-				shared_ptr<Order>(new OrderModifyBuilding(b->gid, workers)));
+				requestWorkers(*b, workers));
 		}
 		else
 			assert(false);
@@ -311,61 +319,64 @@ std::shared_ptr<Order>AICastor::controlUpgrades()
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 									   shared_ptr<Order>());
 	int bi=((controlUpgradeTimer++)&(Building::MAX_COUNT-1));
-	Building **myBuildings=team->myBuildings;
-	Building *b=myBuildings[bi];
+	const auto myBuildings=observation->buildingSlots(observedTeam->number);
+	const AIEngine::BuildingView *b=myBuildings[bi];
 	if (b==NULL)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 									   shared_ptr<Order>());
-	if (b->type->isVirtual)
+	const bool repairing=b->hp<b->maxHp && queries->kind(*b).resolvedType.semantics.repairable;
+	if (queries->kind(*b).resolvedType.isBuildingSite || (!repairing && (observation->rules.upgradesDisabled || !observation->isUpgradeAvailable(*b)))) return {};
+	if (requestedWorkers(*b)<1 && queries->kind(*b).resolvedType.semantics.assignmentLimit>0)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
-									   shared_ptr<Order>());
-	if (b->maxUnitWorking<1)
-		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
-									   shared_ptr<Order>(new OrderModifyBuilding(b->gid, 1)));
-	int numberOfFreeWorkers = team->stats.getLatestStat()->isFree[WORKER];
-	int numberOfAbleWorkers = team->stats.getLatestStat()->upgradeState[BUILD][b->type->level];
+									   requestWorkers(*b, 1));
+	int numberOfFreeWorkers = observedTeam->statistics.isFree[WORKER];
+	const int transition=repairing ? queries->kind(*b).resolvedType.prevLevel : queries->kind(*b).resolvedType.nextLevel;
+	const int qualification=transition>=0 ? (&queries->kind(transition).resolvedType)->semantics.requiredWorkerLevel
+		: queries->kind(*b).resolvedType.semantics.requiredWorkerLevel;
+	int numberOfAbleWorkers=0;
+	for(int level=qualification;level<NB_UNIT_LEVELS;++level)
+		numberOfAbleWorkers+=observedTeam->statistics.workersByConstructionLevel[level];
 	if (numberOfAbleWorkers <= AI_CASTOR_UPGRADE_MIN_ABLE_WORKERS
 		|| numberOfFreeWorkers <= AI_CASTOR_UPGRADE_MIN_FREE_WORKERS
 		|| numberOfAbleWorkers <= (numberOfFreeWorkers/AI_CASTOR_UPGRADE_ABLE_FREE_RATIO_DIV))
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 									   shared_ptr<Order>());
 	// Is it any repair:
-	if (!b->type->isBuildingSite)
+	if (!queries->kind(*b).resolvedType.isBuildingSite && queries->kind(*b).resolvedType.semantics.repairable)
 	{
-		if (b->type->type == "defencetower")
+		if (provides(*b, DefendWithProjectiles))
 		{
-			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->getEffectiveMaxHp()*AI_CASTOR_REPAIR_HP_RATIO_DEFENCE_NUM)
+			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->maxHp*AI_CASTOR_REPAIR_HP_RATIO_DEFENCE_NUM)
 				return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
-											   shared_ptr<Order>(new OrderConstruction(
-												   b->gid, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
-												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS)));
+											   queries->constructionOrder(*b, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
+												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS));
 		}
-		else if (b->type->maxUnitInside)
+		else if (queries->kind(*b).resolvedType.maxUnitInside)
 		{
-			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->getEffectiveMaxHp()*AI_CASTOR_REPAIR_HP_RATIO_INSIDE_NUM)
+			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->maxHp*AI_CASTOR_REPAIR_HP_RATIO_INSIDE_NUM)
 				return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
-											   shared_ptr<Order>(new OrderConstruction(
-												   b->gid, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
-												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS)));
+											   queries->constructionOrder(*b, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
+												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS));
 		}
 		else
 		{
-			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->getEffectiveMaxHp()*AI_CASTOR_REPAIR_HP_RATIO_OTHER_NUM)
+			if (b->hp*AI_CASTOR_REPAIR_HP_RATIO_DIV<b->maxHp*AI_CASTOR_REPAIR_HP_RATIO_OTHER_NUM)
 				return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
-											   shared_ptr<Order>(new OrderConstruction(
-												   b->gid, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
-												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS)));
+											   queries->constructionOrder(*b, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
+												   AI_CASTOR_CONSTRUCTION_ORDER_UNITS));
 		}
 	}
 	// Repairs above remain useful even when upgrades are disabled.
-	if (game->gameHeader.isUnitUpgradesDisabled()) return {};
+	if (observation->rules.upgradesDisabled || !observation->isUpgradeAvailable(*b)) return {};
 	// Do we want to upgrade it:
 	// We compute the number of buildings satifying the strategy:
-	int shortTypeNum=b->type->shortTypeNum;
-	if (shortTypeNum>=NB_HARD_BUILDING)
+	int demand = -1;
+ for (int candidate=0; candidate<NB_HARD_BUILDING; ++candidate)
+  if (provides(*b,candidate) && strategy.build[candidate].baseUpgrade > 0) { demand=candidate; break; }
+ if (demand<0)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 									   shared_ptr<Order>());
-	int level=b->type->level;
+	int level=strategicStage(*observation,*b);
 	int upgradeLevelGoal=((buildsAmount+AI_CASTOR_UPGRADE_LEVEL_FORMULA_BIAS)>>AI_CASTOR_UPGRADE_LEVEL_FORMULA_SHIFT);
 	if (upgradeLevelGoal>AI_CASTOR_UPGRADE_LEVEL_MAX)
 		upgradeLevelGoal=AI_CASTOR_UPGRADE_LEVEL_MAX;
@@ -375,28 +386,28 @@ std::shared_ptr<Order>AICastor::controlUpgrades()
 	int sumOver=0;
 	for (int li=(level+1); li<NB_UNIT_LEVELS; li++)
 		for (int si=0; si<2; si++)
-			sumOver+=buildingLevels[shortTypeNum][si][li];
+			sumOver+=buildingLevels[demand][si][li];
 	
-	int upgradeAmountGoal=strategy.build[shortTypeNum].baseUpgrade;
+	int upgradeAmountGoal=strategy.build[demand].baseUpgrade;
 	for (int ai=1; ai<=upgradeLevelGoal; ai++)
-		upgradeAmountGoal+=strategy.build[shortTypeNum].newUpgrade;
+		upgradeAmountGoal+=strategy.build[demand].newUpgrade;
 
 	if (sumOver>=upgradeAmountGoal)
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 									   shared_ptr<Order>());
 
-	if (shortTypeNum==IntBuildingType::SCIENCE_BUILDING)
+	if (demand==AICastor::TrainConstruction)
 	{
-		int buildBase=team->stats.getWorkersLevel(0);
+		int buildBase=observedTeam->workersLevel[0];
 		int buildSum=0;
 		for (int i=0; i<NB_UNIT_LEVELS; i++)
-			buildSum+=team->stats.getWorkersLevel(i);
+			buildSum+=observedTeam->workersLevel[i];
 		if (buildBase>buildSum)
 			return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
 										   shared_ptr<Order>());
 		int sumEqual=0;
 		for (int li=level; li<NB_UNIT_LEVELS; li++)
-			sumEqual+=buildingLevels[shortTypeNum][0][li];
+			sumEqual+=buildingLevels[demand][0][li];
 		if (sumEqual<AI_CASTOR_SCIENCE_UPGRADE_MIN_COUNT)
 		{
 			return telemetry.returnedOrder(AITrace::AI2::AICastor_controlUpgrades_result,
@@ -406,8 +417,8 @@ std::shared_ptr<Order>AICastor::controlUpgrades()
 	controlUpgradeDelay=AI_CASTOR_UPGRADE_DELAY_TICKS;
 	return telemetry.returnedOrder(
 		AITrace::AI2::AICastor_controlUpgrades_result,
-		shared_ptr<Order>(new OrderConstruction(b->gid, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
-												AI_CASTOR_CONSTRUCTION_ORDER_UNITS)));
+		queries->constructionOrder(*b, AI_CASTOR_CONSTRUCTION_ORDER_UNITS,
+												AI_CASTOR_CONSTRUCTION_ORDER_UNITS));
 }
 
 
@@ -416,7 +427,7 @@ std::shared_ptr<Order>AICastor::controlUpgrades()
 std::shared_ptr<Order>AICastor::controlStrikes()
 {
 	// Combat cannot damage opponents here; military work must not reserve economic labour.
-	if (game->gameHeader.isPeacefulModeEnabled()) return {};
+	if (observation->rules.peaceful) return {};
 	telemetry.count(AITrace::AI2::AICastor_controlStrikes_calls);
 	controlStrikesTimer=timer+AI_CASTOR_CONTROL_STRIKES_INTERVAL;
 
@@ -424,48 +435,46 @@ std::shared_ptr<Order>AICastor::controlStrikes()
 		return telemetry.returnedOrder(AITrace::AI2::AICastor_controlStrikes_result,
 									   shared_ptr<Order>());
 
-	int warriors=team->stats.getTotalUnits(WARRIOR);
+	int warriors=observedTeam->statistics.numberUnitPerType[WARRIOR];
 	int warFlagsGoal=(warriors+AI_CASTOR_WARFLAG_FORMULA_BIAS)/AI_CASTOR_WARRIORS_PER_WARFLAG;
-	int warFlagsReal=buildingSum[IntBuildingType::WAR_FLAG][0];
+	int warFlagsReal=buildingSum[AICastor::AttractWarriors][0];
 
 	if (!strikeTeamSelected)
 	{
 		int bestLevel=AI_CASTOR_LEVEL_NONE;
-		for (int ti=0; ti<game->mapHeader.getNumberOfTeams(); ti++)
+		for (int ti=0; ti<observation->teams.size(); ti++)
 		{
-			Team *enemyTeam=game->teams[ti];
-			Uint32 me=team->me;
-			if ((team->attackableTeams()&enemyTeam->me)==0)
+			const AIEngine::TeamView *enemyTeam=teamAt(ti);
+			Uint32 me=observedTeam->mask;
+			if ((observedTeam->enemies&enemyTeam->mask)==0)
 				continue;
-			Building **enemyBuildings=enemyTeam->myBuildings;
+			const auto enemyBuildings=observation->buildingSlots(enemyTeam->number);
 			for (int bi=0; bi<Building::MAX_COUNT; bi++)
 			{
-				Building *b=enemyBuildings[bi];
+				const AIEngine::BuildingView *b=enemyBuildings[bi];
 				if (b==NULL || ((b->seenByMask&me)==0) || b->locked[canSwim])
 					continue;
-				int level=b->type->level;
+				int level=strategicStage(*observation,*b);
 				if (bestLevel<level)
 					bestLevel=level;
 			}
 		}
 		int bestTeam=0;
 		int bestScore=AI_CASTOR_SCORE_NONE;
-		for (int ti=0; ti<game->mapHeader.getNumberOfTeams(); ti++)
+		for (int ti=0; ti<observation->teams.size(); ti++)
 		{
 			int score=0;
-			Team *enemyTeam=game->teams[ti];
-			Uint32 me=team->me;
-			if ((team->attackableTeams()&enemyTeam->me)==0)
+			const AIEngine::TeamView *enemyTeam=teamAt(ti);
+			Uint32 me=observedTeam->mask;
+			if ((observedTeam->enemies&enemyTeam->mask)==0)
 				continue;
-			Building **enemyBuildings=enemyTeam->myBuildings;
+			const auto enemyBuildings=observation->buildingSlots(enemyTeam->number);
 			for (int bi=0; bi<Building::MAX_COUNT; bi++)
 			{
-				Building *b=enemyBuildings[bi];
-				if (b==NULL || ((b->seenByMask&me)==0) || b->locked[canSwim] || b->type->level<bestLevel)
+				const AIEngine::BuildingView *b=enemyBuildings[bi];
+				if (b==NULL || ((b->seenByMask&me)==0) || b->locked[canSwim] || strategicStage(*observation,*b)<bestLevel)
 					continue;
-				int shortTypeNum=b->type->shortTypeNum;
-				if (shortTypeNum==IntBuildingType::ATTACK_BUILDING
-					|| shortTypeNum==IntBuildingType::SCIENCE_BUILDING)
+				if (provides(*b, TrainAttack) || provides(*b, TrainConstruction))
 					score+=AI_CASTOR_STRIKE_TEAM_SCORE_HIGH;
 				else
 					score+=AI_CASTOR_STRIKE_TEAM_SCORE_LOW;
@@ -482,31 +491,29 @@ std::shared_ptr<Order>AICastor::controlStrikes()
 
 	// We choose the best buildings to attack:
 	
-	int wMask=map->wMask;
-	int hMask=map->hMask;
-	int wDec=map->wDec;
+	int wMask=(observation->width-1);
+	int hMask=(observation->height-1);
+	int wDec=std::countr_zero(unsigned(observation->width));
 	
 	Uint32 bestScore=0;
-	Building *bestBuilding=NULL;
-	Team *enemyTeam=game->teams[strikeTeam];
-	Uint32 me=team->me;
-	Building **enemyBuildings=enemyTeam->myBuildings;
+	const AIEngine::BuildingView *bestBuilding=NULL;
+	const AIEngine::TeamView *enemyTeam=teamAt(strikeTeam);
+	Uint32 me=observedTeam->mask;
+	const auto enemyBuildings=observation->buildingSlots(enemyTeam->number);
 	for (int bi=0; bi<Building::MAX_COUNT; bi++)
 	{
-		Building *b=enemyBuildings[bi];
+		const AIEngine::BuildingView *b=enemyBuildings[bi];
 		if (b==NULL || ((b->seenByMask&me)==0) || b->locked[canSwim])
 			continue;
 		int x=b->posX;
 		int y=b->posY;
 		size_t index=(x&wMask)+((y&hMask)<<wDec);
 		Uint8 workRange=workRangeMap[index];
-		Sint32 level=b->type->level;
+		Sint32 level=strategicStage(*observation,*b);
 		Uint32 score=(AI_CASTOR_STRIKE_BUILDING_SCORE_BIAS+workRange)*(AI_CASTOR_STRIKE_BUILDING_SCORE_BIAS+level);
-		if (b->type->isBuildingSite)
+		if (queries->kind(*b).resolvedType.isBuildingSite)
 			score=(score>>AI_CASTOR_STRIKE_BUILDING_SITE_SHIFT);
-		int shortTypeNum=b->type->shortTypeNum;
-		if (shortTypeNum==IntBuildingType::ATTACK_BUILDING
-			||shortTypeNum==IntBuildingType::SCIENCE_BUILDING)
+		if (provides(*b, TrainAttack) || provides(*b, TrainConstruction))
 			score=(score<<AI_CASTOR_STRIKE_HIGH_VALUE_SHIFT);
 		if (bestScore<score)
 		{
@@ -515,7 +522,10 @@ std::shared_ptr<Order>AICastor::controlStrikes()
 		}
 	}
 	
-	std::list<Building *> *virtualBuildings=&team->virtualBuildings;
+	std::list<const AIEngine::BuildingView *> rallyBuildings;
+ for (auto* candidate : observation->buildingSlots(observedTeam->number))
+  if (candidate && provides(*candidate,AttractWarriors)) rallyBuildings.push_back(candidate);
+ auto* virtualBuildings=&rallyBuildings;
 	if (bestBuilding!=NULL)
 	{
 		Sint32 x=bestBuilding->posX+1;
@@ -523,17 +533,25 @@ std::shared_ptr<Order>AICastor::controlStrikes()
 
 		if (warFlagsReal<warFlagsGoal)
 		{
-			Sint32 typeNum=globalContainer->buildingsTypes.getTypeNum("warflag", 0, false);
+			Sint32 typeNum=selectBuilding(AttractWarriors);
+   if (typeNum < 0) return {};
+   bool place=false;
+   for (int radius=0; radius<=8 && !place; ++radius)
+    for (int dx=-radius; dx<=radius && !place; ++dx)
+     for (int dy=-radius; dy<=radius; ++dy)
+      if (queries->checkRoomForBuilding(x+dx,y+dy,typeNum,teamNumber))
+       { x+=dx; y+=dy; place=true; break; }
+   if (!place) return {};
 			return telemetry.returnedOrder(
 				AITrace::AI2::AICastor_controlStrikes_result,
-				shared_ptr<Order>(new OrderCreate(team->teamNumber, x, y, typeNum, 1, 1)));
+				queries->createOrder(teamNumber, x, y, typeNum, 1, 1));
 		}
 		else
 		{
 			Sint32 maxSqDist=0;
-			Building *maxFlag=NULL;
-			for (std::list<Building *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
-				if ((*it)->type->shortTypeNum==IntBuildingType::WAR_FLAG)
+			const AIEngine::BuildingView *maxFlag=NULL;
+			for (std::list<const AIEngine::BuildingView *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
+				if (provides(**it, AICastor::AttractWarriors))
 				{
 					Sint32 dx=x-(*it)->posX;
 					Sint32 dy=y-(*it)->posY;
@@ -544,29 +562,35 @@ std::shared_ptr<Order>AICastor::controlStrikes()
 						maxFlag=*it;
 					}
 				}
-			if (maxSqDist>AI_CASTOR_FLAG_MOVE_SQ_DIST && maxFlag!=NULL)
+			if (maxSqDist>AI_CASTOR_FLAG_MOVE_SQ_DIST && maxFlag!=NULL && queries->kind(*maxFlag).resolvedType.semantics.relocatable)
 			{
 				return telemetry.returnedOrder(
 					AITrace::AI2::AICastor_controlStrikes_result,
-					shared_ptr<Order>(new OrderMoveFlag(maxFlag->gid, x, y, true)));
+					shared_ptr<Order>(new OrderMoveFlag(maxFlag->identity.gid, x, y, true)));
 			}
-			for (std::list<Building *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
-				if ((*it)->type->shortTypeNum==IntBuildingType::WAR_FLAG
-					&& (*it)->maxUnitWorking<AI_CASTOR_WARFLAG_WORKER_GOAL)
+			for (std::list<const AIEngine::BuildingView *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
+				if (provides(**it, AICastor::AttractWarriors)
+					&& requestedWorkers(**it)<std::min(AI_CASTOR_WARFLAG_WORKER_GOAL,queries->kind(*(*it)).resolvedType.semantics.assignmentLimit))
 				{
 					return telemetry.returnedOrder(AITrace::AI2::AICastor_controlStrikes_result,
-												   shared_ptr<Order>(new OrderModifyBuilding(
-													   (*it)->gid, AI_CASTOR_WARFLAG_WORKER_GOAL)));
+												   requestWorkers(**it, std::min(AI_CASTOR_WARFLAG_WORKER_GOAL,queries->kind(*(*it)).resolvedType.semantics.assignmentLimit)));
 				}
 		}
 	}
 	else
 	{
-		for (std::list<Building *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
-			if ((*it)->type->shortTypeNum==IntBuildingType::WAR_FLAG)
-			{
-				return telemetry.returnedOrder(AITrace::AI2::AICastor_controlStrikes_result,
-											   shared_ptr<Order>(new OrderDelete((*it)->gid)));
+		for (std::list<const AIEngine::BuildingView *>::iterator it=virtualBuildings->begin(); it!=virtualBuildings->end(); ++it)
+			if (provides(**it, AICastor::AttractWarriors)
+    && queries->kind(*(*it)).resolvedType.semantics.instantPlacement && !queries->kind(*(*it)).resolvedType.semantics.occupiesGround
+    && !queries->kind(*(*it)).resolvedType.semantics.feeding.enabled && !queries->kind(*(*it)).resolvedType.semantics.healing.enabled
+    && queries->kind(*(*it)).resolvedType.shootingRange == 0
+    && !queries->kind(*(*it)).resolvedType.semantics.market.interTeamFruitExchange
+    && !queries->kind(*(*it)).resolvedType.semantics.market.suppliesStock
+    && std::none_of(queries->kind(*(*it)).resolvedType.semantics.production.recipes.begin(),queries->kind(*(*it)).resolvedType.semantics.production.recipes.end(),[](const auto& r){return r.enabled;})
+    && std::none_of(queries->kind(*(*it)).resolvedType.semantics.training.begin(),queries->kind(*(*it)).resolvedType.semantics.training.end(),[](const auto& r){return r.enabled;}))
+   {
+    return telemetry.returnedOrder(AITrace::AI2::AICastor_controlStrikes_result,
+											   shared_ptr<Order>(new OrderDelete((*it)->identity.gid)));
 			}
 		strikeTeamSelected=false;
 		onStrike=false;

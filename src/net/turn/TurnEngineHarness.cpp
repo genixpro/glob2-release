@@ -21,6 +21,8 @@
 // writes replays; everything else an Engine touches is its own.
 
 #include "EngineFixtures.h"
+#include "GeneratorPackage.h"
+#include "GenerationService.h"
 
 #include <chrono>
 #include <filesystem>
@@ -44,6 +46,7 @@
 #include "MatchSetup.h"
 #include "MersenneTwister.h"
 #include "BinaryStream.h"
+#include "FileManager.h"
 #include "Brush.h"
 #include "Building.h"
 #include "MapHeader.h"
@@ -419,16 +422,23 @@ public:
 		case 1:
 		{
 			static const char* sites[] = {"inn", "swarm", "hospital", "racetrack", "swimmingpool", "school", "defencetower"};
-			const int type = globalContainer->buildingsTypes.getTypeNum(sites[bot() % 7], 0, true);
-			order = std::make_shared<OrderCreate>(team->teamNumber, x, y, type, 1 + bot() % 5, 1 + bot() % 5);
+			const int type = game.buildingsTypes.getTypeNum(sites[bot() % 7], 0, true);
+			const BuildingType* site = game.buildingsTypes.get(type);
+			const BuildingType* completed = game.buildingsTypes.get(site->nextLevel);
+			const int currentWorkers = std::min<int>(1 + bot() % 5, site->semantics.assignmentLimit);
+			const int futureWorkers = std::min<int>(1 + bot() % 5, completed->semantics.assignmentLimit);
+			order = std::make_shared<OrderCreate>(team->teamNumber, x, y, type, currentWorkers, futureWorkers);
 			break;
 		}
 		case 2:
 		{
 			static const char* flags[] = {"explorationflag", "warflag", "clearingflag"};
-			const int type = globalContainer->buildingsTypes.getTypeNum(flags[bot() % 3], 0, false);
-			order = std::make_shared<OrderCreate>(team->teamNumber, x + offset(bot), y + offset(bot), type, 1 + bot() % 6,
-			                                      1 + bot() % 6);
+			const int type = game.buildingsTypes.getTypeNum(flags[bot() % 3], 0, false);
+			const int limit = game.buildingsTypes.get(type)->semantics.assignmentLimit;
+			const int currentWorkers = std::min<int>(1 + bot() % 6, limit);
+			const int futureWorkers = std::min<int>(1 + bot() % 6, limit);
+			order = std::make_shared<OrderCreate>(team->teamNumber, x + offset(bot), y + offset(bot), type,
+			                                      currentWorkers, futureWorkers);
 			break;
 		}
 		case 3:
@@ -436,10 +446,15 @@ public:
 			std::vector<Uint16> gids;
 			for (int i = 0; i < Building::MAX_COUNT; ++i)
 				if (const Building* b = team->myBuildings[i])
-					if (!b->type->isVirtual && b->type->maxUnitWorking > 0)
+					if (!b->type->isVirtual && b->type->semantics.assignmentLimit > 0)
 						gids.push_back(b->gid);
 			if (!gids.empty())
-				order = std::make_shared<OrderModifyBuilding>(gids[bot() % gids.size()], 1 + bot() % 8);
+			{
+				const Uint16 gid = gids[bot() % gids.size()];
+				const Building* building = team->myBuildings[Building::GIDtoID(gid)];
+				const int workers = std::min<int>(1 + bot() % 8, building->type->semantics.assignmentLimit);
+				order = std::make_shared<OrderModifyBuilding>(gid, workers);
+			}
 			break;
 		}
 		default:
@@ -753,6 +768,8 @@ DragResult dragAndHold(const Turn::TurnSessionConfig& config, const fs::path& ve
 		}
 	REQUIRE(haveFlag);
 	REQUIRE(haveHall);
+	// This headless network fixture explicitly publishes the world its client sees.
+	c.engine->gui.prepareLocalPresentation();
 
 	std::map<std::pair<int, int>, std::uint64_t> queuedAt;
 	std::set<std::pair<int, int>> executed;
@@ -791,7 +808,7 @@ DragResult dragAndHold(const Turn::TurnSessionConfig& config, const fs::path& ve
 		const int x = (team->startPosX + (i % 30) - 15) & game.map.getMaskW();
 		const int y = (team->startPosY + (i / 30) - 20) & game.map.getMaskH();
 		queuedAt.emplace(std::make_pair(x, y), m.net.now);
-		c.engine->gui.queueFlagMove(*flag, x, y, drop);
+		c.engine->gui.queueFlagMove(flagGid, x, y, drop);
 		if (drop)
 		{
 			dropAt = {x, y};
@@ -840,8 +857,129 @@ DragResult dragAndHold(const Turn::TurnSessionConfig& config, const fs::path& ve
 
 TEST_SUITE("TurnEngineHarness")
 {
+	GLOB2_TEST_CASE("embedded terrain definitions travel with shared matches and verifier replays",
+					"[network-sim][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(harnessGlobals());
+		const auto directory = glob2test::artifactDir();
+		const auto customMap = (directory / "custom.map").string();
+		std::string digest;
+		{
+			GameGUI author;
+			GAGCore::BinaryInputStream input(glob2OpenMapOrSaveInputStreamBackend(
+				*globalContainer->fileManager, mapPath("FourSquares1")));
+			REQUIRE(author.game.load(&input));
+			auto &map = author.game.map;
+			map.game = nullptr;
+			map.importTerrainDefinitions(R"({"schemaVersion":1,"terrains":[
+				{"key":"distribution:mud","name":"Mud","base":"grass","appearance":"sand",
+				 "properties":{"groundSpeedQ8":192}},
+				{"key":"distribution:water","name":"Deep water","base":"water","appearance":"water",
+				 "properties":{"groundSpeedQ8":64}}]})");
+			map.setGame(&author.game);
+			digest = map.terrainRegistry().digest();
+			{
+				auto batch = map.editTerrain();
+				for (int y = 0; y < map.getH(); ++y)
+					for (int x = 0; x < map.getW(); ++x)
+					{
+						const auto original = map.terrainTypeAt(x, y);
+						if (original == GRASS && (x + y) % 3 == 0)
+							map.paintCell(x, y,
+											   *map.terrainRegistry().find("distribution:mud"));
+						else if (original == WATER)
+							map.paintCell(x, y,
+											   *map.terrainRegistry().find("distribution:water"));
+					}
+			}
+			REQUIRE(globalContainer->fileManager->writeAtomically(
+				customMap, [&](GAGCore::OutputStream &out)
+				{ author.game.save(&out, true, "Shared custom terrain"); }));
+		}
+		// No local definitions or authoring registry remain. Each recipient loads
+		// the content-addressed map through normal match initialization.
+		auto setup = makeSetup(customMap, 2, {"nicowar", "warrush"}, 2026);
+		setup.map.kind = Online::MapSource::Kind::Upload;
+		EngineMatch match(setup, customMap, {{20 * MS}, {60 * MS, 30 * MS, 0.02}});
+		for (const auto &client : match.clients)
+		{
+			CHECK(client->engine->gui.game.map.terrainRegistry().digest() == digest);
+			CHECK(client->engine->gui.game.map.terrainQueueBuckets() == 256);
+		}
+		match.run(25 * SECOND);
+		const auto end = match.finish();
+		CHECK(match.requireIdenticalChecksums() == end + 1);
+		const auto verified = verifyRecord(match.record("custom-terrain"), match, directory);
+		CHECK(verified.verdict.verdict == "verified");
+		for (const auto &client : match.clients)
+			requireSameOutcomes(verified.result, liveTeams(*client));
+	}
+
+	GLOB2_TEST_CASE(
+		"shared scripted maps play and produce verified ordinary replays without installation",
+		"[network-sim][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(harnessGlobals());
+		const auto directory = glob2test::artifactDir();
+		const auto mapFile = (directory / "shared.map").string();
+		Online::MatchSetup setup;
+		if (const char *given = std::getenv("GLOB2_SHARED_GENERATOR_SETUP"))
+		{
+			setup = Online::MatchSetup::parse(glob2test::readFile(given));
+			const char *world = std::getenv("GLOB2_SHARED_GENERATOR_MAP");
+			REQUIRE(world);
+			fs::copy_file(world, mapFile, fs::copy_options::overwrite_existing);
+		}
+		else
+		{
+			std::string packageHash;
+			{
+				const auto package =
+					MapGeneration::JavaScript::Package::parse(R"({"formatVersion":1,
+                    "manifest":{"id":"test:shared-generator","name":"Shared landscape","revision":1,"apiVersion":1,"tags":["terrain:natural"],"controls":[]},
+                    "modules":{"generator.js":"export function generate(c){const t=c.torus,terrain=c.mask(t.size(),2);c.toolkit.Sketch.writeVertices(terrain);c.addTeams();if(!c.toolkit.Pipeline.settleColonies('shared',team=>terrain,team=>({x:24+team*48,y:24})))return 'Cannot place colonies';c.toolkit.Pipeline.secureStartingCrops(t);}"}})");
+				GeneratorRegistry registry({package->definition(1000000)});
+				GenerationRequest request;
+				request.setMethodDefaults(1000000, registry);
+				request.wDec = 7;
+				request.hDec = 6;
+				request.nbTeams = 2;
+				request.seed = 19;
+				Game game(nullptr);
+				REQUIRE(GenerationService(registry).generate(game, request));
+				REQUIRE(globalContainer->fileManager->writeAtomically(
+					mapFile, [&](GAGCore::OutputStream &out)
+					{ game.save(&out, true, "Shared landscape"); }));
+				packageHash = package->hash;
+			}
+			setup = makeSetup(mapFile, 2, {}, 2026);
+			setup.map.kind = Online::MapSource::Kind::Scripted;
+			setup.map.chosenSeed = 19;
+			setup.map.scriptGenerator =
+				json({{"libraryId", "00000000-0000-4000-8000-000000000001"},
+					  {"versionId", "00000000-0000-4000-8000-000000000002"},
+					  {"fileHash", packageHash},
+					  {"packageHash", packageHash},
+					  {"generatorId", "test:shared-generator"},
+					  {"revision", 1},
+					  {"seed", 19},
+					  {"candidates", 1},
+					  {"startingUnitLevel", 0},
+					  {"params", {{"width", 7}, {"height", 6}, {"teams", 2}, {"workers", 4}}}})
+					.dump();
+		}
+		EngineMatch match(setup, mapFile, {{20 * MS}, {60 * MS, 30 * MS, 0.02}});
+		match.run(16 * SECOND);
+		const auto end = match.finish();
+		CHECK(match.requireIdenticalChecksums() == end + 1);
+		const auto verified = verifyRecord(match.record("shared-generator"), match, directory);
+		CHECK(verified.verdict.verdict == "verified");
+		for (const auto &client : match.clients)
+			requireSameOutcomes(verified.result, liveTeams(*client));
+	}
+
 	GLOB2_TEST_CASE("input delay and stalls of real engines per link profile",
-	                "[network-sim][benchmark][artifacts]")
+					"[network-sim][benchmark][artifacts]")
 	{
 		// Two real engines with an AI; the measured player's link varies, the other
 		// player is on a clean 15 ms link. Sim time, 5 ms frames; the bot clicks
@@ -1553,7 +1691,7 @@ TEST_SUITE("TurnEngineHarness")
 	{
 		glob2test::HeadlessGlobals globals(harnessGlobals());
 		auto setup = makeSetup(mapPath("FourSquares1"), 2, {"nicowar"}, 4242);
-		setup.pauseLimit = Online::PauseLimit{2, 4}; // per seat: two pauses, four seconds (100 ticks) in all
+		setup.pauseLimit = Online::PauseLimit{2, 4}; // per seat: two pauses, four seconds in all
 		EngineMatch m(setup, mapPath("FourSquares1"), {{15 * MS}, {40 * MS, 10 * MS}});
 		for (auto& c : m.clients)
 			c->orderRate = 0.04;
@@ -1588,7 +1726,7 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK(usedByFirst < 40);
 		CHECK(lock0.pauseTicksUsed(1) == 0);
 		// 2. Seat 0 pauses again and never resumes: the game resumes by itself when its
-		// 100 ticks are used up.
+		// four seconds of ticks are used up.
 		pause(0, true);
 		m.run(500 * MS);
 		CHECK(paused(0));
@@ -1597,7 +1735,7 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK_FALSE(paused(0));
 		CHECK_FALSE(paused(1));
 		CHECK(lock0.pausesUsed(0) == 2);
-		CHECK(lock0.pauseTicksUsed(0) == 100);
+		CHECK(lock0.pauseTicksUsed(0) == 4 * GAME_TICKS_PER_SECOND);
 		// 3. A third pause of seat 0 is refused everywhere.
 		pause(0, true);
 		m.run(1 * SECOND);
@@ -1610,7 +1748,7 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK(paused(0));
 		m.run(3500 * MS);
 		CHECK_FALSE(paused(0));
-		CHECK(lock0.pauseTicksUsed(1) == 100);
+		CHECK(lock0.pauseTicksUsed(1) == 4 * GAME_TICKS_PER_SECOND);
 		m.run(2 * SECOND);
 		const std::uint32_t end = m.finish();
 		CHECK(m.requireIdenticalChecksums() == end + 1);
@@ -1719,6 +1857,8 @@ TEST_SUITE("TurnEngineHarness")
 		INFO(v.reason);
 		CHECK(v.verdict == "verified");
 		CHECK(v.compared == rec.reports.size());
+		for (int seat = 0; seat < Turn::MAX_SEATS; ++seat)
+			CHECK(v.orders.seats[seat].rejected == 0);
 		glob2test::expectGolden("multiplayer/FourSquares1.verify-trace.txt", glob2test::readFile(out.path / "checksums.txt"));
 	}
 
@@ -1847,4 +1987,3 @@ TEST_SUITE("TurnEngineHarness")
 		glob2test::writeFile(directory / "timeline-records.txt", loud.output);
 	}
 }
-

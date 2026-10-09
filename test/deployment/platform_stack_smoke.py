@@ -186,6 +186,7 @@ class Smoke:
             'GLOB2_RELAY_REPLICAS': '2',
             'GLOB2_ENGINE_AGENT_REPLICAS': '1',
             'GLOB2_BACKEND_SUBNET': str(subnet),
+            'GLOB2_BACKEND_IP_RANGE': str(list(subnet.subnets(prefixlen_diff=1))[1]),
             'GLOB2_PROXY_ADDRESS': str(subnet.network_address + 10),
             'GLOB2_RELAY_DRAIN_SECONDS': '5',
             'GLOB2_RELAY_STOP_GRACE': '20s',
@@ -198,6 +199,8 @@ class Smoke:
             'GLOB2_ENGINE_AGENT_IMAGE': f'glob2-engine-agent:{tag}',
             'GLOB2_RELAY_IMAGE': f'glob2-relay:{tag}',
             'GLOB2_CADDY_IMAGE': f'glob2-caddy:{tag}',
+            'GLOB2_MUSIC_IMAGE': f'glob2-music-worker:{tag}',
+            'GLOB2_SKIN_RENDER_IMAGE': f'glob2-skin-render-worker:{tag}',
             'LOG_LEVEL': 'info',
         }
         self.env_file = self.directory / '.env'
@@ -206,7 +209,8 @@ class Smoke:
         (self.directory / '.env').write_text(''.join(f'{k}={v}\n' for k, v in settings.items()))
         (self.directory / 'instance.yaml').write_text(INSTANCE_YAML_E2E if arguments.match_e2e else INSTANCE_YAML)
         (self.directory / 'web-client').mkdir()
-        (self.directory / 'web-client/index.html').write_text('<!doctype html><title>glob2 web client</title>')
+        for entry in ('index.html', 'studio.html', 'generator-studio.html'):
+            (self.directory / 'web-client' / entry).write_text('<!doctype html><title>glob2 web client</title>')
         # A content-addressed data package with a precompressed copy, as
         # browser/precompress.py and deploy/install-web-client.py lay them out.
         (self.directory / 'web-client/assets').mkdir()
@@ -300,9 +304,9 @@ class Smoke:
             self.tls = ssl.create_default_context()
             return {'attached': self.project, 'origin': self.origin}
         if not self.arguments.no_build:
-            log('building images (platform, engine-agent, relay, caddy)')
+            log('building images (platform, music-worker, skin-render-worker, engine-agent, relay, caddy)')
             started = time.monotonic()
-            self.compose('build', 'init', 'engine-agent', 'relay', 'caddy', timeout=7200)
+            self.compose('build', 'init', 'music-worker', 'skin-render-worker', 'engine-agent', 'relay', 'caddy', timeout=7200)
             self.results['build_seconds'] = round(time.monotonic() - started)
         log(f'starting project {self.project} on {self.origin}')
         started = time.monotonic()
@@ -328,6 +332,46 @@ class Smoke:
             raise Failure(f'unexpected replica counts {counts}')
         init_log = self.compose('logs', '--no-color', 'init')
         return {'services': summary, 'init': [l.split('|', 1)[-1].strip() for l in init_log.splitlines()][-6:]}
+
+    def studio_edge(self):
+        # Threaded embedded games require both documents to be isolated. Framing
+        # is allowed only for the dedicated child, never the parent/account UI.
+        pages = {}
+        for path, frame_policy, ancestors in (
+            ('/ai-studio', 'DENY', "'none'"),
+            ('/ai-studio/11111111-1111-4111-8111-111111111111', 'DENY', "'none'"),
+            ('/play/studio.html', 'SAMEORIGIN', "'self'"),
+            ('/generator-studio', 'DENY', "'none'"),
+            ('/generator-studio/11111111-1111-4111-8111-111111111111', 'DENY', "'none'"),
+            ('/play/generator-studio.html', 'SAMEORIGIN', "'self'"),
+            ('/play/index.html', 'DENY', "'none'"),
+        ):
+            status, headers, body = self.https('GET', path)
+            if status != 200 or not body:
+                raise Failure(f'{path}: {status} {body[:100]!r}')
+            for name, expected in (
+                ('Cross-Origin-Opener-Policy', 'same-origin'),
+                ('Cross-Origin-Embedder-Policy', 'require-corp'),
+                ('X-Frame-Options', frame_policy),
+            ):
+                if headers.get(name) != expected:
+                    raise Failure(f'{path}: {name} expected {expected!r}, got {headers.get(name)!r}')
+            directives = {part.strip() for part in headers.get('Content-Security-Policy', '').split(';')}
+            if f'frame-ancestors {ancestors}' not in directives:
+                raise Failure(f'{path}: incorrect frame-ancestors policy')
+            if path.startswith(('/ai-studio', '/generator-studio')) and "frame-src 'self'" not in directives:
+                raise Failure(f'{path}: Studio cannot embed its game')
+            pages[path] = status
+        # These policy probes deliberately use stable synthetic worker names: the
+        # deployed Vite hashes change on every editor release. The SPA may answer
+        # the missing file, but the worker-path COEP rule must still be selected.
+        for worker in ('editor', 'ts', 'json'):
+            path = f'/assets/{worker}.worker-studio-header-probe.js'
+            status, headers, _ = self.https('GET', path)
+            if status != 200 or headers.get('Cross-Origin-Embedder-Policy') != 'require-corp':
+                raise Failure(f'{path}: Monaco worker isolation policy is missing')
+            pages[path] = status
+        return pages
 
     def edge(self):
         status, headers, body = self.https('GET', '/')
@@ -376,7 +420,7 @@ class Smoke:
         redirect = connection.getresponse()
         if redirect.status not in (301, 308) or not redirect.getheader('Location', '').startswith('https://'):
             raise Failure(f'HTTP is not redirected to HTTPS: {redirect.status}')
-        detail = {'web': status, 'invite': status_j, 'play': status_play, 'wellKnown': well_known,
+        detail = {'web': status, 'invite': status_j, 'play': status_play, 'studio': self.studio_edge(), 'wellKnown': well_known,
                   'private': denied,
                   'http': redirect.status, 'hsts_or_server': headers.get('Server')}
         if self.arguments.attach:

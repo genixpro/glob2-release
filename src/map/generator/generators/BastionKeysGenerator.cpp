@@ -1,3 +1,4 @@
+#include "../shared/ResourceSemantics.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "BastionKeysGenerator.h"
 #include "Drawing.h"
@@ -369,14 +370,14 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 		for (int i : key.court)
 			for (int dy = 0; dy <= 1; ++dy)
 				for (int dx = 0; dx <= 1; ++dx)
-					L.terrain[t.at(i % t.w + dx, i / t.w + dy)] = GRASS;
+					L.terrain[t.at(t.remainderX(i) + dx, i / t.w + dy)] = GRASS;
 	// Walls own their four grass corners. This keeps beaches a full tile outside the wall.
 	for (int i = 0; i < t.size(); ++i)
 		if (L.wall[i])
 			for (int dy = -1; dy <= 2; ++dy)
 				for (int dx = -1; dx <= 2; ++dx)
 				{
-					const int j = t.at(i % t.w + dx, i / t.w + dy);
+					const int j = t.at(t.remainderX(i) + dx, i / t.w + dy);
 					// Preserve sand circulation/containment in the apron. Only the four
 					// actual wall corners must overwrite terrain; roadTiles removed clashes.
 					if ((dx >= 0 && dx <= 1 && dy >= 0 && dy <= 1) || L.terrain[j] == WATER)
@@ -398,8 +399,8 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 			std::stable_sort(field.begin(), field.end(),
 							 [&](int a, int b)
 							 {
-								 return t.dist2(a % t.w, a / t.w, int(gate.x), int(gate.y)) <
-										t.dist2(b % t.w, b / t.w, int(gate.x), int(gate.y));
+								 return t.dist2(t.remainderX(a), a / t.w, int(gate.x), int(gate.y)) <
+										t.dist2(t.remainderX(b), b / t.w, int(gate.x), int(gate.y));
 							 });
 			L.landingFields.push_back(std::move(field));
 		}
@@ -420,7 +421,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 				for (int ey = 0; ey <= 1; ++ey)
 					for (int ex = 0; ex <= 1; ++ex)
 						ownCorners =
-							ownCorners && L.keyOf[t.at(i % t.w + ex, i / t.w + ey)] == int(k);
+							ownCorners && L.keyOf[t.at(t.remainderX(i) + ex, i / t.w + ey)] == int(k);
 				if (landing[i] || !ownCorners || !grass[i] || L.wall[i] || L.homeOf[i] >= 0 ||
 					(std::abs(dx) <= 5 && std::abs(dy) <= 5))
 					continue;
@@ -465,7 +466,7 @@ bool generate(Game &game, GenerationContext &context)
 	const Torus &t = L.t;
 	for (int k = 0; k < context.request.nbTeams; ++k)
 		game.addTeam();
-	writeUndermap(game.map, L.terrain);
+	writeVertices(game.map, L.terrain);
 	context.stage = "bastion keys walls";
 	const auto walls = designedStone(game.map, t, L.wall);
 	if (walls.gaps)
@@ -475,7 +476,7 @@ bool generate(Game &game, GenerationContext &context)
 	}
 	for (int i = 0; i < t.size(); ++i)
 		if (L.wall[i])
-			game.map.setResource(i % t.w, i / t.w, STONE, 1);
+			game.map.setResourceByIndex(t.remainderX(i), i / t.w, STONE, 1);
 	context.stage = "bastion keys colonies";
 	for (int team = 0; team < context.request.nbTeams; ++team)
 	{
@@ -498,9 +499,9 @@ bool generate(Game &game, GenerationContext &context)
 	{
 		int planted = 0;
 		for (int i : L.landingFields[f])
-			if (planted < 24 && fertility.values()[i] > 0 && game.map.isGrass(i % t.w, i / t.w))
+			if (planted < 24 && fertility.values()[i] > 0 && game.map.terrainSupportsResourceAtByIndex(t.remainderX(i), i / t.w, WHEAT))
 			{
-				game.map.setResource(i % t.w, i / t.w, WHEAT, 1);
+				game.map.setResourceByIndex(t.remainderX(i), i / t.w, WHEAT, 1);
 				++planted;
 			}
 		context.telemetry.measure("bastion-keys.landing.wheat", planted, int(f));
@@ -563,7 +564,7 @@ bool generate(Game &game, GenerationContext &context)
 			{
 				if (planted >= wanted)
 					break;
-				game.map.setResource(i % t.w, i / t.w, key.kind == 1 ? CHERRY + planted % 3 : STONE,
+				game.map.setResourceByIndex(t.remainderX(i), i / t.w, key.kind == 1 ? CHERRY + planted % 3 : STONE,
 									 1);
 				++planted;
 			}
@@ -603,7 +604,7 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 		return error;
 	if (const auto error = startingAccessFailure(
 			game.map, context.request.nbTeams,
-			{{WHEAT, 28, "plantation wheat"}, {WOOD, 36, "plantation timber"}}, 64, 24);
+			{{MaterialId::Food, 28, "plantation food"}, {MaterialId::Wood, 36, "plantation timber"}}, 64, 24);
 		!error.empty())
 		return error;
 	// Even cleared estates must be islands: crops and buildings cannot disguise a land
@@ -611,7 +612,7 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 	std::vector<unsigned char> clearedGround(t.size());
 	for (int i = 0; i < t.size(); ++i)
 		clearedGround[i] =
-			!game.map.isWater(i % t.w, i / t.w) && game.map.getResource(i).type != STONE;
+			game.map.terrainPropertiesAt(t.remainderX(i), i / t.w).walkable && !permanentResourceBarrier(game.map, i);
 	const auto regions = connectedRegions(clearedGround, t.w, t.h, true, GridNeighbors::Eight);
 	const auto ownership = labelComponents(regions, L.homeOf);
 	if (ownership.conflictTile >= 0)
@@ -637,7 +638,7 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 	// and clearable crops: neither may hide a defect in a permanent enclosure.
 	std::vector<unsigned char> swim(t.size());
 	for (int i = 0; i < t.size(); ++i)
-		swim[i] = !(game.map.getResource(i).type == STONE) && !L.gates[i];
+		swim[i] = !permanentResourceBarrier(game.map, i) && !L.gates[i];
 	for (int team = 0; team < context.request.nbTeams; ++team)
 	{
 		if (countBuildings(game, team, "swimmingpool") != 1)

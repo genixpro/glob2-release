@@ -22,6 +22,26 @@
           "anyOf": [
             {
               "type": "string",
+              "const": "validate-generator"
+            },
+            {
+              "type": "string",
+              "const": "generate-script-map"
+            },
+            {
+              "type": "string",
+              "const": "validate-buildings"
+            },
+            {
+              "type": "string",
+              "const": "validate-ai"
+            },
+            {
+              "type": "string",
+              "const": "validate-set"
+            },
+            {
+              "type": "string",
               "const": "import-ai-map"
             },
             {
@@ -73,6 +93,26 @@
         },
         "kind": {
           "anyOf": [
+            {
+              "type": "string",
+              "const": "validate-generator"
+            },
+            {
+              "type": "string",
+              "const": "generate-script-map"
+            },
+            {
+              "type": "string",
+              "const": "validate-buildings"
+            },
+            {
+              "type": "string",
+              "const": "validate-ai"
+            },
+            {
+              "type": "string",
+              "const": "validate-set"
+            },
             {
               "type": "string",
               "const": "import-ai-map"

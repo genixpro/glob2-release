@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "PowerOfTwo.h"
 #include <algorithm>
 
 #include <FormatableString.h>
@@ -8,6 +9,7 @@
 #include <Toolkit.h>
 
 #include "BuildingFailureDisplay.h"
+#include "BuildingPresentation.h"
 #include "Game.h"
 #include "GameGUI.h"
 #include "GameGUIInternal.h"
@@ -18,23 +20,22 @@
 #include "UnitDisplayNames.h"
 #include "FailureShapes.h"
 
-void GameGUI::drawBuildingHeader(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingHeader(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
 	Uint8 r, g, b;
 
 	// draw "building" of "player"
 	std::string title;
-	std::string key = "[" + buildingType->type + "]";
-	title += Toolkit::getStringTable()->getString(key.c_str());
+	title += buildingDisplayName(*buildingType);
 	{
 		title += " (";
-		title += displayPlayerName(selBuild->owner.firstPlayerName);
+		title += displayPlayerName(selBuild->owner().firstPlayerName);
 		title += ")";
 	}
 
-	if (drawnScene().panels.local.teamNumber == selBuild->owner.teamNumber)
+	if (drawnScene().panels.local.state().number == selBuild->owner().number)
 		{ r=160; g=160; b=255; }
-	else if (drawnScene().panels.local.allies & selBuild->owner.me)
+	else if (drawnScene().panels.local.state().allies & selBuild->owner().mask)
 		{ r=255; g=210; b=20; }
 	else
 		{ r=255; g=50; b=50; }
@@ -47,7 +48,7 @@ void GameGUI::drawBuildingHeader(const SceneBuildingPanel* selBuild, BuildingTyp
 
 	// building text
 	title = "";
-	if ((buildingType->nextLevel>=0) ||  (buildingType->prevLevel>=0))
+	if (selBuild->showLevel)
 	{
 		const std::string textT = Toolkit::getStringTable()->getString("[level]");
 		title += FormattableString("%0 %1").arg(textT).arg(buildingType->level+1);
@@ -73,7 +74,7 @@ void GameGUI::drawBuildingHeader(const SceneBuildingPanel* selBuild, BuildingTyp
 	ypos += YOFFSET_NAME;
 }
 
-void GameGUI::drawBuildingIcon(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int ypos)
+void GameGUI::drawBuildingIcon(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int ypos)
 {
 	Sprite *miniSprite;
 	int imgid;
@@ -92,53 +93,55 @@ void GameGUI::drawBuildingIcon(const SceneBuildingPanel* selBuild, BuildingType*
 	constexpr int BUILDING_ICON_BOX_H_PX = 46;
 	const SpriteCenterOffset off = centerSprite(BUILDING_ICON_BOX_W_PX, BUILDING_ICON_BOX_H_PX, miniSprite, imgid);
 	int ddx = (RIGHT_MENU_HALF_WIDTH - 56) / 2 + 2;
-	miniSprite->setBaseColor(selBuild->owner.color);
+	miniSprite->setBaseColor(presentationColor(selBuild->owner().color));
 	globalContainer->gfx->drawSprite(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+ddx+off.dx, ypos+4+off.dy, miniSprite, imgid);
 	globalContainer->gfx->drawSprite(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+ddx, ypos+4, globalContainer->gamegui, 18);
 	globalContainer->gfx->finishDrawingSprite(miniSprite, 255);
 }
 
-void GameGUI::drawBuildingHP(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int ypos)
+void GameGUI::drawBuildingHP(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int ypos, BuildingPreviewRows& rows)
 {
 	if (!buildingType->hpMax)
 		return;
+	rows.hp=ypos+YOFFSET_TEXT_LINE;
 
 	Uint8 r, g, b;
 	globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 185, 195, 21));
 	globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos, globalContainer->littleFont, Toolkit::getStringTable()->getString("[hp]"));
 	globalContainer->littleFont->popStyle();
 
-	if (selBuild->hp <= selBuild->effectiveMaxHp/5)
+	if (selBuild->state().hp <= selBuild->state().maxHp/5)
 		{ r=255; g=0; b=0; }
 	else
 		{ r=0; g=255; b=0; }
 
 	globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, r, g, b));
-	globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->hp).arg(selBuild->effectiveMaxHp).c_str());
+	globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->state().hp).arg(selBuild->state().maxHp).c_str());
 	globalContainer->littleFont->popStyle();
 }
 
-void GameGUI::drawBuildingInsideStats(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int ypos)
+void GameGUI::drawBuildingInsideStats(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int ypos, BuildingPreviewRows& rows)
 {
 	if (!buildingType->maxUnitInside)
 		return;
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
 
+	rows.inside=ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE;
 	globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 185, 195, 21));
 	globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+YOFFSET_TEXT_LINE, globalContainer->littleFont, Toolkit::getStringTable()->getString("[inside]"));
 	globalContainer->littleFont->popStyle();
-	if (selBuild->buildingState==Building::ALIVE)
+	if (selBuild->state().buildingState==Building::ALIVE)
 	{
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->unitsInside).arg(buildingType->maxUnitInside).c_str());
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->state().inside.count).arg(buildingType->maxUnitInside).c_str());
 	}
 	else
 	{
-		if (selBuild->unitsInside>1)
+		if (selBuild->state().inside.count>1)
 		{
-			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString(Toolkit::getStringTable()->getString("[Units still inside: %0]")).arg(selBuild->unitsInside).c_str());
+			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString(Toolkit::getStringTable()->getString("[Units still inside: %0]")).arg(selBuild->state().inside.count).c_str());
 		}
-		else if (selBuild->unitsInside==1)
+		else if (selBuild->state().inside.count==1)
 		{
 			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont,
 				Toolkit::getStringTable()->getString("[Still one]") );
@@ -146,11 +149,11 @@ void GameGUI::drawBuildingInsideStats(const SceneBuildingPanel* selBuild, Buildi
 	}
 }
 
-void GameGUI::drawBuildingFlagInfo(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int ypos)
+void GameGUI::drawBuildingFlagInfo(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int ypos)
 {
-	if (!buildingType->defaultUnitStayRange)
+	if (!(buildingType->zonable[WORKER] || buildingType->zonable[EXPLORER] || buildingType->zonable[WARRIOR]))
 		return;
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
 
 	// get flag stat — feed the displayed (optimistic) position and range
@@ -162,9 +165,12 @@ void GameGUI::drawBuildingFlagInfo(const SceneBuildingPanel* selBuild, BuildingT
 		const Sint32 stayRangeSquare = (1 + stayRange) * (1 + stayRange);
 		const int w = drawnScene().map.getW(), h = drawnScene().map.getH();
 		// Torus distance, exactly as Map::warpDist1d.
-		const auto warp = [](int a, int b, int size) { int d = std::abs(a - b) % size; return d > size / 2 ? size - d : d; };
-		for (const auto &[x, y] : selBuild->workerPositions)
+		const auto warp = [](int a, int b, int size) { int d = powerOfTwoRemainder(std::abs(a - b), size); return d > size / 2 ? size - d : d; };
+		for (const auto ref : selBuild->workingUnits)
 		{
+            const auto* worker=drawnScene().entities.unit(ref.gid);
+            if (!worker || worker->identity!=ref) continue;
+            const auto x=worker->posX, y=worker->posY;
 			const Sint32 dx = warp(posX, x, w), dy = warp(posY, y, h);
 			if (dx * dx + dy * dy < stayRangeSquare)
 				onSpot++;
@@ -184,33 +190,33 @@ void GameGUI::drawBuildingFlagInfo(const SceneBuildingPanel* selBuild, BuildingT
 	globalContainer->gfx->drawString(globalContainer->gfx->getW()-+RIGHT_MENU_HALF_WIDTH, ypos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, globalContainer->littleFont, FormattableString("%0").arg(onSpot).c_str());
 }
 
-void GameGUI::drawBuildingWorkingControls(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingWorkingControls(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
 	if (!buildingType->maxUnitWorking)
 		return;
 
-	if ((selBuild->owner.allies)&(Team::teamNumberToMask(localTeamNo)))
+	if ((selBuild->owner().allies)&(Team::teamNumberToMask(localTeamNo)))
 	{
-		if (selBuild->buildingState==Building::ALIVE)
+		if (selBuild->state().buildingState==Building::ALIVE)
 		{
 			// If we're replaying, display the actual number, not the locally cached one (changeable by the gui user)
-			const int maxUnitsWorking = (globalContainer->isViewingGame()?selBuild->maxUnitWorking:displayedMaxUnitWorking(*selBuild));
+			const int maxUnitsWorking = (globalContainer->isViewingGame()?selBuild->state().maxUnitWorking:displayedMaxUnitWorking(*selBuild));
 
 			std::string working = Toolkit::getStringTable()->getString("[working]");
 			const int len = globalContainer->littleFont->getStringWidth(working)+4;
 			globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 185, 195, 21));
 			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, working);
 			globalContainer->littleFont->popStyle();
-			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4+len, ypos, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->unitsWorking).arg(maxUnitsWorking).c_str());
-			drawScrollBox(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos+YOFFSET_TEXT_BAR, maxUnitsWorking, selBuild->unitsWorking, MAX_UNIT_WORKING);
+			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4+len, ypos, globalContainer->littleFont, FormattableString("%0/%1").arg(selBuild->state().working.count).arg(maxUnitsWorking).c_str());
+			drawScrollBox(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos+YOFFSET_TEXT_BAR, maxUnitsWorking, selBuild->state().working.count, buildingType->semantics.assignmentLimit);
 		}
 		else
 		{
-			if (selBuild->unitsWorking>1)
+			if (selBuild->state().working.count>1)
 			{
-				globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString(Toolkit::getStringTable()->getString("[Units still working: %0]")).arg(selBuild->unitsWorking).c_str());
+				globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString(Toolkit::getStringTable()->getString("[Units still working: %0]")).arg(selBuild->state().working.count).c_str());
 			}
-			else if (selBuild->unitsWorking==1)
+			else if (selBuild->state().working.count==1)
 			{
 				globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont,
 					Toolkit::getStringTable()->getString("[still one unit working]") );
@@ -224,17 +230,17 @@ void GameGUI::drawBuildingWorkingControls(const SceneBuildingPanel* selBuild, Bu
 	ypos += YOFFSET_BAR+YOFFSET_B_SEP;
 }
 
-void GameGUI::drawBuildingPriorityControls(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingPriorityControls(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
 	if (!buildingType->maxUnitWorking)
 		return;
-	if (!((selBuild->owner.allies)&(Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies)&(Team::teamNumberToMask(localTeamNo))))
 		return;
-	if (selBuild->buildingState != Building::ALIVE)
+	if (selBuild->state().buildingState != Building::ALIVE)
 		return;
 
 	// If we're replaying, display the actual value, not the locally cached one (changeable by the gui user)
-	const int priority = (globalContainer->isViewingGame()?selBuild->priority:displayedPriority(*selBuild));
+	const int priority = (globalContainer->isViewingGame()?selBuild->state().priority:displayedPriority(*selBuild));
 
 	ypos += YOFFSET_B_SEP;
 
@@ -258,50 +264,60 @@ void GameGUI::drawBuildingPriorityControls(const SceneBuildingPanel* selBuild, B
 	ypos += YOFFSET_BAR+YOFFSET_B_SEP;
 }
 
-void GameGUI::drawBuildingRangeControls(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingRangeControls(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
-	if (!buildingType->defaultUnitStayRange)
+	if (buildingType->maxUnitStayRange<=0 || !(buildingType->zonable[WORKER] || buildingType->zonable[EXPLORER] || buildingType->zonable[WARRIOR]))
 		return;
 
-	if ((selBuild->owner.allies)&(Team::teamNumberToMask(localTeamNo)))
+	if ((selBuild->owner().allies)&(Team::teamNumberToMask(localTeamNo)))
 	{
 		// If we're replaying, display the actual number, not the locally cached one (changeable by the gui user)
-		const int unitStayRange = (globalContainer->isViewingGame()?selBuild->unitStayRange:displayedUnitStayRange(*selBuild));
+		const int unitStayRange = (globalContainer->isViewingGame()?selBuild->state().unitStayRange:displayedUnitStayRange(*selBuild));
 
 		std::string range = Toolkit::getStringTable()->getString("[range]");
 		const int len = globalContainer->littleFont->getStringWidth(range)+4;
 		globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 185, 195, 21));
 		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, range);
 		globalContainer->littleFont->popStyle();
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4+len, ypos, globalContainer->littleFont, FormattableString("%0").arg(selBuild->unitStayRange).c_str());
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4+len, ypos, globalContainer->littleFont, FormattableString("%0").arg(selBuild->state().unitStayRange).c_str());
 		drawScrollBox(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos+YOFFSET_TEXT_BAR, unitStayRange, 0, selBuild->type->maxUnitStayRange);
 	}
 	ypos += YOFFSET_BAR+YOFFSET_B_SEP;
 }
 
-void GameGUI::drawBuildingCombatStats(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingCombatStats(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos, BuildingPreviewRows& rows)
 {
 	(void)selBuild;
 	if (buildingType->armor)
 	{
+		rows.armor=ypos;
 		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0: %1").arg(Toolkit::getStringTable()->getString("[armor]")).arg(buildingType->armor).c_str());
 		ypos+=YOFFSET_TEXT_LINE;
 	}
 	if (buildingType->maxUnitInside)
 		ypos += YOFFSET_INFOS;
-	if (buildingType->shootDamage)
+	const int damageRows=buildingProjectileDamageRows(*buildingType);
+	if (damageRows)
 	{
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos+1, globalContainer->littleFont, FormattableString("%0 : %1").arg(Toolkit::getStringTable()->getString("[damage]")).arg(buildingType->shootDamage).c_str());
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos+12, globalContainer->littleFont, FormattableString("%0 : %1").arg(Toolkit::getStringTable()->getString("[range]")).arg(buildingType->shootingRange).c_str());
-		ypos += YOFFSET_TOWER;
+		rows.damageRows=damageRows;
+		rows.range=ypos+1+damageRows*11;
+		for (int row=0; row<damageRows; ++row)
+		{
+			rows.damage[row]=ypos+1+row*11;
+			const std::string label=damageRows==1 ? Toolkit::getStringTable()->getString("[damage]") : getUnitName(row);
+			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos+1+row*11, globalContainer->littleFont,
+				FormattableString("%0 : %1").arg(label).arg(buildingType->semantics.projectileDamage[row]).c_str());
+		}
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos+1+damageRows*11, globalContainer->littleFont, FormattableString("%0 : %1").arg(Toolkit::getStringTable()->getString("[range]")).arg(buildingType->shootingRange).c_str());
+		ypos += buildingProjectileStatsHeight(*buildingType);
 	}
 }
 
-void GameGUI::drawBuildingExchange(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingExchange(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos, BuildingPreviewRows& rows)
 {
 	if (!buildingType->canExchange)
 		return;
-	if (!((selBuild->owner.sharedVisionExchange)&(Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().exchangeVision)&(Team::teamNumberToMask(localTeamNo))))
 		return;
 
 	globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 185, 195, 21));
@@ -311,20 +327,21 @@ void GameGUI::drawBuildingExchange(const SceneBuildingPanel* selBuild, BuildingT
 	ypos += YOFFSET_TEXT_PARA;
 	for (unsigned i=0; i<HAPPINESS_COUNT; i++)
 	{
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 (%1/%2)").arg(getResourceName(i+HAPPINESS_BASE)).arg(selBuild->resources[i+HAPPINESS_BASE]).arg(buildingType->maxResource[i+HAPPINESS_BASE]).c_str());
+		rows.resource[i+HAPPINESS_BASE]=ypos;
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 (%1/%2)").arg(getMaterialName(i+HAPPINESS_BASE)).arg(selBuild->materials[i+HAPPINESS_BASE]).arg(buildingType->maxMaterial[i+HAPPINESS_BASE]).c_str());
 
 		/*
 		// Exchange feature is broken/disabled. If revived, this should use
 		// BuildingGuiState::pendingReceiveResourceMask /
 		// pendingSendResourceMask (TODO: add) for the in-flight mask, falling
-		// back to receiveResourceMask / sendResourceMask. See the equivalent
+		// back to receiveMaterialMask / sendMaterialMask. See the equivalent
 		// pattern for ratio / priority.
 		int inId, outId;
-		if (selBuild->receiveResourceMask & (1<<i))
+		if (selBuild->receiveMaterialMask & (1<<i))
 			inId = 20;
 		else
 			inId = 19;
-		if (selBuild->sendResourceMask & (1<<i))
+		if (selBuild->sendMaterialMask & (1<<i))
 			outId = 20;
 		else
 			outId = 19;
@@ -336,25 +353,27 @@ void GameGUI::drawBuildingExchange(const SceneBuildingPanel* selBuild, BuildingT
 	}
 }
 
-void GameGUI::drawBuildingResources(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingResources(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos, BuildingPreviewRows& rows)
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
-	if (buildingType->canExchange)
-		return;
-
-	// resources in
-	for (unsigned i=0; i<globalContainer->resourcesTypes.size(); i++)
+	// resources in. A market's fruit is drawn by drawBuildingExchange; its
+	// basic-resource stock, from level 2 on, is listed here like any store.
+	for (unsigned i=0; i<MaterialCount; i++)
 	{
-		if (buildingType->maxResource[i])
+		if (buildingType->canExchange && i>=HAPPINESS_BASE && i<HAPPINESS_BASE+HAPPINESS_COUNT)
+			continue;
+		if (buildingType->maxMaterial[i] && drawnScene().materialVisible(i))
 		{
-			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 : %1/%2").arg(getResourceName(i)).arg(selBuild->resources[i]).arg(buildingType->maxResource[i]).c_str());
+			rows.resource[i]=ypos;
+			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 : %1/%2").arg(getMaterialName(i)).arg(selBuild->materials[i]).arg(buildingType->maxMaterial[i]).c_str());
 			ypos += YOFFSET_RESOURCE_LINE;
 		}
 	}
 	if (buildingType->maxBullets)
 	{
-		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 : %1/%2").arg(Toolkit::getStringTable()->getString("[Bullets]")).arg(selBuild->bullets).arg(buildingType->maxBullets).c_str());
+		rows.bullets=ypos;
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont, FormattableString("%0 : %1/%2").arg(Toolkit::getStringTable()->getString("[Bullets]")).arg(selBuild->state().bullets).arg(buildingType->maxBullets).c_str());
 		ypos += YOFFSET_RESOURCE_LINE;
 	}
 	ypos += YOFFSET_RESOURCE_SECTION_PAD;
@@ -369,14 +388,15 @@ void GameGUI::drawBuildingResources(const SceneBuildingPanel* selBuild, Building
 // darker overlay). During replay no pending state exists, so both channels
 // equal ratio[i] and overlay exactly; during normal play they differ briefly
 // while OrderModifySwarm is in flight.
-void GameGUI::drawBuildingSwarmRatios(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingSwarmRatios(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
-	if (!buildingType->unitProductionTime)
+	if (!buildingType->semantics.production.enabledUnitMask)
 		return;
 
-	int left=(selBuild->productionTimeout*SWARM_PROGRESS_BAR_WIDTH)/buildingType->unitProductionTime;
+	const int duration=std::max(1,selBuild->productionDuration);
+	int left=std::clamp(int(Sint64(selBuild->state().productionTimeout)*SWARM_PROGRESS_BAR_WIDTH/duration),0,SWARM_PROGRESS_BAR_WIDTH);
 	int elapsed=SWARM_PROGRESS_BAR_WIDTH-left;
 	globalContainer->gfx->drawFilledRect(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos, elapsed, SWARM_PROGRESS_BAR_HEIGHT, 100, 100, 255);
 	globalContainer->gfx->drawFilledRect(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+elapsed, ypos, left, SWARM_PROGRESS_BAR_HEIGHT, 128, 128, 128);
@@ -385,7 +405,8 @@ void GameGUI::drawBuildingSwarmRatios(const SceneBuildingPanel* selBuild, Buildi
 	const std::array<Sint32, NB_UNIT_TYPE> displayed = displayedRatio(*selBuild);
 	for (int i=0; i<NB_UNIT_TYPE; i++)
 	{
-		drawScrollBox(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos, displayed[i], selBuild->ratio[i], MAX_RATIO_RANGE);
+		if (!buildingType->semantics.production.recipes[i].enabled) continue;
+		drawScrollBox(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos, displayed[i], selBuild->state().ratio[i], MAX_RATIO_RANGE);
 		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+24, ypos, globalContainer->littleFont, getUnitName(i));
 
 		if(i==1 && highlights.find(HighlightRatioBar) != highlights.end())
@@ -430,9 +451,9 @@ static const char* failureReasonKey(Building::UnitCantWorkReason reason, bool is
 	return kReasonKey[reason];
 }
 
-void GameGUI::drawBuildingFailureReasons(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingFailureReasons(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
 
 	// Only show the failure-reason rows when the building is still asking for
@@ -440,16 +461,16 @@ void GameGUI::drawBuildingFailureReasons(const SceneBuildingPanel* selBuild, Bui
 	// idle units (UnitNotAvailable only) is in its normal state and gets no
 	// rows; see shouldShowFailingUnitMarkers, which the map view's badges ask
 	// too so that the rows and the badges cannot disagree.
-	if (!shouldShowFailingUnitMarkers(selBuild->unitsFailingRequirements.data(),
+	if (!shouldShowFailingUnitMarkers(selBuild->state().unitsFailingRequirements,
 	                                  Building::UnitCantWorkReasonSize,
 	                                  Building::UnitNotAvailable,
-	                                  selBuild->unitsWorking,
-	                                  selBuild->desiredMaxUnitWorking))
+	                                  selBuild->state().working.count,
+	                                  selBuild->state().desiredMaxUnitWorking))
 		return;
 
 	for(unsigned j=0; j<Building::UnitCantWorkReasonSize; ++j)
 	{
-		int n = selBuild->unitsFailingRequirements[j];
+		int n = selBuild->state().unitsFailingRequirements[j];
 		if(n>0)
 		{
 			const Building::UnitCantWorkReason reason = static_cast<Building::UnitCantWorkReason>(j);
@@ -465,100 +486,91 @@ void GameGUI::drawBuildingFailureReasons(const SceneBuildingPanel* selBuild, Bui
 	}
 }
 
-void GameGUI::drawBuildingActionButtons(const SceneBuildingPanel* selBuild, BuildingType* buildingType, unsigned unitInsideBarYDec)
+GameGUI::BuildingPreview GameGUI::hoveredBuildingPreview(const SceneBuildingPanel& building) const
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+    if (!building.valid || building.owner().number!=drawnScene().panels.local.state().number
+        || !(building.owner().allies&Team::teamNumberToMask(localTeamNo))
+        || building.state().constructionResultState!=Building::NO_CONSTRUCTION
+        || building.state().buildingState!=Building::ALIVE || building.type->isBuildingSite)
+        return BuildingPreview::None;
+    const int x=globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET;
+    const int y=globalContainer->gfx->getH()-BOTTOM_BUTTON_PRIMARY_YOFFSET;
+    if (mouseX<=x+12 || mouseX>=globalContainer->gfx->getW()-12
+        || mouseY<=y || mouseY>=y+BOTTOM_BUTTON_HEIGHT)
+        return BuildingPreview::None;
+    if (building.state().hp<building.state().maxHp)
+        return building.type->semantics.repairable && building.hardSpaceForRepair
+            ? BuildingPreview::Repair : BuildingPreview::None;
+    return building.type->nextLevel>=0 && building.hardSpaceForUpgrade
+        ? BuildingPreview::Upgrade : BuildingPreview::None;
+}
+
+void GameGUI::drawBuildingActionButtons(const SceneBuildingPanel* selBuild, const BuildingType* buildingType)
+{
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
-	if (selBuild->owner.teamNumber != drawnScene().panels.local.teamNumber)
+	if (selBuild->owner().number != drawnScene().panels.local.state().number)
 		return;
 
 	const int btnX = globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET;
 	const int primaryY = globalContainer->gfx->getH()-BOTTOM_BUTTON_PRIMARY_YOFFSET;
 	const int secondaryY = globalContainer->gfx->getH()-BOTTOM_BUTTON_SECONDARY_YOFFSET;
 
-	if (selBuild->constructionResultState==Building::REPAIR)
+	if (selBuild->state().constructionResultState==Building::REPAIR)
 	{
-		if (buildingType->isBuildingSite)
-			assert(buildingType->nextLevel!=-1);
 		drawBlueButton(btnX, primaryY, "[cancel repair]");
 	}
-	else if (selBuild->constructionResultState==Building::UPGRADE)
+	else if (selBuild->state().constructionResultState==Building::UPGRADE)
 	{
 		assert(buildingType->nextLevel!=-1);
-		if (buildingType->isBuildingSite)
-			assert(buildingType->prevLevel!=-1);
 		drawBlueButton(btnX, primaryY, "[cancel upgrade]");
 	}
-	else if ((selBuild->constructionResultState==Building::NO_CONSTRUCTION) && (selBuild->buildingState==Building::ALIVE) && !buildingType->isBuildingSite)
+	else if ((selBuild->state().constructionResultState==Building::NO_CONSTRUCTION) && (selBuild->state().buildingState==Building::ALIVE) && !buildingType->isBuildingSite)
 	{
-		if (selBuild->hp<selBuild->effectiveMaxHp)
+		if (selBuild->state().hp<selBuild->state().maxHp)
 		{
 			// repair
-			if (selBuild->type->regenerationSpeed==0 && selBuild->hardSpaceForRepair && drawnScene().panels.local.maxBuildLevel>=buildingType->level)
+			if (selBuild->type->semantics.repairable && selBuild->hardSpaceForRepair)
 			{
 				drawBlueButton(btnX, primaryY, "[repair]");
-				if ( mouseX>btnX+12 && mouseX<globalContainer->gfx->getW()-12
-					&& mouseY>primaryY && mouseY<primaryY+BOTTOM_BUTTON_HEIGHT )
-					{
-						globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 200, 200, 255));
-						int resources[BASIC_COUNT];
-						std::copy(selBuild->repairCost, selBuild->repairCost + BASIC_COUNT, resources);
-						drawCosts(resources, globalContainer->littleFont);
-						globalContainer->littleFont->popStyle();
-					}
 			}
 		}
 		else if (buildingType->nextLevel!=-1)
 		{
 			// upgrade
-			if (selBuild->hardSpaceForUpgrade && (drawnScene().panels.local.maxBuildLevel>buildingType->level))
+			if (selBuild->hardSpaceForUpgrade)
 			{
 				drawBlueButton(btnX, primaryY, "[upgrade]");
-				if ( mouseX>btnX+12 && mouseX<globalContainer->gfx->getW()-12
-					&& mouseY>primaryY && mouseY<primaryY+BOTTOM_BUTTON_HEIGHT )
-					{
-						globalContainer->littleFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 200, 200, 255));
-						drawBuildingUpgradePreview(selBuild, buildingType, unitInsideBarYDec);
-						globalContainer->littleFont->popStyle();
-					}
 			}
 		}
 	}
 
 	// building destruction
-	if (selBuild->buildingState==Building::WAITING_FOR_DESTRUCTION)
+	if (selBuild->state().buildingState==Building::WAITING_FOR_DESTRUCTION)
 	{
 		drawRedButton(btnX, secondaryY, "[cancel destroy]");
 	}
-	else if (selBuild->buildingState==Building::ALIVE)
+	else if (selBuild->state().buildingState==Building::ALIVE)
 	{
 		drawRedButton(btnX, secondaryY, "[destroy]");
 	}
 }
 
-void GameGUI::drawBuildingTimeToLeaveBar(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos, unsigned& unitInsideBarYDec)
+void GameGUI::drawBuildingTimeToLeaveBar(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos, unsigned& unitInsideBarYDec)
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
 
-	// we select food buildings, heal buildings, and upgrade buildings:
-	int maxTimeTo=0;
-	if (buildingType->timeToFeedUnit)
-		maxTimeTo=buildingType->timeToFeedUnit;
-	else if (buildingType->timeToHealUnit)
-		maxTimeTo=buildingType->timeToHealUnit;
-	else
-		for (int i=0; i<NB_ABILITY; i++)
-			if (buildingType->upgradeTime[i])
-				maxTimeTo=std::max(maxTimeTo, buildingType->upgradeTime[i]);
+	const int maxTimeTo=buildingServiceProgressTimeout(*buildingType);
 	int dec = (RIGHT_MENU_RIGHT_OFFSET-128);
 	if (maxTimeTo)
 	{
 		globalContainer->gfx->drawFilledRect(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET, ypos, 128, 7, 168, 150, 90);
-		for (const SceneBuildingPanel::InsideUnit &inside : selBuild->insideUnits)
+		for (const auto ref : selBuild->insideUnits)
 		{
-			const SceneBuildingPanel::InsideUnit *u = &inside;
-			if (u->inside)
+            const auto* u=drawnScene().entities.unit(ref.gid);
+            if (!u || u->identity!=ref) continue;
+			if (u->displacement==UnitState::DIS_INSIDE)
 			{
 				int dividend=-u->insideTimeout*128+128-u->delta/2;
 				int divisor=1+maxTimeTo;
@@ -591,24 +603,23 @@ void GameGUI::drawBuildingTimeToLeaveBar(const SceneBuildingPanel* selBuild, Bui
 	}
 }
 
-void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, BuildingType* buildingType, int& ypos)
+void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, const BuildingType* buildingType, int& ypos)
 {
-	if (!((selBuild->owner.allies) & (Team::teamNumberToMask(localTeamNo))))
+	if (!((selBuild->owner().allies) & (Team::teamNumberToMask(localTeamNo))))
 		return;
 
-	// cleared resources for clearing flags: one checkbox row per clearable
-	// resource (stone is never cleared, so it has no row)
-	if (buildingType->type == "clearingflag")
+	// Clearing flags select materials yielded by clearable resource definitions.
+	if (buildingType->zonable[WORKER])
 	{
 		ypos += YOFFSET_B_SEP;
 		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont,
 			Toolkit::getStringTable()->getString("[Clearing:]"));
 		ypos += YOFFSET_TEXT_PARA;
-		for (int i=0; i<BASIC_COUNT; i++)
-			if (i!=STONE)
+		for (int i=0; i<MaterialCount; i++)
+			if (drawnScene().clearableMaterial(i))
 			{
 				globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+28, ypos, globalContainer->littleFont,
-					getResourceName(i));
+					getMaterialName(i));
 				int spriteId;
 				if (displayedClearingResource(*selBuild, i))
 					spriteId=20;
@@ -619,9 +630,30 @@ void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, Build
 				ypos+=YOFFSET_TEXT_PARA;
 			}
 	}
+	// min worker qualification for war flags: one radio row per worker level;
+	// row i means minLevelToFlag==i, shown to the player as level 1+i
+	if (buildingType->zonable[WORKER])
+	{
+		ypos += YOFFSET_B_SEP;
+		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont,
+			std::string(getUnitName(WORKER))+": "+Toolkit::getStringTable()->getString("[Min required level:]"));
+		ypos += YOFFSET_TEXT_PARA;
+		for (int i=0; i<NB_UNIT_LEVELS; i++)
+		{
+			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+28, ypos, globalContainer->littleFont, 1+i);
+			int spriteId;
+			if (i==displayedMinWorkerLevelToFlag(*selBuild))
+				spriteId=20;
+			else
+				spriteId=19;
+			globalContainer->gfx->drawSprite(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+10, ypos+2, globalContainer->gamegui, spriteId);
+
+			ypos+=YOFFSET_TEXT_PARA;
+		}
+	}
 	// min war level for war flags: one radio row per warrior level;
 	// row i means minLevelToFlag==i, shown to the player as level 1+i
-	else if (buildingType->type == "warflag")
+	if (buildingType->zonable[WARRIOR])
 	{
 		ypos += YOFFSET_B_SEP;
 		globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, ypos, globalContainer->littleFont,
@@ -641,9 +673,8 @@ void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, Build
 		}
 	}
 	// explorer requirement for exploration flags: one radio row per
-	// EXPLORATION_FLAG_OPTION_* value (see GameGUIInternal.h — the flag
-	// reuses minLevelToFlag as a which-explorers-may-answer choice)
-	else if (buildingType->type == "explorationflag")
+	// EXPLORATION_FLAG_OPTION_* value, independent of ground-unit filters.
+	if (buildingType->zonable[EXPLORER])
 	{
 		static const char* const optionKeys[EXPLORATION_FLAG_OPTION_COUNT] = {
 			"[any explorer]",  // EXPLORATION_FLAG_OPTION_ANY_EXPLORER
@@ -660,7 +691,7 @@ void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, Build
 			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+28, ypos, globalContainer->littleFont,
 				Toolkit::getStringTable()->getString(optionKeys[i]));
 			int spriteId;
-			if (displayedMinLevelToFlag(*selBuild) == i)
+			if (displayedExplorersRequireBombing(*selBuild) == i)
 				spriteId = 20;
 			else
 				spriteId = 19;
@@ -671,59 +702,52 @@ void GameGUI::drawBuildingFlagControls(const SceneBuildingPanel* selBuild, Build
 	}
 }
 
-void GameGUI::drawBuildingUpgradePreview(const SceneBuildingPanel* selBuild, BuildingType* buildingType, unsigned unitInsideBarYDec)
+void GameGUI::drawBuildingUpgradePreview(const SceneBuildingPanel* selBuild, const BuildingType* buildingType,
+    const BuildingPreviewRows& rows, int& ypos)
 {
-	// We draw the resources cost.
-	int typeNum=buildingType->nextLevel;
-	BuildingType *bt=globalContainer->buildingsTypes.get(typeNum);
-	drawCosts(bt->maxResource, globalContainer->littleFont);
-
-	// We draw the new abilities:
-	int blueYpos = YPOS_BASE_BUILDING + YOFFSET_NAME;
-
-	bt=globalContainer->buildingsTypes.get(bt->nextLevel);
-
-	if (bt->hpMax)
-		drawValueAlignedRight(blueYpos+YOFFSET_TEXT_LINE,
-			bt->hpMax * selBuild->buildingHpMultiplier);
-	if (bt->maxUnitInside)
-		drawValueAlignedRight(blueYpos+YOFFSET_TEXT_PARA+2*YOFFSET_TEXT_LINE, bt->maxUnitInside);
-	blueYpos += YOFFSET_ICON+YOFFSET_B_SEP;
-
-	if (buildingType->maxUnitWorking)
-		blueYpos += YOFFSET_BAR+YOFFSET_B_SEP;
-
-	if (bt->armor)
-	{
-		if (!buildingType->armor)
-			globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4, blueYpos-1, globalContainer->littleFont, Toolkit::getStringTable()->getString("[armor]"));
-		drawValueAlignedRight(blueYpos-1, bt->armor);
-		blueYpos+=YOFFSET_TEXT_LINE;
-	}
-	if (buildingType->maxUnitInside)
-		blueYpos += YOFFSET_INFOS;
-	if (bt->shootDamage)
-	{
-		drawValueAlignedRight(blueYpos+1, bt->shootDamage);
-		drawValueAlignedRight(blueYpos+12, bt->shootingRange);
-		blueYpos += YOFFSET_TOWER;
-	}
-	blueYpos += unitInsideBarYDec;
-	blueYpos += YOFFSET_B_SEP;
-
-	unsigned j = 0;
-	for (unsigned i=0; i<globalContainer->resourcesTypes.size(); i++)
-	{
-		if (buildingType->maxResource[i])
-		{
-			drawValueAlignedRight(blueYpos+(j*11), bt->maxResource[i]);
-			j++;
-		}
-	}
-
-	if (bt->maxBullets)
-	{
-		drawValueAlignedRight(blueYpos+(j*11), bt->maxBullets);
-		j++;
-	}
+    // Dense IDs belong to the published PresentationFrame's retained catalog. A newer
+    // simulation catalog must not change the meaning of an older frame.
+    const auto& types=drawnScene().buildingTypes;
+    if (!types || buildingType->nextLevel<0 || size_t(buildingType->nextLevel)>=types->size()) return;
+    const auto* site=&(*types)[buildingType->nextLevel];
+    if (site->nextLevel<0 || size_t(site->nextLevel)>=types->size()) return;
+    const auto* target=&(*types)[site->nextLevel];
+    // Existing rows receive the target value at the exact coordinate recorded
+    // by their draw helper. Target-only metrics use labeled appendix rows, so
+    // none of the current controls or their click regions move on hover.
+    bool heading=false;
+    const auto beginAppendix=[&]() {
+        if (heading) return;
+        ypos+=YOFFSET_B_SEP;
+        globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4,
+            ypos,globalContainer->littleFont,Toolkit::getStringTable()->getString("[upgrade]"));
+        ypos+=YOFFSET_TEXT_PARA;heading=true;
+    };
+    const auto metric=[&](int row,const std::string& label,int value) {
+        if (row>=0) { drawValueAlignedRight(row,value);return; }
+        if (!value) return;
+        beginAppendix();
+        globalContainer->gfx->drawString(globalContainer->gfx->getW()-RIGHT_MENU_RIGHT_OFFSET+4,
+            ypos,globalContainer->littleFont,label);
+        drawValueAlignedRight(ypos,value);ypos+=YOFFSET_RESOURCE_LINE;
+    };
+    metric(rows.hp,Toolkit::getStringTable()->getString("[hp]"),target->hpMax*selBuild->buildingHpMultiplier);
+    metric(rows.inside,Toolkit::getStringTable()->getString("[inside]"),target->maxUnitInside);
+    metric(rows.armor,Toolkit::getStringTable()->getString("[armor]"),target->armor);
+    const int damageRows=buildingProjectileDamageRows(*target);
+    if (rows.damageRows==1 && damageRows<=1)
+        metric(rows.damage[0],Toolkit::getStringTable()->getString("[damage]"),damageRows ? target->semantics.projectileDamage[0] : 0);
+    else if (rows.damageRows==NB_UNIT_TYPE || damageRows==NB_UNIT_TYPE)
+        for (int unit=0;unit<NB_UNIT_TYPE;++unit)
+            metric(rows.damageRows==NB_UNIT_TYPE ? rows.damage[unit] : -1,getUnitName(unit),
+                damageRows ? target->semantics.projectileDamage[unit] : 0);
+    else if (damageRows)
+        metric(-1,Toolkit::getStringTable()->getString("[damage]"),target->semantics.projectileDamage[0]);
+    metric(rows.range,Toolkit::getStringTable()->getString("[range]"),damageRows ? target->shootingRange : 0);
+    for (int resource=0;resource<MaterialCount;++resource)
+        if (drawnScene().materialVisible(resource))
+            metric(rows.resource[resource],getMaterialName(resource),target->maxMaterial[resource]);
+    metric(rows.bullets,Toolkit::getStringTable()->getString("[Bullets]"),target->maxBullets);
+    beginAppendix();
+    drawCosts(site->semantics.constructionCost.data(),globalContainer->littleFont,ypos);
 }

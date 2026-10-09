@@ -24,6 +24,7 @@ class SDLRenderBackend final : public RenderBackend
 	std::vector<SDL_Vertex> transformed;
 	std::unordered_map<const void *, SDL_Texture *> textures;
 	std::unordered_map<const void *, std::uint64_t> revisions;
+	std::unordered_map<const void *, bool> premultiplied;
 	RenderOperations counts;
 
   public:
@@ -32,6 +33,11 @@ class SDLRenderBackend final : public RenderBackend
 	{
 		reset();
 		SDL_DestroyRenderer(renderer);
+	}
+	int maximumTextureSize() const override
+	{
+		return int(SDL_GetNumberProperty(SDL_GetRendererProperties(renderer),
+										 SDL_PROP_RENDERER_MAX_TEXTURE_SIZE_NUMBER, 0));
 	}
 	void transform(float factor, float x, float y, const SDL_Rect *output) override
 	{
@@ -52,11 +58,67 @@ class SDLRenderBackend final : public RenderBackend
 					  y = int(std::floor(rect->y * scale + offsetY));
 			SDL_Rect mapped{x, y, int(std::ceil((rect->x + rect->w) * scale + offsetX)) - x,
 							int(std::ceil((rect->y + rect->h) * scale + offsetY)) - y};
-			if (bounds)
-				SDL_GetRectIntersection(&mapped, &*bounds, &mapped);
+			if (bounds && !SDL_GetRectIntersection(&mapped, &*bounds, &mapped))
+				mapped = {}; // SDL treats negative clip extents as clipping disabled.
 			result = mapped;
 		}
+		if (result && (result->w <= 0 || result->h <= 0))
+			result = SDL_Rect{};
 		check(SDL_SetRenderClipRect(renderer, result ? &*result : nullptr));
+	}
+	SDL_Texture *textureFor(const void *key, SDL_Surface *pixels, std::uint64_t revision,
+							bool linear = false)
+	{
+		SDL_Texture *texture = nullptr;
+		if (!pixels)
+			throw std::invalid_argument("Texture has no CPU pixels");
+		auto version = revisions.find(key);
+		if (version == revisions.end() || version->second != revision ||
+			premultiplied[key] != linear)
+			forget(key);
+		auto found = textures.find(key);
+		if (found == textures.end())
+		{
+			// Linear filtering must interpolate premultiplied color, as the
+			// live skin atlas does. Storage and CPU pages remain straight alpha.
+			std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> converted(
+				nullptr, SDL_DestroySurface);
+			if (linear)
+			{
+				converted.reset(SDL_ConvertSurface(pixels, SDL_PIXELFORMAT_ARGB8888));
+				if (!converted || !SDL_LockSurface(converted.get()))
+					throw std::runtime_error(SDL_GetError());
+				for (int y = 0; y < converted->h; ++y)
+					for (int x = 0; x < converted->w; ++x)
+					{
+						auto &p = reinterpret_cast<Uint32 *>(
+							static_cast<Uint8 *>(converted->pixels) + y * converted->pitch)[x];
+						const Uint32 a = p >> 24;
+						p = (a << 24) | (((((p >> 16) & 255) * a + 127) / 255) << 16) |
+							(((((p >> 8) & 255) * a + 127) / 255) << 8) |
+							(((p & 255) * a + 127) / 255);
+					}
+				SDL_UnlockSurface(converted.get());
+			}
+			texture = SDL_CreateTextureFromSurface(renderer, linear ? converted.get() : pixels);
+			if (!texture)
+				throw std::runtime_error(SDL_GetError());
+			textures.emplace(key, texture);
+			revisions[key] = revision;
+			premultiplied[key] = linear;
+			check(SDL_SetTextureBlendMode(texture, linear ? SDL_BLENDMODE_BLEND_PREMULTIPLIED
+														  : SDL_BLENDMODE_BLEND));
+			check(SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST));
+		}
+		else
+			texture = found->second;
+		check(SDL_SetTextureScaleMode(texture,
+									  linear ? SDL_SCALEMODE_LINEAR : SDL_SCALEMODE_NEAREST));
+		return texture;
+	}
+	void prepareTexture(const void *key, SDL_Surface *pixels, std::uint64_t revision) override
+	{
+		textureFor(key, pixels, revision);
 	}
 	void triangles(std::span<const SDL_Vertex> vertices, const void *key, SDL_Surface *pixels,
 				   std::uint64_t revision) override
@@ -68,7 +130,7 @@ class SDLRenderBackend final : public RenderBackend
 		submit(vertices, nullptr, nullptr, false, false);
 	}
 	void submit(std::span<const SDL_Vertex> vertices, const void *key, SDL_Surface *pixels,
-				std::uint64_t revision, bool applyTransform)
+				std::uint64_t revision, bool applyTransform, bool linear = false)
 	{
 		if (vertices.empty())
 			return;
@@ -78,26 +140,7 @@ class SDLRenderBackend final : public RenderBackend
 			throw std::invalid_argument("Invalid triangle batch size");
 		SDL_Texture *texture = nullptr;
 		if (key)
-		{
-			if (!pixels)
-				throw std::invalid_argument("Texture has no CPU pixels");
-			auto version = revisions.find(key);
-			if (version == revisions.end() || version->second != revision)
-				forget(key);
-			auto found = textures.find(key);
-			if (found == textures.end())
-			{
-				texture = SDL_CreateTextureFromSurface(renderer, pixels);
-				if (!texture)
-					throw std::runtime_error(SDL_GetError());
-				textures.emplace(key, texture);
-				revisions[key] = revision;
-				check(SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_BLEND));
-				check(SDL_SetTextureScaleMode(texture, SDL_SCALEMODE_NEAREST));
-			}
-			else
-				texture = found->second;
-		}
+			texture = textureFor(key, pixels, revision, linear);
 		if (applyTransform && (scale != 1 || offsetX != 0 || offsetY != 0))
 		{
 			transformed.assign(vertices.begin(), vertices.end());
@@ -123,6 +166,19 @@ class SDLRenderBackend final : public RenderBackend
 		const SDL_Vertex vertices[] = {a, b, e, a, e, d};
 		submit(vertices, key, pixels, revision, true);
 	}
+	void blitLinear(const void *key, SDL_Surface *pixels, std::uint64_t revision,
+					const SDL_Rect &src, const SDL_FRect &dst, Uint8 alpha) override
+	{
+		++counts.blits;
+		const float opacity = alpha / 255.f;
+		const SDL_FColor c{opacity, opacity, opacity, opacity};
+		const float u0 = float(src.x) / pixels->w, v0 = float(src.y) / pixels->h;
+		const float u1 = float(src.x + src.w) / pixels->w, v1 = float(src.y + src.h) / pixels->h;
+		const SDL_Vertex a{{dst.x, dst.y}, c, {u0, v0}}, b{{dst.x + dst.w, dst.y}, c, {u1, v0}},
+			d{{dst.x, dst.y + dst.h}, c, {u0, v1}}, e{{dst.x + dst.w, dst.y + dst.h}, c, {u1, v1}};
+		const SDL_Vertex vertices[] = {a, b, e, a, e, d};
+		submit(vertices, key, pixels, revision, true, true);
+	}
 	void fill(const SDL_FRect &rect, SDL_Color color) override
 	{
 		const SDL_FColor c{color.r / 255.0f, color.g / 255.0f, color.b / 255.0f, color.a / 255.0f};
@@ -143,6 +199,7 @@ class SDLRenderBackend final : public RenderBackend
 			textures.erase(found);
 		}
 		revisions.erase(key);
+		premultiplied.erase(key);
 	}
 	void reset() override
 	{
@@ -150,6 +207,7 @@ class SDLRenderBackend final : public RenderBackend
 			SDL_DestroyTexture(texture);
 		textures.clear();
 		revisions.clear();
+		premultiplied.clear();
 	}
 	void clear()
 	{
@@ -158,7 +216,8 @@ class SDLRenderBackend final : public RenderBackend
 	}
 	void logicalSize(int width, int height) override
 	{
-		check(SDL_SetRenderLogicalPresentation(renderer, width, height, SDL_LOGICAL_PRESENTATION_LETTERBOX));
+		check(SDL_SetRenderLogicalPresentation(renderer, width, height,
+											   SDL_LOGICAL_PRESENTATION_LETTERBOX));
 		clear();
 	}
 	void nativeLogicalSize(int width, int height) override
@@ -183,7 +242,8 @@ class SDLRenderBackend final : public RenderBackend
 	SDL_Surface *capture() override
 	{
 		SDL_Surface *pixels = SDL_RenderReadPixels(renderer, nullptr);
-		if (!pixels) throw std::runtime_error(SDL_GetError());
+		if (!pixels)
+			throw std::runtime_error(SDL_GetError());
 		return pixels;
 	}
 };

@@ -26,8 +26,8 @@
 // ---------------------------------------------------------------------------
 // Tick / time intervals
 //
-// All AICastor cadences are measured in 40 ms engine ticks
-// (GAME_TICKS_PER_SECOND = 25, see EngineTiming.h).
+// All AICastor cadences are measured in 33⅓ ms engine ticks
+// (GAME_TICKS_PER_SECOND = 30, see EngineTiming.h).
 // ---------------------------------------------------------------------------
 
 // Initial / post-upgrade cooldown (~1.3 s) before controlUpgrades fires
@@ -493,21 +493,7 @@ static constexpr int AI_CASTOR_GRADIENT_WALL = 255;
 // Maps.cpp — terrain ranges, gradient stamps, hydration / wheat
 // ---------------------------------------------------------------------------
 
-// Terrain ID layout (matches the engine's tile-set encoding):
-//   [0,    16)  : grass (16 tiles)
-//   [256,  272) : water (16 tiles)
-//   [256,  272) : sand  (16 tiles, same range as water in this code)
-// `Maps.cpp:42` uses `>=256 && <256+16` for "is water"; `Maps.cpp:469` uses
-// the identical range for "is sand"; `Maps.cpp:67` uses `>=16` and
-// `Maps.cpp:519` uses `>16` for "is not grass".  See bug M6 — the >=16
-// vs >16 asymmetry in `notGrassMap` vs `obstacleBuildingMap` is preserved
-// verbatim by this rename pass (do NOT change the operator).
-// C++: Maps.cpp:42, 67, 469, 519.
-static constexpr int AI_CASTOR_TERRAIN_GRASS_COUNT = 16;
-static constexpr int AI_CASTOR_TERRAIN_WATER_FIRST = 256;
-static constexpr int AI_CASTOR_TERRAIN_WATER_COUNT = 16;
-static constexpr int AI_CASTOR_TERRAIN_SAND_FIRST = 256;
-static constexpr int AI_CASTOR_TERRAIN_SAND_COUNT = 16;
+// Terrain behavior is defined by TerrainProperties; sprite ranges are not AI rules.
 
 // computeWorkPowerMap: max gradient radius and the "/2" half-map cap.
 // C++: Maps.cpp:324, 325, 326.

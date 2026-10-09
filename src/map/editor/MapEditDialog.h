@@ -5,12 +5,25 @@
 #pragma once
 
 #include "Team.h"
+#include "map/TerrainRegistry.h"
+#include "resource/ResourceRegistry.h"
+#include "BrushCatalog.h"
+class BrushSwatches;
+namespace GAGCore
+{
+class DrawableSurface;
+}
 #include "ui/FrontendUI.h"
 #include <string>
+#include <string_view>
+#include <optional>
+#include <map>
+#include <memory>
+#include <vector>
 
 class Game;
 
-///This is the map editor menu screen. It has 7 buttons. Its very similar to the in-game main menu
+// Editor actions presented through the shared responsive dialog framework.
 class MapEditMenuScreen : public Glob2UI::InGameDialog
 {
   public:
@@ -22,11 +35,16 @@ class MapEditMenuScreen : public Glob2UI::InGameDialog
 	{
 		LOAD_MAP,
 		SAVE_MAP,
+		REROLL_TERRAIN_LOOK,
 		OPEN_SCRIPT_EDITOR,
 		OPEN_TEAMS_EDITOR,
 		RETURN_EDITOR,
 		QUIT_EDITOR,
-		SHARE_MAP
+		SHARE_MAP,
+		IMPORT_TERRAIN,
+		IMPORT_RESOURCES,
+        IMPORT_SET,
+        SET_LIBRARY
 	};
 
   protected:

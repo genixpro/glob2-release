@@ -62,6 +62,8 @@ class PolicyTest(unittest.TestCase):
         self.assertTrue(network['windows'] and network['deployment'] and network['cross_platform'])
         self.assertTrue(self.select(['src/engine/sim/SimulationRunner.cpp'])['tsan'])
         self.assertTrue(self.select(['src/render/scene/Scene.cpp'])['tsan'])
+        self.assertTrue(self.select(['src/ai/engine/AIPipeline.cpp'])['tsan'])
+        self.assertTrue(self.select(['src/ai/observation/AIQueries.cpp'])['tsan'])
 
     def test_music_pipeline_is_a_cheap_job_and_sets_are_packaged_data(self):
         music = self.select(['tools/music/glob2music/qa/seam.py', 'tools/music/sets/woodland/set.toml'])
@@ -83,6 +85,16 @@ class PolicyTest(unittest.TestCase):
         report, _ = self.exercise('schedule', [], reused_run=123)
         self.assertFalse(report['selection']['music'])
 
+    def test_music_runtime_boundaries_select_their_consumers(self):
+        for path in ['tools/music/web/exports.cpp', 'tools/music/build_web.py']:
+            self.assertEqual(self.select([path]), policy.full())
+        for path in ['tools/music/glob2music/community.py', 'tools/music/glob2music/studio/score.py',
+                     'tools/encode_music.py']:
+            selected = self.select([path])
+            self.assertTrue(selected['music'] and selected['platform'] and selected['platform_stack'])
+        self.assertTrue(self.select(['platform/apps/music-worker/src/process.ts'])['platform_stack'])
+        self.assertTrue(self.select(['platform/apps/ai-music-worker/src/runner.ts'])['platform_stack'])
+
     def test_platform_stack_smoke_follows_the_stack_inputs(self):
         for path in ['deploy/compose.yaml', 'deploy/Dockerfile', 'test/deployment/platform_stack_smoke.py',
                      'src/relay/RelayServer.cpp', 'platform/packages/db/migrations/0006_room_kicks_lost_relays.sql',
@@ -91,6 +103,10 @@ class PolicyTest(unittest.TestCase):
         for path in ['deploy/README.md', 'platform/apps/api/src/play/rooms.ts', 'src/ai/Maxima.cpp',
                      'src/hud/input/GameGUIInput.cpp', 'browser/shell.html']:
             self.assertFalse(self.select([path])['platform_stack'], path)
+
+    def test_terrain_catalog_and_compiler_are_shared_boundaries(self):
+        for path in ('data/terrain/tileset.json','tools/terrain_tileset.py','tools/test_terrain_tileset.py'):
+            self.assertEqual(self.select([path]),policy.full())
 
     def test_shared_unknown_and_unavailable_inputs_fail_closed(self):
         for path in ['src/app/Version.h','libgag/include/Surface.h','libgag/include/AudioFormat.h','scons/opus_dependencies.py','SConstruct','unmapped/new.cpp','test/ci_native_shard_plan.py']:
@@ -249,6 +265,45 @@ class ReuseTest(unittest.TestCase):
             with self.assertRaises(ValueError):evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium','firefox'})
             (root/'browser-determinism-windows'/'native.replay.checksums').write_bytes(b'y'*1501)
             with self.assertRaises(ValueError):evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'})
+
+    def test_resource_compositions_require_complete_matching_producers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            trace = b'1 2 3 checksum\n' * 150
+            committed = root / 'committed.trace'
+            committed.write_bytes(trace)
+            producer = dict(revision='revision', sourceTreeSha256='tree', dirty=False)
+            native = root / 'browser-determinism-windows/native/resources/native'
+            native.mkdir(parents=True)
+            (native / 'manifest.json').write_text(json.dumps(dict(producer=producer)))
+            (native / 'seeded-compositions.trace').write_bytes(trace.replace(b'\n', b'\r\n'))
+            for variant in ('serial', 'threaded'):
+                path = root / f'browser-determinism-wasm-0/resources/{variant}/chromium/composition'
+                path.mkdir(parents=True)
+                manifest = dict(producer=producer, variant=variant, browser='chromium',
+                                selection=dict(name='composition'), exit=0)
+                (path / 'manifest.json').write_text(json.dumps(manifest))
+                (path / 'seeded-compositions.trace').write_bytes(trace)
+            self.assertEqual(evidence.validate_resource_compositions(root, ['windows'], {'chromium'}, committed), 3)
+            with self.assertRaises(ValueError):
+                evidence.validate_resource_compositions(root, ['windows', 'macos'], {'chromium'}, committed)
+            with self.assertRaises(ValueError):
+                evidence.validate_resource_compositions(root, ['windows'], {'chromium', 'firefox'}, committed)
+            (path / 'seeded-compositions.trace').write_bytes(trace[:-1])
+            with self.assertRaises(ValueError):
+                evidence.validate_resource_compositions(root, ['windows'], {'chromium'}, committed)
+            (path / 'seeded-compositions.trace').write_bytes(trace)
+            for change in (dict(dirty=True), dict(dirty=None), dict(revision=''),
+                           dict(sourceTreeSha256=''), dict(revision='other'), dict(sourceTreeSha256='other')):
+                manifest['producer'] = dict(producer, **change)
+                (path / 'manifest.json').write_text(json.dumps(manifest))
+                with self.assertRaises(ValueError):
+                    evidence.validate_resource_compositions(root, ['windows'], {'chromium'}, committed)
+            manifest['producer'] = producer
+            manifest['exit'] = 1
+            (path / 'manifest.json').write_text(json.dumps(manifest))
+            with self.assertRaises(ValueError):
+                evidence.validate_resource_compositions(root, ['windows'], {'chromium'}, committed)
 
 
 if __name__=='__main__':unittest.main()

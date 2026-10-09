@@ -1,4 +1,7 @@
+import { Generators, GeneratorPage, GeneratorPublish } from './pages/Generators.tsx';
+import { studioLocal } from './components/studio/storage.ts';
 import { Players } from './pages/Players.tsx';
+import './music/music.css';
 import { Skins } from './pages/Skins.tsx';
 import { CommanderCredits } from './pages/Commander.tsx';
 // The platform web app: home, leaderboards, player and match pages, the map
@@ -6,7 +9,8 @@ import { CommanderCredits } from './pages/Commander.tsx';
 // /players/<id>, /matches/<id>, /maps/<id>, /leaderboard/<queueId>. Invite
 // links (/j/<code>) and sign-in (/signin) are server-rendered by the API.
 import { Suspense, lazy, useEffect, useRef, useState, type ReactNode } from 'react';
-import { ART, GLOB_ICON, Wordmark, type ArtName } from './art.tsx';
+import { GLOB_ICON, Wordmark } from './art.tsx';
+import { Icon, type IconName } from './icons.tsx';
 import { Avatar, Loading } from './components/common.tsx';
 import { DOWNLOAD_URL, Home, WEBSITE_URL, websitePage } from './pages/Home.tsx';
 import { Leaderboard } from './pages/Leaderboard.tsx';
@@ -16,9 +20,50 @@ import { SessionProvider, isModerator, useSession } from './state.tsx';
 import { ThemeProvider, ThemeToggle } from './theme.tsx';
 
 // Pages most visitors never open load on demand.
+const AiBuildingStudio = lazy(() =>
+  import('./pages/AiBuildingStudio.tsx').then((m) => ({ default: m.AiBuildingStudio })),
+);
+const TerrainStudio = lazy(() =>
+  import('./pages/TerrainStudio.tsx').then((m) => ({ default: m.TerrainStudio })),
+);
+const MusicLibrary = lazy(() =>
+  import('./music/Library.tsx').then((m) => ({ default: m.MusicLibrary })),
+);
+const MusicDetail = lazy(() =>
+  import('./music/Library.tsx').then((m) => ({ default: m.MusicDetail })),
+);
+const MusicCreate = lazy(() =>
+  import('./music/Library.tsx').then((m) => ({ default: m.MusicCreate })),
+);
 const Admin = lazy(() => import('./admin/Admin.tsx').then((m) => ({ default: m.Admin })));
+const MusicStudio = lazy(() =>
+  import('./pages/MusicStudio.tsx').then((m) => ({ default: m.MusicStudio })),
+);
 const MapStudio = lazy(() =>
   import('./pages/MapStudio.tsx').then((m) => ({ default: m.MapStudio })),
+);
+const GeneratorStudio = lazy(() =>
+  import('./pages/GeneratorStudio.tsx').then((m) => ({ default: m.GeneratorStudio })),
+);
+const AiStudio = lazy(() => import('./pages/AiStudio.tsx').then((m) => ({ default: m.AiStudio })));
+const BuildingLibrary = lazy(() =>
+  import('./pages/BuildingLibrary.tsx').then((m) => ({ default: m.BuildingLibrary })),
+);
+const BuildingStudio = lazy(() =>
+  import('./pages/BuildingStudio.tsx').then((m) => ({ default: m.BuildingStudio })),
+);
+const Ais = lazy(() => import('./pages/Ais.tsx').then((m) => ({ default: m.Ais })));
+const AiPage = lazy(() => import('./pages/Ais.tsx').then((m) => ({ default: m.AiPage })));
+const AiPublish = lazy(() => import('./pages/Ais.tsx').then((m) => ({ default: m.AiPublish })));
+const SetLibrary = lazy(() =>
+  import('./sets/Library.tsx').then((m) => ({ default: m.SetLibrary })),
+);
+const SetReports = lazy(() =>
+  import('./sets/Library.tsx').then((m) => ({ default: m.SetReports })),
+);
+const SetDetail = lazy(() => import('./sets/Library.tsx').then((m) => ({ default: m.SetDetail })));
+const SetWorkspace = lazy(() =>
+  import('./sets/Workspace.tsx').then((m) => ({ default: m.SetWorkspace })),
 );
 const Maps = lazy(() => import('./pages/Maps.tsx').then((m) => ({ default: m.Maps })));
 const MapPage = lazy(() => import('./pages/Maps.tsx').then((m) => ({ default: m.MapPage })));
@@ -34,12 +79,165 @@ const CREDITS_URL = `${SOURCE_URL}/blob/master/docs/assets/source-attribution.md
 
 interface Route {
   pattern: string;
+  workspace?: boolean;
   section: string;
   title: string;
   render: (params: Record<string, string>) => ReactNode;
 }
 
 export const ROUTES: Route[] = [
+  {
+    pattern: '/buildings',
+    section: 'buildings',
+    title: 'Building library',
+    render: () => <BuildingLibrary />,
+  },
+  {
+    pattern: '/buildings/:id',
+    section: 'buildings',
+    title: 'Building family',
+    render: (p) => <BuildingLibrary key={p['id']} id={p['id']} />,
+  },
+  {
+    pattern: '/ai-building-studio',
+    workspace: true,
+    section: 'buildings',
+    title: 'AI Building Studio',
+    render: () => <AiBuildingStudio />,
+  },
+  {
+    pattern: '/ai-building-studio/:id',
+    workspace: true,
+    section: 'buildings',
+    title: 'AI Building Studio',
+    render: (p) => <AiBuildingStudio key={p['id']} id={p['id']} />,
+  },
+  {
+    pattern: '/building-studio',
+    section: 'buildings',
+    title: 'Building Studio',
+    render: () => <BuildingStudio />,
+  },
+  {
+    pattern: '/building-studio/:id',
+    section: 'buildings',
+    title: 'Building Studio',
+    render: (p) => <BuildingStudio key={p['id']} id={p['id']} />,
+  },
+  {
+    pattern: '/sets',
+    section: 'sets',
+    title: 'Terrain & resource sets',
+    render: () => <SetLibrary />,
+  },
+  {
+    pattern: '/terrain-studio',
+    workspace: true,
+    section: 'sets',
+    title: 'AI Terrain Studio',
+    render: () => <TerrainStudio />,
+  },
+  {
+    pattern: '/terrain-studio/:id',
+    workspace: true,
+    section: 'sets',
+    title: 'AI Terrain Studio',
+    render: (p) => <TerrainStudio key={p['id']} id={p['id']} />,
+  },
+  { pattern: '/sets/mine', section: 'sets', title: 'My sets', render: () => <SetLibrary mine /> },
+  { pattern: '/sets/new', section: 'sets', title: 'Create a set', render: () => <SetWorkspace /> },
+  {
+    pattern: '/sets/drafts/:id',
+    section: 'sets',
+    title: 'Set workspace',
+    render: (p) => <SetWorkspace key={p['id']} id={p['id']} />,
+  },
+  { pattern: '/sets/reports', section: 'sets', title: 'Set reports', render: () => <SetReports /> },
+  {
+    pattern: '/sets/:id',
+    section: 'sets',
+    title: 'Set library',
+    render: (p) => <SetDetail key={p['id']} id={p['id'] ?? ''} />,
+  },
+  {
+    pattern: '/ai-studio',
+    workspace: true,
+    section: 'ais',
+    title: 'AI Studio',
+    render: () => <AiStudio />,
+  },
+  {
+    pattern: '/ai-studio/:id',
+    workspace: true,
+    section: 'ais',
+    title: 'AI Studio',
+    render: (p) => <AiStudio key={p['id']} id={p['id']} />,
+  },
+  {
+    pattern: '/generator-studio',
+    workspace: true,
+    section: 'maps',
+    title: 'Generator Studio',
+    render: () => <GeneratorStudio />,
+  },
+  {
+    pattern: '/generator-studio/:id',
+    workspace: true,
+    section: 'maps',
+    title: 'Generator Studio',
+    render: (p) => <GeneratorStudio key={p['id']} id={p['id']} />,
+  },
+  {
+    pattern: '/generators',
+    section: 'maps',
+    title: 'Map generators',
+    render: () => <Generators />,
+  },
+  {
+    pattern: '/generators/mine',
+    section: 'maps',
+    title: 'My generators',
+    render: () => <Generators mine />,
+  },
+  {
+    pattern: '/generators/new',
+    section: 'maps',
+    title: 'Share a generator',
+    render: () => <GeneratorPublish />,
+  },
+  {
+    pattern: '/generators/:id/new',
+    section: 'maps',
+    title: 'Publish a release',
+    render: (p) => <GeneratorPublish id={p['id'] ?? ''} />,
+  },
+  {
+    pattern: '/generators/:id',
+    section: 'maps',
+    title: 'Map generator',
+    render: (p) => <GeneratorPage id={p['id'] ?? ''} />,
+  },
+  { pattern: '/ais', section: 'ais', title: 'AI Library', render: () => <Ais /> },
+  { pattern: '/ais/mine', section: 'ais', title: 'My AIs', render: () => <Ais view="mine" /> },
+  {
+    pattern: '/ais/favourites',
+    section: 'ais',
+    title: 'Favourite AIs',
+    render: () => <Ais view="favourites" />,
+  },
+  { pattern: '/ais/new', section: 'ais', title: 'Share your AI', render: () => <AiPublish /> },
+  {
+    pattern: '/ais/:id/new',
+    section: 'ais',
+    title: 'New AI version',
+    render: (p) => <AiPublish key={p['id']} id={p['id'] ?? ''} />,
+  },
+  {
+    pattern: '/ais/:id',
+    section: 'ais',
+    title: 'AI Library',
+    render: (p) => <AiPage key={p['id']} id={p['id'] ?? ''} />,
+  },
   { pattern: '/players', section: 'players', title: 'Players', render: () => <Players /> },
   {
     pattern: '/players/ai/:aiId',
@@ -47,16 +245,40 @@ export const ROUTES: Route[] = [
     title: 'AI player',
     render: (p) => <AiPlayer key={p['aiId']} id={p['aiId'] ?? ''} />,
   },
+  {
+    pattern: '/music-studio',
+    workspace: true,
+    section: 'music',
+    title: 'AI Music Studio',
+    render: () => <MusicStudio />,
+  },
+  {
+    pattern: '/music-studio/:id',
+    workspace: true,
+    section: 'music',
+    title: 'AI Music Studio',
+    render: (p) => <MusicStudio key={p['id']} id={p['id']} />,
+  },
+  { pattern: '/music', section: 'music', title: 'Music', render: () => <MusicLibrary /> },
+  { pattern: '/music/new', section: 'music', title: 'Share music', render: () => <MusicCreate /> },
+  {
+    pattern: '/music/:id',
+    section: 'music',
+    title: 'Music',
+    render: (p) => <MusicDetail key={p['id']} id={p['id'] ?? ''} />,
+  },
   { pattern: '/skins', section: 'skins', title: 'Colony skins', render: () => <Skins /> },
   {
     pattern: '/map-studio',
-    section: 'studio',
+    workspace: true,
+    section: 'maps',
     title: 'AI Map Studio',
     render: () => <MapStudio />,
   },
   {
     pattern: '/map-studio/:id',
-    section: 'studio',
+    workspace: true,
+    section: 'maps',
     title: 'AI Map Studio',
     render: (p) => <MapStudio key={p['id']} id={p['id']} />,
   },
@@ -136,7 +358,12 @@ function AccountChip() {
   }
   return (
     <>
-      <Link className="chip" to="/account" data-testid="account-chip">
+      <Link
+        className="chip"
+        to="/account"
+        data-testid="account-chip"
+        aria-label={account.displayName}
+      >
         <Avatar account={account} size="small" />
         <span>{account.displayName}</span>
       </Link>
@@ -151,7 +378,7 @@ interface NavItem {
   to: string;
   id: string;
   name: string;
-  art?: ArtName;
+  icon?: IconName;
 }
 
 function About() {
@@ -182,9 +409,27 @@ function Layout() {
   const section = found?.route.section;
   const name = instance?.name ?? 'Globulation 2';
   const home = section === 'home';
-  const studio = section === 'studio';
+  const studio = section === 'skins' || !!found?.route.workspace;
   const main = useRef<HTMLElement>(null);
-  const [collapsed, setCollapsed] = useState(false);
+  const navigationKey = `studio-navigation:${account?.id ?? 'anonymous'}`;
+  const [navigationPreference, setNavigationPreference] = useState(() => ({
+    key: navigationKey,
+    collapsed: studioLocal.getItem(navigationKey) !== 'expanded',
+  }));
+  if (navigationPreference.key !== navigationKey)
+    setNavigationPreference({
+      key: navigationKey,
+      collapsed: studioLocal.getItem(navigationKey) !== 'expanded',
+    });
+  const collapsed =
+    studio &&
+    (navigationPreference.key === navigationKey
+      ? navigationPreference.collapsed
+      : studioLocal.getItem(navigationKey) !== 'expanded');
+  const setCollapsed = (value: boolean) => {
+    setNavigationPreference({ key: navigationKey, collapsed: value });
+    studioLocal.setItem(navigationKey, value ? 'collapsed' : 'expanded');
+  };
   const drawer = useRef<HTMLDialogElement>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const openNavigation = () => {
@@ -194,15 +439,10 @@ function Layout() {
   useEffect(() => {
     if (typeof window.matchMedia !== 'function') return;
     const close = () => drawer.current?.close();
-    const expanded = window.matchMedia('(min-width: 1100px)');
-    const mobile = window.matchMedia('(max-width: 899px)');
-    expanded.addEventListener('change', close);
-    mobile.addEventListener('change', close);
-    return () => {
-      expanded.removeEventListener('change', close);
-      mobile.removeEventListener('change', close);
-    };
-  }, []);
+    const rail = window.matchMedia(studio ? '(min-width: 600px)' : '(min-width: 900px)');
+    rail.addEventListener('change', close);
+    return () => rail.removeEventListener('change', close);
+  }, [studio]);
   useEffect(() => {
     if (drawer.current?.open) drawer.current.close();
   }, [location.path]);
@@ -221,14 +461,17 @@ function Layout() {
   }, [location.path]);
   const nav: NavItem[] = [
     { to: '/', id: 'home', name: 'Home' },
-    { to: '/leaderboard', id: 'leaderboard', name: 'Leaderboard', art: 'warFlag' },
-    { to: '/players', id: 'players', name: 'Players', art: 'school' },
-    { to: '/matches', id: 'matches', name: 'Matches', art: 'swarm' },
-    { to: '/maps', id: 'maps', name: 'Maps', art: 'explorationFlag' },
-    { to: '/skins', id: 'skins', name: 'Skins', art: 'swarm' },
-    { to: '/map-studio', id: 'studio', name: 'AI Map Studio', art: 'explorationFlag' },
+    { to: '/leaderboard', id: 'leaderboard', name: 'Leaderboard', icon: 'trophy' },
+    { to: '/players', id: 'players', name: 'Players', icon: 'users' },
+    { to: '/matches', id: 'matches', name: 'Matches', icon: 'swords' },
+    { to: '/maps', id: 'maps', name: 'Maps', icon: 'map' },
+    { to: '/sets', id: 'sets', name: 'Terrain & resources', icon: 'palette' },
+    { to: '/ais', id: 'ais', name: 'AI Library', icon: 'robot' },
+    { to: '/buildings', id: 'buildings', name: 'Buildings', icon: 'map' },
+    { to: '/music', id: 'music', name: 'Music', icon: 'music' },
+    { to: '/skins', id: 'skins', name: 'Skins', icon: 'palette' },
     ...(isModerator(account)
-      ? [{ to: '/admin', id: 'admin', name: 'Moderation', art: 'hospital' as ArtName }]
+      ? [{ to: '/admin', id: 'admin', name: 'Moderation', icon: 'shield-check' as IconName }]
       : []),
   ];
   const page = found ? (
@@ -255,7 +498,7 @@ function Layout() {
             onClick={() => drawer.current?.close()}
             aria-label="Close navigation"
           >
-            ×
+            <Icon name="x" />
           </button>
         ) : (
           <button
@@ -264,12 +507,12 @@ function Layout() {
             aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
             aria-expanded={!collapsed}
           >
-            ☰
+            <Icon name="list-details" />
           </button>
         )}
       </div>
       <a className="btn primary sidebar-play" href="/play/" aria-label="Play in browser">
-        <span aria-hidden="true">▶</span>
+        <Icon name="player-play" size={20} />
         <span className="nav-label">Play in browser</span>
       </a>
       <nav className="nav" aria-label="Main">
@@ -278,7 +521,7 @@ function Layout() {
             group === 'Play'
               ? ['home', 'leaderboard', 'players', 'matches'].includes(item.id)
               : group === 'Create'
-                ? ['maps', 'skins', 'studio'].includes(item.id)
+                ? ['maps', 'sets', 'ais', 'buildings', 'music', 'skins'].includes(item.id)
                 : item.id === 'admin',
           );
           return items.length ? (
@@ -292,7 +535,13 @@ function Layout() {
                   aria-label={item.name}
                   aria-current={section === item.id ? 'page' : undefined}
                 >
-                  <img src={item.art ? ART[item.art] : GLOB_ICON} width={26} height={26} alt="" />
+                  {item.icon ? (
+                    <span className={`nav-chip nav-chip-${item.id}`}>
+                      <Icon name={item.icon} size={20} />
+                    </span>
+                  ) : (
+                    <img src={GLOB_ICON} width={26} height={26} alt="" />
+                  )}
                   <span className="nav-label">{item.name}</span>
                   <span className="rail-tooltip" aria-hidden="true">
                     {item.name}
@@ -316,7 +565,6 @@ function Layout() {
       </div>
     </>
   );
-  if (section === 'skins') return <Suspense fallback={<Loading />}>{page}</Suspense>;
   return (
     <div
       className={`site app-shell${home ? ' home' : ''}${studio ? ' studio-shell' : ''}${collapsed ? ' sidebar-collapsed' : ''}`}
@@ -328,21 +576,13 @@ function Layout() {
       <button
         className="rail-expand"
         onClick={() => {
-          if (!studio && window.matchMedia('(min-width: 1100px)').matches) setCollapsed(false);
+          if (window.matchMedia('(min-width: 1100px)').matches) setCollapsed(false);
           else openNavigation();
         }}
         aria-label="Open navigation"
       >
-        ☰
+        <Icon name="list-details" />
       </button>
-      <header className="mobile-bar">
-        <button onClick={openNavigation} aria-label="Open navigation">
-          ☰
-        </button>
-        <Link to="/" aria-label={`${name}, home`}>
-          <Wordmark label={null} />
-        </Link>
-      </header>
       <dialog
         ref={drawer}
         className="navigation-drawer"

@@ -30,12 +30,16 @@ no NaN, infinity, per-tile grids, elapsed-time measurements, or simulation steps
 | --- | --- |
 | `engine.version_major`, `version_minor` | The reporting executable's engine/save-format version constants, not the input file's original version. |
 | `map.name` | Stored map name for an input file; `null` for the freshly generated snapshot, before its output filename supplies a saved name. |
+| `map.setCredits` | Frozen artwork-set attribution from the map asset bundle: set/version IDs, title, license, authors, source hash and credited entries. Empty when no custom sets are used. |
 | `map.width`, `height`, `tiles` | Tile dimensions and their product. |
 | `map.wrap_x`, `wrap_y` | Both true: this is a toroidal map. All reported paths and components wrap. |
 | `map.player_slots` | Actual colony/team count. This is what “number of players” usually means when comparing generated maps. An editor-only generator may create fewer colonies than its request's `teams` value. |
 | `map.controller_count` | Number of controller slots in `GameHeader`. A fresh generated map normally has zero; controllers are assigned later in the lobby. Multiple controllers can share one colony. |
 | `map.saved_game` | Whether the loaded header describes a saved game rather than a premade map. |
 | `map.format_version_minor` | The save-format version (`VERSION_MINOR`) the input file was written with; the executable's own for a freshly generated snapshot. Lets a platform check a map's age without parsing its header. |
+| `map.buildingCatalog` | Canonical building catalog `snapshot` JSON string and lowercase SHA-256 `hash`, including the legacy catalog for old input files. This optional schema-2 extension lets multiplayer retain the map's exact building rules. |
+| `map.resourceExperiments` | Catalog-declared experiment metadata (`key`, `label`, `help`). |
+| `map.requiredResourceExperiments` | Experiment keys required by resources placed on this map. |
 | `map.tick` | Snapshot's simulation tick. Analyzing a save does not advance it. |
 | `map.game_seed` | Seed stored in the game header. For a generated report it equals the requested generation seed. In a loaded file it is not evidence of the original generator or its settings. |
 | `map.colonies[]` | One entry per colony, in team-index order: `team`, `alive`, `start`, live object counts in `units`, and `buildings_and_flags`. |
@@ -47,6 +51,9 @@ no NaN, infinity, per-tile grids, elapsed-time measurements, or simulation steps
 
 For generation in this invocation, `generation.available` is true and includes:
 
+- `package_hash`, `api_version`, and `toolkit_version`: JavaScript package identity
+  and API/toolkit versions. Built-in generators use an empty hash and zero versions;
+  unavailable package identity is null.
 - `generator`: stable string ID; `legacy_id`: numeric ID; `revision`: generator
   revision; `seed`: exact unsigned 32-bit seed supplied to the service.
 - `parameters`: **all resolved registered controls**, including defaults and config/
@@ -102,38 +109,60 @@ and movement connectivity use **eight neighbors**, including diagonals. All wrap
 
 ## Terrain, resources, space, and fertility
 
-`terrain` partitions every tile into one exclusive category, by its actual terrain
-sprite ID from `Map::lookup`: `grass` (0–15), `grass_sand_border` (16–127), `sand`
-(128–143), `sand_water_border` (144–255), `water` (256–271), or `unknown` (other IDs).
-Each value is coverage. Counts sum to `map.tiles`; percentages sum to 100 (subject
-to floating-point rounding). Resource/building occupancy does not change this
-classification. Borders are whole mixed tiles, not estimates of fractional land.
+`terrain` partitions the map's terrain vertices (one per tile: each tile's
+top-left corner) by terrain type: `grass`, `sand`, `water`, `ice`, `road` (the
+legacy report key for Trail) and every other registered type. The retained
+`unknown` key is zero for validated maps. Each value is coverage; counts sum to
+`map.tiles`. Resource/building occupancy does not change this classification.
+A tile's gameplay rules come from its four corners, so walking, swimming and
+building measurements in `space` and `movement` read cells, not this partition.
+The version-2 schema keeps the retired `grass_sand_border` and
+`sand_water_border` keys as optional, so older reports remain readable; current
+writers no longer emit them, because mixed grass/sand and sand/water corners now
+form those transitions. The `ice` and `road` keys are likewise optional for older
+reports; current writers always emit every registered type, including zero
+coverage. Embedded custom types add coverage entries keyed by their namespaced
+registry keys, including unused definitions. The schema permits these namespaced
+keys; IDs and display names are not keys.
 
-`underlying_terrain` separately partitions the engine's underlying terrain grid
-into `grass`, `sand`, `water`, and `unknown`, using coverage objects. It need not
-match the visible terrain percentages: visible tiles combine adjacent terrain
-corners and therefore include border classes.
+`underlying_terrain` partitions the same vertices into `grass`, `sand`, `water`,
+and `unknown` (every other type), using coverage objects. It is retained for
+version-2 consumers that predate the catalogue terrain types.
 
 `resources.occupied` counts all resource-bearing tiles, including unknown types.
-`unknown_type_tiles` counts resource IDs outside 0–7, excluding the no-resource
-sentinel. `resources.types` always includes `wood`, `wheat`, `papyrus`, `stone`,
-`algae`, `cherry`, `orange`, and `prune` (IDs 0–7 respectively):
+`unknown_type_tiles` counts IDs absent from the map's embedded resource registry,
+excluding the no-resource sentinel. `resources.definitions` is keyed by canonical
+resource authoring key (for example `trees`, `rocks`, or a custom catalog key).
+`resources.types` retains version-2 legacy keys for existing study tools:
+`wood`, `wheat`, `papyrus`, `stone`, `algae`, `cherry`, `orange`, and `prune`.
+`resources.legacy_type_aliases` explicitly maps each changed key to its canonical
+key. Other resources use their authoring keys. If a custom key collides with an
+alias, the built-in uses its canonical key instead; no definition is overwritten.
+
+Colony movement, quality catchments, and distance bands expose `materials`, keyed
+by `wood`, `food`, `paper`, `stone`, `algae`, `cherries`, `oranges`, `prunes`, `gold`,
+`metal`, `glass`, and `fabric`. These aggregate all sources yielding the requested
+material, including secondary yields. Their older `resources` objects remain
+compatibility aliases (`wheat` means food, `papyrus` means paper, and singular fruit
+names mean their plural material names). Historical quality-model field names
+such as `wheat_distance` retain their version-2 meaning as food access. New
+consumers should use canonical fields; these additions preserve schema version 2.
 
 | Per-resource field | Meaning |
 | --- | --- |
 | `coverage` | Tiles storing this resource type, including any zero-amount deposits. |
 | `percent_of_resource_tiles` | Percentage of `resources.occupied.tiles`; `null` if no resources exist. |
-| `stored_amount` | Sum of the resource tiles' stored amount fields. This is current inventory, not estimated lifetime production. |
+| `stored_amount` | Sum of all material stocks in the resource tiles. This is current inventory, not estimated lifetime production. |
 | `harvestable_tiles` | Deposits with positive stored amount. |
-| `eternal`, `clearable` | Flags from the engine's resource-type registry. Eternal stone/fruit deposits must not be interpreted as finite stockpiles. |
+| `eternal`, `clearable` | `eternal` describes the primary material's infinite-consumption policy; mixed deposits may also have finite secondary stocks. `clearable` is the configured clearing property. |
 | `amount_per_deposit` | Distribution of stored amounts, one sample per occupied tile of this type, including zeros. |
 | `patches` | Eight-connected components of this resource's occupied tiles. |
 
 `space` contains:
 
 - `building_footprint`: coverage of tiles whose map occupancy points to a building.
-- `buildable`: coverage passing the engine's `isFreeForBuilding` predicate: pure
-  grass, no resource, building, or ground unit. It does not test a particular
+- `buildable`: coverage passing the engine's `isFreeForBuilding` predicate: terrain permits
+  buildings, with no resource, building, or ground unit. It does not test a particular
   colony's visibility, ownership, or construction orders.
 - `build_sites_4x4`: number of valid top-left anchors for entirely buildable 4×4
   footprints, including ones spanning a map edge. **Anchors overlap**: this is a
@@ -141,18 +170,18 @@ sentinel. `resources.types` always includes `wood`, `wheat`, `papyrus`, `stone`,
 - `growth_disabled`: coverage of tiles whose `canResourcesGrow` flag is false. Always zero
   for a generated map, which may not disable growth; nonzero only for hand-made maps and
   scenarios such as the tutorial.
-- `land_regions`: four-connected regions of grass, sand, and their border tiles
-  (sprite IDs below 256); unknown terrain is excluded.
-- `water_regions`: four-connected regions of pure-water tiles (256–271).
+- `land_regions`: four-connected regions whose terrain permits walking.
+- `water_regions`: four-connected regions whose terrain permits swimming.
 
 `fertility` uses the engine's `Fertility::forMap` calculation. `scale` is 65536:
-a raw value f corresponds to the terrain-dependent probability f/65536, before
-other resource-growth conditions. This is not production per tick. Deposit amount,
+a raw value f corresponds to f/65536 expected growth opportunities per scheduled
+visit, including the terrain growth factor and before other resource conditions.
+Bonuses may raise this above one opportunity. This is not production per tick. Deposit amount,
 room to spread, the wheat growth divisor, and no-growth flags also affect growth.
 The field does not apply the `canResourcesGrow` flag; that is reported separately.
 
-- `all_tiles`: distribution over the full map, with non-grass and grass unreachable
-  by deposit spread set to zero by the engine's gating rule.
+- `all_tiles`: distribution over the full map, with terrain that does not permit
+  wheat and cells unreachable by deposit spread set to zero by the gating rule.
 - `grass_tiles`: the same gated field, sampled only on pure grass.
 - `potential_grass_ignoring_deposit_reachability`: terrain potential on pure grass
   without the existing-deposit reachability gate. Useful for spotting fertile
@@ -234,7 +263,7 @@ more games may select them:
 | `catchment_growth_enabled_grass_tiles` | Pure grass with `canResourcesGrow` true in the catchment; positive fertility and growth permission are separate conditions. |
 | `exclusive_nearest_tiles`, `tied_nearest_tiles` | Walkable tiles uniquely closest to this colony, or tied for closest, across the entire map. Tied tiles count for every tied colony. |
 | `exclusive_catchment_tiles`, `tied_catchment_tiles` | The same nearest-colony shares limited to this colony's walking catchment. These estimate private and contested nearby expansion ground, not ownership or future control. |
-| `resources.<type>.nearest_gather_distance` | Closest neighboring ground tile plus one step for each of the eight known resource types; `null` if inaccessible. |
+| `resources.<type>.nearest_gather_distance` | Closest neighboring ground tile plus one step for each material (legacy aliases); `null` if inaccessible. |
 | `resources.<type>.catchment_deposit_tiles`, `catchment_stored_amount` | Distinct accessible deposits and their current stored amount, approached from a tile in the catchment. Zero-amount deposits count as tiles. Eternal deposits' stored amount is not lifetime supply. |
 | `resources.<type>.exclusive_catchment_deposit_tiles`, `exclusive_catchment_stored_amount` | Nearby deposits and stored stock this colony can approach strictly sooner than any rival. |
 | `resources.<type>.tied_catchment_deposit_tiles`, `tied_catchment_stored_amount` | Nearby deposits and stock for which the closest approach ties with at least one rival. A tie counts for each tied colony. |
@@ -244,7 +273,7 @@ Each colony also has `distance_bands[]` at fixed walking radii of **12, 24, and 
 steps**. Unlike the generator-specific `scale.catchment_steps`, these are stable
 across generators. Each band repeats `reached_tiles`, `grass_tiles`,
 `buildable_tiles`, `fertile_grass_tiles`, `exclusive_nearest_tiles`, and
-`tied_nearest_tiles` at that radius. Its eight `resources.<type>` entries repeat
+`tied_nearest_tiles` at that radius. Its `materials.<material>` entries (also exposed through legacy `resources.<type>` aliases) repeat
 accessible `deposit_tiles` and `stored_amount`, plus the exclusive and tied subsets
 of each. A deposit enters a band when the closest neighboring walking tile is
 within the radius; a deposit can be in a player's accessible stock without being
@@ -337,3 +366,19 @@ and worker counts, and all option entries, including invalid ones. Resolved `par
 The [telemetry guide](TELEMETRY.md) defines record kinds, limits, key/subject conventions,
 performance constraints, bulk analysis and permanent versus temporary instrumentation. Check
 both `dropped_records` and `invalid_values` before treating a trace as complete.
+
+Map-study JSON additionally exposes `statistics.material_source_tiles`, keyed by
+canonical material name for every supported material. Counts include any resource
+that currently supplies that material, so mixed deposits may contribute to multiple
+entries. `quality.colonies[].food_distance` and `.material_amount` give the canonical
+names for the historical `wheat_distance` and `resource_amount` fields. The older
+names and `wheat_tiles`/`wood_tiles`/`stone_tiles`/`algae_tiles` remain compatibility
+aliases for existing analysis tools; they describe material sources, not fixed
+resource identities.
+
+Custom JavaScript generation also records `generation.package_hash` (canonical
+package SHA-256), `api_version` and `toolkit_version`. Native generators have an
+empty package hash and zero script versions. `script_failed` and `budget_exceeded`
+are structured outcomes for script exceptions and resource limits. Export the
+package alongside a report to retain the source behind its hash. Loaded maps
+still have no inferred generator provenance.

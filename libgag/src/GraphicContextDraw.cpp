@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "GraphicContextPrivate.h"
+#include <SurfaceRaster.h>
 #include "OpaqueRectangleBatch.h"
 
 #include <algorithm>
@@ -210,6 +211,22 @@ namespace GAGCore
 
     void GraphicContext::drawMapTileFill(int x1, int y1, int x2, int y2, const Color& color)
     {
+        if (nativeSoftware && mapTransformActive)
+        {
+            prepareDraw();
+            const float raster = rasterScale(), scale = mapScale * raster;
+            const float ox = (mapTranslateX + mapCopyTranslateX) * raster;
+            const float oy = (mapTranslateY + mapCopyTranslateY) * raster;
+            const int left = int(std::round(std::min(x1, x2) * scale + ox));
+            const int top = int(std::round(std::min(y1, y2) * scale + oy));
+            const int right = int(std::round(std::max(x1, x2) * scale + ox));
+            const int bottom = int(std::round(std::max(y1, y2) * scale + oy));
+            const bool drawn = renderer->fillPixels({left, top, right - left, bottom - top},
+                {color.r, color.g, color.b, color.a});
+            assert(drawn);
+            (void)drawn;
+            return;
+        }
         if (softwareTransform || !mapTransformActive)
             drawMapSnappedRect(x1, y1, x2, y2, color, false, 0);
         else
@@ -218,21 +235,42 @@ namespace GAGCore
 
     void GraphicContext::drawMapTileSprite(int x, int y, int size, Sprite *sprite, unsigned index, Uint8 alpha)
     {
-        if (!softwareTransform || !mapTransformActive)
+        if ((!softwareTransform && !nativeSoftware) || !mapTransformActive)
         {
             drawSprite(x, y, sprite, index, alpha);
             return;
         }
-        // The same snapping as drawMapSnappedRect, with one logical unit a pixel.
-        const float offsetX = mapTranslateX + mapCopyTranslateX, offsetY = mapTranslateY + mapCopyTranslateY;
-        const float left = std::round(x * mapScale + offsetX), top = std::round(y * mapScale + offsetY);
-        const float right = std::round((x + size) * mapScale + offsetX), bottom = std::round((y + size) * mapScale + offsetY);
+        // Snap in backing pixels, including native HiDPI software targets.
+        const float raster = softwareTransform ? 1.f : rasterScale();
+        const float pixelsPerWorld = mapScale * raster;
+        const float offsetX = (mapTranslateX + mapCopyTranslateX) * raster, offsetY = (mapTranslateY + mapCopyTranslateY) * raster;
+        const float left = std::round(x * pixelsPerWorld + offsetX), top = std::round(y * pixelsPerWorld + offsetY);
+        const float right = std::round((x + size) * pixelsPerWorld + offsetX), bottom = std::round((y + size) * pixelsPerWorld + offsetY);
         if (right <= left || bottom <= top)
             return;
+        if (nativeSoftware)
+        {
+            // Translucent SDL geometry can round logical vertices before DPI
+            // scaling. Keep these shared edges in backing pixels all the way.
+            assert(sprite);
+            if (!sprite->checkBound(index)) return;
+            prepareDraw();
+            const SDL_Rect destination{int(left), int(top), int(right - left), int(bottom - top)};
+            for (bool teamColor : {false, true})
+                if (auto *surface = sprite->prepareDrawSurface(index, teamColor, false))
+                {
+                    auto *pixels = surface->getSDLSurface();
+                    const SDL_Rect source{0, 0, pixels->w, pixels->h};
+                    const bool drawn = renderer->blitPixels(pixels, source, destination, alpha);
+                    assert(drawn);
+                    (void)drawn;
+                }
+            return;
+        }
         // Back to map coordinates, a quarter pixel inside each snapped edge so
         // the rasteriser's truncation lands on it rather than one short.
-        drawSprite((left + 0.25f - offsetX) / mapScale, (top + 0.25f - offsetY) / mapScale,
-                   (right - left) / mapScale, (bottom - top) / mapScale, sprite, index, alpha);
+        drawSprite((left + 0.25f - offsetX) / pixelsPerWorld, (top + 0.25f - offsetY) / pixelsPerWorld,
+                   (right - left) / pixelsPerWorld, (bottom - top) / pixelsPerWorld, sprite, index, alpha);
     }
 
     void GraphicContext::drawMapSnappedRect(int x1, int y1, int x2, int y2, const Color& color, bool stroked, float maxStrokePoints)
@@ -336,7 +374,8 @@ namespace GAGCore
         if (uiTransformActive && !renderer && (optionFlags & USEGPU)) {
             SDL_Rect transformed{int(std::floor(x*uiTransformScale+uiTransformX)),int(std::floor(y*uiTransformScale+uiTransformY)),
                 int(std::ceil(w*uiTransformScale)),int(std::ceil(h*uiTransformScale))};
-            SDL_Rect clipped{}; SDL_GetRectIntersection(&transformed,&uiBounds,&clipped);
+            SDL_Rect clipped{};
+            if (!SDL_GetRectIntersection(&transformed,&uiBounds,&clipped)) clipped={};
             x=clipped.x;y=clipped.y;w=clipped.w;h=clipped.h;
         }
 #endif
@@ -776,4 +815,16 @@ namespace GAGCore
 			renderBatch->barrier();
 		drawCircle(x, y, radius, Color(r, g, b, a));
 	}
+}
+
+namespace GAGCore {
+void GraphicContext::drawSkinSprite(float x,float y,float w,float h,DrawableSurface *surface,int sx,int sy,int sw,int sh,Uint8 alpha)
+{
+    if (!surface || w<=0 || h<=0) return;
+    prepareDraw();Sprite::flushBatches(this);
+    auto *source=surface->getSDLSurface();if(!source)return;
+    if(renderer) renderer->blitLinear(surface,source,surface->contentRevision(),SDL_Rect{sx,sy,sw,sh},SDL_FRect{x,y,w,h},alpha);
+    else SurfaceRaster::skinBlitFloat(getSDLSurface(),source,SDL_Rect{sx,sy,sw,sh},SDL_FRect{x,y,w,h},alpha);
+    ++drawCalls;markPixelsChanged();
+}
 }

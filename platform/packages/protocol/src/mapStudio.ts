@@ -1,45 +1,34 @@
 import { Type, type Static } from 'typebox';
 import { Strict, Uuid } from './common.ts';
-const HiveCreditPack = Strict({
-  id: Type.String({ minLength: 1, maxLength: 64 }),
-  priceId: Type.String({ pattern: '^price_' }),
-  credits: Type.Integer({ minimum: 1 }),
-  amount: Type.Integer({ minimum: 1 }),
-  currency: Type.Union([
-    Type.Literal('usd'),
-    Type.Literal('cad'),
-    Type.Literal('eur'),
-    Type.Literal('gbp'),
-  ]),
-});
+import { StudioCreate, StudioMessage, StudioCreditPack } from './studioCommon.ts';
+export { StudioCreate, StudioMessage } from './studioCommon.ts';
 export const StudioSettings = Strict({
   width: Type.Union([Type.Literal(128), Type.Literal(256), Type.Literal(512)]),
   height: Type.Union([Type.Literal(128), Type.Literal(256), Type.Literal(512)]),
   players: Type.Integer({ minimum: 2, maximum: 8 }),
 });
 export type StudioSettings = Static<typeof StudioSettings>;
-export const StudioCreate = Strict({
-  title: Type.String({ minLength: 1, maxLength: 128 }),
-  /** Lets a prompt-first client recover an interrupted project-creation response. */
-  id: Type.Optional(Uuid),
-});
-export const StudioMessage = Strict({
-  id: Uuid,
-  text: Type.String({ minLength: 1, maxLength: 8000 }),
-});
 export const StudioGenerate = Strict({
   id: Uuid,
   settings: StudioSettings,
   parent: Type.Optional(Uuid),
 });
 export type StudioGenerate = Static<typeof StudioGenerate>;
+/** A conversation turn authorizes at most one server-directed build. */
+export const StudioTurn = Strict({
+  id: Uuid,
+  text: Type.String({ minLength: 1, maxLength: 8000 }),
+  settings: StudioSettings,
+  parent: Type.Optional(Uuid),
+});
+export type StudioTurn = Static<typeof StudioTurn>;
 export const MapStudioConfig = Strict({
   enabled: Type.Boolean(),
   salesEnabled: Type.Boolean(),
   textModel: Type.Optional(Type.String({ minLength: 1 })),
   imageModel: Type.Optional(Type.String({ minLength: 1 })),
   pipelineVersion: Type.Optional(Type.String({ minLength: 1, maxLength: 64 })),
-  packs: Type.Optional(Type.Array(HiveCreditPack, { maxItems: 20 })),
+  packs: Type.Optional(Type.Array(StudioCreditPack, { maxItems: 20 })),
   chatPerHour: Type.Optional(Type.Integer({ minimum: 1, maximum: 1000 })),
   // Required operator ceiling; requests pause when the daily provider-call budget is exhausted.
   providerCallsPerDay: Type.Optional(Type.Integer({ minimum: 1, maximum: 100000 })),
@@ -60,6 +49,8 @@ export interface StudioRequest {
     | 'uncertain';
   input: {
     settings?: StudioSettings;
+    turn?: boolean;
+    sourceTurnId?: string;
     parent?: string;
     brief: string;
     messages: { role: 'user' | 'assistant'; text: string }[];
@@ -200,6 +191,7 @@ export const studioSchemas = {
   StudioCreate,
   StudioMessage,
   StudioGenerate,
+  StudioTurn,
   MapStudioConfig,
   StudioStageProgress,
   StudioCheck,

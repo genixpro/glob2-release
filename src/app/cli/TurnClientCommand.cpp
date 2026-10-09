@@ -22,7 +22,9 @@
 #include <thread>
 
 #include "Building.h"
+#include "ComputeThreads.h"
 #include "BuildingType.h"
+#include "ai/BuildingCapabilities.h"
 #include "Engine.h"
 #include "Environment.h"
 #include "Game.h"
@@ -49,6 +51,7 @@ struct Options
 	double ordersPerSecond = 0.5;
 	double maxSeconds = 1800;
 	std::uint32_t seed = 1;
+	unsigned computeThreads = 0;
 };
 
 std::string readText(const std::string& path)
@@ -78,20 +81,30 @@ static std::shared_ptr<Order> botOrder(Engine& engine, std::mt19937& bot)
 		return nullptr;
 	std::uniform_int_distribution<int> offset(-10, 10);
 	const int x = team->startPosX + offset(bot), y = team->startPosY + offset(bot);
+	using Intent = AIPlanning::BuildingIntent;
+	const auto choose = [&](Intent intent, int workerLimit) -> std::shared_ptr<Order> {
+		std::vector<int> candidates;
+		const auto& index = game.buildingCapabilities();
+		for (const auto& candidate : index.placements(intent))
+			if (index.available(candidate,intent,game.gameHeader)) candidates.push_back(candidate.placementType);
+		if (candidates.empty()) return nullptr;
+		const int type = candidates[bot() % candidates.size()];
+		const int limit = std::min(workerLimit,game.buildingsTypes.get(type)->semantics.assignmentLimit);
+		const int workers = limit ? 1 + bot() % limit : 0;
+		return std::make_shared<OrderCreate>(team->teamNumber,x,y,type,workers,workers);
+	};
 	switch (bot() % 4)
 	{
 	case 0:
 	case 1:
 	{
-		static const char* sites[] = {"inn", "swarm", "hospital", "racetrack", "swimmingpool", "school"};
-		const int type = globalContainer->buildingsTypes.getTypeNum(sites[bot() % 6], 0, true);
-		return std::make_shared<OrderCreate>(team->teamNumber, x, y, type, 1 + bot() % 4, 1 + bot() % 4);
+		static constexpr Intent needs[] = {Intent::Feed,Intent::ProduceWorker,Intent::Heal,
+			Intent::TrainWalk,Intent::TrainSwim,Intent::TrainConstruction};
+		return choose(needs[bot() % std::size(needs)],4);
 	}
 	case 2:
 	{
-		static const char* flags[] = {"explorationflag", "clearingflag"};
-		const int type = globalContainer->buildingsTypes.getTypeNum(flags[bot() % 2], 0, false);
-		return std::make_shared<OrderCreate>(team->teamNumber, x, y, type, 1 + bot() % 6, 1 + bot() % 6);
+		return choose(bot() % 2 ? Intent::AttractExplorers : Intent::ClearResources,6);
 	}
 	default:
 	{
@@ -131,6 +144,7 @@ static int play(const Options& options, const fs::path& output)
 	globalContainer = &globals;
 	globals.runNoX = true;
 	globals.structuredHeadless = true;
+	globals.computeThreads = options.computeThreads;
 	globals.automaticEndingGame = false;
 	globals.load();
 
@@ -195,7 +209,7 @@ static int play(const Options& options, const fs::path& output)
 			firstTickAt = elapsed();
 		// One bot decision per executed tick in real time; none while catching up.
 		if (after > before && !session.catchingUp() && options.ordersPerSecond > 0 &&
-		    uniform(bot) < options.ordersPerSecond / 25.0)
+		    uniform(bot) < options.ordersPerSecond * 1000.0 / session.tickRateMilliHz())
 			if (auto order = botOrder(engine, bot))
 			{
 				engine.gui.orderQueue.push_back(order);
@@ -258,6 +272,10 @@ static int play(const Options& options, const fs::path& output)
 	       << ",\"ended_by\":" << Headless::quote(endedBy) << ",\"session_state\":" << int(finalState)
 	       << ",\"executed_ticks\":" << finalTick << ",\"game_ended\":" << (game.isGameEnded ? "true" : "false")
 	       << ",\"timed_out\":" << (timedOut ? "true" : "false") << ",\"desync_flagged\":" << (desync ? "true" : "false")
+	       << ",\"compute_requested_threads\":" << Headless::quote(options.computeThreads ? std::to_string(options.computeThreads) : "auto")
+	       << ",\"compute_resolved_threads\":" << resolveComputeThreadCount(options.computeThreads)
+	       << ",\"compute_threads\":" << game.map.computeExecutor().threadCount()
+	       << ",\"compute_workers\":" << game.map.computeExecutor().threadCount() - 1
 	       << ",\"reloads\":" << reloads << ",\"orders_queued\":" << ordersQueued
 	       << ",\"rtt_ms\":" << rtt / 1000 << ",\"jitter_ms\":" << jitter / 1000
 	       << ",\"wall_seconds\":" << elapsed() << ",\"first_tick_seconds\":" << firstTickAt
@@ -289,12 +307,13 @@ int runTurnClient(int argc, char** argv)
 	{
 		if (argc < 3)
 			throw Usage("usage: --turn-client <assignment.json> --map <file> --out <dir> [--orders-per-second R] "
-			            "[--max-seconds S] [--seed N] [--profile <name>]");
+			            "[--max-seconds S] [--seed N] [--profile <name>] [--compute-threads auto|N]");
 		Options options;
 		options.assignment = argv[2];
 		for (int i = 3; i < argc; i += 2)
 		{
 			const std::string key = argv[i];
+			if (isRemovedComputeOption(key)) throw Usage(key + " has been removed; use --compute-threads auto|N");
 			if (i + 1 >= argc)
 				throw Usage("missing value for " + key);
 			const std::string value = argv[i + 1];
@@ -302,6 +321,8 @@ int runTurnClient(int argc, char** argv)
 				options.map = value;
 			else if (key == "--out")
 				options.out = value;
+			else if (key == "--compute-threads")
+				options.computeThreads = parseComputeThreadCount(value);
 			else if (key == "--profile")
 				options.profile = value;
 			else if (key == "--orders-per-second")

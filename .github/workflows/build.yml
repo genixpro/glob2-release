@@ -75,6 +75,9 @@ jobs:
           python3 test/ci_run_commands.py \
             --check 'native runner contracts' 'python3 -m unittest discover -s test -p test_run_tests.py -v' \
             --check 'failure aggregation contracts' 'python3 -m unittest discover -s test -p test_ci_failure_aggregation.py -v' \
+            --check 'terrain ecology analysis contracts' 'python3 tools/test_terrain_ecology.py' \
+            --check 'gradient benchmark contracts' 'python3 tools/test_gradient_benchmark.py' \
+            --check 'resource benchmark contracts' "python3 -m unittest discover -s test -p 'test_*benchmark*.py' -v" \
             --check 'recording extraction contracts' 'python3 test/test_recording_tool.py'
       - name: Check that the sim version follows the simulation
         env:
@@ -82,6 +85,8 @@ jobs:
         run: |
           python3 -m unittest discover -s test -p test_check_sim_revision.py -v
           python3 test/check_sim_revision.py --base "$BASE_SHA"
+      - name: Check private RNG ownership
+        run: python3 test/check_entity_random.py
       - name: Verify pinned scripting vendors once
         run: python3 tools/javascript/verify-vendor.py
       - name: Select checks for changed paths
@@ -133,7 +138,7 @@ jobs:
     needs: changes
     if: ${{ needs.changes.outputs.coverage == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
         with:
@@ -158,6 +163,7 @@ jobs:
       - name: Run native coverage without the slow integration tier
         run: |
           GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 test/run_coverage.py --quick --timeout 900 -j4 \
+            --discard-merged-profiles --stream-logs \
             --cc clang-18 --cxx clang++-18 \
             --llvm-profdata llvm-profdata-18 --llvm-cov llvm-cov-18
       - name: Retain coverage and failing test evidence
@@ -455,6 +461,12 @@ jobs:
       run:
         shell: msys2 {0}
     steps:
+      # MinGW Python builds the engine; standard CPython supplies compatible
+      # binary wheels for the private, pinned build-time asset encoder.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: asset_encoder_python
+        with:
+          python-version: '3.12'
       - uses: msys2/setup-msys2@v2
         id: msys2_setup_msys2_v2_1
         with:
@@ -486,6 +498,13 @@ jobs:
         id: actions_checkout_v4_1
         with:
           ref: ${{ inputs.revision || github.sha }}
+
+      - name: Prepare pinned asset encoder
+        shell: pwsh
+        run: |
+          $encoder = & "${{ steps.asset_encoder_python.outputs.python-path }}" tools/package_assets.py --encoder-python
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "GLOB2_ASSET_ENCODER_PYTHON=$encoder" >> $env:GITHUB_ENV
 
       # Checkout uses Git for Windows; MSYS Git otherwise defaults to different
       # newline handling and reports unchanged CRLF source files as modifications.
@@ -679,7 +698,7 @@ jobs:
       - name: Retain browser/native simulation trace
         id: retain_browser_native_simulation_trace
         continue-on-error: true
-        run: python3 test/run-browser-determinism.py build/mingw/client/release/src/glob2.exe artifacts/browser-determinism/native
+        run: python3 test/run-browser-determinism.py build/mingw/client/release/src/glob2.exe artifacts/browser-determinism/native --engine-binary build/mingw/client/release/test/glob2-engine-tests.exe
       - uses: actions/upload-artifact@v4
         id: upload_artifact_1
         continue-on-error: true
@@ -852,6 +871,9 @@ jobs:
           path: |
             build/emscripten/client/release/identity.json
             build/emscripten/client/release/index.html
+            build/emscripten/client/release/studio.html
+            build/emscripten/client/release/generator-studio.html
+            build/emscripten/client/release/set-preview.html
             build/emscripten/client/release/loader.js
             build/emscripten/client/release/hive-worker.js
             build/emscripten/client/release/hive-runtime.js
@@ -861,6 +883,10 @@ jobs:
             build/emscripten/client/release/recording-video.js
             build/emscripten/client/release/recording-runtime.js
             build/emscripten/client/release/recording-runtime.wasm
+            build/emscripten/client/release/music-worker.js
+            build/emscripten/client/release/music-output.js
+            build/emscripten/client/release/music-runtime.js
+            build/emscripten/client/release/music-runtime.wasm
             build/emscripten/client/release/licenses/
             build/emscripten/client/release/threaded/identity.json
             build/emscripten/client/release/threaded/index.js
@@ -884,6 +910,9 @@ jobs:
           retention-days: 7
           path: |
             build/emscripten/client/release/index.html
+            build/emscripten/client/release/studio.html
+            build/emscripten/client/release/generator-studio.html
+            build/emscripten/client/release/set-preview.html
             build/emscripten/client/release/loader.js
             build/emscripten/client/release/hive-worker.js
             build/emscripten/client/release/hive-runtime.js
@@ -893,6 +922,10 @@ jobs:
             build/emscripten/client/release/recording-video.js
             build/emscripten/client/release/recording-runtime.js
             build/emscripten/client/release/recording-runtime.wasm
+            build/emscripten/client/release/music-worker.js
+            build/emscripten/client/release/music-output.js
+            build/emscripten/client/release/music-runtime.js
+            build/emscripten/client/release/music-runtime.wasm
             build/emscripten/client/release/licenses/
             build/emscripten/client/release/threaded/index.js
             build/emscripten/client/release/threaded/index.wasm
@@ -1034,6 +1067,8 @@ jobs:
           tar -czf artifacts/ci-native/web-native.tar.gz \
             build/linux/client/release/src/glob2 \
             build/linux/client/release/src/net-connection-test \
+            build/linux/client/release/runtime-assets \
+            build/linux/client/release/runtime-assets.json \
             build/sdl3-ci/prefix/lib
       - name: Save native object tree
         id: save_native_object_tree
@@ -1111,7 +1146,7 @@ jobs:
   web-test:
     name: browser tests (${{ matrix.name }})
     needs: [changes, web-build, web-native]
-    if: ${{ needs.changes.outputs.browser == 'true' }}
+    if: ${{ !cancelled() && needs.changes.outputs.browser == 'true' && needs.web-build.result == 'success' && needs.web-native.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -1244,7 +1279,7 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
           traces = sorted(Path('artifacts/ci-traces').rglob('verify-match.checksums.txt'))
-          expected = 5 + int('${{ needs.changes.outputs.compatibility }}' == 'true') + int('${{ needs.changes.outputs.macos }}' == 'true')
+          expected = 8 + int('${{ needs.changes.outputs.compatibility }}' == 'true') + int('${{ needs.changes.outputs.macos }}' == 'true')
           assert len(traces) == expected, f'Expected {expected} selected native/browser traces, got {traces}'
           reference = traces[0].read_bytes().replace(b'\r\n', b'\n')
           assert reference.count(b'\n') > 600
@@ -1309,6 +1344,7 @@ jobs:
           --health-retries 20
     env:
       TEST_DATABASE_URL: postgres://glob2:glob2@localhost:5432/postgres
+      TERRAIN_PYTHON: /usr/bin/python3
     defaults:
       run:
         working-directory: platform
@@ -1323,6 +1359,11 @@ jobs:
           node-version: '22'
           cache: npm
           cache-dependency-path: platform/package-lock.json
+      - name: Install music and terrain artwork processing tools
+        id: install_music_upload_processing_tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg python3-pil
       - name: Install platform dependencies
         id: install_platform_dependencies
         run: npm ci
@@ -1346,7 +1387,7 @@ jobs:
           npm run migrate -- latest
           npm run migrate -- status
 
-  # The soundtrack pipeline (tools/music/, Python tooling that never ships): its unit
+  # The soundtrack pipeline and deployed community converter (tools/music/): unit
   # tests with only the core requirements. Tests of the optional extras (sfizz, Surge
   # XT, Demucs) skip without them. A cheap job: it also runs on pull requests that
   # did not request hosted verification.
@@ -1371,7 +1412,7 @@ jobs:
         id: install_ffmpeg
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends ffmpeg
+          sudo apt-get install -y --no-install-recommends ffmpeg g++ pkg-config libopusfile-dev zlib1g-dev
       - name: Create the pipeline venv from requirements.txt
         id: create_the_pipeline_venv
         run: |

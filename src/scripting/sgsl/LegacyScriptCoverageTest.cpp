@@ -6,6 +6,7 @@
 #include <array>
 #include "AI.h"
 #include "Player.h"
+#include <nlohmann/json.hpp>
 
 namespace
 {
@@ -46,6 +47,38 @@ std::string save(MapScriptSGSL& script, Game& game)
 
 TEST_SUITE("LegacyScriptCoverage")
 {
+    TEST_CASE("random legacy summons preserve story progress through full continuation")
+    {
+        glob2test::HeadlessGlobals globals;
+        World original, restored;
+        REQUIRE(original.compile("setArea(\"old\",10,10,4) summonUnits(\"old\",2,Worker,0,0) wait(3) summonUnits(\"old\",2,Worker,0,0)").type==ErrorReport::ET_OK);
+        original.step();
+        const auto scriptBytes=save(original.script,original.world.game);
+        auto* backend=new GAGCore::MemoryStreamBackend;
+        GAGCore::BinaryOutputStream out(backend);
+        original.world.game.save(&out,false,"story RNG continuation"); out.flush();
+        const auto gameBytes=backend->takeContents();
+        GAGCore::BinaryInputStream gameInput(new GAGCore::MemoryStreamBackend(gameBytes.data(),gameBytes.size()));
+        gameInput.seekFromStart(0);
+        REQUIRE(restored.world.game.load(&gameInput));
+        GAGCore::BinaryInputStream scriptInput(new GAGCore::MemoryStreamBackend(scriptBytes.data(),scriptBytes.size()));
+        scriptInput.seekFromStart(0);
+        REQUIRE(restored.script.load(&scriptInput,&restored.world.game));
+        CHECK(original.script.checkSum()==restored.script.checkSum());
+        CHECK(save(original.script,original.world.game)==save(restored.script,restored.world.game));
+        for (unsigned tick=0;tick<5;++tick) {
+            original.step(); restored.step();
+            CHECK(original.script.checkSum()==restored.script.checkSum());
+            CHECK(save(original.script,original.world.game)==save(restored.script,restored.world.game));
+            CHECK(units(original.world.game.teams[0])==units(restored.world.game.teams[0]));
+            for (unsigned slot=0;slot<Unit::MAX_COUNT;++slot) {
+                const auto* a=original.world.game.teams[0]->myUnits[slot];
+                const auto* b=restored.world.game.teams[0]->myUnits[slot];
+                if (a && b) { CHECK(a->posX==b->posX); CHECK(a->posY==b->posY); CHECK(a->entityRandom==b->entityRandom); }
+            }
+        }
+    }
+
     TEST_CASE("supported statements and wait forms compile")
     {
         glob2test::HeadlessGlobals globals;
@@ -236,6 +269,38 @@ TEST_SUITE("LegacyScriptCoverage")
         }
         REQUIRE(w.compile("label(\"again\") wait(1) jump(\"again\") win(0)").type==ErrorReport::ET_OK);
         w.step(12); CHECK_FALSE(w.script.hasTeamWon(0));
+    }
+
+    TEST_CASE("authored flag aliases resolve game catalog IDs and respect missing definitions")
+    {
+        glob2test::HeadlessGlobals globals;
+        for (const bool missing : {false, true})
+        {
+            World w;
+            auto catalog=nlohmann::json::parse(w.world.game.buildingsTypes.snapshotJson());
+            const int old=w.world.game.buildingsTypes.getTypeNum("warflag",0,false);
+            auto flag=catalog["variants"][old]; flag["id"]=0;
+            flag["semantics"]["assignmentLimit"]=3;
+            flag["presentation"]["defaultAssigned"]=3;
+            flag["properties"]["maxUnitStayRange"]=6;
+            if (missing) flag["properties"]["type"]="different-authored-alias";
+            catalog["variants"]=nlohmann::json::array({flag});
+            catalog["startingBuilding"]="";
+            w.world.game.buildingsTypes.loadSnapshotJson(catalog.dump());
+            w.world.game.configureBuildingCatalog();
+            REQUIRE(w.compile("summonFlag(\"attack\",4,4,99,99,0) wait(1)").type==ErrorReport::ET_OK);
+            w.step();
+            if (missing) CHECK(w.script.flags.empty());
+            else
+            {
+                REQUIRE(w.script.flags.size()==1);
+                auto* placed=w.script.flags.at("attack");
+                CHECK(placed->typeNum==0);
+                CHECK(placed->unitStayRange==6);
+                CHECK(placed->maxUnitWorking==3);
+                CHECK(placed->maxUnitWorkingPreferred==3);
+            }
+        }
     }
 
     TEST_CASE("independent stories timers space and saved suspension resume exactly")

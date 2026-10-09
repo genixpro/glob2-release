@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 // Copyright (C) 2006 Bradley Arsenault
 
+#include "EngineTiming.h"
 #include "EndGameScreen.h"
 #include "FrontendTheme.h"
 #include "TeamStatChart.h"
@@ -125,7 +126,8 @@ EndGameScreen::EndGameScreen(GameGUI *gui) : UIScreen(fe::themeFor(fe::Surface::
 
 	// Save the step and order count
 	game = &(gui->game);
-	durationSeconds = game->stepCounter / 25;
+	gameMetrics = Stats::catalogForBuildings(game->buildingsTypes);
+	durationSeconds = game->stepCounter / GAME_TICKS_PER_SECOND;
 	if (Team *local = gui->getLocalTeam())
 	{
 		// Mark the player's own row, as the connection panel does ("Ana (you)").
@@ -145,7 +147,7 @@ EndGameScreen::EndGameScreen(GameGUI *gui) : UIScreen(fe::themeFor(fe::Surface::
 	std::vector<Stats::TeamHistory> histories;
 	for (const auto &team : teams)
 		histories.push_back(Stats::historyOf(team.teamNum, game->teams[team.teamNum]->stats));
-	for (const auto &entry : Stats::catalog())
+	for (const auto &entry : gameMetrics)
 		nothingToShow.push_back(!Stats::buildChart(entry, Stats::defaultView(entry), histories).any);
 	// Open on what the player last looked at; the overview the first time.
 	selectedMetric = Stats::findMetric(globalContainer->settings.statsMetric);
@@ -229,12 +231,12 @@ void EndGameScreen::onEscape()
 
 const Stats::Metric *EndGameScreen::metric() const
 {
-	return selectedMetric >= 0 && selectedMetric < int(Stats::catalog().size()) ? &Stats::catalog()[std::size_t(selectedMetric)] : nullptr;
+	return selectedMetric >= 0 && selectedMetric < int(gameMetrics.size()) ? &gameMetrics[std::size_t(selectedMetric)] : nullptr;
 }
 
 void EndGameScreen::selectMetric(int chosen)
 {
-	if (chosen < OVERVIEW || chosen >= int(Stats::catalog().size()))
+	if (chosen < OVERVIEW || chosen >= int(gameMetrics.size()))
 		return;
 	selectedMetric = chosen;
 	const auto *now = metric();
@@ -359,7 +361,7 @@ Element EndGameScreen::metricSidebar(const Presentation &p)
 	};
 	entry(OVERVIEW, fe::tr("[stat overview]"), fe::tr("[stat overview about]"));
 	Stats::Group group = Stats::Group::Count;
-	const auto &metrics = Stats::catalog();
+	const auto &metrics = gameMetrics;
 	for (std::size_t i = 0; i < metrics.size(); ++i)
 	{
 		if (metrics[i].group != group)
@@ -379,7 +381,7 @@ Element EndGameScreen::metricChoices(const Presentation &p)
 {
 	// Narrow layouts: the group, then the metrics of that group, so neither list
 	// is long. The metric list explains the selected metric.
-	const auto &metrics = Stats::catalog();
+	const auto &metrics = gameMetrics;
 	const auto *now = metric();
 	std::vector<std::string> groups{fe::tr("[stat overview]")};
 	for (int g = 0; g < int(Stats::Group::Count); ++g)
@@ -421,7 +423,7 @@ Element EndGameScreen::metricChoices(const Presentation &p)
 
 std::string EndGameScreen::pickerTitle(int index) const
 {
-	const std::string title = TeamStatChart::title(Stats::catalog()[std::size_t(index)]);
+	const std::string title = TeamStatChart::title(gameMetrics[std::size_t(index)]);
 	return nothingToShow[std::size_t(index)] ? std::string(GAGCore::FormattableString(fe::tr("[stat %0 nothing]")).arg(title)) : title;
 }
 
@@ -836,7 +838,11 @@ void EndGameScreen::paintChart(fe::Canvas &canvas, fe::Rect r)
 		return;
 	}
 	canvas.pushClip(r);
-	TeamStatChart::paint(*game, *surface, r.x, r.y, r.w, r.h, chartOptions());
+	const auto options = chartOptions();
+    std::vector<Stats::TeamHistory> histories;
+    for (const auto& team : options.teams)
+        histories.push_back(Stats::historyOf(team.team, game->teams[team.team]->stats));
+    TeamStatChart::paint(histories, game->stepCounter, *surface, r.x, r.y, r.w, r.h, options);
 	canvas.popClip();
 }
 

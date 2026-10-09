@@ -1,3 +1,6 @@
+import { createGeneratorExecutor } from './generatorValidation.ts';
+import { createAssetSandbox, createSetValidator } from './setValidation.ts';
+import { createAiValidator } from './aiValidation.ts';
 // engine-agent: one image per sim version (the glob2 headless binary of that
 // version plus this wrapper). It has no database or blob-store access: jobs,
 // results and blobs go through platform-api's internal engine API.
@@ -75,6 +78,7 @@ try {
   const platform = new PlatformClient({ baseUrl, key });
 
   let simVersion: SimVersion;
+  let buildingCatalogHash: string | undefined;
   let runner: EngineRunner;
   const binary = env['ENGINE_BINARY'];
   if (binary) {
@@ -106,6 +110,7 @@ try {
       maxOutputBytes: positive('ENGINE_MAX_RECORD_BYTES', DEFAULT_RUNNER_LIMITS.maxRecordBytes),
     });
     const catalog = await engine.catalog();
+    buildingCatalogHash = catalog.buildingCatalogHash;
     let resolved;
     try {
       resolved = await detectSimVersion(engine, catalog, {
@@ -119,7 +124,43 @@ try {
     }
     simVersion = resolved.simVersion;
     logger.info({ simVersion: describeSimVersion(resolved), binary }, 'engine binary identified');
+    let aiValidator;
+    try {
+      aiValidator = await createAiValidator(engine.options, simVersion);
+    } catch (error) {
+      logger.warn(
+        { err: error },
+        'AI publishing unavailable: isolated validator failed its startup probe',
+      );
+    }
+    let generatorExecutor;
+    try {
+      generatorExecutor = await createGeneratorExecutor(engine.options, simVersion);
+    } catch (error) {
+      logger.warn(
+        { err: error },
+        'Generator sharing unavailable: isolated executor failed its startup probe',
+      );
+    }
+    let setValidator;
+    if (catalog.versionMinor >= 144 || catalog.commands.includes('validate_set')) {
+      // Format 144 maps embed uploaded PNGs too. Publishing's opt-in only gates
+      // validate-set availability; ordinary map jobs must use the same boundary.
+      try {
+        engine.options.processLauncher = await createAssetSandbox(engine.options);
+        const validated = await createSetValidator(engine.options);
+        if (env['ENGINE_SET_VALIDATION'] === '1' && catalog.commands.includes('validate_set'))
+          setValidator = validated;
+      } catch (error) {
+        throw new ConfigError(
+          'Asset-capable engine isolation failed its startup probe: ' + (error as Error).message,
+        );
+      }
+    }
     runner = new HeadlessEngineRunner({
+      ...(generatorExecutor ? { generatorExecutor } : {}),
+      ...(setValidator ? { setValidator } : {}),
+      ...(aiValidator ? { aiValidator } : {}),
       engine,
       catalog,
       simVersion,
@@ -141,6 +182,7 @@ try {
   }
 
   const agent = new EngineAgent({
+    ...(buildingCatalogHash ? { buildingCatalogHash } : {}),
     ...(process.env['ENGINE_AGENT_ID'] ? { id: process.env['ENGINE_AGENT_ID'] } : {}),
     simVersion,
     build: process.env['ENGINE_BUILD'] ?? 'unknown',

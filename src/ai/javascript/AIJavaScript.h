@@ -7,6 +7,8 @@
 class AIJavaScript : public AIImplementation
 {
 	Player *player;
+	unsigned teamNumber = 0, observationTick = 0;
+	std::shared_ptr<Order> decide();
 	std::string source;
 	std::string displayName = "JavaScript AI";
 	unsigned profile = 1;
@@ -22,6 +24,21 @@ class AIJavaScript : public AIImplementation
 	bool load(GAGCore::InputStream *, Player *, Sint32) override;
 	void save(GAGCore::OutputStream *) override;
 	std::shared_ptr<Order> getOrder() override;
-	void observe();
+	bool supportsObservation() const override { return true; }
+    SimulationSnapshot::Requirements observationRequirements() const override
+    { return SimulationSnapshot::Simulation & ~(SimulationSnapshot::bit(SimulationSnapshot::Component::Growth)
+        | SimulationSnapshot::bit(SimulationSnapshot::Component::ResourceFields)); }
+    std::optional<Uint64> retainedQueryVectorBytes() const override;
+	std::shared_ptr<Order> getOrder(const AIEngine::DecisionContext&) override;
+	bool isDisabled() const { return disabled; }
+	void enableValidationReporting()
+	{
+		if (services)
+			services->enableValidationReporting();
+	}
+	bool hasRejectedDecision() const { return services && services->hasRejectedDecision(); }
+	const std::string &diagnostic() const { return error; }
+	// Ordered worker-stream observation for boundaries without an AI poll.
+	void observe(const AIEngine::AIWorldView&);
 	void captureTelemetry() override;
 };

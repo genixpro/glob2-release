@@ -15,6 +15,7 @@
 #include <CooperativeSlice.h>
 #include <SDLGraphicContext.h>
 #include <stdexcept>
+#include <iostream>
 
 using namespace GAGGUI;
 
@@ -132,6 +133,59 @@ TEST_CASE("screen phases; completion; reuse; quit and compatibility host")
     GAGCore::setProcessEnvironment("SDL_VIDEODRIVER", "dummy", 1);
     GAGCore::setProcessEnvironment("SDL_AUDIODRIVER", "dummy", 1);
     GAGCore::GraphicContext context(800, 600, 0, "Screen lifecycle regression");
+    {
+        struct DrawingProbe : Probe {
+            void onSDLEvent(SDL_Event *) override { ++inputs; }
+        };
+        context.setTargetRenderFps(25);
+        ScreenStack capped(context);
+        auto owned = std::make_unique<DrawingProbe>();
+        auto *probe = owned.get();
+        capped.push(std::move(owned));
+        capped.frame(1, {});
+        const int initialPaints = probe->paints;
+        require(initialPaints == 1, "First capped frame paints immediately");
+        SDL_Event motion{}; motion.type = SDL_EVENT_MOUSE_MOTION;
+        capped.frame(2, {motion}, false);
+        require(probe->paints == initialPaints && probe->timers == 2 && probe->inputs == 1,
+                "Update-only browser callback still dispatches input and timers");
+        capped.draw();
+        require(probe->paints == initialPaints, "Cap skips expensive drawing");
+        // Child transitions and input still execute before their next paint.
+        auto childOwned = std::make_unique<DrawingProbe>();
+        auto *child = childOwned.get();
+        capped.push(std::move(childOwned));
+        capped.frame(3, {motion}, false);
+        require(child->created == 1 && child->inputs == 1 && child->paints == 0,
+                "A child is admitted and receives input without drawing");
+        child->endExecute(0);
+        capped.frame(4, {}, false);
+        require(capped.top() == probe, "Completed child resumes its parent while drawing is skipped");
+        context.resetRenderPacing();
+        capped.draw();
+        require(probe->paints == initialPaints + 1, "Resume permits a fresh draw");
+        context.setTargetRenderFps(0);
+        capped.frame(3, {});
+        require(probe->paints == initialPaints + 2, "Unlimited takes effect immediately");
+        for (int fps : {25, 60, 120, 0}) {
+            context.setTargetRenderFps(fps);
+            context.resetRenderPacing();
+            const auto started = SDL_GetTicksNS();
+            const int before = probe->paints;
+            const int timersBefore = probe->timers;
+            do {
+                capped.frame(SDL_GetTicks(), {motion});
+                SDL_Delay(1);
+            } while (SDL_GetTicksNS() - started < 120000000);
+            const auto elapsed = SDL_GetTicksNS() - started;
+            const auto draws = probe->paints - before;
+            CHECK(draws > 0);
+            CHECK(probe->timers > timersBefore);
+            if (fps) CHECK(draws <= 1 + elapsed * fps / 1000000000);
+            std::cout << "render cap=" << fps << " elapsed_ns=" << elapsed
+                      << " draws=" << draws << " updates=" << probe->timers - timersBefore << '\n';
+        }
+    }
     GAGCore::DrawableSurface surface(800, 600);
     Probe screen;
     screen.beginExecution(&surface);
@@ -317,5 +371,67 @@ TEST_CASE("screen phases; completion; reuse; quit and compatibility host")
         hostCompleted = true;
     });
     require(hostCompleted, "Native host completes exactly once before returning");
+}
+
+TEST_CASE("a top screen with unsaved work can veto window close")
+{
+    GAGCore::DrawableSurface surface(800, 600);
+    struct Guarded : Screen {
+        bool dirty = true;
+        int quits = 0, terminations = 0, destroyed = 0;
+        bool interceptsQuit() const override { return dirty; }
+        void handleExecutionEvent(SDL_Event event) override
+        {
+            if (event.type == SDL_EVENT_QUIT) ++quits;
+            else if (event.type == SDL_EVENT_TERMINATING) ++terminations;
+        }
+    };
+    SDL_Event quit{}; quit.type = SDL_EVENT_QUIT;
+    {
+        ScreenStack stack(surface);
+        auto owned = std::make_unique<Guarded>();
+        auto *guarded = owned.get();
+        bool continued = false;
+        stack.push(std::move(owned), [&](Screen&, int) { continued = true; });
+        stack.frame(0, {});
+        require(stack.quitIntercepted(), "A dirty top screen intercepts quit");
+        stack.frame(40, {quit});
+        require(stack.running() && guarded->quits == 1, "Intercepted quit is delivered to the top screen instead of stopping");
+        // The screen answers the request by quitting the application itself.
+        guarded->endExecute(Screen::QUIT_APPLICATION);
+        stack.frame(80, {});
+        require(!stack.running() && stack.result() == Screen::QUIT_APPLICATION && !continued,
+                "A screen-confirmed quit stops the stack without running continuations");
+    }
+    {
+        ScreenStack stack(surface);
+        auto owned = std::make_unique<Guarded>();
+        owned->dirty = false;
+        stack.push(std::move(owned));
+        stack.frame(0, {});
+        require(!stack.quitIntercepted(), "A clean screen does not intercept quit");
+        stack.frame(40, {quit});
+        require(!stack.running() && stack.result() == Screen::QUIT_APPLICATION, "A clean screen quits immediately");
+    }
+    {
+        ScreenStack stack(surface);
+        stack.push(std::make_unique<Guarded>());
+        stack.frame(0, {});
+        SDL_Event terminating{}; terminating.type = SDL_EVENT_TERMINATING;
+        stack.frame(40, {terminating});
+        require(!stack.running(), "Platform termination is never vetoed");
+    }
+    {
+        // Only the top screen decides: a dirty parent under a clean child does not veto.
+        ScreenStack stack(surface);
+        stack.push(std::make_unique<Guarded>());
+        stack.frame(0, {});
+        auto child = std::make_unique<Guarded>();
+        child->dirty = false;
+        stack.push(std::move(child));
+        stack.frame(40, {});
+        stack.frame(80, {quit});
+        require(!stack.running(), "A clean child screen lets quit stop the stack");
+    }
 }
 }

@@ -16,6 +16,7 @@
 #include <cstddef>
 #include <algorithm>
 #include <tuple>
+#include <limits>
 
 #include "Game.h"
 #include "GlobalContainer.h"
@@ -26,6 +27,7 @@
 #include "Unit.h"
 #include "Bullet.h"
 #include "Map.h"
+#include "ai/model/BuildingProjection.h"
 
 
 namespace
@@ -84,10 +86,52 @@ void statValue(Stream* stream, const char* name, T (&values)[N])
     leaveStatSection(stream);
 }
 
+template<class Stream, class Measurement>
+void variantFields(Stream* stream, Measurement& value)
+{
+	statValue(stream,"count",value.count);
+	statValue(stream,"completed",value.completed);
+	statValue(stream,"removed",value.removed);
+	statValue(stream,"trapped",value.trapped);
+}
+void statValue(GAGCore::OutputStream* stream,const char* name,const BuildingMeasurement& value)
+{
+	stream->writeEnterSection(name); variantFields(stream,value); stream->writeLeaveSection();
+}
+void statValue(GAGCore::InputStream* stream,const char* name,BuildingMeasurement& value)
+{
+	stream->readEnterSection(name); variantFields(stream,value); stream->readLeaveSection();
+}
+template<class T>
+void statValue(GAGCore::OutputStream* stream,const char* name,const std::vector<T>& values)
+{
+	stream->writeEnterSection(name);
+	stream->writeUint32(values.size(),"size");
+	for (unsigned i=0; i<values.size(); ++i)
+	{
+		stream->writeEnterSection(i); statValue(stream,"value",values[i]); stream->writeLeaveSection();
+	}
+	stream->writeLeaveSection();
+}
+template<class T>
+void statValue(GAGCore::InputStream* stream,const char* name,std::vector<T>& values)
+{
+	stream->readEnterSection(name);
+	const auto count=stream->readUint32("size");
+	if (count>4096) throw std::runtime_error("Invalid building statistics catalog size");
+	values.resize(count);
+	for (unsigned i=0; i<count; ++i)
+	{
+		stream->readEnterSection(i); statValue(stream,"value",values[i]); stream->readLeaveSection();
+	}
+	stream->readLeaveSection();
+}
+
 // Fields are grouped by the save format that introduced them; a stream written
 // at versionMinor carries exactly the groups that existed then.
 template <class Stream, class Stat> void measurementFields(Stream *stream, Stat &stat, int versionMinor = VERSION_MINOR)
 {
+	if (versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG) statValue(stream,"variants",stat.variants);
 	statValue(stream, "tick", stat.tick);
 	statValue(stream, "births", stat.births);
 	statValue(stream, "deaths", stat.deaths);
@@ -99,8 +143,15 @@ template <class Stream, class Stat> void measurementFields(Stream *stream, Stat 
 	statValue(stream, "withdrawn", stat.withdrawn);
 	statValue(stream, "transferredIn", stat.transferredIn);
 	statValue(stream, "transferredOut", stat.transferredOut);
-	statValue(stream, "consumed", stat.consumed);
+	enterStatSection(stream,"consumed");
+	const int purposes = versionMinor >= FILE_FORMAT_VERSION_AREA_EFFECTS ? GameplayMeasurements::PURPOSES : versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG ? GameplayMeasurements::AREA_UPKEEP : GameplayMeasurements::HEALING_COST;
+	for (int i=0; i<purposes; ++i)
+	{
+		enterStatSection(stream,i); statValue(stream,"value",stat.consumed[i]); leaveStatSection(stream);
+	}
+	leaveStatSection(stream);
 	statValue(stream, "repairDelivered", stat.repairDelivered);
+	if (versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG) statValue(stream,"resourceSpillageEvents",stat.materialSpillageEvents); // Historical save-field label.
 	statValue(stream, "meals", stat.meals);
 	statValue(stream, "healingVisits", stat.healingVisits);
 	statValue(stream, "hpRestored", stat.hpRestored);
@@ -153,19 +204,22 @@ template <class Stream, class Stat> void measurementFields(Stream *stream, Stat 
 }
 
 // Packed history rows have the fixed size of one record in the save's own format.
-size_t measurementRecordBytes(int versionMinor)
+size_t measurementRecordBytes(int versionMinor, size_t catalogSize)
 {
     GAGCore::BinaryOutputStream stream(new GAGCore::MemoryStreamBackend);
     GameplayMeasurements value{};
+    value.variants.resize(catalogSize);
     measurementFields(&stream,value,versionMinor);
     return stream.getPosition();
 }
 
 template<class Stream, class Stat>
-void liveStatFields(Stream* stream, Stat& stat)
+void liveStatFields(Stream* stream, Stat& stat, int versionMinor = VERSION_MINOR)
 {
+    if (versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG) statValue(stream,"buildingCountByVariant",stat.buildingCountByVariant);
     statValue(stream, "totalUnit", stat.totalUnit);
     statValue(stream, "numberUnitPerType", stat.numberUnitPerType);
+    if (versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG) statValue(stream,"workersByConstructionLevel",stat.workersByConstructionLevel);
     statValue(stream, "totalFree", stat.totalFree);
     statValue(stream, "isFree", stat.isFree);
     statValue(stream, "totalNeeded", stat.totalNeeded);
@@ -219,6 +273,8 @@ TeamStat::TeamStat()
 
 void TeamStat::reset()
 {
+	std::fill(buildingCountByVariant.begin(),buildingCountByVariant.end(),0);
+	std::fill_n(workersByConstructionLevel, NB_UNIT_LEVELS, 0);
 	totalUnit=0;
 	for(int i=0; i<NB_UNIT_TYPE; ++i)
 	{
@@ -304,10 +360,12 @@ void TeamStats::step(Team *team, bool reloaded)
 	PERF_SCOPE_TIME(Stats);
 	if (!reloaded && needsMeasurementInitialization)
 		initializeMeasurements(team->game->stepCounter);
+	if (reloaded) rebuildMeasurementCountReset();
 	beginMeasurementSnapshot(team);
 	// handle end of game stat step
 	if (((team->game->stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) == 0) && !reloaded)
 	{
+		historySnapshot.reset();
 		endOfGameStats.push_back(EndOfGameStat(stats[statsIndex].totalUnit, stats[statsIndex].totalBuilding, team->prestige,
 			stats[statsIndex].totalHP, stats[statsIndex].totalAttackPower, stats[statsIndex].totalDefensePower));
 
@@ -318,6 +376,28 @@ void TeamStats::step(Team *team, bool reloaded)
 		if (getenv("GLOB2_TEAM_TIMELINE"))
 		{
 			const TeamStat &s = stats[statsIndex];
+            // Historical column names remain log/model aliases. Count each
+            // physical variant once per applicable service, never by family ID.
+            int production=0,feeding=0,healing=0,construction=0,combat=0,walking=0,swimming=0,projectiles=0;
+            for(size_t id=0;id<s.buildingCountByVariant.size();++id)
+            {
+                const int count=s.buildingCountByVariant[id];if(!count)continue;
+                const auto& type=ModelBuildingProjection::completed(team->game->buildingsTypes,*team->game->buildingsTypes.get(id));
+                const auto& spec=type.semantics;
+                auto trains=[&](int ability) {const auto& t=spec.training[ability];return type.maxUnitInside>0 && t.enabled && (t.unitMask&spec.admittedUnitMask);};
+                production+=count*bool(spec.production.enabledUnitMask);
+                feeding+=count*bool(type.maxUnitInside>0 && spec.feeding.enabled && (spec.feeding.unitMask&spec.admittedUnitMask));
+                healing+=count*bool(type.maxUnitInside>0 && spec.healing.enabled && (spec.healing.unitMask&spec.admittedUnitMask));
+                combat+=count*ModelBuildingProjection::trainsWarriorCombat(type);
+                walking+=count*trains(WALK);swimming+=count*trains(SWIM);
+                bool grantsConstruction=false;
+                for(int ability=0;ability<NB_ABILITY;++ability)
+                    grantsConstruction|=trains(ability) && spec.training[ability].constructionLevel>0 &&
+                        (spec.training[ability].unitMask&spec.admittedUnitMask&(1u<<WORKER));
+                construction+=count*grantsConstruction;
+                projectiles+=count*bool(type.shootingRange>0 && type.shootRhythm>0 &&
+                    std::any_of(spec.projectileDamage.begin(),spec.projectileDamage.end(),[](int n){return n>0;}));
+            }
 			std::cout << "GLOB2_ECON team=" << team->teamNumber
 				<< " tick=" << team->game->stepCounter
 				<< " workers=" << s.numberUnitPerType[WORKER]
@@ -327,24 +407,25 @@ void TeamStats::step(Team *team, bool reloaded)
 				<< " fooded=" << s.totalUnitFooded << "/" << s.totalUnitFoodable
 				<< " foodCritical=" << s.needFoodCritical
 				<< " needFood=" << s.needFood
-				<< " swarm=" << s.numberBuildingPerType[IntBuildingType::SWARM_BUILDING]
-				<< " inn=" << s.numberBuildingPerType[IntBuildingType::FOOD_BUILDING]
-				<< " school=" << s.numberBuildingPerType[IntBuildingType::SCIENCE_BUILDING]
-				<< " barracks=" << s.numberBuildingPerType[IntBuildingType::ATTACK_BUILDING]
-				<< " hospital=" << s.numberBuildingPerType[IntBuildingType::HEAL_BUILDING]
-				<< " racetrack=" << s.numberBuildingPerType[IntBuildingType::WALKSPEED_BUILDING]
-				<< " pool=" << s.numberBuildingPerType[IntBuildingType::SWIMSPEED_BUILDING]
-				<< " tower=" << s.numberBuildingPerType[IntBuildingType::DEFENSE_BUILDING]
-				<< std::endl;
+				<< " swarm=" << production
+				<< " inn=" << feeding
+				<< " school=" << construction
+				<< " barracks=" << combat
+				<< " hospital=" << healing
+				<< " racetrack=" << walking
+				<< " pool=" << swimming
+				<< " tower=" << projectiles;
+            for(size_t id=0;id<s.buildingCountByVariant.size();++id)
+                std::cout << " variant_" << id << '=' << s.buildingCountByVariant[id];
+            std::cout << std::endl;
 		}
 	}
 	
 	// handle in game stat step
 	TeamSmoothedStat &smoothedStat=smoothedStats[smoothedIndex];
 	smoothedStat.reset();
-	for (int i=0; i<Unit::MAX_COUNT; i++)
+	for (Unit *u : team->liveUnits.entries())
 	{
-		Unit *u=team->myUnits[i];
 		observeMeasurementUnit(u);
 		// Filter here: most of the 1024 slots hold no worker.
 		if (!reloaded && u && u->typeNum == WORKER)
@@ -356,16 +437,15 @@ void TeamStats::step(Team *team, bool reloaded)
 		}
 	}
 	
-	for (int i=0; i<Building::MAX_COUNT; i++)
+	for (Building *b : team->liveBuildings.entries())
 	{
-		Building *b = team->myBuildings[i];
 		if (b)
 		{
 			observeMeasurementBuilding(b);
 			if(b->type->foodable || b->type->fillable || b->type->zonable[WORKER])
             {
 		        smoothedStat.totalNeeded+=b->desiredMaxUnitWorking-(int)b->unitsWorking.size();
-		        smoothedStat.totalNeededPerLevel[b->type->level]+=b->desiredMaxUnitWorking-(int)b->unitsWorking.size();
+		        smoothedStat.totalNeededPerLevel[b->type->semantics.requiredWorkerLevel]+=b->desiredMaxUnitWorking-(int)b->unitsWorking.size();
             }
         }
     }
@@ -376,6 +456,7 @@ void TeamStats::step(Team *team, bool reloaded)
 	{
 		sampleTraps(team);
 		sampleDefence(team);
+		historySnapshot.reset();
 		measurementHistory.push_back(measurements);
 		AITelemetry::capture(team, true, getenv("GLOB2_TEAM_TIMELINE") != nullptr);
 		if (getenv("GLOB2_TEAM_TIMELINE"))
@@ -407,20 +488,22 @@ void TeamStats::step(Team *team, bool reloaded)
 		}
 	}
 
+	displaySnapshot.reset();
 	// We change current stats:
 	statsIndex++;
 	statsIndex%=STATS_SIZE;
 	TeamStat &stat=stats[statsIndex];
 
 	stat.reset();
+	stat.buildingCountByVariant.resize(team->game->buildingsTypes.size(),0);
 
-	for (int i=0; i<Unit::MAX_COUNT; i++)
+	for (Unit *u : team->liveUnits.entries())
 	{
-		Unit *u=team->myUnits[i];
 		if (u)
 		{
 			stat.totalUnit++;
 			stat.numberUnitPerType[(int)u->typeNum]++;
+			if (u->typeNum==WORKER) ++stat.workersByConstructionLevel[u->workerLevel()];
 			stat.totalHP+=u->hp;
 
 			if (u->isUnitHungry())
@@ -472,18 +555,25 @@ void TeamStats::step(Team *team, bool reloaded)
 		}
 	}
 
-	for (int i=0; i<Building::MAX_COUNT; i++)
+	for (Building *b : team->liveBuildings.entries())
 	{
-		Building *b = team->myBuildings[i];
 		if (b)
 		{
-			stat.numberBuildingPerType[b->type->shortTypeNum]++;
-			int longLevel=b->getLongLevel();
-			assert(longLevel>=0);
-			assert(longLevel<=MAX_BUILDING_LONG_LEVEL);
-			stat.numberBuildingPerTypePerLevel[b->type->shortTypeNum][longLevel]++;
+			++stat.buildingCountByVariant[b->typeNum];
+			// Historical histograms remain for authored SGSL and older dataset readers.
+			const int family=b->type->shortTypeNum, level=b->getLongLevel();
+			if (family>=0 && family<IntBuildingType::NB_BUILDING && level>=0 && level<NB_BUILDING_LONG_LEVELS)
+			{
+				++stat.numberBuildingPerType[family];
+				++stat.numberBuildingPerTypePerLevel[family][level];
+			}
 			stat.totalHP += b->hp;
-			stat.totalDefensePower += (b->type->shootDamage*b->type->shootRhythm) >> SHOOTING_COOLDOWN_MAGNITUDE;
+			// The scalar model/UI convention is damage against warriors. Actual
+            // projectile resolution keeps its independent per-unit damage.
+            if (b->type->shootingRange > 0)
+                stat.totalDefensePower = int(std::min<Sint64>(std::numeric_limits<int>::max(),
+                    Sint64(stat.totalDefensePower) + ((Sint64(b->type->semantics.projectileDamage[WARRIOR]) *
+                        b->type->shootRhythm) >> SHOOTING_COOLDOWN_MAGNITUDE)));
 			if ((!b->type->isBuildingSite) && (!b->type->isVirtual))
 				stat.totalBuilding++;
 		}
@@ -498,7 +588,42 @@ void TeamStats::step(Team *team, bool reloaded)
 		stat.totalNeededPerLevel[k]=maxStat.totalNeededPerLevel[k];
 }
 
-void TeamStats::drawText(int posx, int posy)
+size_t TeamStats::displayCapacityBytes() const
+{
+    size_t bytes=0;
+    for (const auto& sample:stats) bytes+=sample.buildingCountByVariant.capacity()*sizeof(int);
+    bytes += endOfGameStats.capacity() * sizeof(EndOfGameStat);
+    bytes += measurementHistory.capacity() * sizeof(GameplayMeasurements);
+    for (const auto& sample : measurementHistory) bytes += sample.variants.capacity() * sizeof(sample.variants[0]);
+    return bytes;
+}
+
+std::shared_ptr<const TeamStats> TeamStats::frozenHistory() const
+{
+    if (auto previous = historySnapshot.lock()) return previous;
+    auto result = std::make_shared<TeamStats>();
+    result->endOfGameStats = endOfGameStats;
+    result->measurementHistory = measurementHistory;
+    result->coverageStartTick = coverageStartTick;
+    result->extendedCoverageStartTick = extendedCoverageStartTick;
+    result->labourCoverageStartTick = labourCoverageStartTick;
+    historySnapshot = result;
+    return result;
+}
+
+std::shared_ptr<const TeamStats> TeamStats::frozenDisplay() const
+{
+    if (auto previous=displaySnapshot.lock()) return previous;
+    auto result=std::make_shared<TeamStats>();
+    result->statsIndex=statsIndex;
+    std::copy_n(stats,STATS_SIZE,result->stats);
+    // HUD readers do not need live measurement collectors, AI series, or their
+    // growing histories. Retain only the samples consumed by text and graphs.
+    displaySnapshot=result;
+    return result;
+}
+
+void TeamStats::drawText(int posx, int posy) const
 {
 	// local variable to speed up access
 	GraphicContext *gfx=globalContainer->gfx;
@@ -507,7 +632,7 @@ void TeamStats::drawText(int posx, int posy)
 	int textStartPosX=posx+4;
 	int textStartPosY=posy;
 	
-	TeamStat &newStats=stats[statsIndex];
+	const TeamStat &newStats=stats[statsIndex];
 	
 	// general
 	textStartPosY -= 5;
@@ -561,7 +686,7 @@ void TeamStats::drawText(int posx, int posy)
 	}
 }
 
-void TeamStats::drawStat(int posx, int posy)
+void TeamStats::drawStat(int posx, int posy) const
 {
 	assert(STATS_SIZE==128);// We have graphical constraints
 	
@@ -699,38 +824,40 @@ void TeamStats::drawStat(int posx, int posy)
 	}
 }
 
-int TeamStats::getFreeUnits(int type)
+int TeamStats::getFreeUnits(int type) const
 {
 	return (stats[statsIndex].isFree[type]);
 }
 
-int TeamStats::getTotalUnits(int type)
+int TeamStats::getTotalUnits(int type) const
 {
 	return (stats[statsIndex].numberUnitPerType[type]);
 }
 
-int TeamStats::getWorkersNeeded()
+int TeamStats::getWorkersNeeded() const
 {
 	return (stats[statsIndex].totalNeeded);
 }
 
-int TeamStats::getWorkersBalance()
+int TeamStats::getWorkersBalance() const
 {
 	return (stats[statsIndex].isFree[WORKER]-stats[statsIndex].totalNeeded);
 }
 
-int TeamStats::getWorkersLevel(int level)
+int TeamStats::getWorkersLevel(int level) const
 {
-	return (stats[statsIndex].upgradeState[BUILD][level]);
+	return (stats[statsIndex].workersByConstructionLevel[level]);
 }
 
-int TeamStats::getStarvingUnits()
+int TeamStats::getStarvingUnits() const
 {
 	return (stats[statsIndex].needFoodCritical);
 }
 
 bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor)
 {
+    displaySnapshot.reset();
+    historySnapshot.reset();
 	stream->readEnterSection("TeamStats");
 	Uint32 size=0;
 	size=stream->readCount("size");
@@ -771,7 +898,9 @@ bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor)
         for (unsigned i = 0; i < STATS_SIZE; ++i)
         {
             stream->readEnterSection(i);
-            liveStatFields(stream, stats[i]);
+            liveStatFields(stream, stats[i], versionMinor);
+            if (versionMinor < FILE_FORMAT_VERSION_BUILDING_CATALOG)
+                std::copy_n(stats[i].upgradeStatePerType[WORKER][BUILD], NB_UNIT_LEVELS, stats[i].workersByConstructionLevel);
             stream->readLeaveSection();
         }
         stream->readLeaveSection();
@@ -800,14 +929,14 @@ bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor)
 			GameplayMeasurements sample;
 			measurementFields(stream, sample, versionMinor);
 			stream->readLeaveSection();
-			if (sample.tick < coverageStartTick || sample.tick > measurements.tick ||
+			if (sample.variants.size() != measurements.variants.size() || sample.tick < coverageStartTick || sample.tick > measurements.tick ||
 				(sample.tick & 511) ||
 				(!measurementHistory.empty() && sample.tick <= measurementHistory.back().tick))
 				throw std::runtime_error("Invalid gameplay statistics timestamp");
 			measurementHistory.push_back(sample);
         };
         if(versionMinor>=FILE_FORMAT_VERSION_COMPACT_STATE && GAGCore::PackedArray::binary(stream))
-            GAGCore::PackedRecords::read(stream,count,measurementRecordBytes(versionMinor),readMeasurement);
+            GAGCore::PackedRecords::read(stream,count,measurementRecordBytes(versionMinor, measurements.variants.size()),readMeasurement);
         else for(Uint32 i=0;i<count;++i) readMeasurement(stream,i);
 		needsMeasurementInitialization = false;
 		extendedCoverageStartTick = versionMinor >= FILE_FORMAT_VERSION_EXTENDED_GAMEPLAY_STATS
@@ -858,6 +987,50 @@ bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor)
 	else
 		aiTelemetry.clear();
 	stream->readLeaveSection();
+    if (versionMinor < FILE_FORMAT_VERSION_BUILDING_CATALOG)
+    {
+        // Legacy saves always load the legacy catalog. Preserve sampled history,
+        // rather than reconstructing past counts from today's live buildings.
+        BuildingsTypes catalog;
+        catalog.initLegacy();
+        for (auto& stat : stats) stat.buildingCountByVariant.assign(catalog.size(), 0);
+        const auto importMeasurement = [&](GameplayMeasurements& sample)
+        {
+            sample.variants.assign(catalog.size(), {});
+            bool importedTraps[IntBuildingType::NB_BUILDING]{};
+            for (size_t id=0; id<catalog.size(); ++id)
+            {
+                const auto& type = *catalog.get(id);
+                const int family=type.shortTypeNum, longLevel=2*type.level+(type.isBuildingSite ? 0 : 1);
+                if (family<0 || family>=IntBuildingType::NB_BUILDING || longLevel<0 || longLevel>=NB_BUILDING_LONG_LEVELS) continue;
+                auto& variant=sample.variants[id];
+                variant.count=sample.buildings[family][longLevel];
+                for (int kind=0; kind<GameplayMeasurements::REMOVALS; ++kind)
+                    variant.removed[kind]=sample.removed[kind][family][longLevel];
+                if (!type.isBuildingSite && type.level<NB_UNIT_LEVELS)
+                    for (int kind=0; kind<GameplayMeasurements::COMPLETIONS; ++kind)
+                        variant.completed[kind]=sample.completed[kind][family][type.level];
+                // Old blockage samples did not retain levels. Keep the family
+                // aggregate once; it is used only for the total blockage metric.
+                if (!type.isBuildingSite && !importedTraps[family])
+                {
+                    for (int blocked=0; blocked<2; ++blocked) for (int swim=0; swim<2; ++swim)
+                        variant.trapped[blocked][swim]=sample.trappedBuildings[blocked][swim][family];
+                    importedTraps[family]=true;
+                }
+            }
+        };
+        for (size_t id=0; id<catalog.size(); ++id)
+        {
+            const auto& type=*catalog.get(id);
+            const int family=type.shortTypeNum, longLevel=2*type.level+(type.isBuildingSite ? 0 : 1);
+            if (family<0 || family>=IntBuildingType::NB_BUILDING || longLevel<0 || longLevel>=NB_BUILDING_LONG_LEVELS) continue;
+            for (auto& stat : stats) stat.buildingCountByVariant[id]=stat.numberBuildingPerTypePerLevel[family][longLevel];
+        }
+        importMeasurement(measurements);
+        for (auto& sample : measurementHistory) importMeasurement(sample);
+    }
+	rebuildMeasurementCountReset();
 	return true;
 }
 
@@ -904,13 +1077,17 @@ void TeamStats::save(GAGCore::OutputStream *stream)
 	measurementFields(stream, measurements);
 	stream->writeUint32(measurementHistory.size(), "measurementCount");
     if(GAGCore::PackedArray::binary(stream))
-        GAGCore::PackedRecords::write(stream,measurementHistory.size(),measurementRecordBytes(VERSION_MINOR),
-            [&](GAGCore::OutputStream* rows,size_t i){measurementFields(rows,measurementHistory[i]);});
+        GAGCore::PackedRecords::write(stream,measurementHistory.size(),measurementRecordBytes(VERSION_MINOR, measurements.variants.size()),
+            [&](GAGCore::OutputStream* rows,size_t i){
+				auto sample=measurementHistory[i]; sample.variants.resize(measurements.variants.size());
+				measurementFields(rows,sample);
+			});
     else
 	for (unsigned i = 0; i < measurementHistory.size(); ++i)
 	{
 		stream->writeEnterSection(i);
-		measurementFields(stream, measurementHistory[i]);
+		auto sample=measurementHistory[i]; sample.variants.resize(measurements.variants.size());
+		measurementFields(stream, sample);
 		stream->writeLeaveSection();
 	}
 	stream->writeUint32(extendedCoverageStartTick, "extendedCoverageStartTick");
@@ -932,7 +1109,10 @@ void TeamStats::save(GAGCore::OutputStream *stream)
 
 void TeamStats::initializeMeasurements(Uint32 tick)
 {
+    historySnapshot.reset();
 	measurements = GameplayMeasurements{};
+	measurementCountTouched.clear();
+	measurementCountCatalogSize = 0;
 	measurements.tick = coverageStartTick = tick;
 	extendedCoverageStartTick = labourCoverageStartTick = tick;
 	coverageBuildingTick = 0;
@@ -1001,6 +1181,15 @@ void TeamStats::printMeasurements(int team, bool final) const
 	printMeasurement("stock", measurements.stock);
 	printMeasurement("carried", measurements.carried);
 	printMeasurement("buildings", measurements.buildings);
+	for (size_t i=0; i<measurements.variants.size(); ++i)
+	{
+		const auto key="variant_"+std::to_string(i);
+		const auto& value=measurements.variants[i];
+		printMeasurement(key+"_count",value.count);
+		printMeasurement(key+"_completed",value.completed);
+		printMeasurement(key+"_removed",value.removed);
+		printMeasurement(key+"_trapped",value.trapped);
+	}
 	printMeasurement("hungry", measurements.hungry);
 	printMeasurement("critical", measurements.critical);
 	printMeasurement("feeding", measurements.feeding);
@@ -1037,23 +1226,37 @@ void TeamStats::printMeasurements(int team, bool final) const
 	emit(measurements, "GLOB2_MEASURE", final);
 }
 
+void TeamStats::rebuildMeasurementCountReset()
+{
+	measurementCountTouched.clear();
+	measurementCountCatalogSize = measurements.variants.size();
+	measurementCountTouched.reserve(measurementCountCatalogSize);
+	for (size_t id=0; id<measurementCountCatalogSize; ++id)
+		if (measurements.variants[id].count) measurementCountTouched.push_back(id);
+}
+
 void TeamStats::beginMeasurementSnapshot(Team *team)
 {
 	measurements.tick = team->game->stepCounter;
+	measurements.variants.resize(team->game->buildingsTypes.size());
+	if (measurementCountCatalogSize != measurements.variants.size())
+		rebuildMeasurementCountReset();
+	for (const auto id : measurementCountTouched) measurements.variants[id].count=0;
+	measurementCountTouched.clear();
 	std::fill(std::begin(measurements.stock), std::end(measurements.stock), 0);
 	std::fill(std::begin(measurements.carried), std::end(measurements.carried), 0);
 	for (auto &row : measurements.buildings)
 		std::fill(std::begin(row), std::end(row), 0);
 	measurements.hungry = measurements.critical = measurements.feeding = measurements.healing = 0;
-	for (int r = 0; r < MAX_NB_RESOURCES; ++r)
-		measurements.stock[r] = std::max(0, team->teamResources[r]);
+	for (int r = 0; r < MaterialSlotCount; ++r)
+		measurements.stock[r] = std::max(0, team->teamMaterials[r]);
 }
 void TeamStats::observeMeasurementUnit(Unit *u)
 {
 	if (u && !u->isDead)
 	{
-		if (u->carriedResource >= 0 && u->carriedResource < MAX_NB_RESOURCES)
-			++measurements.carried[u->carriedResource];
+		if (u->carriedMaterial >= 0 && u->carriedMaterial < MaterialSlotCount)
+			++measurements.carried[u->carriedMaterial];
 		if (u->isUnitHungry())
 		{
 			++measurements.hungry;
@@ -1073,10 +1276,14 @@ void TeamStats::observeMeasurementBuilding(Building *b)
 {
 	if (b && !b->type->isVirtual && b->buildingState != Building::DEAD)
 	{
-		++measurements.buildings[b->type->shortTypeNum][b->getLongLevel()];
-		if (!b->type->useTeamResources)
-			for (int r = 0; r < MAX_NB_RESOURCES; ++r)
-				measurements.stock[r] += std::max(0, b->resources[r]);
+		auto& count=measurements.variants[b->typeNum].count;
+		if (count == 0) measurementCountTouched.push_back(size_t(b->typeNum));
+		++count;
+		if (b->type->shortTypeNum>=0 && b->type->shortTypeNum<IntBuildingType::NB_BUILDING && b->getLongLevel()<NB_BUILDING_LONG_LEVELS)
+			++measurements.buildings[b->type->shortTypeNum][b->getLongLevel()];
+		if (!b->type->useTeamMaterials)
+			for (int r = 0; r < MaterialSlotCount; ++r)
+				measurements.stock[r] += std::max(0, b->materials[r]);
 	}
 }
 GameplayMeasurements::Place TeamStats::placeOf(const Team *team, int x, int y)
@@ -1138,9 +1345,9 @@ void TeamStats::observeLabour(Unit *u)
 			M::LabourJob job = M::OTHER_JOB;
 			if (b->type->isBuildingSite)
 				job = M::SITE_JOB;
-			else if (b->type->shortTypeNum == IntBuildingType::SWARM_BUILDING)
+			else if (b->type->semantics.production.enabledUnitMask)
 				job = M::SWARM_JOB;
-			else if (b->type->shortTypeNum == IntBuildingType::FOOD_BUILDING)
+			else if (b->type->canFeedUnit)
 				job = M::INN_JOB;
 			M::LabourPhase phase = M::OTHER_PHASE;
 			if (u->displacement == Unit::DIS_GOING_TO_RESOURCE)
@@ -1172,13 +1379,15 @@ void TeamStats::recordCombatDeath(Unit *u)
 	++measurements.combatDeathPlace[u->typeNum][placeOf(u->owner, u->posX, u->posY)];
 	M::Assignment assignment = M::UNASSIGNED;
 	if (u->attachedBuilding)
-		switch (u->attachedBuilding->type->shortTypeNum)
+	{
+		assignment=M::OTHER_BUILDING;
+		if (u->activity==Unit::ACT_FLAG)
 		{
-		case IntBuildingType::WAR_FLAG: assignment = M::WAR_FLAG; break;
-		case IntBuildingType::CLEARING_FLAG: assignment = M::CLEARING_FLAG; break;
-		case IntBuildingType::EXPLORATION_FLAG: assignment = M::EXPLORATION_FLAG; break;
-		default: assignment = M::OTHER_BUILDING; break;
+			if (u->typeNum==WARRIOR) assignment=M::WAR_FLAG;
+			else if (u->typeNum==WORKER) assignment=M::CLEARING_FLAG;
+			else if (u->typeNum==EXPLORER) assignment=M::EXPLORATION_FLAG;
 		}
+	}
 	++measurements.combatDeathAssignment[u->typeNum][assignment];
 }
 
@@ -1201,7 +1410,7 @@ void TeamStats::sampleDefence(Team *team)
 		m.warriorLevels[place] += attackLevels(u);
 		m.warriorsHurt += u->medical == Unit::MED_DAMAGED;
 		m.warriorsFlagged += u->attachedBuilding &&
-			u->attachedBuilding->type->shortTypeNum == IntBuildingType::WAR_FLAG;
+			u->activity == Unit::ACT_FLAG && u->attachedBuilding->type->zonable[WARRIOR];
 		m.warriorsInside += u->displacement == Unit::DIS_INSIDE;
 	}
 	for (int t = 0; t < team->game->teamsCount(); ++t)
@@ -1224,6 +1433,8 @@ void TeamStats::sampleDefence(Team *team)
 
 void TeamStats::refreshMeasurements(Team *team)
 {
+	// Explicit cold refresh also accepts caller-supplied diagnostic counts.
+	rebuildMeasurementCountReset();
 	beginMeasurementSnapshot(team);
 	for (int i = 0; i < Unit::MAX_COUNT; ++i)
 		observeMeasurementUnit(team->myUnits[i]);
@@ -1237,6 +1448,8 @@ void TeamStats::sampleTraps(Team *team)
 {
 	auto &m = measurements;
 	m.trappedTick = team->game->stepCounter;
+	m.variants.resize(team->game->buildingsTypes.size());
+	for (auto& variant : m.variants) for (auto& row : variant.trapped) std::fill(std::begin(row),std::end(row),0);
 	for (auto &row : m.trappedUnits) std::fill(std::begin(row), std::end(row), 0);
 	for (auto &row : m.trappedBuildings)
 		for (auto &swim : row) std::fill(std::begin(swim), std::end(swim), 0);
@@ -1317,8 +1530,13 @@ void TeamStats::sampleTraps(Team *team)
 						hardExit |= map->isHardSpaceForGroundUnit(x,y,swim != 0,team->me);
 			int x,y,dx,dy;
 			const bool freeExit = b->findGroundExit(&x,&y,&dx,&dy,swim != 0);
-			if (!hardExit) ++m.trappedBuildings[0][swim][b->type->shortTypeNum];
-			if (!freeExit) ++m.trappedBuildings[1][swim][b->type->shortTypeNum];
+			if (!hardExit) ++m.variants[b->typeNum].trapped[0][swim];
+			if (!freeExit) ++m.variants[b->typeNum].trapped[1][swim];
+			if (b->type->shortTypeNum>=0 && b->type->shortTypeNum<IntBuildingType::NB_BUILDING)
+			{
+				if (!hardExit) ++m.trappedBuildings[0][swim][b->type->shortTypeNum];
+				if (!freeExit) ++m.trappedBuildings[1][swim][b->type->shortTypeNum];
+			}
 		}
 	}
 	if ((m.tick & END_OF_GAME_STAT_INTERVAL_MASK) == 0 &&

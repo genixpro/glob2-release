@@ -8,6 +8,7 @@
 #include "Order.h"
 #include "Player.h"
 #include "AINumbi.h"
+#include "ai/observation/WorldQueries.h"
 #include "ai/cortex/AICortex.h"
 #include "ai/cortex/CortexObservation.h"
 #include "ai/cortex/CortexPlacement.h"
@@ -23,7 +24,7 @@ namespace
 struct World
 {
 	glob2test::HeadlessGame world;
-	explicit World(AI::ImplementationID id, int enemies = 1, Uint32 seed = 713)
+	explicit World(AI::ImplementationID id, int enemies = 1, Uint32 seed = 713, int warriors = 4)
 		: world(glob2test::GameOptions{.wDec = 6, .hDec = 6, .teams = 1 + enemies, .discovered = true,
 									   .clearImmobile = true, .loadDefaultRace = true})
 	{
@@ -45,16 +46,16 @@ struct World
 			for (auto *b : {world.addBuilding("swarm", 4 + ox, 4 + oy, 0, team),
 							world.addBuilding("inn", 10 + ox, 4 + oy, 0, team)})
 			{
-				b->resources[WHEAT] = b->type->maxResource[WHEAT];
+				b->materials[WHEAT] = b->type->maxMaterial[WHEAT];
 				b->update();
 				// Seen by everyone, so Cortex may rank enemy buildings as targets.
 				b->seenByMask = ~0u;
 			}
-			for (int unit = 0; unit < 12; ++unit)
+			for (int unit = 0; unit < 8 + warriors; ++unit)
 				world.addUnit(unit < 8 ? WORKER : WARRIOR, 4 + ox + unit, 12 + oy, team);
 			for (int y = 18 + oy; y < 24 + oy; ++y)
 				for (int x = 4 + ox; x < 20 + ox; ++x)
-					world.game.map.setResource(x, y, WHEAT, 1);
+					world.game.map.setResourceByIndex(x, y, WHEAT, 1);
 		}
 		world.game.map.setMapDiscovered();
 		for (int team = 0; team < teams; ++team)
@@ -82,7 +83,7 @@ std::vector<Uint32> state(Game &game)
 	return result;
 }
 
-const AITelemetry::Value &field(AI &ai, unsigned index)
+const AITelemetry::Value &telemetryField(AI &ai, unsigned index)
 {
 	return ai.telemetrySeries->current.values[index];
 }
@@ -145,7 +146,7 @@ TEST_SUITE("AITargetTelemetrySave")
 		World w(AI::CORTEX, 3);
 		Cortex::BuildCandidate out[Cortex::CORTEX_FLAG_TARGETS];
 		Sint32 outTeam[Cortex::CORTEX_FLAG_TARGETS];
-		const int count = Cortex::placeFlagTargets(&w.game(), w.game().teams[0], out, outTeam);
+		const int count = Cortex::placeFlagTargets(syncRandEngine(), &w.game(), w.game().teams[0], out, outTeam);
 		REQUIRE(count > 0);
 		std::vector<bool> seen(4, false);
 		for (int i = 0; i < Cortex::CORTEX_FLAG_TARGETS; ++i)
@@ -170,8 +171,15 @@ TEST_SUITE("AITargetTelemetrySave")
 		glob2test::HeadlessGlobals globals;
 		World w(AI::CORTEX, 2);
 		auto &ai = *static_cast<AICortex *>(w.ai().aiImplementation);
+        auto withDecision = [&](auto invoke) {
+            const auto view=AIEngine::AIWorldView::capture(w.game(),AIEngine::AIWorldView::captureCatalog(w.game()));
+            struct Reset { AICortex& ai; ~Reset(){ai.observedWorld=nullptr;ai.observedTeam=nullptr;ai.intents.clear();} } reset{ai};
+            ai.observedWorld=view.get();ai.observedTeam=&view->teams[0];ai.observedPlayer=0;
+            ai.intents.clear();ai.applyQueuedIntent(*view);
+            invoke();
+        };
 		const unsigned index = AITrace::AI6::offense_target_team;
-		CHECK_FALSE(field(w.ai(), index).valid);
+		CHECK_FALSE(telemetryField(w.ai(), index).valid);
 
 		auto obs = Cortex::makeEmptyObservation();
 		obs.valid = 1;
@@ -180,21 +188,21 @@ TEST_SUITE("AITargetTelemetrySave")
 		obs.flagTargets[3].x = 4 + 32; // team 1's swarm
 		obs.flagTargets[3].y = 4;
 		obs.flagTargetTeam[3] = 1;
-		ai.translateAction(Cortex::makeWarFlagAction(3, 4, 4, 0), obs);
-		CHECK(field(w.ai(), index).valid);
-		CHECK(Sint64(field(w.ai(), index).bits) == 1);
+		withDecision([&] { ai.translateAction(Cortex::makeWarFlagAction(3, 4, 4, 0), obs); });
+		CHECK(telemetryField(w.ai(), index).valid);
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == 1);
 
 		// The value is saved with the series: a reload sees the commit.
 		auto restored = loaded(saved(w.game()));
 		CHECK(Sint64(restored->game.players[0]->ai->telemetrySeries->current.values[index].bits) == 1);
 
 		// Every way the offense stands down clears the target.
-		ai.translateActionClearFlags();
-		CHECK(Sint64(field(w.ai(), index).bits) == -1);
-		ai.translateAction(Cortex::makeWarFlagAction(3, 4, 4, 0), obs);
-		CHECK(Sint64(field(w.ai(), index).bits) == 1);
-		ai.translateAction(Cortex::makeWarFlagAction(-1, 4, 4, 0), obs);
-		CHECK(Sint64(field(w.ai(), index).bits) == -1);
+		withDecision([&] { ai.translateActionClearFlags(); });
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == -1);
+		withDecision([&] { ai.translateAction(Cortex::makeWarFlagAction(3, 4, 4, 0), obs); });
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == 1);
+		withDecision([&] { ai.translateAction(Cortex::makeWarFlagAction(-1, 4, 4, 0), obs); });
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == -1);
 	}
 
 	TEST_CASE("Numbi reports the highest-numbered enemy its attack searches")
@@ -204,12 +212,19 @@ TEST_SUITE("AITargetTelemetrySave")
 		auto &numbi = *static_cast<AINumbi *>(w.ai().aiImplementation);
 		const unsigned index = AITrace::AI1::AINumbi_mayAttack_enemy_team;
 		// Already attacking with warriors to spare: the next call searches for an enemy.
+        auto search = [&] {
+            const auto view=AIEngine::AIWorldView::capture(w.game(),AIEngine::AIWorldView::captureCatalog(w.game()));
+            AIEngine::WorldQueries queries(*view,numbi.teamNumber,numbi.resourceInitializations);
+            numbi.observation=view.get();numbi.queries=&queries;
+            struct Reset { AINumbi& ai; ~Reset(){ai.observation=nullptr;ai.queries=nullptr;} } reset{numbi};
+            numbi.mayAttack(0,0,1);
+        };
 		numbi.attackPhase = 1;
-		numbi.mayAttack(0, 0, 1);
-		CHECK(Sint64(field(w.ai(), index).bits) == 3);
+        search();
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == 3);
 		w.game().teams[0]->enemies = 0;
-		numbi.mayAttack(0, 0, 1);
-		CHECK(Sint64(field(w.ai(), index).bits) == -1);
+        search();
+		CHECK(Sint64(telemetryField(w.ai(), index).bits) == -1);
 	}
 
 	TEST_CASE("target telemetry names only real enemies and leaves the simulation unchanged")
@@ -221,7 +236,9 @@ TEST_SUITE("AITargetTelemetrySave")
 			CAPTURE(name);
 			// Two copies of one saved state; without a series every telemetry write
 			// is a no-op, so the detached copy is the reference run.
-			World world(f.id);
+            // Exercise targeting without depending on births or a famine to
+            // reach Cortex's existing eight-warrior normal offense threshold.
+            World world(f.id,1,713,f.id==AI::CORTEX?8:4);
 			const auto bytes = saved(world.game());
 			auto collectedGame = loaded(bytes), detachedGame = loaded(bytes);
 			Game &collected = collectedGame->game, &detached = detachedGame->game;
@@ -231,10 +248,14 @@ TEST_SUITE("AITargetTelemetrySave")
 			int firstTarget = -1;
 			for (int t = 0; t < 6000; ++t)
 			{
+				// Exercise the targeting/telemetry boundary with visible enemies;
+				// reaching them through a particular scouting strategy is separate.
+				for (Game* game : {&collected, &detached})
+					game->map.setMapDiscovered(32, 0, 32, 32, game->teams[0]->me);
 				tick(collected);
 				tick(detached);
 				REQUIRE(state(collected) == state(detached));
-				const auto &value = field(ai, f.index);
+				const auto &value = telemetryField(ai, f.index);
 				if (value.valid)
 				{
 					const Sint64 team = Sint64(value.bits);

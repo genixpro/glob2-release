@@ -2,6 +2,9 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "Map.h"
+#include "gradient/GradientRuntime.h"
+#include "Bullet.h"
+#include "Sector.h"
 #include "Utilities.h"
 #include "GlobalContainer.h"
 #include "MapInternal.h"
@@ -12,54 +15,56 @@
 
 // Miscellaneous helpers: checkSum, warpDist*, dumpGradient
 
-Uint32 Map::checkSum(bool heavy)
+Uint32 Map::checkSum(bool heavy, bool includePending)
 {
-	Uint32 cs=size;
+	preparePendingWorld();
+    Uint32 cs = size ^ terrainRegistry().checksum() ^ resourceRegistry().checksum() ^ gradientRuntime->growth.checksum(heavy && includePending);
 	if (heavy)
 	{
-		for (const auto& c: tiles)
+		for (size_t index = 0; index < cellCount(); ++index)
 		{
+
 			cs+=
-				c.terrain +
-				c.building +
-				c.resource.getUint32() +
-				c.groundUnit +
-				c.airUnit +
-				c.forbidden +
-				c.farmArea + // zero everywhere unless a farm area was painted
-				c.scriptAreas;
+				static_cast<Uint32>(vertexTerrain[index]) +
+				occupancyCells[index].building +
+				resourceCells[index].resource.getUint32() +
+                resourceCells[index].mayGrow +
+				occupancyCells[index].groundUnit +
+				occupancyCells[index].airUnit +
+				areaCells[index].forbidden +
+				areaCells[index].farm + // zero everywhere unless a farm area was painted
+				scriptAreaCells[index];
+            if (!resourceStockIndices.empty() && resourceStockIndices[index])
+                for (auto stock:resourceStocks[resourceStockIndices[index]-1]) cs=rotl1(cs)^stock;
 			cs=rotl1(cs);
 		}
 	};
+	// Bullets retain launch-time recipe state after their source disappears.
+	// Include list order: multiple impacts can change destruction and attribution.
+	for (int sector = 0; sector < sizeSector; ++sector)
+		if (!sectors[sector].bullets.empty())
+		{
+			cs = rotl1(cs) ^ static_cast<Uint32>(sector);
+			cs = rotl1(cs) ^ static_cast<Uint32>(sectors[sector].bullets.size());
+			for (const Bullet* bullet : sectors[sector].bullets) cs = rotl1(cs) ^ bullet->checkSum();
+		}
+	// Cache age and eviction order affect subsequent routes and are simulation state.
+	const auto mix64=[&](Uint64 value) { cs=rotl1(cs)^Uint32(value)^Uint32(value>>32); };
+	mix64(std::max<Uint64>(gradientRuntime->materialCacheBudget,Uint64(size)*sizeof(Uint16))); mix64(gradientRuntime->materialCacheClock);
+	for (const auto& team : gradientRuntime->stockRevision) for (Uint64 revision : team) mix64(revision);
+	for (Uint64 key : gradientRuntime->materialLru)
+	{
+		const auto& entry=gradientRuntime->materialFields.at(key);
+		cs=rotl1(cs)^Uint32(key)^Uint32(key>>32)^entry.topology^entry.builtStep;
+		cs=rotl1(cs)^Uint32(entry.recency)^Uint32(entry.recency>>32)^Uint32(entry.sourceRevision)^Uint32(entry.sourceRevision>>32);
+		if (heavy) for (size_t i=0; i<size; ++i) cs=rotl1(cs)^entry.cells[i];
+	}
+
+	privateRandom(RandomDomain::GrowthJobs); // Initialize without advancing.
+	for (const auto& random : worldRandom.streams)
+		cs = rotr1(cs) ^ random.checksum();
 	return cs;
 }
-
-Sint32 Map::warpDist1d(int p, int q, int l)
-{
-	Sint32 d=abs(p-q);
-	d%=l;
-	if (d>l/2)
-		d=l-d;
-	return d;
-}
-
-Sint32 Map::warpDistSquare(int px, int py, int qx, int qy)
-{
-	Sint32 dx=warpDist1d(px,qx,w);
-	Sint32 dy=warpDist1d(py,qy,h);
-	return ((dx*dx)+(dy*dy));
-}
-
-Sint32 Map::warpDistMax(int px, int py, int qx, int qy)
-{
-	Sint32 dx=warpDist1d(px,qx,w);
-	Sint32 dy=warpDist1d(py,qy,h);
-	if (dx>dy)
-		return dx;
-	else
-		return dy;
-}
-
 
 void Map::dumpGradient(Uint8 *gradient, const std::string filename)
 {

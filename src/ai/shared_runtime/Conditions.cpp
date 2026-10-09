@@ -4,7 +4,7 @@
 #include "shared_runtime/Runtime.h"
 #include <memory>
 #include "Building.h"
-#include "IntBuildingType.h"
+#include "shared_runtime/BuildingDemands.h"
 
 using namespace AISharedRuntime;
 using namespace AISharedRuntime::Conditions;
@@ -33,6 +33,7 @@ Condition* Condition::load_condition(GAGCore::InputStream *stream, Player *playe
 		LOAD_CASE(CEnemyBuildingDestroyed, EnemyBuildingDestroyed)
 		LOAD_CASE(CEitherCondition,        EitherCondition)
 		LOAD_CASE(CPopulation,             Population)
+        LOAD_CASE(CAttractionRetiredOrDestroyed, AttractionRetiredOrDestroyed)
 	}
 	stream->readLeaveSection();
 	if (!condition) throw std::runtime_error("Unknown saved AI object type");
@@ -63,12 +64,12 @@ BuildingCondition* BuildingCondition::load_condition(GAGCore::InputStream *strea
 		LOAD_CASE(CUnderConstruction,       UnderConstruction)
 		LOAD_CASE(CBeingUpgraded,           BeingUpgraded)
 		LOAD_CASE(CBeingUpgradedTo,         BeingUpgradedTo)
-		LOAD_CASE(CSpecificBuildingType,    SpecificBuildingType)
-		LOAD_CASE(CNotSpecificBuildingType, NotSpecificBuildingType)
+		LOAD_CASE(CSpecificBuildingType,    ProvidesBuildingCapability)
+		LOAD_CASE(CNotSpecificBuildingType, LacksBuildingCapability)
 		LOAD_CASE(CBuildingLevel,           BuildingLevel)
 		LOAD_CASE(CUpgradable,              Upgradable)
-		LOAD_CASE(CResourceTrackerAmount,  ResourceTrackerAmount)
-		LOAD_CASE(CResourceTrackerAge,     ResourceTrackerAge)
+		LOAD_CASE(CMaterialTrackerAmount,  MaterialTrackerAmount)
+		LOAD_CASE(CMaterialTrackerAge,     MaterialTrackerAge)
 	}
 	stream->readLeaveSection();
 	if (!condition) throw std::runtime_error("Unknown saved AI object type");
@@ -91,7 +92,7 @@ void BuildingCondition::save_condition(BuildingCondition* condition, GAGCore::Ou
 
 bool NotUnderConstruction::passes(Runtime& runtime, int id)
 {
-	Building* building = runtime.get_building_register().get_building(id);
+	const AIEngine::BuildingView* building = runtime.get_building_register().get_building(id);
 	bool result=building->constructionResultState==::Building::NO_CONSTRUCTION && !runtime.get_building_register().is_building_upgrading(id);
 	return result;
 }
@@ -100,7 +101,7 @@ bool NotUnderConstruction::passes(Runtime& runtime, int id)
 
 bool UnderConstruction::passes(Runtime& runtime, int id)
 {
-	Building* building = runtime.get_building_register().get_building(id);
+	const AIEngine::BuildingView* building = runtime.get_building_register().get_building(id);
 	return building->constructionResultState!=::Building::NO_CONSTRUCTION && building->buildingState==Building::ALIVE;
 }
 
@@ -116,19 +117,13 @@ bool BeingUpgraded::passes(Runtime& runtime, int id)
 
 bool Upgradable::passes(Runtime& runtime, int id)
 {
-	Building* building = runtime.get_building_register().get_building(id);
-	if((building->type->shortTypeNum==IntBuildingType::FOOD_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::HEAL_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::SWIMSPEED_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::WALKSPEED_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::ATTACK_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::SCIENCE_BUILDING ||
-	    building->type->shortTypeNum==IntBuildingType::DEFENSE_BUILDING) &&
-	   building->constructionResultState==Building::NO_CONSTRUCTION &&
-	   building->type->level!=AI_SHARED_RUNTIME_MAX_BUILDING_LEVEL_INDEX &&
-	   building->isHardSpaceForBuildingSite(Building::UPGRADE) &&
-	   building->hp == building->getEffectiveMaxHp()
-	    )
+	const AIEngine::BuildingView* building = runtime.get_building_register().get_building(id);
+ if(building && !runtime.get_building_register().is_building_upgrading(id)
+    && !runtime.observation().configuration->isUnitUpgradesDisabled()
+    && building->constructionResultState==Building::NO_CONSTRUCTION
+    && runtime.observation().isUpgradeAvailable(*building)
+    && runtime.observation().isHardSpaceForBuildingSite(*building, true)
+    && building->hp==building->maxHp)
 		return true;
 	return false;
 }

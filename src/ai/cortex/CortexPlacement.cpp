@@ -1,9 +1,12 @@
+#include "CortexSnapshotQueries.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Globulation 2 Authors
 
+#include "Material.h"
 #include "CortexPlacement.h"
 
 #include "CortexPlacementGeo.h"
+#include "CortexFoodAvailability.h"
 #include "Game.h"
 #include "Utilities.h"
 #include "building/Building.h"
@@ -44,7 +47,7 @@
 //
 // Determinism (this runs inside lockstep): we iterate the team building array by
 // index (never an std::set), scan map tiles in fixed (x, y) order, break ties
-// strictly by scan order (first-seen wins on equal score), and use syncRand()
+// strictly by scan order (first-seen wins on equal score), and use random()
 // only as a final, fully-deterministic tie-break when even the score AND the
 // distance-to-colony are identical, so two equally good far-apart spots do not
 // always collapse to the lowest coordinate. We never read wall-clock or pointer
@@ -90,81 +93,31 @@ namespace Cortex
 		}
 	} // namespace
 
-	// Chebyshev distance from tile (x, y) to the nearest wheat resource
+	// Chebyshev distance from tile (x, y) to the nearest food resource
 	// tile, found by an outward "ring" scan capped at `cap`. Shared utility used
-	// by placeCandidates (wheatDist of each retained BuildCandidate) and by
-	// Cortex::observe (TrackedBuilding::nearestWheatDist for each tracked swarm
-	// and inn), so the wheat-proximity metric is defined in exactly one place.
+	// by placeCandidates (foodSourceDistance of each retained BuildCandidate) and by
+	// Cortex::observe (TrackedBuilding::nearestFoodSourceDistance for each tracked swarm
+	// and inn), so the food-proximity metric is defined in exactly one place.
 	//
 	// Algorithm: for r = 0, 1, 2, ..., cap, iterate every tile at EXACTLY
 	// Chebyshev distance r from (x, y) — the square ring of side 2r+1. Return
-	// the first r at which a WHEAT tile is found. The scan terminates immediately
+	// the first r at which a Food tile is found. The scan terminates immediately
 	// on the first hit at the current radius, not at the first hit overall, so we
-	// never report a radius larger than the true minimum. Return -1 if no WHEAT is
+	// never report a radius larger than the true minimum. Return -1 if no Food is
 	// found within `cap`.
 	//
-	// WHEAT detection: map.getResource(x, y).type == WHEAT — identical to the
-	// isWheat() predicate in CortexWheat.cpp (anonymous namespace, line ~29) so
-	// the two subsystems agree on what counts as wheat.
-	// C++: Resource.h:#define WHEAT 1; Map::getResource (map/Map.h:302).
+	// Food detection: MapState::hasMaterialSlot(map.state(),map.tileIndex(x,y),Food) — identical to the
+	// isFoodSource() predicate in CortexFoodSources.cpp (anonymous namespace, line ~29) so
+	// the two subsystems agree on what counts as food.
+	// Material stock is queried independently of map resource identity.
 	//
 	// Determinism: fixed ring/scan order (top row → right col → bottom row →
 	// left col, no rand, no pointer reads), warp-safe via normalizeX/normalizeY.
-	int nearestWheatDist(const Map& map, int x, int y, int cap)
+	int nearestFoodSourceDistance(const AIEngine::AIWorldView& map, int x, int y, int cap)
 	{
-		for (int r = 0; r <= cap; r++)
-		{
-			if (r == 0)
-			{
-				// Centre tile: radius-0 ring is just (x, y) itself.
-				if (map.getResource(map.normalizeX(x), map.normalizeY(y)).type == WHEAT)
-					return 0;
-				continue;
-			}
-
-			// Iterate the square ring at Chebyshev distance exactly r.
-			// The ring has four sides; adjacent corners are shared — use half-
-			// open intervals to avoid double-counting corners.
-			//
-			// Top row:    y - r,  x in [x-r, x+r)   (left-to-right, right col excluded)
-			// Right col:  x + r,  y in [y-r, y+r)   (top-to-bottom, bottom row excluded)
-			// Bottom row: y + r,  x in (x-r, x+r]   (right-to-left, left col excluded)
-			// Left col:   x - r,  y in (y-r, y+r]   (bottom-to-top, top row excluded)
-
-			// Top row: (x-r .. x+r-1, y-r)
-			for (int dx = -r; dx < r; dx++)
-			{
-				const int nx = map.normalizeX(x + dx);
-				const int ny = map.normalizeY(y - r);
-				if (map.getResource(nx, ny).type == WHEAT)
-					return r;
-			}
-			// Right column: (x+r, y-r .. y+r-1)
-			for (int dy = -r; dy < r; dy++)
-			{
-				const int nx = map.normalizeX(x + r);
-				const int ny = map.normalizeY(y + dy);
-				if (map.getResource(nx, ny).type == WHEAT)
-					return r;
-			}
-			// Bottom row: (x+r .. x-r+1, y+r) — right-to-left
-			for (int dx = r; dx > -r; dx--)
-			{
-				const int nx = map.normalizeX(x + dx);
-				const int ny = map.normalizeY(y + r);
-				if (map.getResource(nx, ny).type == WHEAT)
-					return r;
-			}
-			// Left column: (x-r, y+r .. y-r+1) — bottom-to-top
-			for (int dy = r; dy > -r; dy--)
-			{
-				const int nx = map.normalizeX(x - r);
-				const int ny = map.normalizeY(y + dy);
-				if (map.getResource(nx, ny).type == WHEAT)
-					return r;
-			}
-		}
-		return -1; // no WHEAT within cap tiles
+		return food_queries::nearest(x,y,cap,[&](int px,int py) {
+			return MapState::hasMaterial(map.state(),map.tileIndex(px,py),MaterialId::Food);
+		});
 	}
 
 	// AICortex war-flag offense-target surface.
@@ -177,12 +130,12 @@ namespace Cortex
 	// FAIRNESS GATE (no fog-of-war cheat): we only ever consider enemy buildings
 	// the team has legitimately discovered. Each Building carries the engine's own
 	// per-team discovery record, seenByMask (building/Building.h:560), and we
-	// include a building ONLY when (b->seenByMask & team->me) != 0. We never read
+	// include a building ONLY when (b->seenByMask & team->mask) != 0. We never read
 	// unfogged enemy state — an undiscovered enemy base is invisible to this scan,
 	// exactly as it is on the player's minimap. The same enemy/alive test as the
 	// observation opponents loop (CortexObservation.cpp:171-172) selects which
-	// teams to scan: an enemy is (team->attackableTeams() & other->me) != 0 and alive is
-	// other->isAlive.
+	// teams to scan: an enemy is (team->enemies & other->mask) != 0 and alive is
+	// other->alive.
 	//
 	// SCORING (nearer == higher): we reuse scoreFromDistance on the Chebyshev
 	// distance from the enemy building to our NEAREST live building
@@ -194,10 +147,10 @@ namespace Cortex
 	// gets a well-defined, equal score and ranking degrades to scan order.
 	//
 	// DETERMINISM: teams are iterated by index over game->teams[], buildings by
-	// index over other->myBuildings[] (never an std::set); ties break first by scan
-	// order (strict-greater insert) and finally by syncRand() — never rand(), never
+	// index over game->buildingSlots(other->number)[] (never an std::set); ties break first by scan
+	// order (strict-greater insert) and finally by random() — never rand(), never
 	// wall-clock — exactly as placeCandidates does.
-	int placeFlagTargets(Game* game, Team* team, BuildCandidate out[CORTEX_FLAG_TARGETS], Sint32 outTeam[CORTEX_FLAG_TARGETS])
+	int placeFlagTargetsWorld(MersenneTwister& random, const AIEngine::AIWorldView* game, const AIEngine::TeamView* team, const PlanningIntent& intents, BuildCandidate out[CORTEX_FLAG_TARGETS], Sint32 outTeam[CORTEX_FLAG_TARGETS])
 	{
 		// Always leave the output well-defined, even on the error paths below.
 		for (int i = 0; i < CORTEX_FLAG_TARGETS; i++)
@@ -216,38 +169,38 @@ namespace Cortex
 		int count = 0;
 
 		// Enumerate enemy teams strictly by index.
-		for (int i = 0; i < game->teamsCount(); i++)
+		for (int i = 0; i < game->teams.size(); i++)
 		{
-			Team* other = game->teams[i];
+			const AIEngine::TeamView* other = &game->teams[i];
 			if (other == NULL)
 				continue;
-			const bool isEnemy = (team->attackableTeams() & other->me) != 0;
-			if (!isEnemy || !other->isAlive)
+			const bool isEnemy = (team->enemies & other->mask) != 0;
+			if (!isEnemy || !other->alive)
 				continue;
 
 			// Scan this enemy's buildings by index (never an std::set).
-			for (int j = 0; j < Building::MAX_COUNT; j++)
+			for (int j = 0; j < ::Building::MAX_COUNT; j++)
 			{
-				Building* b = other->myBuildings[j];
-				if (b == NULL || b->buildingState == Building::DEAD)
+				const AIEngine::BuildingView* b = game->buildingSlots(other->number)[j];
+				if (b == NULL || b->buildingState == ::Building::DEAD)
 					continue;
 
 				// Fairness gate: only buildings we have legitimately seen. An
 				// undiscovered enemy building is invisible to this scan.
-				if ((b->seenByMask & team->me) == 0)
+				if ((b->seenByMask & team->mask) == 0)
 					continue;
 
 				// Distance from the enemy building to our nearest live building;
 				// nearer enemies score higher (slot 0 == closest reachable).
-				const int distToColony = distanceToNearestBuilding(game, team, b->posX, b->posY);
+				const int distToColony = distanceToNearestBuilding(game, team, intents, plannedX(intents,*b), plannedY(intents,*b));
 				const int score = scoreFromDistance(distToColony);
 
 				ScoredSpot spot;
-				spot.x = b->posX;
-				spot.y = b->posY;
+				spot.x = plannedX(intents,*b);
+				spot.y = plannedY(intents,*b);
 				spot.score = score;
 				spot.distToColony = distToColony;
-				spot.team = other->teamNumber;
+				spot.team = other->number;
 				insertTopKBounded(heap, count, CORTEX_FLAG_TARGETS, spot);
 			}
 		}
@@ -261,7 +214,7 @@ namespace Cortex
 			if (heap[i].score == heap[i + 1].score &&
 			    heap[i].distToColony == heap[i + 1].distToColony)
 			{
-				if ((syncRand() & 1) != 0)
+				if ((random() & 1) != 0)
 				{
 					ScoredSpot tmp = heap[i];
 					heap[i] = heap[i + 1];
@@ -282,3 +235,12 @@ namespace Cortex
 		return count;
 	}
 } // namespace Cortex
+
+namespace Cortex {
+int placeFlagTargets(MersenneTwister& random, ::Game* game,::Team* team,BuildCandidate out[CORTEX_FLAG_TARGETS],Sint32 owners[CORTEX_FLAG_TARGETS])
+{
+    const auto view=AIEngine::AIWorldView::capture(*game, AIEngine::AIWorldView::captureCatalog(*game));
+    QueryScratch scratch; PlanningIntent intents;
+    return placeFlagTargetsWorld(random, view.get(),&view->teams[team->teamNumber],intents,out,owners);
+}
+}

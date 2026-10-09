@@ -1,11 +1,15 @@
+#include "Material.h"
+#include "AIRuleOrders.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "field/Influence.h"
+#include "field/TerrainTravel.h"
 #include "AITelemetryFields.h"
 #include "AICastor.h"
+#include "ai/observation/WorldQueries.h"
 #include "Game.h"
-#include "GlobalContainer.h"
+#include <algorithm>
 #include "Order.h"
 #include "Player.h"
 #include "Unit.h"
@@ -22,24 +26,30 @@ std::shared_ptr<Order>AICastor::findGoodBuilding(Sint32 typeNum, bool food, bool
 	telemetry.set(AITrace::AI2::AICastor_findGoodBuilding_input_food, food);
 	telemetry.set(AITrace::AI2::AICastor_findGoodBuilding_input_typeNum, typeNum);
 	telemetry.count(AITrace::AI2::AICastor_findGoodBuilding_calls);
-	int w=map->w;
-	int h=map->h;
-	int bw=globalContainer->buildingsTypes.get(typeNum)->width;
-	int bh=globalContainer->buildingsTypes.get(typeNum)->height;
-	assert(bw==bh);
-	//int hDec=map->hDec;
-	int wDec=map->wDec;
-	int wMask=map->wMask;
-	int hMask=map->hMask;
+	int w=observation->width;
+	int h=observation->height;
+	const auto* placement = (&queries->kind(typeNum).resolvedType);
+ const auto* completed = placement->isBuildingSite ? (&queries->kind(placement->nextLevel).resolvedType) : placement;
+ food = completed->semantics.feeding.enabled && completed->semantics.feeding.cost[materialIndex(MaterialId::Food)] > 0;
+ for (const auto& recipe : completed->semantics.production.recipes)
+  food |= recipe.enabled && recipe.cost[materialIndex(MaterialId::Food)] > 0;
+ defense = queries->matches(placement->isBuildingSite ? placement->nextLevel : typeNum, AIPlanning::BuildingIntent::ProjectileDefense);
+ int bw=placement->width;
+	int bh=(&queries->kind(typeNum).resolvedType)->height;
+
+	//int hDec=observation->heightDec;
+	int wDec=std::countr_zero(unsigned(observation->width));
+	int wMask=(observation->width-1);
+	int hMask=(observation->height-1);
 	size_t size=w*h;
-	Uint32 *mapDiscovered=&(map->mapDiscovered[0]);
-	Uint32 me=team->me;
+
+	Uint32 me=observedTeam->mask;
 
 	// minWork computation:
 	Sint32 bestWorkScore=AI_CASTOR_BEST_WORK_SCORE_FLOOR;
 	for (size_t i=0; i<size; i++)
 	{
-		if ((mapDiscovered[i]&me)==0)
+		if ((observation->visibilityAt(i).discovered&me)==0)
 			continue;
 		Uint8 work=workAbilityMap[i];
 		if (bestWorkScore<work)
@@ -83,18 +93,18 @@ std::shared_ptr<Order>AICastor::findGoodBuilding(Sint32 typeNum, bool food, bool
 		{
 			size_t corner0=(x|(y<<wDec));
 			size_t corner1=(((x+bw-1)&wMask)|(y<<wDec));
-			size_t corner2=(x|(((y+bw-1)&hMask)<<wDec));
-			size_t corner3=(((x+bw-1)&wMask)|(((y+bw-1)&hMask)<<wDec));
+			size_t corner2=(x|(((y+bh-1)&hMask)<<wDec));
+			size_t corner3=(((x+bw-1)&wMask)|(((y+bh-1)&hMask)<<wDec));
 			
 			if (critical
-				&& (mapDiscovered[corner0]&me)==0
-				&& (mapDiscovered[corner1]&me)==0
-				&& (mapDiscovered[corner2]&me)==0
-				&& (mapDiscovered[corner3]&me)==0)
+				&& (observation->visibilityAt(corner0).discovered&me)==0
+				&& (observation->visibilityAt(corner1).discovered&me)==0
+				&& (observation->visibilityAt(corner2).discovered&me)==0
+				&& (observation->visibilityAt(corner3).discovered&me)==0)
 				continue;
 			
 			Uint8 space=spaceForBuildingMap[corner0];
-			if (space<bw)
+			if (placement->semantics.occupiesGround && space<std::max(bw,bh))
 				continue;
 			
 			Sint32 work=workAbilityMap[corner0]+workAbilityMap[corner1]+workAbilityMap[corner2]+workAbilityMap[corner3];
@@ -137,7 +147,7 @@ std::shared_ptr<Order>AICastor::findGoodBuilding(Sint32 typeNum, bool food, bool
 			else
 				score=(AI_CASTOR_SCORE_NORMAL_BIAS+work-(wheatGrowth<<AI_CASTOR_SCORE_NORMAL_GROWTH_SHIFT)-enemyRange)*(AI_CASTOR_SCORE_NORMAL_NEIGHBOUR_BIAS+(directNeighboursCount<<AI_CASTOR_SCORE_NEIGHBOUR_DIRECT_SHIFT)+farNeighboursCount);
 
-			if (bestScore<score)
+			if (bestScore<score && queries->checkRoomForBuilding(x,y,typeNum,teamNumber))
 			{
 				bestScore=score;
 				bestIndex=corner0;
@@ -150,11 +160,11 @@ std::shared_ptr<Order>AICastor::findGoodBuilding(Sint32 typeNum, bool food, bool
 	telemetry.set(AITrace::AI2::placement_bestWorkScore, bestWorkScore);
 	if (bestScore>0)
 	{
-		Sint32 x=(bestIndex&map->wMask);
-		Sint32 y=((bestIndex>>map->wDec)&map->hMask);
+		Sint32 x=(bestIndex&(observation->width-1));
+		Sint32 y=((bestIndex>>std::countr_zero(unsigned(observation->width)))&(observation->height-1));
 		return telemetry.returnedOrder(
 			AITrace::AI2::AICastor_findGoodBuilding_result,
-			shared_ptr<Order>(new OrderCreate(team->teamNumber, x, y, typeNum, 1, 1)));
+			queries->createOrder(teamNumber, x, y, typeNum, 1, 1));
 	}
 
 	return telemetry.returnedOrder(AITrace::AI2::AICastor_findGoodBuilding_result,
@@ -163,12 +173,19 @@ std::shared_ptr<Order>AICastor::findGoodBuilding(Sint32 typeNum, bool food, bool
 
 void AICastor::updateGlobalGradientNoObstacle(Uint8 *gradient)
 {
-	field::directionalInfluence(gradient,{map->w,map->h},
+	field::directionalInfluence(gradient,{observation->width,observation->height},
 		field::ZeroFloorPinned<AI_CASTOR_GRADIENT_OBSTACLE_NO_OBSTACLE>{});
 }
 
 void AICastor::updateGlobalGradient(Uint8 *gradient)
 {
-	field::directionalInfluence(gradient,{map->w,map->h},
+    if(observation->terrainMovementModifiers)
+    {
+		field::expandTerrainInfluence(
+			gradient, observation->width, observation->height, [&](std::size_t i) { return observation->cellRuleAt(i); },
+			*observation->cellRules);
+		return;
+    }
+	field::directionalInfluence(gradient,{observation->width,observation->height},
 		field::BlockedUnitFloor<AI_CASTOR_GRADIENT_WALL>{});
 }

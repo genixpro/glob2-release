@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { sql, type Kysely, type Transaction } from 'kysely';
 import type { Database } from '@glob2/db';
 import Stripe from 'stripe';
-import { HiveError, integer, type CreditProduct } from './credits.ts';
+import { CREDIT_PRODUCTS, HiveError, integer, type CreditProduct } from './credits.ts';
+import { recordPaymentFact } from './reporting.ts';
 export interface CreditPack {
   id: string;
   priceId: string;
@@ -22,7 +23,7 @@ export interface Purchase {
 export class Checkout {
   readonly product: CreditProduct;
   private table(name: string) {
-    return sql.table(`${this.product === 'hive' ? 'hive' : 'map'}_${name}`);
+    return sql.table(`${CREDIT_PRODUCTS[this.product].prefix}_${name}`);
   }
   readonly db: Kysely<Database>;
   readonly stripe: Stripe;
@@ -57,31 +58,63 @@ export class Checkout {
         throw new Error('Invalid credit pack.');
     }
   }
-  async begin(account: string, packId: string) {
-    const pack = this.packs.find((p) => p.id === packId);
-    if (!pack) throw new HiveError('bad_request', 'Unknown credit pack.');
-    const id = randomUUID();
-    await sql`INSERT INTO ${this.table('purchases')}(id,account_id,pack) VALUES(${id},${account},${JSON.stringify(pack)}::jsonb)`.execute(
-      this.db,
-    );
+  async begin(account: string, packId: string, requestId: string = randomUUID()) {
+    const load = async () =>
+      (
+        await sql<
+          Purchase & { retryable: boolean }
+        >`SELECT *,created_at>now()-interval '23 hours' AS retryable FROM ${this.table('purchases')} WHERE id=${requestId}`.execute(
+          this.db,
+        )
+      ).rows[0];
+    let purchase = await load();
+    if (!purchase) {
+      const configuredPack = this.packs.find((p) => p.id === packId);
+      if (!configuredPack) throw new HiveError('bad_request', 'Unknown credit pack.');
+      // The caller may retain this ID after a lost response. Keep the original
+      // pack even if its price changes or the operator removes it from sale.
+      await sql`INSERT INTO ${this.table('purchases')}(id,account_id,pack) VALUES(${requestId},${account},${JSON.stringify(configuredPack)}::jsonb) ON CONFLICT(id) DO NOTHING`.execute(
+        this.db,
+      );
+      purchase = await load();
+    }
+    if (!purchase || purchase.account_id !== account || purchase.pack.id !== packId)
+      throw new HiveError('conflict', 'Checkout identifier was already used.');
+    if (purchase.paid) throw new HiveError('conflict', 'This purchase is already complete.');
+    if (purchase.checkout_id) {
+      const session = await this.stripe.checkout.sessions.retrieve(purchase.checkout_id);
+      if (!session.url || session.status !== 'open')
+        throw new HiveError('conflict', 'This checkout has ended. Start a new purchase.');
+      return { url: session.url };
+    }
+    // Stripe can prune idempotency keys after 24h. Never redispatch an older
+    // unknown outcome; an operator can reconcile it from the purchase metadata.
+    if (!purchase.retryable)
+      throw new HiveError('conflict', 'This checkout outcome needs reconciliation.');
+    const pack = purchase.pack;
     const session = await this.stripe.checkout.sessions.create(
       {
         mode: 'payment',
         line_items: [{ price: pack.priceId, quantity: 1 }],
-        client_reference_id: id,
-        metadata: { purchaseId: id, creditProduct: this.product },
-        payment_intent_data: { metadata: { purchaseId: id, creditProduct: this.product } },
-        success_url: `${this.origin}/${this.product === 'hive' ? 'commander' : 'map-studio'}?payment=returned`,
-        cancel_url: `${this.origin}/${this.product === 'hive' ? 'commander' : 'map-studio'}?payment=cancelled`,
+        client_reference_id: requestId,
+        metadata: { purchaseId: requestId, creditProduct: this.product },
+        payment_intent_data: { metadata: { purchaseId: requestId, creditProduct: this.product } },
+        success_url: `${this.origin}/${CREDIT_PRODUCTS[this.product].path}?payment=returned`,
+        cancel_url: `${this.origin}/${CREDIT_PRODUCTS[this.product].path}?payment=cancelled`,
       },
-      { idempotencyKey: `${this.product}:${id}` },
+      { idempotencyKey: `${this.product}:${requestId}` },
     );
-    await sql`UPDATE ${this.table('purchases')} SET checkout_id=${session.id} WHERE id=${id}`.execute(
+    await sql`UPDATE ${this.table('purchases')} SET checkout_id=${session.id} WHERE id=${requestId}`.execute(
       this.db,
     );
+    if (!session.url) throw new HiveError('conflict', 'This checkout has ended.');
     return { url: session.url };
   }
-  async fulfill(session: Stripe.Checkout.Session, connection?: Transaction<Database>) {
+  async fulfill(
+    session: Stripe.Checkout.Session,
+    connection?: Transaction<Database>,
+    paymentAt?: Date,
+  ) {
     if (
       session.mode !== 'payment' ||
       session.payment_status !== 'paid' ||
@@ -109,6 +142,17 @@ export class Checkout {
       )
         throw new Error('Checkout does not match the purchase.');
       if (p.paid) return;
+      await recordPaymentFact(db, {
+        product: this.product,
+        purchaseId: p.id,
+        providerId: payment,
+        mode: session.livemode ? 'live' : 'test',
+        currency: p.pack.currency,
+        paid: session.amount_total ?? p.pack.amount,
+        refunded: 0,
+        disputed: false,
+        occurredAt: paymentAt ?? new Date(session.created * 1000),
+      });
       await sql`INSERT INTO ${this.table('wallets')}(account_id) VALUES(${p.account_id}) ON CONFLICT DO NOTHING`.execute(
         db,
       );
@@ -218,12 +262,18 @@ export class Checkout {
         session = list.data[0];
       }
       if (!session) throw new Error('Purchase checkout is not yet available.');
-      await this.fulfill(session, lock);
       if (session.payment_status !== 'paid') return;
       const charges = await this.stripe.charges.list({ payment_intent: paymentId, limit: 100 });
       if (charges.has_more) throw new Error('Purchase requires manual reconciliation.');
+      const successful = charges.data.filter((c) => c.paid);
+      const paymentAt = successful.length
+        ? new Date(Math.min(...successful.map((c) => c.created)) * 1000)
+        : new Date(event.created * 1000);
+      await this.fulfill(session, lock, paymentAt);
       const disputes = await this.stripe.disputes.list({ payment_intent: paymentId, limit: 100 });
       if (disputes.has_more) throw new Error('Purchase requires manual reconciliation.');
+      if (disputes.data.some((d) => d.currency !== session?.currency))
+        throw new Error('Dispute currency does not match the purchase.');
       const disputed = disputes.data.some(
         (d) => d.status !== 'won' && d.status !== 'warning_closed',
       );
@@ -234,6 +284,36 @@ export class Checkout {
         event.id,
         lock,
       );
+      const refunded = charges.data.reduce((sum, c) => sum + c.amount_refunded, 0);
+      let refunds: { id: string; amount: number; at: Date }[] | undefined;
+      if (refunded) {
+        const page = await this.stripe.refunds.list({ payment_intent: paymentId, limit: 100 });
+        if (page.has_more) throw new Error('Refund history requires manual reconciliation.');
+        refunds = page.data
+          .filter((r) => r.status === 'succeeded')
+          .map((r) => ({ id: r.id, amount: r.amount, at: new Date(r.created * 1000) }));
+      }
+      const closedEvent = event.type === 'charge.dispute.closed' ? event.data.object : undefined;
+      await recordPaymentFact(lock, {
+        product: this.product,
+        purchaseId,
+        providerId: paymentId,
+        mode: session.livemode ? 'live' : 'test',
+        currency: session.currency ?? '',
+        paid: session.amount_total ?? 0,
+        refunded,
+        refunds,
+        disputes: disputes.data.map((d) => ({
+          id: d.id,
+          amount: d.amount,
+          at: new Date(d.created * 1000),
+          active: d.status !== 'won' && d.status !== 'warning_closed',
+          ...(closedEvent?.id === d.id ? { closedAt: new Date(event.created * 1000) } : {}),
+        })),
+        paymentAt,
+        disputed,
+        occurredAt: new Date(),
+      });
     });
   }
 }

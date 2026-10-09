@@ -5,6 +5,7 @@
 // GlobalContainer.cpp because parseArgs and its helpers are nearly
 // 400 lines on their own and have no overlap with the asset/init code.
 
+#include "ComputeThreads.h"
 #include <sstream>
 #include <cerrno>
 #include <cstdlib>
@@ -142,7 +143,12 @@ void GlobalContainer::parseArgs(int argc, char *argv[])
 {
 	for (int  i=1; i<argc; i++)
 	{
-		if (strcmp(argv[i], "-nox")==0 || strcmp(argv[i], "--nox")==0)
+		if (strcmp(argv[i], "--building-catalog")==0)
+		{
+			// Resolved before constructing GlobalContainer and loading preferences.
+			if (++i >= argc) throw std::invalid_argument("--building-catalog requires a manifest path");
+		}
+		else if (strcmp(argv[i], "-nox")==0 || strcmp(argv[i], "--nox")==0)
 		{
 			bool good=true;
 			if (i + 3 < argc)
@@ -193,19 +199,21 @@ void GlobalContainer::parseArgs(int argc, char *argv[])
 					"--ai-types <comma-separated-list> requires an argument\n"),
 				testGamesAIPool, false);
 		}
-		else if (strcmp(argv[i], "--ai-threads")==0)
+		else if (isRemovedComputeOption(argv[i]))
+		{
+			std::cerr << argv[i] << " has been removed; use --compute-threads auto|N\n";
+			exit(1);
+		}
+		else if (strcmp(argv[i], "--compute-threads")==0)
 		{
 			const char *value = requireStringArg(i, argc, argv,
-				"--ai-threads <1..64> requires an argument\n");
-			char *end = nullptr;
-			errno = 0;
-			const long count = std::strtol(value, &end, 10);
-			if (errno || end == value || *end || count < 1 || count > 64)
+				"--compute-threads <auto|N> requires an argument\n");
+			try { computeThreads = parseComputeThreadCount(value); }
+			catch (const std::invalid_argument& error)
 			{
-				std::cerr << "--ai-threads expects an integer from 1 to 64\n";
+				std::cerr << error.what() << '\n';
 				exit(1);
 			}
-			aiThreads = static_cast<unsigned>(count);
 		}
 		else if (strcmp(argv[i], "--map")==0)
 		{
@@ -440,12 +448,15 @@ void GlobalContainer::parseArgs(int argc, char *argv[])
 			printf("--local-map / --room-map <mapId> <hash> <title> [--instance <origin>]\tplay a catalog map\n");
 			printf("--join <invite link or code>\tjoin an online room (also: a glob2:// or https://<instance>/j/<code> link)\n");
 			printf("--instance <origin>\tthe instance of an invite code given to --join\n");
+			printf("--skin-render-info\tcheck native OpenGL skin exporter capabilities and pinned codec\n");
+			printf("--render-skin --manifest <json> --texture <image> --material <image> --output-dir <directory>\tbake transparent colony sprites\n");
 			printf("-nox <game file name> \t runs the game without using the X server\n");
 			printf("-textshot <directory>\t takes pictures of various translation texts as they are drawn on the screen, requires the convert command\n");
 			printf("-test-games\tCreates random games with AI and tests them\n");
 			printf("-test-games-nox\tCreates random games with AI and tests them, without gui\n");
 			printf("--ai-types <list>\tcomma-separated AI names to draw from in -test-games* (default: all)\n");
 			printf("\t\tvalid: %s\n", AINames::validAINames().c_str());
+			printf("--compute-threads <auto|N>\tshared compute pool; auto uses logical CPU count\n");
 			printf("--map <name>\tpin the map for -test-games* (resolved as maps/<name>.map)\n");
 			printf("--matchup <list>\tcomma-separated per-team AI names; matchup[k] plays team k\n");
 			printf("\t\trequires --map; mutually exclusive with --ai-types\n");

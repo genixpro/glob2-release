@@ -1,6 +1,7 @@
+#include "GenerationWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "PowerOfTwo.h"
 #include "StartDiagnostics.h"
-#include "FertilityField.h"
 #include "Game.h"
 #include "Grid.h"
 #include "Map.h"
@@ -27,46 +28,63 @@ std::vector<int> walkFromWorkers(const Map &map, const std::vector<int> &workers
 	return stepsFrom(t, tileMask(t, workers), groundUnitTiles(map));
 }
 
-bool neighbourHolds(const Map &map, int x, int y, bool (*kind)(int))
+bool neighbourHolds(const Map &map, int x, int y, MaterialMask materials)
 {
 	for (int dy = -1; dy <= 1; ++dy)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int dx = -1; dx <= 1; ++dx)
-			if ((dx || dy) &&
-				kind(map.getResource(map.normalizeX(x + dx), map.normalizeY(y + dy)).type))
+		{
+			::MapGeneration::generationCheckpoint();
+			if ((dx || dy) && (map.materialMaskAt(map.coordToIndex(x + dx, y + dy)) & materials))
 				return true;
+		}
+	}
 	return false;
 }
-bool isWheat(int type) { return type == WHEAT; }
-bool isWood(int type) { return type == WOOD; }
-bool isStone(int type) { return type == STONE; }
-bool isFruit(int type) { return type >= CHERRY && type <= PRUNE; }
+constexpr auto isFoodSource = materialBit(MaterialId::Food);
+constexpr auto isWood = materialBit(MaterialId::Wood);
+constexpr auto isStone = materialBit(MaterialId::Stone);
+constexpr MaterialMask isFruit = materialBit(MaterialId::Cherries) | materialBit(MaterialId::Oranges) | materialBit(MaterialId::Prunes);
 
-/// Wheat that is a race: this colony reaches it, and some rival reaches it within the slack.
+/// Food that is a race: this colony reaches it, and some rival reaches it within the slack.
 int nearestContestedWheat(const Map &map, const std::vector<std::vector<int>> &fields, int team)
 {
 	const int w = map.getW(), h = map.getH();
 	int nearest = -1;
 	for (int y = 0; y < h; ++y)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int x = 0; x < w; ++x)
 		{
-			if (map.getResource(x, y).type != WHEAT)
+			::MapGeneration::generationCheckpoint();
+			if (!map.materialAmountAt(map.coordToIndex(x, y), MaterialId::Food))
 				continue;
 			int mine = -1, rival = -1;
 			for (int other = 0; other < int(fields.size()); ++other)
+			{
+				::MapGeneration::generationCheckpoint();
 				for (int dy = -1; dy <= 1; ++dy)
+				{
+					::MapGeneration::generationCheckpoint();
 					for (int dx = -1; dx <= 1; ++dx)
 					{
+						::MapGeneration::generationCheckpoint();
 						if (!dx && !dy)
 							continue;
-						const int d = fields[other][map.normalizeY(y + dy) * w + map.normalizeX(x + dx)];
+						const int d = fields.at(other).at(map.normalizeY(y + dy) * w +
+														  map.normalizeX(x + dx));
 						int &best = other == team ? mine : rival;
 						if (d >= 0 && (best < 0 || d < best))
 							best = d;
 					}
+				}
+			}
 			if (mine >= 0 && rival >= 0 && rival <= mine + kContestedSlack &&
 				(nearest < 0 || mine < nearest))
 				nearest = mine;
 		}
+	}
 	return nearest;
 }
 
@@ -78,32 +96,49 @@ int chokeWidth(const Map &map, const std::vector<int> &dist,
 	const int w = map.getW();
 	int here = -1, reach = -1;
 	for (int other = 0; other < int(workers.size()); ++other)
+	{
+		::MapGeneration::generationCheckpoint();
 		if (other != team)
-			for (int p : workers[other])
-				if (dist[p] >= 0 && (reach < 0 || dist[p] < reach))
+			for (int p : workers.at(other))
+			{
+				::MapGeneration::generationCheckpoint();
+				if (dist.at(p) >= 0 && (reach < 0 || dist.at(p) < reach))
 				{
-					reach = dist[p];
+					reach = dist.at(p);
 					here = p;
 				}
+			}
+	}
 	if (here < 0)
 		return -1;
 	int narrowest = map.getW() * map.getH();
-	while (dist[here] > 0)
+	while (dist.at(here) > 0)
 	{
-		const int x = here % w, y = here / w;
+		::MapGeneration::generationCheckpoint();
+		const int x = powerOfTwoRemainder(here, w), y = here / w;
 		int open = 0;
 		for (int dy = -kChokeWindow; dy <= kChokeWindow; ++dy)
+		{
+			::MapGeneration::generationCheckpoint();
 			for (int dx = -kChokeWindow; dx <= kChokeWindow; ++dx)
-				open += dist[map.normalizeY(y + dy) * w + map.normalizeX(x + dx)] >= 0;
+			{
+				::MapGeneration::generationCheckpoint();
+				open += dist.at(map.normalizeY(y + dy) * w + map.normalizeX(x + dx)) >= 0;
+			}
+		}
 		narrowest = std::min(narrowest, open);
 		int next = -1;
 		for (int dy = -1; dy <= 1 && next < 0; ++dy)
+		{
+			::MapGeneration::generationCheckpoint();
 			for (int dx = -1; dx <= 1 && next < 0; ++dx)
 			{
+				::MapGeneration::generationCheckpoint();
 				const int q = map.normalizeY(y + dy) * w + map.normalizeX(x + dx);
-				if ((dx || dy) && dist[q] >= 0 && dist[q] < dist[here])
+				if ((dx || dy) && dist.at(q) >= 0 && dist.at(q) < dist.at(here))
 					next = q;
 			}
+		}
 		if (next < 0)
 			break; // no downhill neighbour: stop rather than loop
 		here = next;
@@ -122,53 +157,96 @@ StartDiagnosticsReport diagnoseStarts(Game &game, int requestedTeams, const Star
 		return report;
 	const std::vector<std::vector<int>> workers = unitTilesByTeam(map, nbTeams);
 	for (const auto &team : workers)
+	{
+		::MapGeneration::generationCheckpoint();
 		if (team.empty())
 			return report;
+	}
 
-	const Fertility::Field fertility = Fertility::forMap(map);
-	// Ground within feeding reach of standing wheat, marked once for the whole map rather than
+	// Ground within feeding reach of standing food sources, marked once for the whole map rather than
 	// re-searched around every candidate building site.
 	std::vector<unsigned char> fedGround(w * h, 0);
 	for (int y = 0; y < h; ++y)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int x = 0; x < w; ++x)
-			if (map.getResource(x, y).type == WHEAT)
+		{
+			::MapGeneration::generationCheckpoint();
+			if (map.materialAmountAt(map.coordToIndex(x, y), MaterialId::Food) > 0)
 				for (int dy = -kFeedingReach; dy <= kFeedingReach; ++dy)
+				{
+					::MapGeneration::generationCheckpoint();
 					for (int dx = -kFeedingReach; dx <= kFeedingReach; ++dx)
-						fedGround[map.normalizeY(y + dy) * w + map.normalizeX(x + dx)] = 1;
+					{
+						::MapGeneration::generationCheckpoint();
+						fedGround.at(map.normalizeY(y + dy) * w + map.normalizeX(x + dx)) = 1;
+					}
+				}
+		}
+	}
 
 	std::vector<std::vector<int>> fields;
 	fields.reserve(nbTeams);
 	for (int team = 0; team < nbTeams; ++team)
-		fields.push_back(walkFromWorkers(map, workers[team]));
+	{
+		::MapGeneration::generationCheckpoint();
+		fields.push_back(walkFromWorkers(map, workers.at(team)));
+	}
 
 	report.colonies.resize(nbTeams);
 	for (int team = 0; team < nbTeams; ++team)
 	{
-		ColonyDiagnostics &colony = report.colonies[team];
-		const std::vector<int> &dist = fields[team];
+		::MapGeneration::generationCheckpoint();
+		ColonyDiagnostics &colony = report.colonies.at(team);
+		const std::vector<int> &dist = fields.at(team);
 		for (int p = 0; p < w * h; ++p)
 		{
-			const int d = dist[p];
+			::MapGeneration::generationCheckpoint();
+			const int d = dist.at(p);
 			if (d < 0)
 				continue;
-			const int x = p % w, y = p / w;
-			if (d <= scale.catchmentSteps && map.isGrass(p) && map.tiles[p].canResourcesGrow &&
-				fertility.at(x, y) > 0)
+			const int x = powerOfTwoRemainder(p, w), y = p / w;
+			if (d <= scale.catchmentSteps)
 			{
-				const double chance = double(fertility.at(x, y)) / Fertility::kScale;
-				if (neighbourHolds(map, x, y, isWheat))
-					colony.renewableWheat += chance;
-				if (neighbourHolds(map, x, y, isWood))
+                double foodRenewal = 0, woodExpansion = 0;
+                const double scarcity = double(1u << game.gameHeader.getResourceScarcityLevel());
+                for (int dy = -1; dy <= 1; ++dy)
 				{
-					colony.encroachingWood += chance;
-					if (map.isFreeForBuilding(x, y, 4, 4))
-						++colony.threatenedBuildSites;
+					::MapGeneration::generationCheckpoint();
+					for (int dx = -1; dx <= 1; ++dx)
+					{
+						::MapGeneration::generationCheckpoint();
+						if (!dx && !dy) continue;
+                        const auto source = map.coordToIndex(x + dx, y + dy);
+                        const auto& deposit = map.getResource(source);
+                        if (deposit.type == NO_RES_TYPE) continue;
+                        const auto id = static_cast<ResourceId>(deposit.type);
+                        if (map.materialAmountAt(source, MaterialId::Food))
+                        {
+                            const auto& yield = map.resourceRegistry().yields(id)[materialIndex(MaterialId::Food)];
+                            const double potential = yield.consumption == ResourceConsumption::Infinite ? 1.0 :
+                                double(map.materialRenewalPotentialAt(source, MaterialId::Food)) / ResourceRateScale / scarcity;
+                            foodRenewal = std::max(foodRenewal, potential);
+                        }
+                        // An occupied target cannot become a new deposit. Source ecology,
+                        // exact habitat permission and the selected yield determine spread.
+                        if (map.getResource(p).type == NO_RES_TYPE && map.canResourcesGrow(x,y) &&
+                            map.materialAmountAt(source, MaterialId::Wood) &&
+                            map.terrainSupportsResourceAt(size_t(p), id) &&
+                            map.isResourceAllowed(x,y,resourceIndex(id)))
+                            woodExpansion += double(map.materialExpansionRateAt(source, MaterialId::Wood)) /
+                                (8.0 * ResourceRateScale * scarcity);
+					}
 				}
+				colony.renewableFood += foodRenewal;
+                colony.encroachingWood += woodExpansion;
+                if (woodExpansion > 0 && map.isFreeForBuilding(x,y,4,4))
+                    ++colony.threatenedBuildSites;
 			}
 			if (d <= kHarvestReach)
 			{
 				const double trip = 1.0 / (2.0 * d + kHarvestSteps);
-				colony.wheatThroughput += neighbourHolds(map, x, y, isWheat) ? trip : 0.0;
+				colony.wheatThroughput += neighbourHolds(map, x, y, isFoodSource) ? trip : 0.0;
 				colony.woodThroughput += neighbourHolds(map, x, y, isWood) ? trip : 0.0;
 				colony.stoneThroughput += neighbourHolds(map, x, y, isStone) ? trip : 0.0;
 				colony.fruitThroughput += neighbourHolds(map, x, y, isFruit) ? trip : 0.0;
@@ -176,10 +254,16 @@ StartDiagnosticsReport diagnoseStarts(Game &game, int requestedTeams, const Star
 				{
 					bool fed = false;
 					for (int dy = -1; dy <= kInnSize && !fed; ++dy)
+					{
+						::MapGeneration::generationCheckpoint();
 						for (int dx = -1; dx <= kInnSize && !fed; ++dx)
+						{
+							::MapGeneration::generationCheckpoint();
 							fed = (dx < 0 || dy < 0 || dx >= kInnSize || dy >= kInnSize) &&
-								  map.getResource(map.normalizeX(x + dx), map.normalizeY(y + dy))
-										  .type == WHEAT;
+								  map.materialAmountAt(map.coordToIndex(x + dx, y + dy),
+													   MaterialId::Food) > 0;
+						}
+					}
 					if (fed)
 					{
 						++colony.innNextToWheatSites;
@@ -188,7 +272,7 @@ StartDiagnosticsReport diagnoseStarts(Game &game, int requestedTeams, const Star
 					}
 				}
 			}
-			if (d >= kOpeningCourt && d <= kExpansionReach && fedGround[p] &&
+			if (d >= kOpeningCourt && d <= kExpansionReach && fedGround.at(p) &&
 				map.isFreeForBuilding(x, y, 4, 4))
 				++colony.secondSwarmSites;
 		}
@@ -206,30 +290,38 @@ int removeResourceNear(Game &game, int team, int resource, int radius)
 	if (team < 0 || team >= game.teamsCount())
 		return -1;
 	const auto workers = unitTilesByTeam(map, team + 1);
-	if (int(workers.size()) <= team || workers[team].empty())
+	if (int(workers.size()) <= team || workers.at(team).empty())
 		return -1;
-	const std::vector<int> dist = walkFromWorkers(map, workers[team]);
+	const std::vector<int> dist = walkFromWorkers(map, workers.at(team));
 	int removed = 0;
 	for (int y = 0; y < h; ++y)
+	{
+		::MapGeneration::generationCheckpoint();
 		for (int x = 0; x < w; ++x)
 		{
+			::MapGeneration::generationCheckpoint();
 			if (map.getResource(x, y).type != resource)
 				continue;
 			int nearest = -1;
 			for (int dy = -1; dy <= 1; ++dy)
+			{
+				::MapGeneration::generationCheckpoint();
 				for (int dx = -1; dx <= 1; ++dx)
 				{
-					const int d = dist[map.normalizeY(y + dy) * w + map.normalizeX(x + dx)];
+					::MapGeneration::generationCheckpoint();
+					const int d = dist.at(map.normalizeY(y + dy) * w + map.normalizeX(x + dx));
 					if ((dx || dy) && d >= 0 && (nearest < 0 || d < nearest))
 						nearest = d;
 				}
+			}
 			if (nearest < 0 || nearest > radius)
 				continue;
 			// Clear in place: setResource/decResource draw from the synchronised random stream,
 			// and a perturbation must leave every other tile and the game's RNG untouched.
-			map.getTile(x, y).resource.clear();
+			map.replaceResource(x, y, Resource{});
 			++removed;
 		}
+	}
 	return removed;
 }
 } // namespace MapGeneration

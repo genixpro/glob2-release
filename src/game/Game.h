@@ -8,9 +8,12 @@
 
 #include <iostream>
 #include <memory>
+#include <span>
 
 #include "Map.h"
+#include "sim/snapshot/SnapshotStore.h"
 #include "Utilities.h"
+#include "OwnerRandom.h"
 #include "SGSL.h"
 #include <string>
 #include <valarray>
@@ -20,8 +23,11 @@
 #include "GameHints.h"
 #include "MapScript.h"
 #include "BuildingGuiState.h"
+#include "AreaEffects.h"
+#include "BuildingType.h"
 #include "sim/ClientEvents.h"
 #include "sim/EntityRef.h"
+#include "sim/ScriptClientChannel.h"
 #include "render/MapRenderState.h"
 
 namespace GAGCore
@@ -32,10 +38,11 @@ namespace GAGCore
 	class ChunkedBuffer;
 }
 using namespace GAGCore;
+namespace SimulationSnapshot { class Store; }
 class GameGUI;
 class SceneMap;
-struct Scene;
-struct SceneUnit;
+struct PresentationFrame;
+using SnapshotUnit = SimulationSnapshot::UnitView;
 class MapEdit;
 class ClientCommandSink;
 class ClientRequests;
@@ -62,6 +69,9 @@ class SetAllianceOrder;
 class PlayerQuitsGameOrder;
 class GameAnimations;
 class SoftwareTerrainCache;
+namespace AIPlanning { class BuildingCapabilityIndex; }
+namespace AIEngine { class Pipeline; }
+namespace GameDiagnostics { class Session; }
 
 // Minimum value of the prestige-victory threshold.
 #define MIN_MAX_PRESTIGE 500
@@ -144,13 +154,24 @@ class Game
 	friend class PointBarRenderTest;
 	bool hasSavedRandomState = false;
 public:
-	//! This game's synchronized random stream. syncStep, executeOrder, load and save
-	//! bind it, so syncRand() draws from the game being simulated on whichever thread
-	//! simulates it. Saved and restored with the game; never shared between games.
+	// Frozen for the lifetime of this simulation. Entity type pointers always
+	// refer to this registry, never to the application's authoring defaults.
+	BuildingsTypes buildingsTypes;
+	BuildingAreaEffects::Runtime areaEffects;
+	const AIPlanning::BuildingCapabilityIndex& buildingCapabilities() const;
+	// Setup/load only: compile experiment gates and discard catalog-derived AI
+	// indexes before controllers observe the resolved game configuration.
+	void configureBuildingCatalog();
+	// Retained only for reading/writing historical continuation records and test
+	// diagnostics. Production decisions never draw from this obsolete stream.
 	MersenneTwister syncRandom;
-	//! Bind syncRandom for other code that advances this game's simulation.
+	EntityRandom& privateRandom(RandomDomain domain) {
+		return map.privateRandom(domain);
+	}
+	//! Legacy test diagnostics only; production consumers are forbidden.
 	SyncRandScope bindRandom() { return SyncRandScope(syncRandom); }
 private:
+	std::unique_ptr<const AIPlanning::BuildingCapabilityIndex> buildingCapabilityIndex;
 	friend class HighResolutionIntegrationHarness;
 	friend class EnteringUnitDrawHarness;
 	friend class FailingUnitMarkersHarness;
@@ -201,6 +222,8 @@ public:
 		DRAW_NO_RESOURCE_GROWTH_AREAS = 0x80,
 		DRAW_OVERLAY = 0x100,
 		DRAW_NO_CLOUD_LAYER = 0x200,
+		// All tiles of a torus atlas share one whole-map terrain sampling density.
+		DRAW_TILED_CAPTURE = 0x400,
 	};
 
 	/// This method will prepare the game with the provided gameHeader,
@@ -208,7 +231,30 @@ public:
 	void setGameHeader(const GameHeader& gameHeader, bool saveAI=false);
 
 	/// Executes an Order with respect to the localPlayer of the GUI. All Orders get processed here.
-	void executeOrder(std::shared_ptr<Order> order, int localPlayer);
+	// Returns whether the existing executor admitted the command, including queued construction.
+	bool executeOrder(std::shared_ptr<Order> order, int localPlayer);
+	std::vector<std::pair<unsigned, std::shared_ptr<Order>>> prepareAIOrders(
+		std::span<const unsigned> eligiblePlayers, bool paused, const std::shared_ptr<GameDiagnostics::Session>& diagnostics = {},
+		const SimulationSnapshot::Handle* captured = nullptr);
+	//! Declare every reader before publishing this immutable observation boundary.
+	SimulationSnapshot::Handle captureReadBoundary(std::span<const unsigned> eligiblePlayers, bool paused,
+		SimulationSnapshot::Requirements additional = 0) const;
+	std::shared_ptr<Order> validateAIOrder(std::shared_ptr<Order> order, unsigned player);
+	void settleAIOrder(const std::shared_ptr<Order>& order, bool accepted);
+	void cancelAI(unsigned player);
+	void drainAI();
+	//! Simulation-owner service shared by AI, gradients and presentation.
+	SimulationSnapshot::Store& snapshots() const { return worldSnapshots; }
+	void clearAI();
+	void saveAI(GAGCore::OutputStream* stream);
+	bool loadAI(GAGCore::InputStream* stream);
+	void observeUnpolledAI();
+	SimulationSnapshot::Store& snapshotStore() { return worldSnapshots; }
+	std::vector<std::pair<std::string, Uint64>> aiMetrics() const;
+private:
+	mutable SimulationSnapshot::Store worldSnapshots;
+	std::unique_ptr<AIEngine::Pipeline> aiPipeline;
+public:
 
 	/// Makes a step for building projects that are waiting for the areas to clear of units.
 	void buildProjectSyncStep(Sint32 localTeam);
@@ -231,7 +277,10 @@ public:
 
 	/// Advances the Game by one tick, in reference to localTeam being the localTeam. This does all
 	/// internal processing.
-	void syncStep(Sint32 localTeam);
+	// Complete is safe for direct stepping followed by arbitrary orders/saves.
+	// Engine alone defers into its next read-only batch, before applying orders.
+	enum class PreparationCompletion { Complete, Deferred };
+	void syncStep(Sint32 localTeam, PreparationCompletion completion = PreparationCompletion::Complete);
 
 	void dirtyWarFlagGradient();
 
@@ -256,6 +305,7 @@ public:
 	bool tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam);
 
 	Unit *addUnit(int x, int y, int team, int type, int level, int delta, int dx, int dy);
+	bool isBuildingTypeAvailable(int typeNum) const;
 	Building *addBuilding(int x, int y, int typeNum, int teamNumber, Sint32 unitWorking = 1, Sint32 unitWorkingFuture = 1);
 	//! This remove anything at case(x, y), and return a rect which include every removed things.
 	bool removeUnitAndBuildingAndFlags(int x, int y, unsigned flags=DEL_UNIT|DEL_BUILDING|DEL_FLAG);
@@ -276,7 +326,7 @@ public:
 	bool checkHardRoomForBuilding(int coordX, int coordY, const BuildingType *bt, int *mapX, int *mapY);
 	bool checkHardRoomForBuilding(int x, int y, const BuildingType *bt);
 
-	static void drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene);
+	static void drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene);
 	/// `view` carries the calling front-end's selection/mouse state (see
 	/// ViewState); render reads selectedUnit/selectedBuilding for highlights and
 	/// writes back mouseUnit from hit-testing. `buildingGuiState` (optional)
@@ -285,10 +335,10 @@ public:
 	/// mutates buildings directly without an orderQueue, so there is no pending
 	/// shadow to consult.
     // Prepare one immutable presentation frame for several offscreen regions.
-    void prepareMapCapture(int team, ViewState &view, Uint32 options, bool paused);
     static void finishMapCapture(ViewState &view, Uint32 options, bool paused);
-	static void drawSceneMap(const Scene& scene, int sx, int sy, int sw, int sh, int rightMargin, int topMargin, int viewportX, int viewportY, int teamSelected, ViewState& view, Uint32 drawOptions = 0, std::set<Uint16> *visibleBuildings = 0, const BuildingGuiStateMap* buildingGuiState = nullptr, bool animationsPaused = false, int cloudGridLimit = 0, bool preparedCapture = false);
-	void drawMap(int sx, int sy, int sw, int sh, int rightMargin, int topMargin, int viewportX, int viewportY, int teamSelected, ViewState& view, Uint32 drawOptions = 0, std::set<Uint16> *visibleBuildings = 0, const BuildingGuiStateMap* buildingGuiState = nullptr, bool animationsPaused = false, int cloudGridLimit = 0, bool preparedCapture = false);
+    static void prepareSceneMapFrame(const PresentationFrame &scene, int team, ViewState &view, Uint32 options, bool paused);
+	static void drawSceneMap(const PresentationFrame& scene, int sx, int sy, int sw, int sh, int rightMargin, int topMargin, int viewportX, int viewportY, int teamSelected, ViewState& view, Uint32 drawOptions = 0, std::set<Uint16> *visibleBuildings = 0, const BuildingGuiStateMap* buildingGuiState = nullptr, bool animationsPaused = false, int cloudGridLimit = 0, bool preparedCapture = false);
+	static void drawMap(int sx, int sy, int sw, int sh, int rightMargin, int topMargin, int viewportX, int viewportY, int teamSelected, ViewState& view, Uint32 drawOptions = 0, std::set<Uint16> *visibleBuildings = 0, const BuildingGuiStateMap* buildingGuiState = nullptr, bool animationsPaused = false, int cloudGridLimit = 0, bool preparedCapture = false);
 
 	///Sets the mask representing which players the game is waiting on
 	void setWaitingOnMask(Uint32 mask);
@@ -330,33 +380,33 @@ private:
 	/// Per-order-type executors. The dispatcher executeOrder() downcasts the
 	/// shared_ptr<Order> to its concrete type and calls the matching helper.
 	/// Helpers do NOT re-check team aliveness — the dispatcher gates that.
-	void executeCreate(const OrderCreate& order, int localPlayer);
-	void executeModifyBuilding(const OrderModifyBuilding& order, int localPlayer);
-	void executeModifyExchange(const OrderModifyExchange& order, int localPlayer);
-	void executeModifyFlag(const OrderModifyFlag& order, int localPlayer);
-	void executeModifyClearingFlag(const OrderModifyClearingFlag& order, int localPlayer);
+	bool executeCreate(const OrderCreate& order, int localPlayer);
+	bool executeModifyBuilding(const OrderModifyBuilding& order, int localPlayer);
+	bool executeModifyExchange(const OrderModifyExchange& order, int localPlayer);
+	bool executeModifyFlag(const OrderModifyFlag& order, int localPlayer);
+	bool executeModifyClearingFlag(const OrderModifyClearingFlag& order, int localPlayer);
 	/// Sets minLevelToFlag and flushes currently-assigned units by toggling
 	/// maxUnitWorking through zero so the building releases them on update().
-	void executeModifyMinLevelToFlag(const OrderModifyMinLevelToFlag& order, int localPlayer);
-	void executeMoveFlag(const OrderMoveFlag& order, int localPlayer);
-	void executeAlterForbidden(const OrderAlterForbidden& order, int localPlayer);
-	void executeAlterGuardArea(const OrderAlterGuardArea& order, int localPlayer);
-	void executeAlterClearArea(const OrderAlterClearArea& order, int localPlayer);
-	void executeAlterFarmArea(const OrderAlterFarmArea& order, int localPlayer);
+	bool executeModifyMinLevelToFlag(const OrderModifyMinLevelToFlag& order, int localPlayer);
+	bool executeMoveFlag(const OrderMoveFlag& order, int localPlayer);
+	bool executeAlterForbidden(const OrderAlterForbidden& order, int localPlayer);
+	bool executeAlterGuardArea(const OrderAlterGuardArea& order, int localPlayer);
+	bool executeAlterClearArea(const OrderAlterClearArea& order, int localPlayer);
+	bool executeAlterFarmArea(const OrderAlterFarmArea& order, int localPlayer);
 	/// The team exists and the brush mode is add or delete; shared by the area orders.
 	bool isValidAlterArea(const OrderAlterArea& order) const;
-	void executeModifySwarm(const OrderModifySwarm& order, int localPlayer);
+	bool executeModifySwarm(const OrderModifySwarm& order, int localPlayer);
 	/// Delete-building. Bypasses the team-alive gate: dead-team buildings
 	/// can still be torn down.
-	void executeDelete(const OrderDelete& order);
-	void executeChangePriority(const OrderChangePriority& order);
-	void executeCancelDelete(const OrderCancelDelete& order);
-	void executeConstruction(const OrderConstruction& order);
-	void executeCancelConstruction(const OrderCancelConstruction& order);
-	void executeSetAlliance(const SetAllianceOrder& order);
+	bool executeDelete(const OrderDelete& order);
+	bool executeChangePriority(const OrderChangePriority& order);
+	bool executeCancelDelete(const OrderCancelDelete& order);
+	bool executeConstruction(const OrderConstruction& order);
+	bool executeCancelConstruction(const OrderCancelConstruction& order);
+	bool executeSetAlliance(const SetAllianceOrder& order);
 	/// Marks the leaving player's team dead only if no other player still
 	/// controls that team; either way, the leaving player slot becomes AI::NONE.
-	void executePlayerQuitGame(const PlayerQuitsGameOrder& order);
+	bool executePlayerQuitGame(const PlayerQuitsGameOrder& order);
 
 public:
 	bool anyPlayerWaited;
@@ -381,34 +431,32 @@ private:
 	///draws an HP bar coloured green/yellow/red against the 0.6 / 0.3 hpRatio thresholds
 	static void drawHealthBar(int x, int y, int maxLength, int actLength, float hpRatio, MapRenderState* drawnRender=nullptr, float opacity = 1.f);
 	///draws a building resource bar (food, bullets, ...) auto-shrinking to fit within (height*32)-10 pixels
-	static void drawBuildingResourceBar(int x, int y, BuildingType* type, int maxValue, int currentValue, Uint8 r, Uint8 g, Uint8 b, MapRenderState* drawnRender=nullptr);
-	///draws the flat per-tile colours that replace terrain and resources when zoomed far out
+	static void drawBuildingResourceBar(int x, int y, const BuildingType* type, int maxValue, int currentValue, Uint8 r, Uint8 g, Uint8 b, MapRenderState* drawnRender=nullptr);
+	///draws sampled terrain palette colours and tile resource tints when zoomed far out
 	static void drawMapOverview(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& sceneMap, MapRenderState& render);
 	///draws a faint wash of each team's colour over the land around its buildings, in the strategic view
-	static void drawMapTerritory(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const Scene& scene, float opacity);
+	static void drawMapTerritory(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene, float opacity);
 	///draws the overlay representing water
-	static void drawMapWater(int sw, int sh, int viewportX, int viewportY, int time);
 	///draws the terrain tiles of sand and gras
-	static void drawMapTerrain(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& sceneMap);
+	static void drawMapTerrain(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& sceneMap, int animationTime = 0);
 	///draws the resources like algae, wheat or fruit trees
 	static void drawMapResources(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& sceneMap);
 	///draws the ground units. up till now those are workers and warriors
-	static void drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene);
+	static void drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene);
 	///draws debug information. switched in the code.
 	static void drawMapDebugAreas(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view);
-	static void drawMapGroundBuildings(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, std::set<Uint16> *visibleBuildings, const BuildingGuiStateMap* buildingGuiState, const Scene& scene, MapRenderState* drawnRender, ViewState* view = nullptr);
-	static void drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const Scene& scene, MapRenderState* drawnRender, ViewState* view = nullptr);
-    static void prepareSceneMapFrame(const Scene &scene, int team, ViewState &view, Uint32 options, bool paused);
+	static void drawMapGroundBuildings(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, std::set<Uint16> *visibleBuildings, const BuildingGuiStateMap* buildingGuiState, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view = nullptr);
+	static void drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view = nullptr);
 	static void drawMapAreas(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const SceneMap& sceneMap, bool advanceAnimation = true);
-	static void drawMapArea(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& map, bool (SceneMap::*mapIs)(int, int) const, int areaAnimationTick, AreaType areaType, const MapRenderState& render);
-	static void drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene);
+	static void drawMapArea(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& map, bool (SceneMap::*mapIs)(int, int) const, int areaAnimationTick, AreaType areaType, const MapRenderState& render, const Utilities::BitArray* preview = nullptr);
+	static void drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene);
 	static void drawMapScriptAreas(int left, int top, int right, int bot, int viewportX, int viewportY, const SceneMap& map);
-	static void drawMapBulletsExplosionsDeathAnimations(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const Scene& scene);
-	static void drawMapFogOfWar(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const MapRenderState& render, const Scene& scene);
+	static void drawMapBulletsExplosionsDeathAnimations(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene);
+	static void drawMapFogOfWar(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const MapRenderState& render, const PresentationFrame& scene);
 	static void drawMapOverlayMaps(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view);
-	static void drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const Scene& scene);
-	static void drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneUnit& unit, const Scene& scene, float unitMotion = 0);
-	static void drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SceneUnit& unit, Uint32 drawOptions, const Scene& scene, float unitMotion = 0);
+	static void drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene);
+	static void drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SnapshotUnit& unit, const PresentationFrame& scene, float unitMotion = 0);
+	static void drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SnapshotUnit& unit, Uint32 drawOptions, const PresentationFrame& scene, float unitMotion = 0);
 	static bool isOnScreen(int left, int top, int right, int bot, int viewportX, int viewportY, int x, int y, const SceneMap& map);
 public:
 	Uint32 checkSum(std::vector<Uint32> *checkSumsVector=NULL, std::vector<Uint32> *checkSumsVectorForBuildings=NULL, std::vector<Uint32> *checkSumsVectorForUnits=NULL, bool heavy=false);
@@ -431,6 +479,7 @@ public:
 	Player * players[Team::MAX_COUNT];
 	Map map;
 	MapScriptSGSL sgslScript; ///< SGSL script
+	ScriptClientChannel scriptClient; ///< stable simulation-owned script endpoint
 	MapScript mapscript; ///< new script, currently USL
 	GameObjectives objectives;
 	GameHints gameHints;
@@ -490,10 +539,11 @@ public:
 		Unit *selectedUnit = nullptr;
 		Building *selectedBuilding = nullptr;
 		MapRenderState render;            //!< This view's animation phases and render caches.
-		//! Scene to draw, published by the simulation; null to extract one from the game.
-		const Scene *scene = nullptr;
+		//! PresentationFrame to draw, published by the simulation; null to extract one from the game.
+		const PresentationFrame *scene = nullptr;
+        const std::array<Utilities::BitArray,4>* displayedAreas = nullptr;
 		//! The scene the last drawMap drew: the published one, else the view's own.
-		const Scene &drawnScene() const { return scene ? *scene : render.ownScene; }
+		const PresentationFrame &drawnScene() const { return scene ? *scene : render.ownScene; }
 	};
 
 	Uint32 stepCounter;
@@ -511,12 +561,7 @@ public:
 	int prestigeToReach;
 	bool totalPrestigeReached;
 	bool isGameEnded;
-	///This is the IntBuildingType of a building type to be highlighted. All buildings of this type will be drawn
-	///With an arrow pointed at them. This is primarily for tutorials and is linked through the script system
-	///This is a mask, where 1<<typenum is the buildings to be highlighted
-	Uint32 highlightBuildingType;
-	///Similar to above, but for units
-	Uint32 highlightUnitType;
+
 
 
 	Team *getTeamWithMostPrestige(void);

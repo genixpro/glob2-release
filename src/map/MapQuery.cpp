@@ -6,7 +6,12 @@
 #include "Utilities.h"
 #include "BuildingType.h"
 #include "Unit.h"
+#include "Building.h"
+#include "Team.h"
+#include "Game.h"
 #include "MapInternal.h"
+#include "gradient/GradientRuntime.h"
+#include "gradient/ResourceSeedCache.h"
 
 
 
@@ -20,16 +25,17 @@
 bool Map::checkTile(int x, int y, TileChecks c, bool canSwim,
                     Uint32 teamMask, Uint16 ignoreGid) const
 {
-	if (c.noResource && isResource(x, y))
+	if (c.noResource && (c.requireBuildable ? resourceBlocksBuilding(coordToIndex(x,y))
+		: resourceBlocksGround(coordToIndex(x,y))))
 		return false;
 	Uint16 buid = getBuilding(x, y);
 	if (buid != NOGBID && buid != ignoreGid)
 		return false;
 	if (c.noUnit && getGroundUnit(x, y) != NOGUID)
 		return false;
-	if (c.waterBlocks && !canSwim && isWater(x, y))
+	if (c.requireGroundPassable && !terrainPropertiesAt(x, y).walkable && !(canSwim && terrainPropertiesAt(x, y).swimmable))
 		return false;
-	if (c.requireGrass && !isGrass(x, y))
+	if (c.requireBuildable && !terrainPropertiesAt(x, y).buildable)
 		return false;
 	if (c.checkForbidden && (getForbidden(x, y) & teamMask))
 		return false;
@@ -101,18 +107,22 @@ bool Map::isHardSpaceForBuilding(int x, int y, int w, int h, Uint16 gid) const
 
 std::optional<Offset> Map::doesUnitTouchBuilding(Unit *unit, Uint16 gbid) const
 {
-	int x=unit->posX;
-	int y=unit->posY;
-
-	for (int tdx=-1; tdx<=1; tdx++)
-		for (int tdy=-1; tdy<=1; tdy++)
-			if (getBuilding(x+tdx, y+tdy)==gbid)
-				return Offset{tdx, tdy};
-	return std::nullopt;
+	return doesPosTouchBuilding(unit->posX,unit->posY,gbid);
 }
 
 std::optional<Offset> Map::doesPosTouchBuilding(int x, int y, Uint16 gbid) const
 {
+	const Building* target = nullptr;
+	if (game && gbid != NOGBID && Building::GIDtoTeam(gbid) < Team::MAX_COUNT && game->teams[Building::GIDtoTeam(gbid)])
+		target = game->teams[Building::GIDtoTeam(gbid)]->myBuildings[Building::GIDtoID(gbid)];
+	if (target && !target->type->semantics.occupiesGround)
+	{
+		for (int dx=-1; dx<=1; ++dx)
+			for (int dy=-1; dy<=1; ++dy)
+				if (((x+dx-target->posX)&wMask)<target->type->width && ((y+dy-target->posY)&hMask)<target->type->height)
+					return Offset{dx,dy};
+		return std::nullopt;
+	}
 	for (int tdx=-1; tdx<=1; tdx++)
 		for (int tdy=-1; tdy<=1; tdy++)
 			if (getBuilding(x+tdx, y+tdy)==gbid)
@@ -132,23 +142,99 @@ std::optional<Offset> Map::doesUnitTouchResource(Unit *unit) const
 	return std::nullopt;
 }
 
-std::optional<Offset> Map::doesUnitTouchResource(Unit *unit, int resourceType) const
+std::optional<Offset> Map::doesUnitTouchMaterialSource(Unit *unit, MaterialId material) const
 {
 	int x=unit->posX;
 	int y=unit->posY;
 	Uint32 me=unit->owner->me;
 	for (int tdx=-1; tdx<=1; tdx++)
 		for (int tdy=-1; tdy<=1; tdy++)
-			if (isResourceTakeable(x+tdx, y+tdy, resourceType) && ((getForbidden(x+tdx, y+tdy)&me)==0))
+			if (isMaterialTakeable(x+tdx, y+tdy, material) && ((getForbidden(x+tdx, y+tdy)&me)==0))
 				return Offset{tdx, tdy};
 	return std::nullopt;
 }
 
-std::optional<Offset> Map::doesPosTouchResource(int x, int y, int resourceType) const
+bool Map::marketsV2Enabled() const
+{
+	return game && game->buildingsTypes.usesMarketRouting();
+}
+
+bool Map::isStockedMarketTile(Uint16 gid, int teamNumber, int resourceType) const
+{
+	if (!marketsV2Enabled() || gid == NOGBID || Building::GIDtoTeam(gid) != teamNumber)
+		return false;
+	const Building *b = game->teams[teamNumber]->myBuildings[Building::GIDtoID(gid)];
+	// The stock is the team's shared pool; only a market whose level takes the
+	// resource at all hands it out.
+	return stockSupplierEligibleSlot(b,nullptr,resourceType,1);
+}
+
+void Map::invalidateSupplierLocations()
+{
+	gradientRuntime->supplierLocationsDirty=true;
+	for (auto& team : gradientRuntime->stockRevision) for (auto& revision : team) ++revision;
+}
+
+Building *Map::touchedStockedMarketSlot(Unit *unit, int resourceType) const
+{
+	const int teamNumber=unit->owner->teamNumber;
+	const Building* consumer=unit->attachedBuilding;
+	const unsigned modes=materialSupplyModesSlot(consumer,resourceType);
+	const bool overlays=(modes&2) || game->buildingsTypes.usesOverlaySuppliers();
+	if (overlays && gradientRuntime->supplierLocationsDirty)
+	{
+		auto& locations=gradientRuntime->overlaySupplierLocations;
+		locations.clear();
+		for (int team=0; team<game->mapHeader.getNumberOfTeams(); ++team)
+			for (const Building* supplier : game->teams[team]->stockSuppliers)
+				if (!supplier->runtime->has(BuildingRuntimeTraits::OccupiesGround))
+					for (int y=0; y<supplier->type->height; ++y)
+						for (int x=0; x<supplier->type->width; ++x)
+							locations[coordToIndex(supplier->posX+x,supplier->posY+y)].push_back(supplier->gid);
+		for (int team=0; team<game->mapHeader.getNumberOfTeams(); ++team)
+			for (const Building* supplier : game->teams[team]->directStockSuppliers)
+				if (!supplier->runtime->has(BuildingRuntimeTraits::OccupiesGround))
+					for (int y=0; y<supplier->type->height; ++y)
+						for (int x=0; x<supplier->type->width; ++x)
+							locations[coordToIndex(supplier->posX+x,supplier->posY+y)].push_back(supplier->gid);
+		for (auto& [tile, suppliers] : locations) {
+			std::sort(suppliers.begin(),suppliers.end());
+			suppliers.erase(std::unique(suppliers.begin(),suppliers.end()),suppliers.end());
+		}
+		gradientRuntime->supplierLocationsDirty=false;
+	}
+	Building* best=nullptr;
+	const auto consider = [&](Uint16 gid) {
+		if (gid==NOGBID || Building::GIDtoTeam(gid)!=teamNumber) return;
+		Building* supplier=game->teams[teamNumber]->myBuildings[Building::GIDtoID(gid)];
+		if (!stockSupplierEligibleSlot(supplier,consumer,resourceType,modes)) return;
+		if (!best || supplier->type->semantics.market.pickupPenalty < best->type->semantics.market.pickupPenalty ||
+			(supplier->type->semantics.market.pickupPenalty == best->type->semantics.market.pickupPenalty && supplier->gid<best->gid)) best=supplier;
+	};
+	for (int dx=-1; dx<=1; ++dx)
+		for (int dy=-1; dy<=1; ++dy)
+		{
+			const Uint16 gid=getBuilding(unit->posX+dx,unit->posY+dy);
+			if (!overlays)
+			{
+				if (isStockedMarketTile(gid,teamNumber,resourceType)) {
+					Building* candidate=game->teams[teamNumber]->myBuildings[Building::GIDtoID(gid)];
+					if (stockSupplierEligibleSlot(candidate,consumer,resourceType,1)) return candidate;
+				}
+				continue;
+			}
+			consider(gid);
+			const auto found=gradientRuntime->overlaySupplierLocations.find(coordToIndex(unit->posX+dx,unit->posY+dy));
+			if (found!=gradientRuntime->overlaySupplierLocations.end()) for (const Uint16 overlay : found->second) consider(overlay);
+		}
+	return best;
+}
+
+std::optional<Offset> Map::doesPosTouchMaterialSource(int x, int y, MaterialId material) const
 {
 	for (int tdx=-1; tdx<=1; tdx++)
 		for (int tdy=-1; tdy<=1; tdy++)
-			if (isResourceTakeable(x+tdx, y+tdy, resourceType))
+			if (isMaterialTakeable(x+tdx, y+tdy, material))
 				return Offset{tdx, tdy};
 	return std::nullopt;
 }
@@ -188,23 +274,20 @@ std::optional<Offset> Map::doesUnitTouchEnemy(Unit *unit) const
 					assert(game->teams[otherTeam]);
 					int otherID=Building::GIDtoID(gbid);
 					Building *b=game->teams[otherTeam]->myBuildings[otherID];
-					if (!b->type->defaultUnitStayRange)
+					if (b->runtime->shootingRange)
 					{
-						if (b->type->shootingRange)
-						{
-							// Unconditional write — later shooter wins ties.
-							bdx=tdx;
-							bdy=tdy;
-							bestTime=ENEMY_TOUCH_SCORE_SHOOTER;
-						}
-						else if (bestTime>ENEMY_TOUCH_SCORE_BUILDING_FALLBACK)
-						{
-							// Only fall back to a non-shooting enemy building
-							// when no other candidate has been seen yet.
-							bdx=tdx;
-							bdy=tdy;
-							bestTime=ENEMY_TOUCH_SCORE_BUILDING_FALLBACK;
-						}
+						// Unconditional write — later shooter wins ties.
+						bdx=tdx;
+						bdy=tdy;
+						bestTime=ENEMY_TOUCH_SCORE_SHOOTER;
+					}
+					else if (bestTime>ENEMY_TOUCH_SCORE_BUILDING_FALLBACK)
+					{
+						// Only fall back to a non-shooting enemy building
+						// when no other candidate has been seen yet.
+						bdx=tdx;
+						bdy=tdy;
+						bestTime=ENEMY_TOUCH_SCORE_BUILDING_FALLBACK;
 					}
 				}
 			}
@@ -267,28 +350,67 @@ int Map::isClearingAreaClaimed(int x, int y, int teamNumber) const
 
 void Map::markImmobileUnit(int x, int y, int teamNumber)
 {
-	immobileUnits[coordToIndex(x, y)] = teamNumber;
+	const auto index = coordToIndex(x, y);
+	if (occupancyCells[index].immobileUnit == teamNumber) return;
+	occupancyCells[index].immobileUnit = teamNumber;
+	markOccupancy(index);
+	resourceSeedChanged(index, ResourceSeedCache::Immobile);
 }
 
 
 void Map::clearImmobileUnit(int x, int y)
 {
-	immobileUnits[coordToIndex(x, y)] = IMMOBILE_UNIT_NONE;
+	const auto index = coordToIndex(x, y);
+	if (occupancyCells[index].immobileUnit == IMMOBILE_UNIT_NONE) return;
+	occupancyCells[index].immobileUnit = IMMOBILE_UNIT_NONE;
+	markOccupancy(index);
+	resourceSeedChanged(index, ResourceSeedCache::Immobile);
 }
 
 
 bool Map::isImmobileUnit(int x, int y) const
 {
-	return immobileUnits[coordToIndex(x, y)] != IMMOBILE_UNIT_NONE;
+	return occupancyCells[coordToIndex(x, y)].immobileUnit != IMMOBILE_UNIT_NONE;
 }
 
 
 
 Uint8 Map::getImmobileUnit(int x, int y) const
 {
-	return immobileUnits[coordToIndex(x, y)];
+	return occupancyCells[coordToIndex(x, y)].immobileUnit;
 }
 
 
+
+
+
+// Wrapped spatial distances are also used by point-to-point searches.
+Sint32 Map::warpDist1d(int p, int q, int l)
+{
+	Sint32 d=abs(p-q);
+	// Normalized coordinates already differ by less than one period.
+	if (d>=l)
+		d%=l;
+	if (d>l/2)
+		d=l-d;
+	return d;
+}
+
+Sint32 Map::warpDistSquare(int px, int py, int qx, int qy)
+{
+	Sint32 dx=warpDist1d(px,qx,w);
+	Sint32 dy=warpDist1d(py,qy,h);
+	return ((dx*dx)+(dy*dy));
+}
+
+Sint32 Map::warpDistMax(int px, int py, int qx, int qy)
+{
+	Sint32 dx=warpDist1d(px,qx,w);
+	Sint32 dy=warpDist1d(py,qy,h);
+	if (dx>dy)
+		return dx;
+	else
+		return dy;
+}
 
 

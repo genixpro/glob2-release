@@ -2,11 +2,33 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #pragma once
+#include "FileFormatVersions.h"
 
 // This is the version of map and savegame format, and all of the recorded data on the server
 #define VERSION_MAJOR 0
 #define MINIMUM_VERSION_MINOR 58
-#define VERSION_MINOR 133
+#define VERSION_MINOR 152
+// version 152 gives world operations and legacy stories private streams.
+// version 151 gives units and buildings salted private PCG32 streams.
+// version 150 preserves building area-effect funding and fractional services.
+// version 149 adds delayed resource growth to vertex terrain and scheduled building gradients.
+// version 148 adds the match-wide building gradient delay rule and pending scheduled
+//             building gradient state.
+// version 147 removes round-trip resource fetching: workers always fetch greedily, and
+//             saves drop the round-trip fields that earlier formats carry and the loader discards.
+// version 146 stores terrain once per map vertex.
+// version 145 embeds immutable custom building artwork; older save readers remain supported.
+// version 144 embeds custom terrain/resource artwork and set attribution in maps and saves.
+// version 143 adds engine snapshots, scheduled AI decision streams and pending command state.
+// version 142 rebuilds pre-penalty terrain route caches; replay trajectories change.
+// version 141 adds the built-in terrain catalogue; older custom terrain IDs are remapped on load.
+// version 140 separates fixed materials from embedded runtime resource definitions.
+// version 139 moves periodic gradient preparation to the completed-tick observation phase.
+// version 138 saves the map's terrain look seed; older maps load with seed 0.
+// version 137 embeds building catalogs and independent capability state.
+// version 136 embeds immutable terrain registries before map tile identities.
+// version 135 adds optional market resource gradients and their scheduling state.
+// version 134 adds canonical terrain properties and calibrated ecology.
 // version 133 adds worker time use, combat-death places and the defence snapshot to team statistics.
 // version 132 preserves legacy AI clocks, specialist caches and learned policy state.
 // version 131 adds the optional win-probability winning-condition tag.
@@ -60,7 +82,7 @@
 // version 24 added Building::bullets
 // version 25 added Multiple AI support
 // version 26 added saved type of player (human/ai) in Team
-// version 27 adding clearingResources[] to allow flags to clear specific resources
+// version 27 adding clearingMaterials[] to allow flags to clear specific resources
 // version 28 changed eternal resources way to count the amount.
 // version 29 added Team::startPosSet for easy map editing.
 // version 30 *added version for AI implementations*
@@ -78,7 +100,7 @@
 // version 42 added AIWarrush
 // version 43 added AINicowar
 // version 44 added Bullet:revealX/Y/W/H into the saved file
-// version 45 added teamResources to Team for shared resources among markets
+// version 45 added teamMaterials to Team for shared resources among markets
 // version 46 added Unit::validTarget
 // version 47 added new map generation system
 // version 48 added script state load/save
@@ -167,7 +189,13 @@
 //NetMessage, and the likes, in parallel to change of the VERSION_MINOR above. It is part of
 //the simulation version (src/online/SimVersion.cpp). The YOG lobby that also checked it
 //(YOG_MIN_CLIENT_NET_PROTOCOL_VERSION) was removed at protocol 51.
-#define NET_PROTOCOL_VERSION 54
+#define NET_PROTOCOL_VERSION 68
+// Protocol 68 transfers area-effect funding and fractional services.
+// Protocol 67 combines scheduled building gradients and delayed resource growth.
+// protocol 61 requires format-143 AI decision scheduling and the match-wide AI order delay.
+// protocol 60 requires damage-weighted routing and safe idle movement.
+// protocol 59 requires readers of format-140 runtime resource and material snapshots.
+// protocol 58 requires readers of version-138 map snapshots (terrain look seed).
 // protocol 54 transfers the format-132 AI continuation fields.
 // version 53 supports the optional win-probability winning condition.
 // version 52 adds ORDER_ALTER_FARM_AREA and requires readers of version-130 map snapshots.

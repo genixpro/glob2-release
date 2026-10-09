@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "field/Grid.h"
+#include "PowerOfTwo.h"
 #include "MapImage.h"
+#include "TerrainCornerPresentation.h"
+#include "TerrainPresentation.h"
 #include "Game.h"
 #include "GlobalContainer.h"
 #include "GenerationContext.h"
@@ -28,20 +32,40 @@ struct Category
 	TerrainType terrain;
 	int resource;
 };
-// Order also defines nearest-color and cell-majority ties. Keep in sync with CLI.md.
-constexpr std::array<Category, 12> palette{{{0, 128, 0, GRASS, NO_RES},
-											{240, 220, 140, SAND, NO_RES},
-											{0, 64, 255, WATER, NO_RES},
-											{0, 64, 0, GRASS, WOOD},
-											{255, 255, 0, GRASS, WHEAT},
-											{128, 128, 128, GRASS, STONE},
-											{0, 255, 255, WATER, ALGA},
-											{255, 0, 255, GRASS, PAPYRUS},
-											{255, 0, 0, GRASS, CHERRY},
-											{255, 128, 0, GRASS, ORANGE},
-											{128, 0, 255, GRASS, PRUNE},
-											{255, 255, 255, GRASS, NO_RES}}};
+constexpr Category terrainCategory(TerrainType type)
+{
+    const auto c=terrainPresentation(type).image;
+    return {c.r,c.g,c.b,type,NO_RES};
+}
+// Explicit legacy image-format palette: these named built-in content choices
+// define nearest-color and vertex-majority ties. Keep in sync with CLI.md. Every
+// other built-in terrain follows in identity order with its own image colour.
+constexpr auto palette = [] {
+    constexpr std::array<Category,12> legacy{{terrainCategory(GRASS), terrainCategory(SAND), terrainCategory(WATER),
+        {0,64,0,GRASS,WOOD}, {255,255,0,GRASS,WHEAT}, {128,128,128,GRASS,STONE},
+        {0,255,255,WATER,ALGA}, {255,0,255,GRASS,PAPYRUS}, {255,0,0,GRASS,CHERRY},
+        {255,128,0,GRASS,ORANGE}, {128,0,255,GRASS,PRUNE}, {255,255,255,GRASS,NO_RES}}};
+    std::array<Category,legacy.size()+TERRAIN_COUNT-3> result{};
+    unsigned cursor=0;
+    for (const auto& entry : legacy) result[cursor++]=entry;
+    for (unsigned type=0;type<TERRAIN_COUNT;++type)
+        if (!classicTerrain(static_cast<TerrainType>(type)))
+            result[cursor++]=terrainCategory(static_cast<TerrainType>(type));
+    return result;
+}();
 constexpr int marker = 11;
+std::array<int, palette.size()> paletteResourceIds(const Map& map)
+{
+    // Resolve the legacy colors by content key, never by a runtime dense ID.
+    static constexpr const char* keys[] = {
+        "trees", "wheat", "rocks", "algae", "papyrus", "cherry-tree", "orange-tree", "prune-tree"};
+    std::array<int, palette.size()> ids;
+    ids.fill(NO_RES);
+    for (unsigned i = 0; i < std::size(keys); ++i)
+        if (const auto id = map.resourceRegistry().find(keys[i])) ids[i + 3] = resourceIndex(*id);
+    return ids;
+}
+
 using Surface = std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)>;
 Surface surface(SDL_Surface *p)
 {
@@ -49,6 +73,10 @@ Surface surface(SDL_Surface *p)
 		throw std::runtime_error(std::string("Map image: ") + SDL_GetError());
 	return Surface(p, SDL_DestroySurface);
 }
+// Classic categories plus ice and trail classify by nearest colour, as they always
+// have. Catalogue terrains are recognised only by their exact exported colour, so an
+// off-palette shade in an existing image still becomes classic ground rather than a
+// gated catalogue type.
 int nearest(Uint8 r, Uint8 g, Uint8 b)
 {
 	int best = 0, distance = std::numeric_limits<int>::max();
@@ -57,6 +85,8 @@ int nearest(Uint8 r, Uint8 g, Uint8 b)
 		const auto &c = palette[i];
 		int d = (int(r) - c.r) * (int(r) - c.r) + (int(g) - c.g) * (int(g) - c.g) +
 				(int(b) - c.b) * (int(b) - c.b);
+		if (unsigned(c.terrain) > unsigned(TRAIL) && d != 0)
+			continue;
 		if (d < distance)
 		{
 			best = i;
@@ -124,10 +154,10 @@ bool inInteriorSeamStrip(int x, int y, int w, int h, int band)
 
 int resourceNeighborCount(const std::vector<int> &resources, int w, int h, int i, int type)
 {
-	const int x = i % w, y = i / w;
+	const int x = powerOfTwoRemainder(i, w), y = i / w;
 	int count = 0;
 	for (const auto &d : std::array<std::pair<int, int>, 4>{{{1, 0}, {-1, 0}, {0, 1}, {0, -1}}})
-		count += resources[((y + d.second + h) % h) * w + (x + d.first + w) % w] == type;
+		count += resources[(powerOfTwoRemainder(y + d.second + h, h)) * w + powerOfTwoRemainder(x + d.first + w, w)] == type;
 	return count;
 }
 
@@ -155,7 +185,7 @@ void repairSeams(std::vector<Value> &terrain, int w, int h, int band,
 				continue;
 			for (int j = 0; j < 2 * band; ++j)
 			{
-				const int a = (extent - band + j) % extent, i = axis.index(a, b);
+				const int a = dimensionRemainder(extent - band + j, extent), i = axis.index(a, b);
 				if (protectedCells[i])
 					continue;
 				const int t = j < band ? j + 1 : j;
@@ -191,8 +221,9 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 	const int w = map.getW(), h = map.getH();
 	const auto before = resources;
 	std::vector<int> types{NO_RES};
+	const auto paletteIds = paletteResourceIds(map);
 	for (int c = 3; c < marker; ++c)
-		types.push_back(palette[c].resource);
+		if (paletteIds[c] != NO_RES) types.push_back(paletteIds[c]);
 	std::vector<unsigned char> protectedPatches = protectedCells;
 	// Budget restoration is confined to cross-sections with an input mismatch.
 	// Otherwise repairing a small defect could consume a distant, aligned grove.
@@ -207,14 +238,20 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 	}
 	for (int i = 0; i < w * h; ++i)
 		protectedPatches[i] |= !repairable[i];
-	// The seam stitcher only redistributes renewable land resources and algae.
-	// Preserve permanent/special deposits exactly instead of approximating them.
+	// The palette chooses content; configured spreading determines which deposits
+	// can form a renewable seam. Fixed deposits retain their authored locations.
+    std::vector<int> spreading{NO_RES};
+    for (const int type : types) if (type!=NO_RES) {
+        const auto& properties=map.resourcePropertiesByIndex(type);
+        if (properties.growthRate && properties.spreadRate && properties.ecology!=ResourceEcology::None)
+            spreading.push_back(type);
+    }
 	for (int i = 0; i < w * h; ++i)
-		if (before[i] != NO_RES && before[i] != WOOD && before[i] != WHEAT && before[i] != ALGA)
+        if (std::find(spreading.begin(),spreading.end(),before[i])==spreading.end())
 			protectedPatches[i] = 1;
-	repairSeams(resources, w, h, band, protectedPatches, {NO_RES, WOOD, WHEAT, ALGA});
+	repairSeams(resources, w, h, band, protectedPatches, spreading);
 	const auto legal = [&](int i, int type) {
-		return type == NO_RES || map.isResourceAllowed(i % w, i / w, type);
+		return type == NO_RES || map.isResourceAllowed(powerOfTwoRemainder(i, w), i / w, type);
 	};
 	for (int i = 0; i < w * h; ++i)
 		if (!legal(i, resources[i]))
@@ -236,14 +273,22 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 		join({y * w, y * w + w - 1});
 	for (int x = 1; x < w - 1; ++x)
 		join({x, (h - 1) * w + x});
-	std::array<std::vector<int>, 3> delta;
-	for (auto &d : delta)
-		d.resize(types.size());
+	std::vector<std::vector<int>> delta;
+    std::vector<std::uint64_t> habitats;
 	std::vector<int> buckets(w * h);
 	const auto category = [&](int type) {
 		return int(std::find(types.begin(), types.end(), type) - types.begin());
 	};
-	const auto bucketFor = [&](int i) { return legal(i, WOOD) ? 0 : legal(i, ALGA) ? 1 : 2; };
+	const auto bucketFor = [&](int i) {
+        std::uint64_t permissions=0;
+        for (unsigned t=0;t<types.size();++t)
+            if (legal(i,types[t])) permissions|=std::uint64_t(1)<<t;
+        const auto found=std::find(habitats.begin(),habitats.end(),permissions);
+        if (found!=habitats.end()) return int(found-habitats.begin());
+        habitats.push_back(permissions);
+        delta.emplace_back(types.size());
+        return int(habitats.size()-1);
+    };
 	for (int i = 0; i < w * h; ++i)
 	{
 		buckets[i] = bucketFor(i);
@@ -253,13 +298,13 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 	// Clear surplus deposits first, making temporary empty slots. A surplus wood
 	// patch and a wheat deficit may be far apart; a direct label swap would
 	// otherwise refuse a feasible, budget-preserving trade through empty cells.
-	for (int bucket = 0; bucket < 3; ++bucket)
+	for (int bucket = 0; bucket < int(delta.size()); ++bucket)
 		for (int source = 1; source < int(types.size()); ++source)
 		{
 			std::vector<int> candidates;
 			for (int i = 0; i < w * h; ++i)
 			{
-				const int x = i % w, y = i / w;
+				const int x = powerOfTwoRemainder(i, w), y = i / w;
 				if (buckets[i] == bucket && resources[i] == types[source] && !protectedPatches[i] &&
 					inInteriorSeamStrip(x, y, w, h, band))
 					candidates.push_back(i);
@@ -281,13 +326,13 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 		}
 	// Separate empty budgets by legal terrain. This permits an empty grass cell
 	// to become wood while an algae surplus is independently cleared on water.
-	for (int bucket = 0; bucket < 3; ++bucket)
+	for (int bucket = 0; bucket < int(delta.size()); ++bucket)
 		for (int target = 0; target < int(types.size()); ++target)
 		{
 			std::vector<int> candidates;
 			for (int i = 0; i < w * h; ++i)
 			{
-				const int x = i % w, y = i / w;
+				const int x = powerOfTwoRemainder(i, w), y = i / w;
 				if (buckets[i] != bucket || protectedPatches[i] ||
 					!inInteriorSeamStrip(x, y, w, h, band) || !legal(i, types[target]))
 					continue;
@@ -331,7 +376,7 @@ void repairResourceSeams(std::vector<int> &resources, Map &map, int band,
 
 int wrapCoord(int v, int extent)
 {
-	return (v % extent + extent) % extent;
+	return field::Grid(extent, 1).wrapX(v);
 }
 
 struct DecodedMapImage
@@ -389,7 +434,7 @@ std::vector<MapGeneratorPoint> findImageMarkers(const std::vector<int> &cells, i
 		if (cells[i] != marker || visited[i])
 			continue;
 		// Unwrap coordinates along the flood so a marker crossing the seam has a local centroid.
-		std::vector<MapGeneratorPoint> queue{{i % w, i / w}};
+		std::vector<MapGeneratorPoint> queue{{powerOfTwoRemainder(i, w), i / w}};
 		visited[i] = 1;
 		std::int64_t sumX = 0, sumY = 0;
 		for (size_t j = 0; j < queue.size(); ++j)
@@ -420,7 +465,8 @@ std::vector<MapGeneratorPoint> findImageMarkers(const std::vector<int> &cells, i
 	return anchors;
 }
 
-std::vector<unsigned char> clearImageHomes(Map &map, const std::vector<int> &cells,
+// Each colony's 7x7 starting patch of vertices is cleared to grass.
+std::vector<unsigned char> clearImageHomes(const Map &map, const std::vector<int> &cells,
 										 const std::vector<MapGeneratorPoint> &anchors,
 										 MapImageImportReport &report)
 {
@@ -436,7 +482,6 @@ std::vector<unsigned char> clearImageHomes(Map &map, const std::vector<int> &cel
 				if (homes[i])
 					throw std::runtime_error("Colony starting patches overlap");
 				homes[i] = 1;
-				map.setUMTerrain(x, y, GRASS);
 				if (palette[cells[i]].resource != NO_RES)
 					++report.clearedResources;
 			}
@@ -454,41 +499,53 @@ std::vector<unsigned char> makeProtectedResources(const std::vector<unsigned cha
 	return protectedResources;
 }
 
-std::vector<TerrainType> applyImportedTerrain(Map &map, const std::vector<int> &cells,
-										 const std::vector<unsigned char> &homes,
-										 const std::vector<unsigned char> &protectedResources,
-										 MapImageImportReport &report)
+// Each decoded pixel is one vertex. Seam repair and beaches reshape only grass,
+// sand and water; every other terrain keeps its authored vertices and counts as
+// sand while the classic terrain around it is repaired.
+void applyImportedTerrain(Map &map, const std::vector<int> &cells,
+						  const std::vector<unsigned char> &homes,
+						  const std::vector<unsigned char> &protectedResources,
+						  MapImageImportReport &report)
 {
 	const int w = map.getW(), h = map.getH();
 	std::vector<TerrainType> original(w * h);
 	for (int i = 0; i < w * h; ++i)
 		original[i] = palette[cells[i]].terrain;
-	std::vector<TerrainType> repaired = original;
+	std::vector<TerrainType> classic = original;
+	for (auto &type : classic)
+		if (!classicTerrain(type))
+			type = SAND;
+	auto repaired = classic;
 	repairSeams(repaired, w, h, report.seamWidth, protectedResources, {GRASS, SAND, WATER});
+	std::vector<TerrainType> vertices(w * h);
 	for (int i = 0; i < w * h; ++i)
 	{
-		report.seamTerrainChanges += repaired[i] != original[i];
-		map.setUMTerrain(i % w, i / w, homes[i] ? GRASS : repaired[i]);
+		report.seamTerrainChanges += repaired[i] != classic[i];
+		vertices[i] = homes[i] ? GRASS : classicTerrain(original[i]) ? repaired[i] : original[i];
 	}
-	map.controlSand();
+	map.assignVertexTerrain(vertices);
+	map.layBeaches();
 	if (report.seamWidth)
 	{
-		// controlSand is in-place and may give identical edge cells different
-		// shores. Reconcile with sand: this cannot introduce water/grass contact.
+		// Beaches depend on each edge vertex's own neighbours, so vertices the
+		// seam repair made equal can still differ afterwards. Reconcile with sand:
+		// this cannot bring grass and water together.
+		std::vector<TerrainType> next(map.vertexTerrainState().begin(), map.vertexTerrainState().end());
+		const auto seen = [&](int i) { return classicTerrain(next[i]) ? next[i] : SAND; };
 		const auto join = [&](const std::vector<int> &indices) {
-			const auto type = map.getUMTerrain(indices.front() % w, indices.front() / w);
+			const auto type = seen(indices.front());
 			bool mismatch = false;
 			for (int i : indices)
 			{
 				if (protectedResources[i])
 					return;
-				mismatch |= map.getUMTerrain(i % w, i / w) != type;
+				mismatch |= seen(i) != type;
 			}
 			if (mismatch)
 				for (int i : indices)
-					if (map.getUMTerrain(i % w, i / w) != SAND)
+					if (classicTerrain(next[i]) && next[i] != SAND)
 					{
-						map.setUMTerrain(i % w, i / w, SAND);
+						next[i] = SAND;
 						++report.seamShoreChanges;
 					}
 		};
@@ -497,24 +554,25 @@ std::vector<TerrainType> applyImportedTerrain(Map &map, const std::vector<int> &
 			join({y * w, y * w + w - 1});
 		for (int x = 1; x < w - 1; ++x)
 			join({x, (h - 1) * w + x});
+		if (report.seamShoreChanges)
+			map.assignVertexTerrain(next);
 	}
-	map.rebuildTerrain();
-	return original;
+	for (int i = 0; i < w * h; ++i)
+		report.terrainChanges += map.vertexTerrainAt(size_t(i)) != original[i];
 }
 
 std::vector<int> collectImportedResources(Map &map, const std::vector<int> &cells,
 										 const std::vector<unsigned char> &homes,
-										 const std::vector<TerrainType> &original,
 										 MapImageImportReport &report)
 {
 	const int w = map.getW(), h = map.getH();
 	std::vector<int> resources(w * h, NO_RES);
+	const auto paletteIds = paletteResourceIds(map);
 	for (int i = 0; i < w * h; ++i)
 	{
-		const int x = i % w;
+		const int x = powerOfTwoRemainder(i, w);
 		const int y = i / w;
-		const int type = palette[cells[i]].resource;
-		report.terrainChanges += map.getUMTerrain(x, y) != original[i];
+		const int type = paletteIds[cells[i]];
 		if (type == NO_RES || homes[i])
 			continue;
 		if (!map.isResourceAllowed(x, y, type))
@@ -532,14 +590,15 @@ void applyImportedResources(Map &map, GenerationContext &context, const std::vec
 	const int w = map.getW(), h = map.getH();
 	for (int i = 0; i < w * h; ++i)
 	{
-		const int x = i % w;
+		const int x = powerOfTwoRemainder(i, w);
 		const int y = i / w;
 		const int type = resources[i];
 		if (type == NO_RES)
 			continue;
-		auto &resource = map.getTile(x, y).resource;
-		resource.type = Uint8(type);
-		const auto *resourceType = globalContainer->resourcesTypes.get(type);
+		auto resource = map.getResource(x, y);
+		resource.type = Uint16(type);
+		const auto& properties = map.resourcePropertiesByIndex(type);
+		const auto& yield = map.resourceRegistry().yields(static_cast<ResourceId>(type))[materialIndex(properties.primaryMaterial)];
 		// Match normal authored deposits: valid amounts are 1..sizesCount-1.
 		// Dense patch interiors start mature; fringes include younger deposits.
 		int neighbors = 0;
@@ -547,12 +606,12 @@ void applyImportedResources(Map &map, GenerationContext &context, const std::vec
 			for (int dx = -1; dx <= 1; ++dx)
 				if ((dx || dy) && resources[wrapCoord(y + dy, h) * w + wrapCoord(x + dx, w)] == type)
 					++neighbors;
-		const int maximum = std::max(1, resourceType->sizesCount - 1);
+		const int maximum = std::max(1, int(yield.capacity) - 1);
 		const int minimum =
-			(type == WOOD || type == WHEAT) && neighbors >= 5 ? std::min(2, maximum) : 1;
-		resource.amount = Uint8(minimum + context.bounded("map-image-amounts", maximum - minimum + 1));
-		resource.variety = Uint8(context.bounded(
-			"map-image-resources", globalContainer->resourcesTypes.get(type)->varietiesCount));
+			properties.ecology == ResourceEcology::Land && properties.spreadRate && neighbors >= 5 ? std::min(2, maximum) : 1;
+		resource.amount = Uint32(minimum + context.bounded("map-image-amounts", maximum - minimum + 1));
+		resource.variety = 0;
+		map.replaceResource(x, y, resource);
 	}
 }
 
@@ -605,32 +664,37 @@ std::string MapImageImportReport::json() const
 void exportMapImage(const Game &game, const std::string &path)
 {
 	const auto &map = game.map;
+	const auto paletteIds = paletteResourceIds(map);
 	const int w = map.getW(), h = map.getH();
 	auto out = surface(SDL_CreateSurface(w, h, SDL_PIXELFORMAT_RGBA32));
-	std::vector<int> cells(w * h);
+	// Pixel (x,y) is vertex (x,y): its terrain's registered image colour, unless
+	// the cell it is the top-left corner of holds a palette resource.
+	std::vector<TerrainColor> colors(w * h);
+	const auto paletteColor = [](int index) {
+		return TerrainColor{palette[index].r, palette[index].g, palette[index].b};
+	};
 	for (int y = 0; y < h; ++y)
 		for (int x = 0; x < w; ++x)
 		{
-			const auto terrain = map.getUMTerrain(x, y);
-			int c = terrain == GRASS ? 0 : terrain == SAND ? 1 : 2;
+			auto c = map.terrainPresentation(map.vertexTerrainAt(x, y)).image;
 			const auto &resource = map.getResource(x, y);
 			for (int r = 3; r < marker; ++r)
-				if (resource.type == palette[r].resource)
+				if (paletteIds[r] != NO_RES && resource.type == paletteIds[r])
 				{
-					c = r;
+					c = paletteColor(r);
 					break;
 				}
-			cells[y * w + x] = c;
+			colors[y * w + x] = c;
 		}
 	for (int team = 0; team < game.teamsCount(); ++team)
 		for (int dy = -1; dy <= 5; ++dy)
 			for (int dx = -1; dx <= 5; ++dx)
-				cells[map.normalizeY(game.teams[team]->startPosY + dy) * w +
-					  map.normalizeX(game.teams[team]->startPosX + dx)] = marker;
+				colors[map.normalizeY(game.teams[team]->startPosY + dy) * w +
+					   map.normalizeX(game.teams[team]->startPosX + dx)] = paletteColor(marker);
 	for (int y = 0; y < h; ++y)
 		for (int x = 0; x < w; ++x)
 		{
-			const auto &c = palette[cells[y * w + x]];
+			const auto c = colors[y * w + x];
 			const Uint32 pixel = SDL_MapRGBA(SDL_GetPixelFormatDetails(out->format), SDL_GetSurfacePalette(out.get()), c.r, c.g, c.b, 255);
 			std::memcpy(static_cast<Uint8 *>(out->pixels) + y * out->pitch + x * 4, &pixel, 4);
 		}
@@ -657,13 +721,8 @@ void importMapImage(Game &game, const std::string &path, GenerationRequest &requ
 							 " colony markers; observed " + std::to_string(report.markers));
 	request.nbTeams = report.markers;
 	GenerationContext context(request);
-	struct RestoreRandom
-	{
-		MersenneTwister saved = syncRandEngine();
-		~RestoreRandom() { syncRandEngine() = saved; }
-	} restore;
-	setSyncRandSeed(GenerationContext::deriveSeed(request.seed, "map-image-engine"));
 	game.gameHeader.setRandomSeed(request.seed);
+	game.map.worldRandom.initialize(request.seed);
 	game.map.setSize(request.wDec, request.hDec);
 	game.map.setGame(&game);
 	auto &map = game.map;
@@ -672,8 +731,8 @@ void importMapImage(Game &game, const std::string &path, GenerationRequest &requ
 	report.seamWidth = seamWidth < 0 ? std::min(12, std::max(2, std::min(w, h) / 32)) : seamWidth;
 	if (report.seamWidth > 16 || report.seamWidth < 0 || 2 * report.seamWidth + 2 >= std::min(w, h))
 		throw std::runtime_error("Image seam width does not fit the map");
-	const auto original = applyImportedTerrain(map, decoded.cells, homes, protectedResources, report);
-	auto resources = collectImportedResources(map, decoded.cells, homes, original, report);
+	applyImportedTerrain(map, decoded.cells, homes, protectedResources, report);
+	auto resources = collectImportedResources(map, decoded.cells, homes, report);
 	repairResourceSeams(resources, map, report.seamWidth, protectedResources, report);
 	applyImportedResources(map, context, resources);
 	placeImportedSettlements(game, context, request, anchors);

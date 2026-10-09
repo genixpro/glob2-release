@@ -49,3 +49,30 @@ TEST_SUITE("UnitTiming")
 	TEST_CASE_FIXTURE(UnitTimingTest, "NonTravelActions") { testNonTravelActions(); }
 	TEST_CASE_FIXTURE(UnitTimingTest, "IntegerQuantization") { testIntegerQuantization(); }
 }
+
+TEST_CASE("terrain travel speed uses deterministic bounded Q8 factors")
+{
+    CHECK_EQ(unitTerrainMovementSpeed(32,256),32);
+    CHECK_EQ(unitTerrainMovementSpeed(32,128),16);
+    CHECK_EQ(unitTerrainMovementSpeed(32,512),64);
+    CHECK_EQ(unitTerrainMovementSpeed(3,128),2);
+    CHECK_EQ(unitTerrainMovementSpeed(200,512),UNIT_DELTA_MAX);
+    CHECK_EQ(unitTerrainMovementSpeed(0,512),0);
+    CHECK_EQ(unitTerrainMovementSpeed(30,1024),120);
+    CHECK_EQ(unitTerrainMovementSpeed(28,1024),112);
+    CHECK_EQ(unitTerrainMovementSpeed(32,512,false),32);
+    CHECK_EQ(unitTerrainMovementSpeed(32,128,false),32);
+    CHECK(unitActionStepSpeed(unitTerrainMovementSpeed(1,64),WALK,1,1)>0);
+}
+
+
+TEST_CASE("inside service phase advances stay within one action per tick")
+{
+    CHECK(unitActionStepSpeed(1,WALK,1,1,true)==1);
+    CHECK(unitActionStepSpeed(12,WALK,1,0,true)==12);
+    CHECK(unitActionStepSpeed(12,WALK,1,1,true)==8);
+    CHECK(unitActionStepSpeed(256,STOP_WALK,0,0,true)==256);
+    CHECK(unitActionStepSpeed(2400,STOP_WALK,0,0,true)==256);
+    CHECK(unitActionStepSpeed(51200,WALK,1,1,true)==256);
+    CHECK(unitActionStepSpeed(2400,STOP_WALK,0,0)==2400);
+}

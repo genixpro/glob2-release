@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "TerrainPresentation.h"
+#include "render/terrain/TerrainCatalogIO.h"
 #include "MapThumbnail.h"
+#include "ResourceRegistry.h"
 #include "BinaryStream.h"
 #include "FileManager.h"
 #include "GUIBase.h"
@@ -162,6 +165,7 @@ void MapThumbnail::render(const Map &map, const MapHeader *header)
 	const int mw = map.getW(), mh = map.getH();
 	if (mw <= 0 || mh <= 0 || mw > 32767 || mh > 32767)
 		return;
+	const auto palette = TerrainVisual::minimapPalette(TerrainVisual::loadCatalog());
 	const int longest = std::max(mw, mh), resolution = std::min(MaxResolution, longest);
 	auto result = std::make_shared<Image>();
 	result->width = std::max(1, mw * resolution / longest);
@@ -176,18 +180,20 @@ void MapThumbnail::render(const Map &map, const MapHeader *header)
 			for (int sy = y * mh / result->height; sy < (y + 1) * mh / result->height; ++sy)
 				for (int sx = x * mw / result->width; sx < (x + 1) * mw / result->width; ++sx)
 				{
-					const auto terrain = map.getUMTerrain(sx, sy);
-					int color = terrain == GRASS ? 0 : terrain == WATER ? 1 : 2;
-					const int resources[] = {WOOD, WHEAT, STONE, ALGA};
-					for (int r = 0; r < 4; ++r)
-						if (map.isResourceTakeable(sx, sy, resources[r]))
-						{
-							color = r + 3;
-							break;
-						}
-					color = std::clamp(color, 0, 6);
+					// One sample per vertex: the terrain stored at (sx,sy).
+					const auto terrain = map.vertexTerrainAt(sx, sy);
+					const auto color = unsigned(terrain) < TERRAIN_COUNT
+										   ? palette[terrain]
+										   : map.terrainPresentation(terrain).preview;
+					int channels[3] = {color.r,color.g,color.b};
+					const auto& resource = map.getResource(sx, sy);
+					if (resource.type != NO_RES_TYPE)
+					{
+						const auto& resourceColor = map.resourceRegistry().presentation(static_cast<ResourceId>(resource.type)).minimap;
+						std::copy_n(resourceColor.begin(), 3, channels);
+					}
 					for (int c = 0; c < 3; ++c)
-						sums[c] += colors[color][c];
+						sums[c] += channels[c];
 					++count;
 					// a building or unit paints the whole pixel in its team's colour
 					if (header && map.getBuilding(sx, sy) != NOGBID)

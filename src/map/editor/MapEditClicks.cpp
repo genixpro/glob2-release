@@ -18,6 +18,8 @@ void MapEdit::addWidget(MapEditorWidget* widget)
 
 bool MapEdit::findAction(int x, int y)
 {
+	layoutBuildingSelectors();
+	layoutBuildingEditRows();
 	for(std::vector<MapEditorWidget*>::iterator i=mew.begin(); i!=mew.end(); ++i)
 	{
 		MapEditorWidget* mi=*i;
@@ -53,6 +55,8 @@ void MapEdit::enableOnlyGroup(const std::string& group)
 
 void MapEdit::drawWidgets()
 {
+	layoutBuildingSelectors();
+	layoutBuildingEditRows();
 	for(std::vector<MapEditorWidget*>::iterator i=mew.begin(); i!=mew.end(); ++i)
 	{
 		(*i)->drawSelf();
@@ -123,11 +127,9 @@ void MapEdit::handleBrushClick(int mx, int my)
 				if (BrushTool::getBrushValue(fig, x-startX, y-startY, mapX, mapY, firstX, firstY)
 					&& !(honourFarmTerrain && !game.map.canPaintFarmArea(x, y)))
 				{
-					Uint32& tileMask = game.map.getTile(x, y).*target.tileMask;
-					if (add)
-						tileMask |= teamBit;
-					else
-						tileMask &= ~teamBit; // clears the team bit, same as the old `mask ^= mask & teamBit`
+					const size_t index = game.map.coordToIndex(x, y);
+					const Uint32 mask = game.map.getTile(index).*target.tileMask;
+					game.map.setAreaMask(index, target.tileMask, add ? mask | teamBit : mask & ~teamBit);
 					target.view.set(game.map.w*(y&game.map.hMask)+(x&game.map.wMask), add);
 				}
 	}
@@ -158,158 +160,6 @@ MapEdit::AreaBrushTarget MapEdit::areaBrushTarget()
 }
 
 
-
-void MapEdit::handleTerrainClick(int mx, int my)
-{
-	// we add brush to accumulator
-	int mapX, mapY;
-	game.map.displayToMapCaseAligned(mx+(terrainType>TerrainSelector::Water ? 0 : 16), my+(terrainType>TerrainSelector::Water ? 0 : 16), &mapX, &mapY,  viewportX, viewportY);
-	if(lastPlacementX==mapX && lastPlacementY==mapY)
-		return;
-		
-	if(lastPlacementX == -1)
-		firstPlacement = FirstPlacement{mapX, mapY};
-	int fig = brush.getFigure();
-	brushAccumulator.applyBrush(BrushApplication(mapX, mapY, fig), &game.map);
-	// we get coordinates
-	int startX = mapX-BrushTool::getBrushDimXMinus(fig);
-	int startY = mapY-BrushTool::getBrushDimYMinus(fig);
-	int width  = BrushTool::getBrushWidth(fig);
-	int height = BrushTool::getBrushHeight(fig);
-	// BrushTool treats -1 as "no stroke origin" for checkerboard parity alignment
-	const int firstX = firstPlacement ? firstPlacement->x : -1;
-	const int firstY = firstPlacement ? firstPlacement->y : -1;
-	// we update local values
-	if (brush.getType() == BrushTool::MODE_ADD)
-	{
-		for (int y=startY; y<startY+height; y++)
-		{
-			for (int x=startX; x<startX+width; x++)
-			{
-				if (BrushTool::getBrushValue(fig, x-startX, y-startY, mapX, mapY, firstX, firstY))
-				{
-					int resToSet=-1;
-					switch(terrainType)
-					{
-					case TerrainSelector::Grass:
-						game.map.setUMatPos(x, y, GRASS, 1);
-						// a tile is drawn from the undermap corners at (x..x+1, y..y+1), so cells
-						// painted at (x-1..x+1) change the tiles from (x-2, y-2) on; only the
-						// resources, buildings and units those tiles no longer allow go
-						game.map.removeUnallowedResources(x-2, y-2, 4, 4);
-						game.removeUnallowedUnitsAndBuildings(x-2, y-2, 4, 4);
-						// grass is also the brush that clears: the tiles the cell touches go bare
-						game.removeUnitAndBuildingAndFlags(x, y, 2, Game::DEL_BUILDING | Game::DEL_UNIT);
-						for (int ty=y-1; ty<=y; ty++)
-							for (int tx=x-1; tx<=x; tx++)
-								game.map.getResource(tx, ty).clear();
-						break;
-					case TerrainSelector::Sand:
-						game.map.setUMatPos(x, y, SAND, 1);
-						// a tile is drawn from the undermap corners at (x..x+1, y..y+1), so cells
-						// painted at (x-1..x+1) change the tiles from (x-2, y-2) on; only the
-						// resources, buildings and units those tiles no longer allow go
-						game.map.removeUnallowedResources(x-2, y-2, 4, 4);
-						game.removeUnallowedUnitsAndBuildings(x-2, y-2, 4, 4);
-						break;
-					case TerrainSelector::Water:
-						game.map.setUMatPos(x, y, WATER, 1);
-						// a tile is drawn from the undermap corners at (x..x+1, y..y+1), so cells
-						// painted at (x-1..x+1) change the tiles from (x-2, y-2) on; only the
-						// resources, buildings and units those tiles no longer allow go
-						game.map.removeUnallowedResources(x-2, y-2, 4, 4);
-						game.removeUnallowedUnitsAndBuildings(x-2, y-2, 4, 4);
-						break;
-					case TerrainSelector::Wheat:
-						resToSet=WHEAT;
-						break;
-					case TerrainSelector::Trees:
-						resToSet=WOOD;
-						break;
-					case TerrainSelector::Stone:
-						resToSet=STONE;
-						break;
-					case TerrainSelector::Algae:
-						resToSet=ALGA;
-						break;
-					case TerrainSelector::Papyrus:
-						resToSet=PAPYRUS;
-						break;
-					case TerrainSelector::CherryTree:
-						resToSet=CHERRY;
-						break;
-					case TerrainSelector::OrangeTree:
-						resToSet=ORANGE;
-						break;
-					case TerrainSelector::PruneTree:
-						resToSet=PRUNE;
-						break;
-					case TerrainSelector::NoTerrain:
-						break;
-					}
-					if(resToSet!=-1 && game.map.isResourceAllowed(x, y, resToSet))
-					{
-						game.map.setResource(x, y, resToSet, 1);
-					}
-				}
-			}
-		}
-	}
-	else if (brush.getType() == BrushTool::MODE_DEL)
-	{
-		for (int y=startY; y<startY+height; y++)
-			for (int x=startX; x<startX+width; x++)
-				if (BrushTool::getBrushValue(fig, x-startX, y-startY, mapX, mapY, firstX, firstY))
-				{
-					switch(terrainType)
-					{
-					case TerrainSelector::Sand:
-					case TerrainSelector::Water:
-						game.map.setUMatPos(x, y, GRASS, 1);
-						game.map.removeUnallowedResources(x-2, y-2, 4, 4);
-						for (int ty=y-1; ty<=y; ty++)
-							for (int tx=x-1; tx<=x; tx++)
-								game.map.getResource(tx, ty).clear();
-						break;
-					case TerrainSelector::Wheat:
-						if(game.map.isResourceTakeable(x, y, WHEAT))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::Trees:
-						if(game.map.isResourceTakeable(x, y, WOOD))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::Stone:
-						if(game.map.isResourceTakeable(x, y, STONE))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::Algae:
-						if(game.map.isResourceTakeable(x, y, ALGA))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::Papyrus:
-						if(game.map.isResourceTakeable(x, y, PAPYRUS))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::CherryTree:
-					case TerrainSelector::OrangeTree:
-					case TerrainSelector::PruneTree:
-						if(game.map.isResourceTakeable(x, y, CHERRY)
-						|| game.map.isResourceTakeable(x, y, ORANGE)
-						|| game.map.isResourceTakeable(x, y, PRUNE))
-							game.map.setNoResource(x, y, 1);
-						break;
-					case TerrainSelector::Grass:
-					case TerrainSelector::NoTerrain:
-						break;
-					}
-				}
-	}
-	else
-		assert(false);
-	lastPlacementX=mapX;
-	lastPlacementY=mapY;
-}
 
 void MapEdit::handleClick(int mx, int my, BrushTool::ClickType clickType)
 {
@@ -347,7 +197,7 @@ void MapEdit::handleClick(int mx, int my, BrushTool::ClickType clickType)
 						game.map.setPoint(areaNumber->getIndex(), x, y);
 						break;
 					case BrushTool::CT_NO_RESOURCE_GROWTH:
-						game.map.getTile(x, y).canResourcesGrow=false;
+						game.map.setResourcesGrow(x, y, false);
 						break;
 					}
 				}
@@ -364,7 +214,7 @@ void MapEdit::handleClick(int mx, int my, BrushTool::ClickType clickType)
 						game.map.unsetPoint(areaNumber->getIndex(), x, y);
 						break;
 					case BrushTool::CT_NO_RESOURCE_GROWTH:
-						game.map.getTile(x, y).canResourcesGrow=true;
+						game.map.setResourcesGrow(x, y, true);
 						break;
 					default:break;
 					}

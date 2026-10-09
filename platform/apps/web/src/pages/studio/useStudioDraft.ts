@@ -1,3 +1,4 @@
+import { studioSession } from '../../components/studio/storage.ts';
 import { useCallback, useEffect, useState } from 'react';
 import type { StudioSettings } from '@glob2/protocol';
 
@@ -8,10 +9,11 @@ export interface Pending {
 interface Design {
   settings: StudioSettings;
   parent?: string;
+  fresh?: boolean;
 }
 function readSaved<T>(key: string): T | undefined {
   try {
-    return (JSON.parse(sessionStorage.getItem(key) ?? 'null') as T | null) ?? undefined;
+    return (JSON.parse(studioSession.getItem(key) ?? 'null') as T | null) ?? undefined;
   } catch {
     return undefined;
   }
@@ -23,26 +25,27 @@ export function useStudioDraft(accountId: string, id?: string) {
   const draftKey = `studio-draft:${suffix}`;
   const pendingKey = `studio-pending:${suffix}`;
   const settingsKey = `studio-settings:${suffix}`;
-  const [draft, setDraft] = useState(() => sessionStorage.getItem(draftKey) ?? '');
+  const [draft, setDraft] = useState(() => studioSession.getItem(draftKey) ?? '');
   const [pending, updatePending] = useState(() => readSaved<Pending>(pendingKey));
   const [design, setDesign] = useState<Design>(() => {
     const saved = readSaved<Design>(settingsKey);
     return {
       settings: saved?.settings ?? { width: 256, height: 256, players: 4 },
       parent: saved?.parent,
+      fresh: saved?.fresh ?? false,
     };
   });
   useEffect(() => {
-    sessionStorage.setItem(draftKey, draft);
+    studioSession.setItem(draftKey, draft);
   }, [draftKey, draft]);
   useEffect(() => {
-    sessionStorage.setItem(settingsKey, JSON.stringify(design));
+    studioSession.setItem(settingsKey, JSON.stringify(design));
   }, [settingsKey, design]);
   // Persist before sending, rather than waiting for an effect after the network call.
   const setPending = useCallback(
     (value: Pending | undefined) => {
-      if (value) sessionStorage.setItem(pendingKey, JSON.stringify(value));
-      else sessionStorage.removeItem(pendingKey);
+      if (value) studioSession.setItem(pendingKey, JSON.stringify(value));
+      else studioSession.removeItem(pendingKey);
       updatePending(value);
     },
     [pendingKey],
@@ -55,7 +58,9 @@ export function useStudioDraft(accountId: string, id?: string) {
     setPending,
     settings: design.settings,
     parent: design.parent,
+    fresh: design.fresh,
     setSettings: (settings: StudioSettings) => setDesign((current) => ({ ...current, settings })),
-    setParent: (parent: string | undefined) => setDesign((current) => ({ ...current, parent })),
+    setParent: (parent: string | undefined) =>
+      setDesign((current) => ({ ...current, parent, fresh: !parent })),
   };
 }

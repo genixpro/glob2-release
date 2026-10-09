@@ -9,9 +9,12 @@ FLAGS = ('native', 'browser', 'map_generators', 'deployment', 'cross_platform',
          'android', 'windows', 'compatibility', 'variants', 'coverage', 'tsan', 'macos', 'platform',
          'platform_stack', 'music')
 # Cheap jobs that run on pull requests without `ci:run`, like the selector's own
-# contracts: they compile nothing and gate no engine verification.
-# The music pipeline (Python tooling, never shipped): its own unit-test job only.
+# contracts: they do not build the game and gate no engine verification.
+# Music tooling has inexpensive unit tests; deployed processor and shared WASM
+# inputs also select their affected runtime coverage when requested.
 MUSIC_TOOL_PATHS = ('tools/music/',)
+MUSIC_SHARED_PATHS = ('tools/music/web/', 'tools/music/build_web.py')
+MUSIC_PROCESSOR_PATHS = ('tools/music/glob2music/studio/','tools/music/glob2music/community.py', 'tools/encode_music.py')
 CHEAP_PATHS = {'music': MUSIC_TOOL_PATHS}
 CHEAP_FLAGS = tuple(CHEAP_PATHS)
 LABELS = {'ci:run', 'ci:full', 'ci:windows', 'ci:android', 'ci:browsers'}
@@ -19,10 +22,10 @@ SIMULATION = ('src/ai/', 'src/unit/', 'src/building/', 'src/team/', 'src/map/',
               'src/scripting/sgsl/', 'src/engine/sim/', 'src/game/orders/')
 PRESENTATION = ('src/hud/', 'src/render/', 'src/unit/render/', 'src/building/hud/')
 # Code inside the directories above that belongs to neither class: every check.
-UNCLASSIFIED = ('src/render/torus/', 'src/render/clouds/', 'src/render/overlay/', 'src/unit/types/',
+UNCLASSIFIED = ('data/buildings/', 'src/render/torus/', 'src/render/clouds/', 'src/render/overlay/', 'src/unit/types/',
                 'src/building/types/', 'src/team/stats/', 'src/map/preview/', 'src/map/tools/',
                 'src/net/lan/screens/')
-UNCLASSIFIED_FILES = {'src/team/BaseTeam.cpp', 'src/map/MapTiling.cpp', 'src/map/FertilityCalculator.cpp',
+UNCLASSIFIED_FILES = {'libgag/include/RenderFramePacer.h', 'src/team/BaseTeam.cpp', 'src/map/MapTiling.cpp', 'src/map/FertilityCalculator.cpp',
                       'src/map/Brush.cpp', 'src/map/BrushCoverage.cpp', 'src/unit/UnitDisplayNames.cpp',
                       'src/net/ConnectionOverlay.cpp', 'src/net/turn/TurnMatchPresenter.cpp',
                       'src/map/editor/screens/EditorMainMenu.cpp'}
@@ -30,15 +33,17 @@ UNCLASSIFIED_FILES = {'src/team/BaseTeam.cpp', 'src/map/MapTiling.cpp', 'src/map
 TEST_SOURCE = re.compile(r'(Test|Harness|Benchmark|Fixture)\.(cpp|mm|py)$')
 TEST_SOURCE_NAMES = {'RuntimePackCheck.cpp', 'MaximaStrategyDump.cpp', 'source_contracts.py', 'MapGeneratorStudy.cpp',
                      'RecordingMultiplayerPeer.cpp', 'OnlineProbeFileManager.cpp', 'PlatformClientProbe.cpp',
-                     'OnlineScreensProbe.cpp', 'RelayTestMain.cpp'}
+                     'OnlineScreensProbe.cpp', 'RelayTestMain.cpp', 'ResourceGrowthFixtures.cpp'}
 # Build-system and service suites: unknown to the selector, so every check.
 TOOLING_TESTS = ('test/build_system/', 'test/baselines/', 'test/relay_service/', 'test/online_service/')
 TEST_ROOTS = ('src/', 'libgag/', 'libusl/', 'natsort/', 'mobile/')
 SIMULATION_FILES = {'src/game/Game_sync.cpp', 'src/game/Game.cpp', 'src/engine/EngineRun.cpp',
                     'src/engine/Engine.cpp', 'src/replay/ReplayReader.cpp', 'src/replay/ReplayWriter.cpp'}
-THREAD_FILES = {'src/game/diagnostics/GameDiagnostics.cpp', 'src/engine/Engine.cpp', 'src/engine/EngineRun.cpp', 'src/game/screens/GameSessionScreen.cpp',
+THREAD_FILES = {'src/map/ResourceGrowth.cpp', 'src/map/ResourceGrowth.h', 'src/game/diagnostics/GameDiagnostics.cpp', 'src/engine/Engine.cpp', 'src/engine/EngineRun.cpp', 'src/game/screens/GameSessionScreen.cpp',
                 'src/hud/draw/GameGUIDraw.cpp', 'src/hud/GameGUIStep.cpp', 'src/hud/GameGUIOrders.cpp',
-                'libgag/src/PerformanceTelemetry.cpp'}
+                'libgag/src/PerformanceTelemetry.cpp', 'libgag/src/AssetLoader.cpp',
+                'libgag/include/AssetLoader.h', 'libgag/src/SpriteLoad.cpp',
+                'src/audio/SoundMixer.cpp', 'src/audio/MusicBuffer.h', 'browser/Audio.cpp'}
 # Paths whose changes rebuild and smoke-test the whole self-hosted stack
 # (deploy/compose.yaml). Its images compile the engine, so engine changes that
 # do not otherwise select every check skip it rather than adding a second
@@ -47,6 +52,7 @@ PLATFORM_STACK_PATHS = (
     'deploy/', 'test/deployment/', 'src/relay/', 'platform/package-lock.json',
     'platform/packages/db/migrations/', 'platform/apps/api/src/main.ts',
     'platform/apps/worker/src/main.ts', 'platform/apps/engine-agent/src/main.ts',
+    'platform/apps/music-worker/', 'platform/apps/ai-music-worker/',
 )
 TRANSPORT_HARNESSES = {'NetConnectionHarness.cpp', 'NativeMultiplayerPeer.cpp', 'WssTransportHarness.cpp',
                        'WssListenerHarness.cpp', 'LANDiscoveryHarness.cpp', 'run-network-transport-tests.py'}
@@ -80,7 +86,7 @@ def unclassified(path):
 def cheap_path(path):
     return (path.startswith(('docs/', 'test/build_system/test_ci', 'fdroid/', 'fastlane/'))
             or path.endswith('.md') or path in MIRROR_DEPLOY_FILES or path in {
-                'test/test_run_tests.py', 'test/test_ci_failure_aggregation.py',
+                'requirements-dev.txt', 'test/test_run_tests.py', 'test/test_ci_failure_aggregation.py',
                 'tools/package_steam_windows.py', 'test/test_steam_windows_package.py',
                 'mobile/android_release.py', '.github/workflows/steam-windows-package.yml',
                 '.github/workflows/mac-app-store.yml'})
@@ -123,6 +129,12 @@ def select(paths, labels=(), known=False):
             else:
                 add(path, 'platform')
             continue
+        if path.startswith(MUSIC_SHARED_PATHS):
+            add(path, *FLAGS)
+            continue
+        if path.startswith(MUSIC_PROCESSOR_PATHS):
+            add(path, 'music', 'platform', 'platform_stack')
+            continue
         if path.startswith(MUSIC_TOOL_PATHS):
             add(path, 'music')
             continue
@@ -146,7 +158,7 @@ def select(paths, labels=(), known=False):
                 add(path, 'native', 'map_generators', 'compatibility')
             else:
                 add(path, 'native')
-        elif path.startswith(('scons/', 'libusl/')) or path in {'SConstruct', 'vcpkg.json', 'libgag/include/AudioFormat.h'} or unclassified(path):
+        elif path.startswith(('scons/', 'libusl/', 'data/terrain/', 'data/resources/')) or path in {'SConstruct', 'vcpkg.json', 'libgag/include/AudioFormat.h', 'tools/image_encoding.json', 'tools/terrain_tileset.py', 'tools/test_terrain_tileset.py'} or unclassified(path):
             add(path, *FLAGS)
         elif path.startswith(('test/fixtures/', 'test/support/', '.github/')) or path in {
             'test/run_tests.py', 'test/ci_native_shard_plan.py', 'test/ci-native-auxiliary.json',
@@ -185,7 +197,7 @@ def select(paths, labels=(), known=False):
             add(path, 'native')
         else:
             add(path, *FLAGS)
-        if path.startswith(('src/engine/sim/', 'src/render/scene/')) and not is_test_source(path) or path in THREAD_FILES:
+        if path.startswith(('src/engine/sim/', 'src/render/scene/', 'src/ai/engine/', 'src/ai/observation/')) and not is_test_source(path) or path in THREAD_FILES:
             add(path, 'tsan')
     # The stack's own inputs run the stack smoke; shared and unknown paths
     # above already select every check, the stack included.

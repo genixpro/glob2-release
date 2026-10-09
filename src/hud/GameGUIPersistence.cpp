@@ -13,6 +13,8 @@
 #include <BinaryStream.h>
 
 #include "Game.h"
+#include "FileFormatVersions.h"
+#include <stdexcept>
 #include "GameGUI.h"
 #include "GameGUIViewport.h"
 #include "GameGUITouch.h"
@@ -72,6 +74,7 @@ GAGCore::CooperativeTask GameGUI::loadFromStreamTask(MapHeader mapHeader, GameHe
 	if(setGameHeader)
 	{
 		game.setGameHeader(gameHeader, saveAI);
+		rebuildBuildingChoices(true);
 		// A saved game already carries its units and buildings under the rules.
 		if (!game.mapHeader.getIsSavedGame())
 			game.applyStartingRules();
@@ -93,6 +96,7 @@ GAGCore::CooperativeTask GameGUI::loadTask(GAGCore::InputStream *stream, bool ig
 		std::cerr << "GameGUI::load : can't load game" << std::endl;
 		co_return false;
 	}
+	rebuildBuildingChoices();
 	defaultGameSaveName = game.mapHeader.getMapName();
 	if (game.mapHeader.getIsSavedGame())
 	{
@@ -108,8 +112,11 @@ GAGCore::CooperativeTask GameGUI::loadTask(GAGCore::InputStream *stream, bool ig
 			stream->readSint32("viewportX");
 			stream->readSint32("viewportY");
 			stream->readUint32("hiddenGUIElements");
-			stream->readUint32("buildingsChoiceMask");
-			stream->readUint32("flagsChoiceMask");
+			if (game.mapHeader.getVersionMinor()<FILE_FORMAT_VERSION_BUILDING_CATALOG)
+			{
+				stream->readUint32("buildingsChoiceMask");
+				stream->readUint32("flagsChoiceMask");
+			}
 		}
 		else
 		{
@@ -128,29 +135,56 @@ GAGCore::CooperativeTask GameGUI::loadTask(GAGCore::InputStream *stream, bool ig
 			viewportY = stream->readSint32("viewportY");
 
 			hiddenGUIElements = stream->readUint32("hiddenGUIElements");
+			if (game.mapHeader.getVersionMinor()<FILE_FORMAT_VERSION_BUILDING_CATALOG)
+			{
 			Uint32 buildingsChoiceMask = stream->readUint32("buildingsChoiceMask");
 			Uint32 flagsChoiceMask = stream->readUint32("flagsChoiceMask");
 
 			// invert value if hidden
 			for (unsigned i=0; i<buildingsChoiceState.size(); ++i)
 			{
-				int id = IntBuildingType::shortNumberFromType(buildingsChoiceName[i]);
-				buildingsChoiceState[i] = ((1<<id) & buildingsChoiceMask) != 0;
+				int id = game.buildingsTypes.get(game.buildingsTypes.findByKey(buildingsChoiceName[i]))->shortTypeNum;
+				buildingsChoiceState[i] = id>=0 && id<32 && ((Uint32(1)<<id) & buildingsChoiceMask) != 0;
 			}
 			for (unsigned i=0; i<flagsChoiceState.size(); ++i)
 			{
-				int id = IntBuildingType::shortNumberFromType(flagsChoiceName[i]);
-				flagsChoiceState[i] = ((1<<id) & flagsChoiceMask) != 0;
+				int id = game.buildingsTypes.get(game.buildingsTypes.findByKey(flagsChoiceName[i]))->shortTypeNum;
+				flagsChoiceState[i] = id>=0 && id<32 && ((Uint32(1)<<id) & flagsChoiceMask) != 0;
+			}
 			}
 		}
 
+		if (game.mapHeader.getVersionMinor()>=FILE_FORMAT_VERSION_BUILDING_CATALOG)
+		{
+			const auto readChoices = [&](const char* section,const auto& names,auto& states) {
+				stream->readEnterSection(section);
+				const auto count=stream->readUint32("count");
+				if (count>game.buildingsTypes.size()) throw std::runtime_error("Invalid building choice count");
+				std::set<std::string> seen;
+				for (Uint32 i=0; i<count; ++i)
+				{
+					stream->readEnterSection(i);
+					const auto key=stream->readText("key");
+					const auto enabled=stream->readUint32("enabled");
+					if (enabled>1 || !seen.insert(key).second || game.buildingsTypes.findByKey(key)<0)
+						throw std::runtime_error("Invalid saved building choice");
+					if (!ignoreGUIData)
+						for (size_t choice=0; choice<names.size(); ++choice) if(names[choice]==key) states[choice]=enabled;
+					stream->readLeaveSection();
+				}
+				stream->readLeaveSection();
+			};
+			readChoices("buildingChoices",buildingsChoiceName,buildingsChoiceState);
+			readChoices("flagChoices",flagsChoiceName,flagsChoiceState);
+		}
+
 		if(game.mapHeader.getVersionMinor() >= 69)
-			defaultAssign.load(stream, game.mapHeader.getVersionMinor());
+			defaultAssign.load(stream, game.mapHeader.loadingVersion());
 		stream->readLeaveSection();
 	}
 
 	game.mapscript.restorePresentation(*this);
-	minimap.setGame(game);
+	minimap.setMapSize(game.map.getW(), game.map.getH());
 
 	co_return true;
 }
@@ -167,34 +201,26 @@ void GameGUI::save(GAGCore::OutputStream *stream, const std::string name, Deferr
 	stream->writeSint32(viewportX, "viewportX");
 	stream->writeSint32(viewportY, "viewportY");
 	stream->writeUint32(hiddenGUIElements, "hiddenGUIElements");
-	Uint32 buildingsChoiceMask = 0;
-	Uint32 flagsChoiceMask = 0;
-	// save one if visible
-	for (unsigned i=0; i<buildingsChoiceState.size(); ++i)
-	{
-		if (buildingsChoiceState[i])
+	const auto writeChoices = [&](const char* section,const auto& names,const auto& states) {
+		stream->writeEnterSection(section);
+		stream->writeUint32(names.size(),"count");
+		for (size_t i=0; i<names.size(); ++i)
 		{
-			int id = IntBuildingType::shortNumberFromType(buildingsChoiceName[i]);
-			buildingsChoiceMask |= (1<<id);
+			stream->writeEnterSection(i);
+			stream->writeText(names[i],"key");
+			stream->writeUint32(states[i],"enabled");
+			stream->writeLeaveSection();
 		}
-	}
-	for (unsigned i=0; i<flagsChoiceState.size(); ++i)
-	{
-		if (flagsChoiceState[i])
-		{
-			int id = IntBuildingType::shortNumberFromType(flagsChoiceName[i]);
-			flagsChoiceMask |= (1<<id);
-		}
-	}
-	stream->writeUint32(buildingsChoiceMask, "buildingsChoiceMask");
-	stream->writeUint32(flagsChoiceMask, "flagsChoiceMask");
+		stream->writeLeaveSection();
+	};
+	writeChoices("buildingChoices",buildingsChoiceName,buildingsChoiceState);
+	writeChoices("flagChoices",flagsChoiceName,flagsChoiceState);
 	defaultAssign.save(stream);
 	stream->writeLeaveSection();
 }
 
 void GameGUI::viewportResized(int oldWidth, int oldHeight, int width, int height)
 {
-    if (!game.map.getW() || !game.map.getH()) return;
     minimap.resizeViewport(width);
     suspendInput();
     const int oldX = viewportX, oldY = viewportY;
@@ -202,9 +228,14 @@ void GameGUI::viewportResized(int oldWidth, int oldHeight, int width, int height
     // legacy tile-centered viewport in that case; an initialized camera keeps
     // its precise world center (including zoom and fractional panning).
     if (camera.width <= 0 || camera.height <= 0) {
-        viewportX = (viewportX + (oldWidth - GAME_GUI_RIGHT_MENU_WIDTH) / 64 -
-                     (width - GAME_GUI_RIGHT_MENU_WIDTH) / 64) & game.map.wMask;
-        viewportY = (viewportY + oldHeight / 64 - height / 64) & game.map.hMask;
+        viewportX += (oldWidth - GAME_GUI_RIGHT_MENU_WIDTH) / 64 - (width - GAME_GUI_RIGHT_MENU_WIDTH) / 64;
+        viewportY += oldHeight / 64 - height / 64;
+        // Before first publication, retain the client-space resize delta. The
+        // first snapshot supplies dimensions for wrapping and camera bounds.
+        if (drawnScene().map.getW() && drawnScene().map.getH()) {
+            viewportX &= drawnScene().map.getMaskW();
+            viewportY &= drawnScene().map.getMaskH();
+        }
     }
     updateCamera();
     viewportChanged(oldX, viewportX, oldY, viewportY);

@@ -4,6 +4,7 @@
 #include "ui/ThemeCatalog.h"
 #include "FrontendTheme.h"
 #include <Toolkit.h>
+#include <AssetLoader.h>
 #include <StringTable.h>
 #include "GlobalContainer.h"
 #include "GameSessionScreen.h"
@@ -29,6 +30,7 @@
 #include "OnlineServices.h"
 #include "RelayTransport.h"
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
@@ -162,6 +164,10 @@ Application::Application()
 						 std::vector<std::string>{strings.getString("[continue]")}),
 					 [this](GAGGUI::Screen &, int) { mainMenu(); });
 	}
+	else if (std::getenv("GLOB2_GENERATOR_STUDIO"))
+		singlePlayer.generatorStudio();
+	else if (std::getenv("GLOB2_STUDIO_PLAYTEST"))
+		singlePlayer.studio();
 	else if (globalContainer->replaying)
 		singlePlayer.replay(globalContainer->replayFileName);
 	else
@@ -202,7 +208,7 @@ void Application::choose(int choice)
 		singlePlayer.load();
 		break;
 	case MainMenuScreen::GAME_SETUP:
-		screens.push(std::make_unique<SettingsScreen>());
+		screens.push(std::make_unique<SettingsScreen>(&screens));
 		break;
 	case MainMenuScreen::CREDITS:
 		screens.push(std::make_unique<CreditScreen>());
@@ -229,8 +235,10 @@ void Application::choose(int choice)
 void Application::installStagedAssets()
 {
 	const bool inMatch = dynamic_cast<GameSessionScreen *>(screens.top()) != nullptr;
-	for (const auto &package : GAGCore::ApplicationHost::takeInstalledAssetPackages())
-	{
+    GAGCore::Toolkit::pollAssets();
+    for (const auto &package : GAGCore::ApplicationHost::takeInstalledAssetPackages())
+    {
+        GAGCore::Toolkit::assets().invalidate();
 		if (package == "game")
 		{
 			// The menu colony and the settings' building artwork use them at once.
@@ -307,7 +315,10 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 					  return false;
 				  });
 	if (GAGCore::ApplicationHost::takeVisibilityChange(hidden))
-		screens.suspendExecution();
+	{
+        globalContainer->gfx->resetRenderPacing();
+        screens.suspendExecution();
+    }
 	if (hidden)
 		return true;
 	int width, height;
@@ -328,11 +339,19 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 		// explicit failure decision. Closing a browser tab remains abrupt.
 		auto input = filtered;
 		std::erase_if(input, [](const SDL_Event &event) { return event.type == SDL_EVENT_QUIT; });
-		shutdownScreens.frame(tick, input);
+#ifdef __EMSCRIPTEN__
+        shutdownScreens.frame(tick, input, false);
+#else
+        shutdownScreens.frame(tick, input);
+#endif
 		return shutdownScreens.running();
 	}
 	installStagedAssets();
-	screens.frame(tick, filtered);
+#ifdef __EMSCRIPTEN__
+    screens.frame(tick, filtered, false);
+#else
+    screens.frame(tick, filtered);
+#endif
 #if !defined(GLOB2_CHINA_RELEASE) && !defined(GLOB2_AMAZON_RELEASE)
 	// An invite link (at launch or while running) opens the online hub from the
 	// main menu; the hub consumes it.
@@ -374,6 +393,11 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 		mainMenu();
 	}
 	return true;
+}
+
+void Application::draw()
+{
+    if (!hidden) (quitting ? shutdownScreens : screens).draw();
 }
 
 std::uint32_t Application::delay(std::uint32_t now)

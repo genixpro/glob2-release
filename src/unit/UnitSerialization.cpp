@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "Material.h"
 #include <algorithm>
 #include "Unit.h"
 #include <BinaryStream.h>
@@ -15,6 +16,7 @@
 
 #include "FileFormatVersions.h"
 #include "Utilities.h"
+#include "EntityRandomIO.h"
 #include <Stream.h>
 
 void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
@@ -41,6 +43,10 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 		throw std::runtime_error("Invalid unit identity");
 	scriptIdentity=versionMinor >= FILE_FORMAT_VERSION_JAVASCRIPT ? stream->readUint32("scriptIdentity") : owner->game->allocateScriptIdentity(false,gid);
 	this->owner = owner;
+	if (versionMinor >= FILE_FORMAT_VERSION_ENTITY_RANDOM)
+		loadEntityRandom(stream, entityRandom);
+	else
+		entityRandom.initialize(owner->game->gameHeader.getRandomSeed(), EntityRandom::Kind::Unit, gid, scriptIdentity);
 	isDead = stream->readSint32("isDead");
 	diagnosticDeathCause = GameplayMeasurements::UNKNOWN;
 	if (versionMinor >= FILE_FORMAT_VERSION_GAMEPLAY_STATS)
@@ -60,7 +66,20 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	direction = stream->readSint32("direction");
 	insideTimeout = stream->readSint32("insideTimeout");
 	speed = stream->readSint32("speed");
+	terrainHealthRemainder = versionMinor >= FILE_FORMAT_VERSION_TERRAIN_PROPERTIES ? stream->readSint32("terrainHealthRemainder") : 0;
+	if (terrainHealthRemainder <= -256 || terrainHealthRemainder >= 256) throw std::runtime_error("Invalid terrain exposure remainder");
 
+	areaServiceRemainders.fill(0);
+	areaLastPulseTick=Uint32(-1);
+	if (versionMinor>=FILE_FORMAT_VERSION_AREA_EFFECTS) {
+		areaLastPulseTick=stream->readUint32("areaLastPulseTick");
+		if (areaLastPulseTick!=Uint32(-1) && (areaLastPulseTick&15)) throw std::runtime_error("Invalid area pulse tick");
+		for (int i=0;i<3;++i) {
+			const auto remainder=stream->readUint16(("areaServiceRemainder"+std::to_string(i)).c_str());
+			if (remainder>=256) throw std::runtime_error("Invalid area service remainder");
+			areaServiceRemainders[i]=Uint8(remainder);
+		}
+	}
 	// states
 	needToRecheckMedical = (bool)stream->readUint32("needToRecheckMedical");
 	auto readState = [&](const char* name, Uint32 maximum) {
@@ -71,6 +90,9 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	medical = static_cast<Medical>(readState("medical", MED_DAMAGED));
 	activity = static_cast<Activity>(readState("activity", ACT_UPGRADING));
 	displacement = static_cast<Displacement>(readState("displacement", DIS_EXITING_BUILDING));
+	serviceResourcesReserved = versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
+		? readState("serviceResourcesReserved", 1) != 0
+		: activity == ACT_UPGRADING && displacement != DIS_EXITING_BUILDING;
 	movement = static_cast<Movement>(readState("movement", MOV_ATTACKING_TARGET));
 	action = static_cast<Abilities>(readState("action", NB_ABILITY - 1));
 	if ((displacement % 2) != 0 || movement == 10 ||
@@ -119,15 +141,26 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 		&& canLearn[BUILD] && level[HARVEST] != level[BUILD])
 		setWorkerLevel(std::max(level[HARVEST], level[BUILD]));
 
+	constructionLevel = versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
+		? stream->readSint32("constructionLevel") : level[BUILD];
+	if (constructionLevel < 0 || constructionLevel >= NB_UNIT_LEVELS) throw std::runtime_error("Invalid construction qualification");
 
 	experience = stream->readSint32("experience");
 	experienceLevel = stream->readSint32("experienceLevel");
 
 	destinationPurpose = stream->readSint32("destinationPurpose");
-	carriedResource = stream->readSint32("carriedRessource");
-	if (carriedResource < -1 || carriedResource >= MAX_RESOURCES || destinationPurpose < -1 || destinationPurpose > FEED)
-		throw std::runtime_error("Invalid unit resource or destination");
-	if ((activity == ACT_FILLING && (destinationPurpose < 0 || destinationPurpose >= MAX_RESOURCES)) ||
+	carriedMaterial = stream->readSint32("carriedRessource");
+	carriedPacket={};
+	if (versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG)
+	{
+		carriedPacket.numerator=stream->readUint32("carriedNumerator");
+		carriedPacket.denominator=stream->readUint32("carriedDenominator");
+		if (!carriedPacket.numerator || !carriedPacket.denominator || carriedPacket.denominator>1000000 || carriedPacket.numerator>carriedPacket.denominator)
+			throw std::runtime_error("Invalid carried material packet");
+	}
+	if (carriedMaterial < -1 || carriedMaterial >= int(MaterialCount) || destinationPurpose < -1 || destinationPurpose > FEED)
+		throw std::runtime_error("Invalid unit material or destination");
+	if ((activity == ACT_FILLING && (destinationPurpose < 0 || destinationPurpose >= MaterialCount)) ||
 		(activity == ACT_UPGRADING && destinationPurpose < 0))
 		throw std::runtime_error("Invalid unit activity destination");
 
@@ -174,6 +207,7 @@ void Unit::save(GAGCore::OutputStream *stream)
 	// identity
 	stream->writeUint16(gid, "gid");
 	stream->writeUint32(scriptIdentity, "scriptIdentity");
+	saveEntityRandom(stream, entityRandom);
 	stream->writeSint32(isDead, "isDead");
 	stream->writeSint32(diagnosticDeathCause, "diagnosticDeathCause");
 
@@ -186,12 +220,16 @@ void Unit::save(GAGCore::OutputStream *stream)
 	stream->writeSint32(direction, "direction");
 	stream->writeSint32(insideTimeout, "insideTimeout");
 	stream->writeSint32(speed, "speed");
+	stream->writeSint32(terrainHealthRemainder, "terrainHealthRemainder");
+	stream->writeUint32(areaLastPulseTick,"areaLastPulseTick");
+	for (int i=0;i<3;++i) stream->writeUint16(areaServiceRemainders[i],("areaServiceRemainder"+std::to_string(i)).c_str());
 
 	// states
 	stream->writeUint32((Uint32)needToRecheckMedical, "needToRecheckMedical");
 	stream->writeUint32((Uint32)medical, "medical");
 	stream->writeUint32((Uint32)activity, "activity");
 	stream->writeUint32((Uint32)displacement, "displacement");
+	stream->writeUint32(serviceResourcesReserved, "serviceResourcesReserved");
 	stream->writeUint32((Uint32)movement, "movement");
 	stream->writeUint32((Uint32)action, "action");
 	stream->writeSint32(targetX, "targetX");
@@ -225,11 +263,14 @@ void Unit::save(GAGCore::OutputStream *stream)
 	}
 	stream->writeLeaveSection();
 
+	stream->writeSint32(constructionLevel, "constructionLevel");
 	stream->writeSint32(experience, "experience");
 	stream->writeSint32(experienceLevel, "experienceLevel");
 
 	stream->writeSint32(destinationPurpose, "destinationPurpose");
-	stream->writeSint32(carriedResource, "carriedRessource");
+	stream->writeSint32(carriedMaterial, "carriedRessource");
+	stream->writeUint32(carriedPacket.numerator,"carriedNumerator");
+	stream->writeUint32(carriedPacket.denominator,"carriedDenominator");
 	stream->writeSint32(jobTimer, "jobTimer");
 	stream->writeUint8(previousClearingArea.has_value(), "hasClearingClaim");
 	if (previousClearingArea)
@@ -299,8 +340,10 @@ bool Unit::integrity()
 
 Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector)
 {
-	Uint32 cs=0;
+	Uint32 cs=(serviceResourcesReserved ? 0x73657276u : 0) ^ (Uint32(constructionLevel) << 20);
 
+	if(areaLastPulseTick!=Uint32(-1)) cs ^= areaLastPulseTick ^ 0x70756c73u;
+	cs ^= Uint32(areaServiceRemainders[0]) | (Uint32(areaServiceRemainders[1])<<8) | (Uint32(areaServiceRemainders[2])<<16);
 	cs^=typeNum;
 	if (checkSumsVector)
 		checkSumsVector->push_back(typeNum);// [0]
@@ -342,6 +385,7 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector)
 		checkSumsVector->push_back(insideTimeout);// [9]
 	cs=rotl1(cs);
 	cs^=speed;
+	cs ^= static_cast<Uint32>(terrainHealthRemainder) * 0x9e3779b9u;
 	if (checkSumsVector)
 		checkSumsVector->push_back(speed);// [10]
 	cs=rotl1(cs);
@@ -429,9 +473,11 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector)
 	cs^=destinationPurpose;
 	if (checkSumsVector)
 		checkSumsVector->push_back(destinationPurpose);// [31]
-	cs^=carriedResource;
+	cs^=carriedMaterial;
+	cs=rotl1(cs); cs^=carriedPacket.numerator;
+	cs=rotl1(cs); cs^=carriedPacket.denominator;
 	if (checkSumsVector)
-		checkSumsVector->push_back(carriedResource);// [33]
+		checkSumsVector->push_back(carriedMaterial);// [33]
 
 	if (checkSumsVector)
 		checkSumsVector->push_back(0);// [34]
@@ -446,5 +492,15 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector)
 	if (checkSumsVector)
 		checkSumsVector->push_back(0);// [39]
 
+	if (checkSumsVector)
+	{
+		const auto random = entityRandom.exportState();
+		checkSumsVector->push_back(Uint32(random.value >> 32));
+		checkSumsVector->push_back(Uint32(random.value));
+		checkSumsVector->push_back(Uint32(random.increment >> 32));
+		checkSumsVector->push_back(Uint32(random.increment));
+	}
+
+	cs ^= entityRandom.checksum();
 	return cs;
 }

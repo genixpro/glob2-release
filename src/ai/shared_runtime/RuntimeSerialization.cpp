@@ -16,12 +16,17 @@ bool Runtime::load(GAGCore::InputStream *stream, Player *player, Sint32 versionM
 {
 	GAGCore::BinaryInputStream::CheckedReads checked(stream);
 	this->player=player;
+    currentObservation.reset();observationCatalog.reset();
 	gm.reset();
+    // Loading helpers read restored map metadata through one owner-scoped borrow.
+    // The borrow is released on success, early return and exceptions.
+    OwnerObservationScope observationScope(*this);
 	orders.clear();
 	management_orders.clear();
 	building_orders.clear();
-	resource_trackers.clear();
+	material_trackers.clear();
 	starting_buildings.clear();
+    retired_attractions.clear();
 	previous_building_id=-1;
 	from_load_timer=0;
 	is_fruit=false;
@@ -41,6 +46,8 @@ bool Runtime::load(GAGCore::InputStream *stream, Player *player, Sint32 versionM
 		} else stream->read(buffer.data(),buffer.size(),"data");
 		auto order = Order::getOrder(buffer.data(), buffer.size(), versionMinor);
 		if (!order) return false;
+		AIStateSerialization::normalizeLegacyOrderStaffing(*player->game,*order,versionMinor);
+        AIEngine::loadSelectedTarget(*stream,*order,versionMinor);
 		orders.push_back(order);
 		stream->readLeaveSection();
 	}
@@ -101,9 +108,9 @@ bool Runtime::load(GAGCore::InputStream *stream, Player *player, Sint32 versionM
 	{
 		stream->readEnterSection(resourceTrackerIndex);
 		int id=stream->readUint32("echo_building_id");
-		std::shared_ptr<ResourceTracker> rt(new ResourceTracker(*this, stream, player, versionMinor));
+		std::shared_ptr<MaterialTracker> rt(new MaterialTracker(*this, stream, player, versionMinor));
 		bool activated=stream->readUint8("active");
-		resource_trackers[id]=std::make_tuple(rt, activated);
+		material_trackers[id]=std::make_tuple(rt, activated);
 		stream->readLeaveSection();
 	}
 	stream->readLeaveSection();
@@ -175,6 +182,18 @@ bool Runtime::load(GAGCore::InputStream *stream, Player *player, Sint32 versionM
 				gm=runtime->gm->clone();
 			}
 		}
+        if(versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG) {
+            stream->readEnterSection("retiredAttractions");
+            const auto count=stream->readCount("size");
+            for(Uint32 i=0;i<count;++i) {
+                stream->readEnterSection(i);
+                const int id=stream->readSint32("id");
+                const unsigned mask=stream->readUint8("unitMask");
+                if(id<0 || !mask || (mask&~((1u<<NB_UNIT_TYPE)-1)) || !retired_attractions.emplace(id,mask).second) return false;
+                stream->readLeaveSection();
+            }
+            stream->readLeaveSection();
+        }
 		stream->readLeaveSection();
 	}
 
@@ -203,6 +222,7 @@ void Runtime::save(GAGCore::OutputStream *stream)
 		///one byte indicating the type is required to be written for order.
 		stream->writeUint8((*i)->getOrderType(), "type");
 		stream->write((*i)->getData(), (*i)->getDataLength(), "data");
+        AIEngine::saveSelectedTarget(*stream,**i);
 		stream->writeLeaveSection();
 		ordersIndex++;
 	}
@@ -248,9 +268,9 @@ void Runtime::save(GAGCore::OutputStream *stream)
 	signature_write(stream);
 
 	stream->writeEnterSection("ressource_trackers");
-	stream->writeUint32(resource_trackers.size(), "size");
+	stream->writeUint32(material_trackers.size(), "size");
 	Uint32 resourceTrackerIndex=0;
-	for(tracker_iterator i=resource_trackers.begin(); i!=resource_trackers.end(); ++resourceTrackerIndex, ++i)
+	for(tracker_iterator i=material_trackers.begin(); i!=material_trackers.end(); ++resourceTrackerIndex, ++i)
 	{
 		stream->writeEnterSection(resourceTrackerIndex);
 		stream->writeUint32(i->first, "echo_building_id");
@@ -295,7 +315,23 @@ void Runtime::save(GAGCore::OutputStream *stream)
 	stream->writeSint32(from_load_timer,"fromLoadTimer");
 	stream->writeUint8(is_fruit,"isFruit");
 	stream->writeUint8(gm != nullptr,"hasGradientManager");
-	if(gm)gm->save(stream);
+	if(gm) {
+        // Save runs on the simulation owner after the ordered worker stream is
+        // drained. Only refresh the validity comparison, never the field.
+        auto observed=AIEngine::AIWorldView::capture(*player->game,observationCatalog ? observationCatalog : AIEngine::AIWorldView::captureCatalog(*player->game));
+        gm->bindWorld(*observed);
+        try {gm->save(stream);gm->unbindWorld();}
+        catch(...) {gm->unbindWorld();throw;}
+    }
+    stream->writeEnterSection("retiredAttractions");
+    stream->writeUint32(retired_attractions.size(),"size");
+    Uint32 retiredIndex=0;
+    for(const auto& [id,mask]:retired_attractions) {
+        stream->writeEnterSection(retiredIndex++);
+        stream->writeSint32(id,"id");stream->writeUint8(mask,"unitMask");
+        stream->writeLeaveSection();
+    }
+    stream->writeLeaveSection();
 	stream->writeLeaveSection();
 
 	stream->writeLeaveSection();

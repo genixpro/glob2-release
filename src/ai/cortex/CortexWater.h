@@ -2,13 +2,14 @@
 // Copyright (C) 2026 The Globulation 2 Authors
 
 #pragma once
+#include "CortexSnapshotQueries.h"
+class Player;
 
 #include <SDL3/SDL_stdinc.h>
 
-class Player;
 
 // AICortex swim/water assessment. Lives on the observation side of the three-
-// layer split (like CortexPlacement / CortexWheat): Cortex::observe() calls it to
+// layer split (like CortexPlacement / CortexFoodSources): Cortex::observe() calls it to
 // fill the swim-decision fields of a CortexObservation, so the pure policy only
 // ever reads bounded scalars and never touches Game*/Team*/Map*.
 //
@@ -20,7 +21,7 @@ class Player;
 //      flood-fill the colony's vicinity twice — once treating water as an
 //      obstacle (a non-swimmer) and once treating it as passable (a swimmer) —
 //      and compare the two tile counts. A large gap means swimming opens up
-//      water-separated land (fresh wheat patches across a channel, a shorter or
+//      water-separated land (fresh food patches across a channel, a shorter or
 //      only route to a water-locked enemy). This mirrors the INTENT of AICastor's
 //      computeNeedSwim (ai/castor/State.cpp:82-109).
 
@@ -48,7 +49,7 @@ namespace Cortex
 	/// the latter throughout the game). landReach is computed by the ground flood-fill
 	/// used for shore harvesting. The additional swim flood-fill and waterReach count
 	/// are computed only when `wantSwimReach` is true; otherwise waterReach is zero.
-	SwimAssessment assessSwim(Player* player, bool wantSwimReach);
+	SwimAssessment assessSwimWorld(const AIEngine::AIWorldView* game, const AIEngine::TeamView* team, QueryScratch& scratch, const PlanningIntent& intents, std::ostream* diagnostics, bool wantSwimReach);
 
 	/// Result of the amphibious-campaign assessment for one (rally -> target) push.
 	/// POD; the caller copies it into the observation (obs.campaign*/landingZone*/
@@ -109,8 +110,13 @@ namespace Cortex
 	/// short land campaign costs exactly two BFS. Deterministic and safe inside lockstep.
 	/// Returns all-zero / unreachable when the player/team/game/map is unavailable or the
 	/// team has no anchor.
-	AmphibiousAssessment assessAmphibious(Player* player, int targetX, int targetY,
+	AmphibiousAssessment assessAmphibiousWorld(const AIEngine::AIWorldView* game, const AIEngine::TeamView* team, QueryScratch& scratch, const PlanningIntent& intents, std::ostream* diagnostics, int targetX, int targetY,
 	                                      const Sint32* standoffX, const Sint32* standoffY,
 	                                      int standoffCount, int landingStandoffTiles,
 	                                      int forwardRallyPathDist);
+}
+
+namespace Cortex {
+SwimAssessment assessSwim(::Player*,bool);
+AmphibiousAssessment assessAmphibious(::Player*,int,int,const Sint32*,const Sint32*,int,int,int);
 }

@@ -9,6 +9,7 @@
 // platform workspace is on this branch; once it is, the tests read the source and
 // also check that the copy has not drifted from it.
 
+#include "EngineTiming.h"
 #include "EngineFixtures.h"
 
 #include <algorithm>
@@ -19,6 +20,7 @@
 #include "AI.h"
 #include "AINames.h"
 #include "BasePlayer.h"
+#include "BuildingType.h"
 #include "ExperimentalFeatures.h"
 #include "GameHeader.h"
 #include "MapHeader.h"
@@ -83,6 +85,119 @@ std::string sha256Hex(const std::string& text)
 
 TEST_SUITE("MatchSetup")
 {
+    TEST_CASE("New match rules default to eight tick AI decisions")
+    {
+        CHECK(MatchRules{}.aiOrderDelay == 8);
+    }
+
+    TEST_CASE("AI order delay is optional bounded integer data and round trips through headers")
+    {
+        glob2test::HeadlessGlobals globals;
+        auto document=json::parse(glob2test::readFile(fixtureRoot()/"valid/MatchSetup/room-closed-seats.json"));
+        document["rules"].erase("aiOrderDelay");
+        const auto absent=MatchSetup::fromJson(document);
+        CHECK(absent.rules.aiOrderDelay==0);
+        CHECK(absent.toGameHeader(mapWithTeams(4)).getAIOrderDelay()==0);
+        for(unsigned delay : {0u,8u}) {
+            CAPTURE(delay);
+            document["rules"]["aiOrderDelay"]=delay;
+            const auto setup=MatchSetup::fromJson(document);
+            CHECK(setup.rules.aiOrderDelay==delay);
+            CHECK(MatchSetup::parse(setup.dump()).rules.aiOrderDelay==delay);
+            auto map=mapWithTeams(4);
+            auto header=setup.toGameHeader(map);
+            CHECK(header.getAIOrderDelay()==delay);
+            const auto restored=MatchSetup::fromGameHeader(header,map,setup.map,setup.simVersion);
+            CHECK(restored.rules.aiOrderDelay==delay);
+            CHECK(restored.toJson()["rules"]["aiOrderDelay"]==delay);
+        }
+        for(const auto& invalid : {json(-1),json(9),json(0.5),json(8.0),json("4"),json(true),json(nullptr)}) {
+            CAPTURE(invalid);
+            document["rules"]["aiOrderDelay"]=invalid;
+            CHECK_THROWS_AS(MatchSetup::fromJsonSchemaOnly(document),MatchSetupError);
+        }
+    }
+
+    TEST_CASE("Building gradient delay is optional bounded integer data and round trips through headers")
+    {
+        CHECK(MatchRules{}.buildingGradientDelay == 8);
+        CHECK(MatchRules{}.buildingGradientDelay == int(GameHeader::DEFAULT_BUILDING_GRADIENT_DELAY));
+        glob2test::HeadlessGlobals globals;
+        auto document=json::parse(glob2test::readFile(fixtureRoot()/"valid/MatchSetup/room-closed-seats.json"));
+        document["rules"].erase("buildingGradientDelay");
+        const auto absent=MatchSetup::fromJson(document);
+        CHECK(absent.rules.buildingGradientDelay==8);
+        CHECK(absent.toGameHeader(mapWithTeams(4)).getBuildingGradientDelay()==8);
+        for(unsigned delay : {1u,2u,4u}) {
+            CAPTURE(delay);
+            document["rules"]["buildingGradientDelay"]=delay;
+            const auto setup=MatchSetup::fromJson(document);
+            CHECK(setup.rules.buildingGradientDelay==delay);
+            CHECK(MatchSetup::parse(setup.dump()).rules.buildingGradientDelay==delay);
+            CHECK_FALSE(setup.rules==absent.rules);
+            auto map=mapWithTeams(4);
+            auto header=setup.toGameHeader(map);
+            CHECK(header.getBuildingGradientDelay()==delay);
+            const auto restored=MatchSetup::fromGameHeader(header,map,setup.map,setup.simVersion);
+            CHECK(restored.rules.buildingGradientDelay==delay);
+            CHECK(restored.toJson()["rules"]["buildingGradientDelay"]==delay);
+        }
+        for(const auto& invalid : {json(0),json(-1),json(9),json(1.5),json(4.0),json("4"),json(true),json(nullptr)}) {
+            CAPTURE(invalid);
+            document["rules"]["buildingGradientDelay"]=invalid;
+            CHECK_THROWS_AS(MatchSetup::fromJsonSchemaOnly(document),MatchSetupError);
+        }
+    }
+
+	TEST_CASE("embedded catalogs carry dynamic experiments independently of installed definitions")
+	{
+		glob2test::HeadlessGlobals globals;
+		BuildingsTypes catalog;
+		catalog.initLegacy();
+		json snapshot = json::parse(catalog.snapshotJson());
+		snapshot["experiments"].push_back({{"key", "catalog-fixture"}, {"label", "Fixture"}, {"help", "Fixture gate."}});
+		catalog.loadSnapshotJson(snapshot.dump());
+		json document = json::parse(glob2test::readFile(fixtureRoot() / "valid/MatchSetup/room-closed-seats.json"));
+		document["buildingCatalog"] = {{"snapshot", catalog.snapshotJson()}, {"hash", catalog.fingerprint()}};
+		document["experiments"] = {"catalog-fixture"};
+		const MatchSetup setup = MatchSetup::fromJson(document);
+		const MapHeader map = mapWithTeams(4);
+		GameHeader header = setup.toGameHeader(map);
+		CHECK(header.getBuildingCatalogSnapshot() == catalog.snapshotJson());
+		CHECK(header.getExperiments().has("catalog-fixture"));
+		CHECK(!knownExperimentKey("catalog-fixture"));
+        const auto restored=MatchSetup::fromGameHeader(header,map,setup.map,setup.simVersion).toJson();
+        // Account IDs and closed lobby slots are not simulation-header state.
+        // Every durable setup field, especially embedded experiment identity,
+        // must survive this conversion unchanged.
+        auto durable=document;durable.erase("seats");
+        auto restoredDurable=restored;restoredDurable.erase("seats");
+        CHECK(restoredDurable==durable);
+        REQUIRE(restored["seats"].size()==2);
+        CHECK(restored["seats"][0]["name"]=="Alice");
+        CHECK(restored["seats"][1]["team"]==2);
+		document["buildingCatalog"]["hash"] = std::string(64, '0');
+		CHECK_THROWS_AS(MatchSetup::fromJson(document), MatchSetupError);
+		document["buildingCatalog"]["hash"] = catalog.fingerprint();
+		document["buildingCatalog"]["snapshot"] = catalog.snapshotJson() + "\n";
+		CHECK_THROWS_AS(MatchSetup::fromJson(document), MatchSetupError);
+		document.erase("buildingCatalog");
+		CHECK_THROWS_AS(MatchSetup::fromJson(document), MatchSetupError);
+	}
+
+	TEST_CASE("catalog rules identity partitions ratings without changing the executable identity")
+	{
+		const SimVersion engine{135, 55, std::string(64, 'a')};
+		CHECK(catalogRulesVersion(engine, "") == engine);
+		const auto first = catalogRulesVersion(engine, std::string(64, 'b'));
+		CHECK(first.versionMinor == engine.versionMinor);
+		CHECK(first.netProtocol == engine.netProtocol);
+		CHECK(first.dataHash == sha256Hex("glob2-building-rules-v1\n" + engine.key() + "\n" + std::string(64, 'b')));
+		CHECK(first != engine);
+		CHECK(first != catalogRulesVersion(engine, std::string(64, 'c')));
+		CHECK_THROWS_AS(catalogRulesVersion(engine, "bad-hash"), std::invalid_argument);
+	}
+
 	TEST_CASE("SHA-256 matches the FIPS 180-4 test vectors")
 	{
 		CHECK(sha256Hex("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
@@ -133,9 +248,15 @@ TEST_SUITE("MatchSetup")
 			{
 				MatchSetup setup;
 				CHECK_NOTHROW(setup = MatchSetup::parse(text));
-				// The canonical form round-trips to the same document.
-				CHECK(setup.toJson() == document);
-				CHECK(MatchSetup::parse(setup.dump()).toJson() == document);
+				// Older setup documents omit the optional delays. Canonical output
+				// spells out their engine defaults while preserving every other field.
+				json canonical = document;
+				if (!canonical["rules"].contains("aiOrderDelay"))
+					canonical["rules"]["aiOrderDelay"] = 0;
+				if (!canonical["rules"].contains("buildingGradientDelay"))
+					canonical["rules"]["buildingGradientDelay"] = 8;
+				CHECK(setup.toJson() == canonical);
+				CHECK(MatchSetup::parse(setup.dump()).toJson() == canonical);
 				++valid;
 				continue;
 			}
@@ -242,7 +363,7 @@ TEST_SUITE("MatchSetup")
 			for (const auto& condition : header.getWinningConditions())
 				if (condition->getType() == WCSuddenDeath)
 					CHECK(static_cast<const WinningConditionSuddenDeath&>(*condition).endStepTick ==
-					      Uint32(r.suddenDeathMinutes) * 60 * 25);
+					      Uint32(r.suddenDeathMinutes) * 60 * GAME_TICKS_PER_SECOND);
 			CHECK(header.isMapDiscovered() == r.mapDiscovered);
 			CHECK(header.areAllyTeamsFixed() == r.allyTeamsFixed);
 			CHECK(header.isResourceGrowthDisabled() == r.resourceGrowthDisabled);
@@ -282,6 +403,22 @@ TEST_SUITE("MatchSetup")
 			CHECK_THROWS_AS(setup.toGameHeader(mapWithTeams(static_cast<int>(setup.teams.size()), !save)),
 			                MatchSetupError);
 		}
+	}
+
+	TEST_CASE("map-required terrain experiments propagate to setup and cannot be omitted")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto document = glob2test::readFile(fixtureRoot() / "valid/MatchSetup/room-closed-seats.json");
+		const MatchSetup setup = MatchSetup::parse(document);
+		MapHeader map = mapWithTeams(4);
+		GameHeader header = setup.toGameHeader(map);
+		map.requiredTerrainExperiments.set(ExperimentId::IceTerrain);
+		map.requiredTerrainExperiments.set(ExperimentId::TrailTerrain);
+		CHECK_THROWS_AS(setup.toGameHeader(map),MatchSetupError);
+		const MatchSetup required = MatchSetup::fromGameHeader(header,map,setup.map,setup.simVersion);
+		const GameHeader restored = required.toGameHeader(map);
+		CHECK(restored.hasExperiment(ExperimentId::IceTerrain));
+		CHECK(restored.hasExperiment(ExperimentId::TrailTerrain));
 	}
 
 	TEST_CASE("closed seats close their team and follow every player seat")
@@ -415,6 +552,11 @@ TEST_SUITE("MatchSetup")
 			}
 		onDisk.insert("data/nicowar.default.txt");
 		onDisk.insert("data/nicowar.txt");
+		onDisk.insert("data/buildings/manifest.json");
+        onDisk.insert("data/resources/registry.json");
+		const auto buildingManifest = json::parse(glob2test::readFile(root / "data/buildings/manifest.json"));
+		for (const auto& name : buildingManifest.at("files"))
+			onDisk.insert("data/buildings/" + name.get<std::string>());
 		const auto& listed = simDataFiles();
 		CHECK(std::set<std::string>(listed.begin(), listed.end()) == onDisk);
 		CHECK(std::is_sorted(listed.begin(), listed.end()));
@@ -456,4 +598,31 @@ TEST_SUITE("MatchSetup")
 		CHECK_FALSE(SimVersion::parseKey("125-" + version.dataHash, parsed));
 		MESSAGE("sim version " << version.key());
 	}
+}
+
+TEST_CASE("Scripted map sources preserve exact provenance and enforce team count" *
+		  doctest::test_suite("MatchSetup"))
+{
+	auto document =
+		json::parse(glob2test::readFile(fixtureRoot() / "valid/MatchSetup/room-closed-seats.json"));
+	const auto count = document["teams"].size();
+	document["map"] = {{"kind", "scripted"},
+					   {"hash", std::string(64, 'a')},
+					   {"chosenSeed", 91},
+					   {"generator",
+						{{"libraryId", "11111111-1111-4111-8111-111111111111"},
+						 {"versionId", "22222222-2222-4222-8222-222222222222"},
+						 {"packageHash", std::string(64, 'b')},
+						 {"fileHash", std::string(64, 'c')},
+						 {"generatorId", "author:landscape"},
+						 {"revision", 2},
+						 {"seed", 19},
+						 {"candidates", 1},
+						 {"startingUnitLevel", 0},
+						 {"params", {{"teams", count}, {"width", 7}, {"height", 7}}}}}};
+	const auto setup = Online::MatchSetup::fromJson(document);
+	CHECK(setup.map.kind == Online::MapSource::Kind::Scripted);
+	CHECK(setup.toJson()["map"] == document["map"]);
+	document["map"]["generator"]["params"]["teams"] = count + 1;
+	CHECK_THROWS(Online::MatchSetup::fromJson(document));
 }

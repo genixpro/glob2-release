@@ -1,9 +1,15 @@
+#include "EngineTiming.h"
+#include "CortexSnapshotQueries.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Globulation 2 Authors
 
 #include "AICortex.h"
 #include "CortexObservation.h"
-#include "CortexWheat.h"
+#include "CortexFoodSources.h"
+
+// CORTEX_DUMP and CSV column names containing wheat/maxWheat are legacy
+// diagnostic aliases. Values now describe recipe supply stock/capacity or
+// sources of the Food material, as indicated by the canonical C++ fields.
 
 #include "Player.h"
 #include "team/Team.h"
@@ -24,14 +30,14 @@ using std::shared_ptr;
 void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 {
 	using namespace Cortex;
-	using std::cerr;
-	Team* team = player->team;
-	Game* game = team->game;
-	const int me = team->teamNumber;
+	auto& cerr = diagnosticStream;
+	const AIEngine::TeamView* team = observedTeam;
+
+	const int me = team->number;
 
 	cerr << "CORTEX_DUMP ==== first-under-attack snapshot ====\n";
 	cerr << "CORTEX_DUMP team=" << me << " tick=" << obs.tick
-	     << " (~" << (obs.tick / 25) << "s)"
+	     << " (~" << (obs.tick / GAME_TICKS_PER_SECOND) << "s)"
 	     << " buildingsUnderAttack=" << obs.buildingsUnderAttack
 	     << " unitsUnderAttack=" << obs.unitsUnderAttack << "\n";
 
@@ -69,34 +75,34 @@ void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 	     << " maxBuildLevel=" << obs.maxBuildLevel
 	     << " warFlagsActive=" << obs.warFlagsActive << "\n";
 
-	// per-swarm WHEAT buffer / workers — shows whether the economy loop has stalled.
+	// per-swarm Food buffer / workers — shows whether the economy loop has stalled.
 	for (int i = 0; i < obs.swarmCount && i < CORTEX_MAX_TRACKED_SWARMS; i++)
 	{
 		const TrackedBuilding& s = obs.trackedSwarms[i];
 		if (!s.valid) continue;
-		cerr << "CORTEX_DUMP   swarm[" << i << "] wheat=" << s.wheat << "/" << s.maxWheat
+		cerr << "CORTEX_DUMP   swarm[" << i << "] wheat=" << s.supplyStock << "/" << s.supplyCapacity
 		     << " maxUnitWorking=" << s.maxUnitWorking
 		     << " inside=" << s.unitsInside
 		     << " priority=" << s.priority
-		     << " nearestWheat=" << s.nearestWheatDist
-		     << " harvestable=" << s.harvestableWheatNearby << "\n";
+		     << " nearestWheat=" << s.nearestFoodSourceDistance
+		     << " harvestable=" << s.harvestableFoodSourcesNearby << "\n";
 	}
 
-	// per-inn wheat-gate detail (DIAGNOSTIC: feedCap root-cause). feedCapacity sums
+	// per-inn food-gate detail (DIAGNOSTIC: feedCap root-cause). feedCapacity sums
 	// only inns that pass the gate (harvestable >= CORTEX_WHEAT_MIN_TILES). nearestWheat
-	// is forbidden-BLIND; harvestable is the forbidden-AWARE gate count. wheat-present
-	// (nearestWheat small) but gate-fail (harvestable < MIN) => wheat is FORBIDDEN (b);
-	// nearestWheat large/-1 => wheat DEPLETED/ABSENT (c).
+	// is forbidden-BLIND; harvestable is the forbidden-AWARE gate count. food-present
+	// (nearestWheat small) but gate-fail (harvestable < MIN) => food is FORBIDDEN (b);
+	// nearestWheat large/-1 => food DEPLETED/ABSENT (c).
 	for (int i = 0; i < obs.innCount && i < CORTEX_MAX_TRACKED_INNS; i++)
 	{
 		const TrackedBuilding& n = obs.trackedInns[i];
 		if (!n.valid) continue;
-		const bool feeds = (n.harvestableWheatNearby >= CORTEX_WHEAT_MIN_TILES);
-		cerr << "CORTEX_DUMP   inn[" << i << "] wheat=" << n.wheat << "/" << n.maxWheat
+		const bool feeds = (n.harvestableFoodSourcesNearby >= CORTEX_WHEAT_MIN_TILES);
+		cerr << "CORTEX_DUMP   inn[" << i << "] wheat=" << n.supplyStock << "/" << n.supplyCapacity
 		     << " maxUnitWorking=" << n.maxUnitWorking
 		     << " inside=" << n.unitsInside << "/" << n.maxUnitInside
-		     << " nearestWheat=" << n.nearestWheatDist
-		     << " harvestable=" << n.harvestableWheatNearby
+		     << " nearestWheat=" << n.nearestFoodSourceDistance
+		     << " harvestable=" << n.harvestableFoodSourcesNearby
 		     << " feedsGate=" << (feeds ? 1 : 0) << "\n";
 	}
 
@@ -111,7 +117,7 @@ void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 			{
 				const BuildCandidate& cand = obs.buildCandidates[types[ti]][c];
 				if (!cand.valid) continue;
-				if (valid == 0) { bestWheat = cand.wheatDist; bx = cand.x; by = cand.y; }
+				if (valid == 0) { bestWheat = cand.foodSourceDistance; bx = cand.x; by = cand.y; }
 				valid++;
 			}
 			cerr << "CORTEX_DUMP PLACE " << names[ti] << " validCandidates=" << valid
@@ -136,11 +142,11 @@ void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 	}
 
 	// --- ground truth (diagnostic only; never fed to the policy) ---
-	for (int t = 0; t < game->teamsCount(); t++)
+	for (int t = 0; t < observedWorld->teams.size(); t++)
 	{
-		Team* et = game->teams[t];
-		if (!et || et->teamNumber == me) continue;
-		const TeamStat* es = et->stats.getLatestStat();
+		const AIEngine::TeamView* et = &observedWorld->teams[t];
+		if (!et || et->number == me) continue;
+		const TeamStat* es = &et->statistics;
 		if (!es) continue;
 		int as0 = es->upgradeState[ATTACK_STRENGTH][0];
 		int as1 = es->upgradeState[ATTACK_STRENGTH][1];
@@ -150,7 +156,7 @@ void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 		int sp1 = es->upgradeState[ATTACK_SPEED][1];
 		int sp2 = es->upgradeState[ATTACK_SPEED][2];
 		int sp3 = es->upgradeState[ATTACK_SPEED][3];
-		cerr << "CORTEX_DUMP TRUTH enemy team=" << et->teamNumber
+		cerr << "CORTEX_DUMP TRUTH enemy team=" << et->number
 		     << " totalUnit=" << es->totalUnit
 		     << " warriors=" << es->numberUnitPerType[WARRIOR]
 		     << " workers=" << es->numberUnitPerType[WORKER]
@@ -165,41 +171,22 @@ void AICortex::dumpAttackState(const Cortex::CortexObservation& obs) const
 // one CSV row per valid tracked swarm to <prefix>.team<N>.csv, where <prefix> is
 // GLOB2_CORTEX_TRACE. Each row is the swarm's observed state this decision cycle
 // plus the cap the HAND RULE chose (the BC target). Pure read of obs + the tune
-// action already computed for gameplay; opening/writing a file never touches RNG,
+// action already computed for gameplay; buffering output never touches RNG,
 // orders, or persisted state, so the lockstep sync stream is unaffected. One file
 // per AI instance avoids interleaving and lets each write its own header once.
 void AICortex::dumpWorkerTrace(const Cortex::CortexObservation& obs,
                                const Cortex::CortexAction& tune)
 {
 	using namespace Cortex;
-	const int me = player->team->teamNumber;
+	const int me = observedTeam->number;
 
-	if (!traceFile)
-	{
-		if (traceOpenAttempted) return; // already tried (and failed) once; do not retry.
-		traceOpenAttempted = true;
-		const char* prefix = getenv("GLOB2_CORTEX_TRACE");
-		if (!prefix || !prefix[0]) return;
-		std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
-		traceFile = std::fopen(path.c_str(), "a");
-		if (!traceFile)
-		{
-			// glob2 chdir()s to its resource dir at startup, so a relative prefix
-			// resolves there, not in the launch dir — pass an ABSOLUTE path. Warn
-			// once (traceOpenAttempted gate above) rather than silently dumping nothing.
-			std::cerr << "CORTEX_TRACE: cannot open '" << path
-			          << "' for the worker-tuning trace — pass an ABSOLUTE GLOB2_CORTEX_TRACE"
-			             " path (glob2 chdir()s at startup). Trace disabled.\n";
-			return;
-		}
-		// "a" positions at end, so a non-zero offset means the file already has rows;
-		// only the first writer emits the header.
-		if (std::ftell(traceFile) == 0)
-			std::fputs("tick,team,swarm_index,gid,wheat,maxWheat,maxUnitWorking,"
-			           "unitsInside,maxUnitInside,nearestWheatDist,harvestableWheatNearby,"
+	const char* prefix = getenv("GLOB2_CORTEX_TRACE");
+	if (!prefix || !prefix[0]) return;
+	const std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
+	const std::string header = "tick,team,swarm_index,gid,wheat,maxWheat,maxUnitWorking,"
+			           "unitsInside,maxUnitInside,nearestFoodSourceDistance,harvestableWheatNearby,"
 			           "freeWorkers,totalFree,totalNeeded,workers,swarmCount,feedCapacity,"
-			           "starvingUnits,needFood,maxBuildLevel,desired\n", traceFile);
-	}
+			           "starvingUnits,needFood,maxBuildLevel,desired\n";
 
 	const bool haveTune = (tune.kind == ACTION_TUNE_WORKERS);
 	std::ostringstream row;
@@ -212,9 +199,9 @@ void AICortex::dumpWorkerTrace(const Cortex::CortexObservation& obs,
 		const int desired = (haveTune && tune.swarmWorkers[i] >= 0)
 		                  ? tune.swarmWorkers[i] : t.maxUnitWorking;
 		row << obs.tick << ',' << me << ',' << i << ',' << t.gid << ','
-		    << t.wheat << ',' << t.maxWheat << ',' << t.maxUnitWorking << ','
+		    << t.supplyStock << ',' << t.supplyCapacity << ',' << t.maxUnitWorking << ','
 		    << t.unitsInside << ',' << t.maxUnitInside << ','
-		    << t.nearestWheatDist << ',' << t.harvestableWheatNearby << ','
+		    << t.nearestFoodSourceDistance << ',' << t.harvestableFoodSourcesNearby << ','
 		    << obs.freeWorkers << ',' << obs.totalFree << ',' << obs.totalNeeded << ','
 		    << obs.workers << ',' << obs.swarmCount << ',' << obs.feedCapacity << ','
 		    << obs.starvingUnits << ',' << obs.needFood << ',' << obs.maxBuildLevel << ','
@@ -223,8 +210,7 @@ void AICortex::dumpWorkerTrace(const Cortex::CortexObservation& obs,
 	const std::string text = row.str();
 	if (!text.empty())
 	{
-		std::fputs(text.c_str(), traceFile);
-		std::fflush(traceFile); // once per ~25 ticks; survive a killed headless run.
+		bufferedDiagnostics.push_back({path, header, text});
 	}
 }
 
@@ -236,39 +222,18 @@ void AICortex::dumpWorkerTrace(const Cortex::CortexObservation& obs,
 // bitmask, the chosen class index, and the cycle's failed feasibility-gate bitmask
 // (CortexGate bits — ANDed with a candidate's candidateGates[] mask this shows WHY a
 // gated candidate was vetoed). Pure read of obs + the DecideTrace decide()
-// already produced for gameplay; opening/writing a file never touches RNG, orders, or
-// persisted state, so the lockstep sync stream is unaffected. SEPARATE file handle +
-// open-attempt guard from the worker trace (distinct CSV, distinct schema).
+// already produced for gameplay; buffering output never touches RNG, orders, or
+// persisted state, so the lockstep sync stream is unaffected. Separate output path from the worker trace (distinct CSV, distinct schema).
 void AICortex::dumpDecideTrace(const Cortex::CortexObservation& obs,
                                const Cortex::DecideTrace& trace)
 {
 	using namespace Cortex;
-	const int me = player->team->teamNumber;
+	const int me = observedTeam->number;
 
-	if (!decideTraceFile)
-	{
-		if (decideTraceOpenAttempted) return; // already tried (and failed) once; do not retry.
-		decideTraceOpenAttempted = true;
-		const char* prefix = getenv("GLOB2_CORTEX_DECIDE_TRACE");
-		if (!prefix || !prefix[0]) return;
-		std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
-		decideTraceFile = std::fopen(path.c_str(), "a");
-		if (!decideTraceFile)
-		{
-			// glob2 chdir()s to its resource dir at startup, so a relative prefix
-			// resolves there, not in the launch dir — pass an ABSOLUTE path. Warn
-			// once (decideTraceOpenAttempted gate above) rather than silently dumping nothing.
-			std::cerr << "CORTEX_DECIDE_TRACE: cannot open '" << path
-			          << "' for the decision-selection trace — pass an ABSOLUTE"
-			             " GLOB2_CORTEX_DECIDE_TRACE path (glob2 chdir()s at startup)."
-			             " Trace disabled.\n";
-			return;
-		}
-		// "a" positions at end, so a non-zero offset means the file already has rows;
-		// only the first writer emits the header. The 48 feature names are in
-		// DECIDE_CONTRACT idx order — they MUST match extractDecideFeatures 1:1.
-		if (std::ftell(decideTraceFile) == 0)
-			std::fputs("tick,team,"
+	const char* prefix = getenv("GLOB2_CORTEX_DECIDE_TRACE");
+	if (!prefix || !prefix[0]) return;
+	const std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
+	const std::string header = "tick,team,"
 			           "swarms,swarmSites,inns,innSites,school,schoolSites,race,raceSites,"
 			           "heal,healSites,barracks,barracksSites,upgradableCount,totalUnit,"
 			           "workers,explorers,warriors,freeWorkers,totalFree,totalNeeded,"
@@ -279,8 +244,7 @@ void AICortex::dumpDecideTrace(const Cortex::CortexObservation& obs,
 			           "warFlagsActive,enemyCount,enemyUnitsNearFlag,flagTargetsValid,"
 			           "flagPosture,haveDefenseTarget,algaeReachable,algaeDiscovered,"
 			           "swimLandReach,swimWaterReach,tick,"
-			           "eligible_mask,chosen,failedGates\n", decideTraceFile);
-	}
+			           "eligible_mask,chosen,failedGates\n";
 
 	int features[CortexPolicy::NUM_DECIDE_FEATURES];
 	CortexPolicy::extractDecideFeatures(obs, features);
@@ -293,57 +257,36 @@ void AICortex::dumpDecideTrace(const Cortex::CortexObservation& obs,
 	    << ',' << trace.failedGates << '\n';
 
 	const std::string text = row.str();
-	std::fputs(text.c_str(), decideTraceFile);
-	std::fflush(decideTraceFile); // once per ~25 ticks; survive a killed headless run.
+	bufferedDiagnostics.push_back({path, header, text});
 }
 
 // INN DIAGNOSTIC TRACE (docs debugging Cortex-vs-Nicowar worker allocation to inns).
 // The inn-side companion to dumpWorkerTrace: appends one CSV row per valid tracked
 // inn to <prefix>.team<N>.csv, where <prefix> is GLOB2_CORTEX_INN_TRACE. Each row is
-// the inn's observed state this decision cycle (wheat buffer, restock demand, the
-// forbidden-blind/aware wheat diagnostics), the worker cap the tune action chose (the
+// the inn's observed state this decision cycle (food buffer, restock demand, the
+// forbidden-blind/aware food diagnostics), the worker cap the tune action chose (the
 // same `desired` convention as the swarm trace), plus colony-level context and the
 // production-mix tier facts. The tiers are recomputed here via the pure
 // CortexPolicy::computeFacts because getOrder() has no DecideFacts to pass through
 // (decide() builds one internally) — re-deriving it is byte-identical and avoids
 // duplicating the tier formula. Pure read of obs + the tune action already computed
-// for gameplay; opening/writing a file never touches RNG, orders, or persisted state,
-// so the lockstep sync stream is unaffected. SEPARATE FILE* handle + open-attempt
-// guard from the worker/decision traces (distinct CSV, distinct schema).
+// for gameplay; buffering output never touches RNG, orders, or persisted state,
+// so the lockstep sync stream is unaffected. Separate output path from the worker/decision traces (distinct CSV, distinct schema).
 void AICortex::dumpInnTrace(const Cortex::CortexObservation& obs,
                             const Cortex::CortexAction& tune)
 {
 	using namespace Cortex;
-	const int me = player->team->teamNumber;
+	const int me = observedTeam->number;
 
-	if (!innTraceFile)
-	{
-		if (innTraceOpenAttempted) return; // already tried (and failed) once; do not retry.
-		innTraceOpenAttempted = true;
-		const char* prefix = getenv("GLOB2_CORTEX_INN_TRACE");
-		if (!prefix || !prefix[0]) return;
-		std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
-		innTraceFile = std::fopen(path.c_str(), "a");
-		if (!innTraceFile)
-		{
-			// glob2 chdir()s to its resource dir at startup, so a relative prefix
-			// resolves there, not in the launch dir — pass an ABSOLUTE path. Warn
-			// once (innTraceOpenAttempted gate above) rather than silently dumping nothing.
-			std::cerr << "CORTEX_INN_TRACE: cannot open '" << path
-			          << "' for the inn-diagnostic trace — pass an ABSOLUTE GLOB2_CORTEX_INN_TRACE"
-			             " path (glob2 chdir()s at startup). Trace disabled.\n";
-			return;
-		}
-		// "a" positions at end, so a non-zero offset means the file already has rows;
-		// only the first writer emits the header.
-		if (std::ftell(innTraceFile) == 0)
-			std::fputs("tick,team,inn_index,gid,wheat,maxWheat,maxUnitWorking,unitsInside,"
-			           "maxUnitInside,nearestWheatDist,harvestableWheatNearby,"
+	const char* prefix = getenv("GLOB2_CORTEX_INN_TRACE");
+	if (!prefix || !prefix[0]) return;
+	const std::string path = std::string(prefix) + ".team" + std::to_string(me) + ".csv";
+	const std::string header = "tick,team,inn_index,gid,wheat,maxWheat,maxUnitWorking,unitsInside,"
+			           "maxUnitInside,nearestFoodSourceDistance,harvestableWheatNearby,"
 			           "diagBlindWheatNearby,restockTripsNeeded,priority,ticksSinceFinished,"
 			           "desired,freeWorkers,workers,warriors,totalUnit,feedCapacity,"
 			           "starvingUnits,needFood,growWorker,growWarrior,tierBase,tierMid,"
-			           "tierNeeds\n", innTraceFile);
-	}
+			           "tierNeeds\n";
 
 	// Recompute the production-mix tier facts (CortexPolicy.cpp:205-269) from the pure
 	// computeFacts: tierBase = the hauler floor (Σ swarm+inn maxUnitWorking +
@@ -366,10 +309,10 @@ void AICortex::dumpInnTrace(const Cortex::CortexObservation& obs,
 		const int desired = (haveTune && tune.innWorkers[i] >= 0)
 		                  ? tune.innWorkers[i] : n.maxUnitWorking;
 		row << obs.tick << ',' << me << ',' << i << ',' << n.gid << ','
-		    << n.wheat << ',' << n.maxWheat << ',' << n.maxUnitWorking << ','
+		    << n.supplyStock << ',' << n.supplyCapacity << ',' << n.maxUnitWorking << ','
 		    << n.unitsInside << ',' << n.maxUnitInside << ','
-		    << n.nearestWheatDist << ',' << n.harvestableWheatNearby << ','
-		    << n.diagBlindWheatNearby << ',' << n.restockTripsNeeded << ','
+		    << n.nearestFoodSourceDistance << ',' << n.harvestableFoodSourcesNearby << ','
+		    << n.unrestrictedFoodSourcesNearby << ',' << n.restockTripsNeeded << ','
 		    << n.priority << ',' << n.ticksSinceFinished << ',' << desired << ','
 		    << obs.freeWorkers << ',' << obs.workers << ',' << obs.warriors << ','
 		    << obs.totalUnit << ',' << obs.feedCapacity << ',' << obs.starvingUnits << ','
@@ -379,7 +322,6 @@ void AICortex::dumpInnTrace(const Cortex::CortexObservation& obs,
 	const std::string text = row.str();
 	if (!text.empty())
 	{
-		std::fputs(text.c_str(), innTraceFile);
-		std::fflush(innTraceFile); // once per ~25 ticks; survive a killed headless run.
+		bufferedDiagnostics.push_back({path, header, text});
 	}
 }

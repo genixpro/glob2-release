@@ -20,6 +20,9 @@ class Loop
 	virtual ~Loop() = default;
 	virtual bool frame(std::uint32_t tick, const std::vector<SDL_Event> &events) = 0;
 	virtual std::uint32_t delay(std::uint32_t now) = 0;
+    // Browser host calls painting separately on animation frames. Native hosts
+    // retain the combined frame callback. Timer callbacks never block on paint.
+    virtual void draw() {}
 };
 // Own the loop until it completes; destroy it before the completion callback.
 // Native hosts return after completion; browser hosts return after scheduling.
@@ -120,6 +123,16 @@ void overviewDrawn(bool drawn, bool settled);
 void roomReady(bool canStart);
 // Whether the custom-game lobby can launch its current map.
 void customGameReady(bool canStart);
+// Embedded Studio feedback; native hosts ignore it. Call progress only while
+// the simulation is parked; the browser host bounds and throttles publication.
+// tick is the completed simulation step. ended means the match/session stopped;
+// disabled/diagnostic describe the user's controller. won/lost describe its team.
+// The browser bridge supplies the launch's run and source-revision identifiers.
+void studioProgress(std::uint32_t tick, bool ended, bool disabled,
+                    const std::string &diagnostic, bool won, bool lost);
+void studioError(const std::string &message);
+void studioGenerated(const std::string &report);
+bool studioWatchRequested();
 // Read-only presentation diagnostic: the interactive controls of one element
 // host (a screen or dialog) after layout, as JSON keyed by control key with
 // logical-pixel bounds, or null when the host goes away. Tests drive the real

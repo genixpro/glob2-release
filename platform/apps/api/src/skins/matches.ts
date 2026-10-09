@@ -1,3 +1,4 @@
+import type { BlobStore } from '@glob2/core';
 import { sql, type Kysely } from 'kysely';
 import type { Database } from '@glob2/db';
 import {
@@ -6,11 +7,12 @@ import {
   type ColonySkinClaims,
   type ColonySkinVersion,
   type MatchColonySkin,
+  type SoftwareSprites,
   type MatchSetup,
 } from '@glob2/protocol';
 import type { SigningKeys } from '../auth/keys.ts';
 import { HttpError } from '../errors.ts';
-import { knownSwarmMesh } from './manifest.ts';
+import { knownSwarmMesh, webpSkinVersion } from './manifest.ts';
 import { authorizedSkin } from './equipment.ts';
 
 /** Serialize the first assignment across API replicas, freezing defaults too.
@@ -18,6 +20,7 @@ import { authorizedSkin } from './equipment.ts';
  * Later equipment/purchase changes affect future matches only. */
 export async function matchColonySkins(
   db: Kysely<Database>,
+  blobs: BlobStore,
   keys: SigningKeys,
   origin: string,
   matchId: string,
@@ -28,6 +31,7 @@ export async function matchColonySkins(
     accountId: string,
     version: ColonySkinVersion,
     buildingColor: number,
+    softwareSprites?: SoftwareSprites,
   ) => {
     const iat = Math.floor(Date.now() / 1000);
     const claims: ColonySkinClaims = {
@@ -41,6 +45,7 @@ export async function matchColonySkins(
       accountId,
       version,
       buildingColor,
+      ...(softwareSprites ? { softwareSprites } : {}),
     };
     return keys.sign(COLONY_SKIN_TYPE, claims);
   };
@@ -111,12 +116,44 @@ export async function matchColonySkins(
         .where('id', '=', matchId)
         .execute();
     });
+  // First available derivative is pinned independently from the frozen source.
+  // Concurrent refreshes serialize on each match appearance row.
+  await db.transaction().execute(async (trx) => {
+    const appearances = await trx
+      .selectFrom('match_colony_skins')
+      .select(['team_index', 'version_id'])
+      .where('match_id', '=', matchId)
+      .where('sprites_id', 'is', null)
+      .orderBy('team_index')
+      .forUpdate()
+      .execute();
+    for (const appearance of appearances) {
+      const ready = await trx
+        .selectFrom('colony_skin_sprites')
+        .select('id')
+        .where('version_id', '=', appearance.version_id)
+        .where('status', '=', 'ready')
+        .orderBy('created_at', 'desc')
+        .orderBy('id')
+        .executeTakeFirst();
+      if (ready)
+        await trx
+          .updateTable('match_colony_skins')
+          .set({ sprites_id: ready.id })
+          .where('match_id', '=', matchId)
+          .where('team_index', '=', appearance.team_index)
+          .execute();
+    }
+  });
   const rows = await db
     .selectFrom('match_colony_skins as m')
     .innerJoin('colony_skin_versions as v', 'v.id', 'm.version_id')
     .innerJoin('colony_skins as s', 's.id', 'v.skin_id')
+    .leftJoin('colony_skin_sprites as d', 'd.id', 'm.sprites_id')
     .where('s.disabled_at', 'is', null)
     .select([
+      'd.manifest_sha256 as spriteManifest',
+      'd.render_revision as spriteRevision',
       'm.team_index',
       'm.account_id',
       'm.building_color as chosen_color',
@@ -133,29 +170,53 @@ export async function matchColonySkins(
     .where('m.match_id', '=', matchId)
     .orderBy('m.team_index')
     .execute();
-  return rows.flatMap((row) => {
-    const swarmMesh = knownSwarmMesh(row.swarm_mesh);
-    if (!swarmMesh) return [];
-    const version: ColonySkinVersion = {
-      id: row.id,
-      skinId: row.skin_id,
-      textureSha256: row.texture_sha256,
-      materialSha256: row.material_sha256,
-      manifestSha256: row.manifest_sha256,
-      layout: row.layout,
-      buildingColor: row.building_color,
-      swarmMesh,
-      swarmViewAngle: row.swarm_view_angle,
-    };
-    // Refresh only authorization lifetime; the frozen content never changes.
-    return [
-      {
-        team: row.team_index,
-        accountId: row.account_id,
-        version,
-        buildingColor: row.chosen_color,
-        assertion: sign(row.team_index, row.account_id, version, row.chosen_color),
-      },
-    ];
-  });
+  const appearances = await Promise.all(
+    rows.map(async (row) => {
+      const swarmMesh = knownSwarmMesh(row.swarm_mesh);
+      if (!swarmMesh) return [];
+      const sourceVersion: ColonySkinVersion = {
+        id: row.id,
+        skinId: row.skin_id,
+        textureSha256: row.texture_sha256,
+        materialSha256: row.material_sha256,
+        manifestSha256: row.manifest_sha256,
+        layout: row.layout,
+        buildingColor: row.building_color,
+        swarmMesh,
+        swarmViewAngle: row.swarm_view_angle,
+      };
+      const version = await webpSkinVersion({ db, blobs }, sourceVersion);
+      const softwareSprites: SoftwareSprites | undefined =
+        row.spriteManifest && row.spriteRevision
+          ? {
+              format: 'colony-sprites-v1',
+              source: {
+                manifestSha256: row.manifest_sha256,
+                textureSha256: row.texture_sha256,
+                materialSha256: row.material_sha256,
+              },
+              manifestSha256: row.spriteManifest,
+              renderRevision: row.spriteRevision,
+            }
+          : undefined;
+      // Refresh only authorization lifetime; the frozen content never changes.
+      return [
+        {
+          team: row.team_index,
+          accountId: row.account_id,
+          version,
+          buildingColor: row.chosen_color,
+          ...(softwareSprites ? { softwareSprites } : {}),
+          assertion: sign(
+            row.team_index,
+            row.account_id,
+            version,
+            row.chosen_color,
+            softwareSprites,
+          ),
+        },
+      ];
+    }),
+  );
+  return appearances.flat();
 }

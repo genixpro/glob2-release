@@ -2,14 +2,17 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #pragma once
+#include <atomic>
 
 #include <memory>
 #include <CooperativeTask.h>
 #include <vector>
 
 #include "BuildingType.h"
-#include "RessourceType.h"
 #include "Settings.h"
+#include "TerrainType.h"
+class MapAssetBundle;
+#include <array>
 
 namespace GAGCore
 {
@@ -27,6 +30,8 @@ class ReplayReader;
 class ReplayWriter;
 class DatasetWriter;
 
+namespace TerrainVisual { class Compositor; }
+
 class GlobalContainer
 {
 public:
@@ -37,16 +42,22 @@ public:
 private:
 	void updateLoadProgressScreen(int value);
 	void loadGameGraphics(bool showProgress);
+    void requestGameGraphics();
 	void loadGameFonts();
 	bool gameGraphics = false;
+    bool gameGraphicsRequested = false;
 	bool menuMusic = false;
 
 public:
-	explicit GlobalContainer(const char *profileName="glob2");
+	explicit GlobalContainer(const char *profileName="glob2", const std::string& buildingCatalog="");
 	virtual ~GlobalContainer(void);
 
 	void parseArgs(int argc, char *argv[]);
 	void loadClient(void);
+    bool deferAssetLoading = false;
+    //! Advance required preparation without painting; the host schedules drawing.
+    bool finishAssetLoading();
+    void drawAssetLoading();
 	//! Load the in-game sprites (terrain, units, buildings, game interface) if
 	//! they are not loaded yet. Native and browser builds load them in loadClient;
 	//! hosts staging sprites later return false until
@@ -73,8 +84,13 @@ public:
 
 	std::unique_ptr<DrawableSurface> title; //!< Owned.
 	
+	TerrainVisual::Compositor &terrainCompositor();
+    TerrainVisual::Compositor &terrainCompositor(std::shared_ptr<const MapAssetBundle> assets);
+    std::shared_ptr<const MapAssetBundle> compositorAssets;
+    std::unique_ptr<TerrainVisual::Compositor> customTerrainCompositor;
+    std::unique_ptr<TerrainVisual::Compositor> terrainCompositor_;
 	Sprite *terrain = nullptr;
-	Sprite *terrainWater = nullptr;
+
 	Sprite *terrainCloud = nullptr;
 	Sprite *terrainBlack = nullptr;
 	Sprite *terrainShader = nullptr;
@@ -101,7 +117,6 @@ public:
 	Settings settings;
 
 	BuildingsTypes buildingsTypes;
-	ResourcesTypes resourcesTypes;
 
 	std::string videoshotName; //!< Legacy -vs shorthand for compressed capture.
 	std::string recordingPath;
@@ -110,9 +125,9 @@ public:
 	bool networkInitialized = false;
 	bool structuredHeadless = false;
 	bool headlessReplay = false;
-	// Zero selects the bounded hardware/AI-count default. Structured
+	// Zero selects the reported logical CPU count (one if unavailable). Structured
 	// --run-game configures its own compute executor instead.
-	unsigned aiThreads = 0;
+	unsigned computeThreads = 0;
 	std::string runNoXGameName;
 	int runNoXCountRuns; //!< The number of runs you want to repeat the no X run
 	bool automaticEndingGame;
@@ -147,12 +162,7 @@ public:
 	//! one captured in testGamesSeed below.
 	std::string testGamesSaveGameAs;
 
-	//! Seed actually passed to setSyncRandSeed() at the top of runTestGames().
-	//! createRandomGame() mirrors this into GameHeader::seed so the saved
-	//! .game file (via --save-game-as or GLOB2_DUMP_GAME) loads with the same
-	//! syncRand state. Without this mirror, GameHeader's constructor default
-	//! (time(NULL) at header-construction time) wins and the loaded game
-	//! diverges from the original -test-games-nox run.
+	//! Match setup seed captured by runTestGames; also initializes map/seat streams.
 	Uint32 testGamesSeed;
 	bool testGamesSeedSet;
 
@@ -165,7 +175,7 @@ public:
 	bool isViewingGame() const { return replaying || liveSpectating; }
 	bool replaying; //!< Whether the current game is a replay or a usual game
 	std::string replayFileName; //!< The name of the replay file.
-	bool replayFastForward; //!< If set to true, the replay will play faster.
+	std::atomic<bool> replayFastForward{false}; //!< If set to true, the replay will play faster.
 	bool replayShowFog; //!< Draw the fog of war or draw the entire map. Can be edited real-time.
 	Uint32 replayVisibleTeams; //!< A mask of which teams can be seen in the replay. Can be edited real-time.
 	bool replayShowAreas; //!< Show areas of gui.localPlayer or not. Can be edited real-time.

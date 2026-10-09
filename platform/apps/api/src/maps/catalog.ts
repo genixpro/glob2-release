@@ -8,7 +8,7 @@
 // A map hidden by a moderator is shown only to its owner and to moderators,
 // and rooms cannot choose it. Moderators and administrators see every map.
 // Invisible maps answer 404, never 403, so their existence does not leak.
-import { sql, type Kysely } from 'kysely';
+import { sql, type Kysely, type Selectable } from 'kysely';
 import type { Account, Database } from '@glob2/db';
 import type { MapInfo, MapVersionInfo, PublicAccount } from '@glob2/protocol';
 import { STORED_GENERATOR, readStored, storedSimVersion } from '@glob2/play';
@@ -71,6 +71,11 @@ export type MapRow = {
 };
 
 export type VersionRow = {
+  generator_provenance?: MapVersionInfo['generatorProvenance'] | null;
+  set_credits: Selectable<Database['map_versions']>['set_credits'];
+  building_catalog: Selectable<Database['map_versions']>['building_catalog'];
+  resource_experiments: Selectable<Database['map_versions']>['resource_experiments'];
+  required_resource_experiments: string[];
   id: string;
   map_id: string;
   hash: string;
@@ -179,13 +184,15 @@ export function publicOwner(row: MapRow): PublicAccount {
 
 export function versionUrls(origin: string, mapId: string, hash: string) {
   const base = `${origin}/api/v1/maps/${mapId}/versions/${hash}`;
-  return { downloadUrl: `${base}/file`, previewUrl: `${base}/preview.png` };
+  return { downloadUrl: `${base}/file`, previewUrl: `${base}/preview.webp` };
 }
 
 export function versionView(origin: string, row: VersionRow): MapVersionInfo {
   const urls = versionUrls(origin, row.map_id, row.hash);
   const sim = row.sim_version ? storedSimVersion(row.sim_version) : undefined;
   return {
+    ...(row.generator_provenance ? { generatorProvenance: row.generator_provenance } : {}),
+    setCredits: row.set_credits,
     hash: row.hash,
     size: Number(row.size),
     ...(row.width !== null ? { width: row.width } : {}),

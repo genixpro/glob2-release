@@ -5,6 +5,7 @@ import gzip
 import hashlib
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import tempfile
@@ -67,6 +68,51 @@ class CliSmoke(unittest.TestCase):
         self.assertTrue(records)
         return records
 
+    def test_unified_compute_pool_preserves_trace_with_auto_sizing(self):
+        source = self.generated()
+        serial = self.game(self.root / 'serial', source, workers=1)
+        automatic = self.game(self.root / 'auto', source, workers='auto')
+        shared = self.game(self.root / 'shared', source, workers=2)
+        self.assertEqual(serial, automatic)
+        self.assertEqual(serial, shared)
+        report = json.loads((self.root / 'auto/result.json').read_text())
+        self.assertGreaterEqual(report['compute_resolved_threads'], 1)
+        self.assertEqual(report['compute_requested_threads'], 'auto')
+        self.assertIn(report['compute_threads'], (1, report['compute_resolved_threads']))
+        self.assertEqual(report['compute_workers'], report['compute_threads'] - 1)
+        self.assertEqual(report['gradient_workers'], report['compute_threads'] - 1)
+        self.assertNotIn('compute_experiments', report)
+
+    def test_removed_compute_options_point_to_unified_setting(self):
+        for flag, value in (('--ai-threads', '2'), ('--gradient-workers', '2'),
+                            ('--compute-experiments', 'ai')):
+            for prefix, status in (([], 1), (['--run-game'], 2),
+                                   (['--verify-match', 'missing.record'], 2),
+                                   (['--turn-client', 'missing.json'], 2)):
+                with self.subTest(flag=flag, command=prefix):
+                    result = self.command(*prefix, flag, value, status=status)
+                    self.assertIn('has been removed', result.stderr)
+                    self.assertIn('--compute-threads auto|N', result.stderr)
+
+    def test_match_verification_preserves_trace_across_compute_sizes(self):
+        reference = None
+        # Git may check out the golden text with CRLF on Windows.
+        golden = (ROOT / 'test/fixtures/multiplayer/FourSquares1.verify-trace.txt').read_text(encoding='utf-8')
+        for count in (1, 2, 4, 8, 'auto'):
+            output = self.root / f'verify-{count}'
+            self.command('--verify-match', ROOT / 'test/fixtures/multiplayer/FourSquares1.g2mr',
+                         '--map', ROOT / 'maps/FourSquares1.map.gz', '--out', output,
+                         '--compute-threads', count)
+            self.assertEqual((output / 'checksums.txt').read_text(encoding='utf-8'), golden)
+            result = (output / 'result.json').read_bytes()
+            if reference is None:
+                reference = result
+            self.assertEqual(result, reference)
+            compute = json.loads((output / 'compute.json').read_text())
+            self.assertEqual(compute['compute_requested_threads'], str(count))
+            self.assertIn(compute['compute_threads'], (1, compute['compute_resolved_threads']))
+            self.assertEqual(compute['compute_workers'], compute['compute_threads'] - 1)
+
     def test_help_and_catalog_describe_real_commands(self):
         self.assertIn('-nox',self.command('--help').stdout)
         catalog=json.loads(self.command('--headless-catalog').stdout)
@@ -82,6 +128,7 @@ class CliSmoke(unittest.TestCase):
 
     def test_headless_numeric_and_missing_input_errors_are_structured(self):
         for index, extra in enumerate([['--ticks','0'],['--compute-threads','-1'],
+                                       ['--compute-threads','4294967296'],
                                        ['--map-file',self.root/'missing.map','--game-seed','713','--player','castor']]):
             output=self.root/f'invalid-{index}'
             self.command('--run-game','--output-dir',output,*extra,status=2)
@@ -141,6 +188,54 @@ class CliSmoke(unittest.TestCase):
         self.assertTrue(list(output.glob('map-r*.map.gz')))
         self.assertGreater((output/'terrain.txt').stat().st_size,100)
         self.assertIsInstance(json.loads((output/'artifacts.json').read_text()),dict)
+
+    def test_experimental_catalog_survives_generated_map_and_saved_continuation(self):
+        # Exercise the production argument forwarding with a nonnumeric path
+        # containing spaces, then remove it so reloads must use embedded rules.
+        catalog_dir = self.root / 'custom building catalog'
+        shutil.copytree(ROOT / 'data/buildings', catalog_dir)
+        example = ROOT / 'test/fixtures/building-catalog/authoring'
+        shutil.copy2(example / 'field-kitchen.json', catalog_dir)
+        manifest_path = catalog_dir / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['catalogKey'] = 'cli-field-kitchens'
+        manifest['files'].append('field-kitchen.json')
+        manifest['experiments'].extend(json.loads((example / 'manifest.json').read_text())['experiments'])
+        manifest_path.write_text(json.dumps(manifest, indent=2) + '\n')
+
+        output = self.root / 'generated-game'
+        self.command('--run-game', '--building-catalog', manifest_path,
+                     '--generator', '15', '--map-seed', '42',
+                     '--param', 'teams=2', '--param', 'width=7', '--param', 'height=7',
+                     '--game-seed', '713', '--player', 'castor', '--player', 'cortex',
+                     '--experiment', 'field-kitchens', '--ticks', '64',
+                     '--compute-threads', '1', '--telemetry', 'checksums', '--replay', 'true',
+                     '--save', 'every:32', '--save', 'final', '--output-dir', output)
+        report = json.loads((output / 'result.json').read_text())
+        self.assertEqual(report['status'], 'completed')
+        self.assertEqual(report['ticks'], 64)
+        self.assertEqual(report['resolved']['experiments'], ['field-kitchens'])
+        original = complete_ticks((output / 'game.replay.checksums').read_bytes())
+        self.assertEqual(len(original), 64)
+        maps = list((output / 'generated').glob('map-r*.map.gz'))
+        self.assertEqual(len(maps), 1)
+        shutil.rmtree(catalog_dir)
+
+        # Stock startup does not declare field-kitchens. Accepting the requested
+        # gate here proves the generated map retained its catalog metadata.
+        from_map = self.root / 'embedded-map'
+        reopened = self.game(from_map, maps[0], extra=('--experiment', 'field-kitchens'))
+        self.assertEqual(reopened, original)
+        self.assertEqual(json.loads((from_map / 'result.json').read_text())['resolved']['experiments'],
+                         ['field-kitchens'])
+
+        # A save additionally retains its enabled selection without a CLI gate.
+        from_save = self.root / 'embedded-save'
+        resumed = self.game(from_save, output / 'checkpoint-32.game.gz', saved=True)
+        self.assertEqual(len(resumed), 32)
+        self.assertEqual(resumed, {tick: record for tick, record in original.items() if tick in resumed})
+        self.assertEqual(json.loads((from_save / 'result.json').read_text())['resolved']['experiments'],
+                         ['field-kitchens'])
 
     def test_headless_workers_and_saved_continuation_match_complete_tick_records(self):
         source=self.generated()

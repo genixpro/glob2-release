@@ -7,11 +7,10 @@ class Game;
 namespace Script
 {
 // Native calculations see only the same observations offered to JavaScript.
-// Cached fields are exact functions of their source and obstacle masks. No
+// Cached fields are exact functions of their source, obstacle and terrain-cost masks. No
 // cache timestamp, hit/miss, eviction or allocation order affects decisions.
 class Spatial
 {
-	Game &game;
 	int team, width, height;
 	Observations &observations;
 	unsigned tick = ~0u;
@@ -22,6 +21,7 @@ class Spatial
 	{
 		std::vector<unsigned char> sources, passable;
 		std::vector<int> distances;
+        std::vector<unsigned> entryCosts;
 		std::string metric;
 	};
 	std::map<std::string, std::shared_ptr<Field>> cache;
@@ -38,6 +38,7 @@ class Spatial
 
   public:
 	Spatial(Game &, int, Observations &);
+    std::uint64_t retainedQueryVectorBytes() const;
 	void begin(const Value &records);
 	Value query(const std::string &, const std::vector<Value> &, const QueryBudget &);
 };

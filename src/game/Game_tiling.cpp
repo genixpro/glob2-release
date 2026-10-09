@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Repeating a map at game setup: see MapTiling.h.
+#include "PowerOfTwo.h"
 #include "Game.h"
 #include "Building.h"
 #include "BuildingType.h"
@@ -19,16 +20,22 @@ namespace
 	{
 		int x, y, typeNum, hp, bullets;
 		int maxUnitWorking, maxUnitWorkingFuture, maxUnitInside;
-		int priority, unitStayRange, minLevelToFlag;
-		Uint32 receiveResourceMask, sendResourceMask;
-		Sint32 resources[MAX_NB_RESOURCES];
+		int priority, unitStayRange, minLevelToFlag, minWorkerLevelToFlag;
+		bool explorersRequireBombing;
+		Uint32 receiveMaterialMask, sendMaterialMask;
+		Sint32 materials[MaterialSlotCount];
 		Sint32 ratio[NB_UNIT_TYPE];
-		bool clearingResources[BASIC_COUNT];
+		bool clearingMaterials[MaterialCount];
+		Building::ConstructionResultState constructionResultState;
+		int constructionOriginTypeNum;
+		std::array<Sint32,NB_UNIT_TYPE> constructionOriginRatios;
+		int repairInitialDeficit, repairHealthGranted;
+		BuildingMaterialCost constructionBudget, constructionReserved;
 	};
 
 	struct UnitTemplate
 	{
-		int x, y, typeNum, hp, hungry, hungriness, experience, experienceLevel;
+		int x, y, typeNum, hp, hungry, hungriness, experience, experienceLevel, constructionLevel;
 		Uint32 fruitMask, fruitCount;
 		Unit::Medical medical;
 		Sint32 level[NB_ABILITY];
@@ -44,7 +51,7 @@ namespace
 	//! Signed offset from a to v on a ring of `size`, taking the shorter way round
 	int wrapOffset(int v, int a, int size)
 	{
-		int d = (v - a) % size;
+		int d = powerOfTwoRemainder(v - a, size);
 		if (d < 0)
 			d += size;
 		if (d >= size / 2)
@@ -89,7 +96,7 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 			for (int i = 0; i < Building::MAX_COUNT && colony.anchorX < 0; i++)
 			{
 				const Building* b = teams[t]->myBuildings[i];
-				if (b && b->buildingState == Building::ALIVE && (pass == 1 || b->type->unitProductionTime))
+				if (b && b->buildingState == Building::ALIVE && (pass == 1 || b->type->semantics.production.enabledUnitMask))
 				{
 					colony.anchorX = b->posX;
 					colony.anchorY = b->posY;
@@ -110,13 +117,19 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 				continue;
 			BuildingTemplate bt = {wrapOffset(b->posX, colony.anchorX, w0), wrapOffset(b->posY, colony.anchorY, h0),
 				b->typeNum, b->hp, b->bullets, b->maxUnitWorking, b->getMaxUnitWorkingFuture(), b->maxUnitInside,
-				b->priority, b->unitStayRange, b->minLevelToFlag, b->receiveResourceMask, b->sendResourceMask, {}, {}, {}};
-			for (int r = 0; r < MAX_NB_RESOURCES; r++)
-				bt.resources[r] = b->resources[r];
+				b->priority, b->unitStayRange, b->minLevelToFlag, b->minWorkerLevelToFlag, b->explorersRequireBombing, b->receiveMaterialMask, b->sendMaterialMask, {}, {}, {}};
+			bt.constructionResultState=b->constructionResultState;
+			bt.constructionOriginTypeNum=b->constructionOriginTypeNum;
+			bt.constructionOriginRatios=b->constructionOriginRatios;
+			bt.repairInitialDeficit=b->repairInitialDeficit; bt.repairHealthGranted=b->repairHealthGranted;
+			bt.constructionBudget=b->constructionBudget;
+			bt.constructionReserved=b->constructionReserved;
+			for (int r = 0; r < MaterialSlotCount; r++)
+				bt.materials[r] = b->materials[r];
 			for (int u = 0; u < NB_UNIT_TYPE; u++)
 				bt.ratio[u] = b->ratio[u];
-			for (int r = 0; r < BASIC_COUNT; r++)
-				bt.clearingResources[r] = b->clearingResources[r];
+			for (int r = 0; r < MaterialCount; r++)
+				bt.clearingMaterials[r] = b->clearingMaterials[r];
 			colonies[t].buildings.push_back(bt);
 		}
 		for (int i = 0; i < Unit::MAX_COUNT; i++)
@@ -128,7 +141,7 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 			if (map.getGroundUnit(u->posX, u->posY) != u->gid && map.getAirUnit(u->posX, u->posY) != u->gid)
 				continue;
 			UnitTemplate ut = {wrapOffset(u->posX, colony.anchorX, w0), wrapOffset(u->posY, colony.anchorY, h0),
-				u->typeNum, u->hp, u->hungry, u->hungriness, u->experience, u->experienceLevel,
+				u->typeNum, u->hp, u->hungry, u->hungriness, u->experience, u->experienceLevel, u->constructionLevel,
 				u->fruitMask, u->fruitCount, u->medical, {}};
 			for (int a = 0; a < NB_ABILITY; a++)
 				ut.level[a] = u->level[a];
@@ -212,9 +225,8 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 					continue;
 				// the anchor of this copy; offsets wrap on the repeated map
 				const int ax = colonies[t].anchorX + i * w0, ay = colonies[t].anchorY + j * h0;
-				const int W = map.getW(), H = map.getH();
-				auto wrapX = [&](int v) { return ((v % W) + W) % W; };
-				auto wrapY = [&](int v) { return ((v % H) + H) % H; };
+				auto wrapX = [&](int v) { return map.normalizeX(v); };
+				auto wrapY = [&](int v) { return map.normalizeY(v); };
 				for (const BuildingTemplate& bt : colonies[t].buildings)
 				{
 					Building* b = addBuilding(wrapX(ax + bt.x), wrapY(ay + bt.y), bt.typeNum, k, bt.maxUnitWorking, bt.maxUnitWorkingFuture);
@@ -224,17 +236,26 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 					b->bullets = bt.bullets;
 					b->maxUnitInside = bt.maxUnitInside;
 					b->minLevelToFlag = bt.minLevelToFlag;
-					b->receiveResourceMask = bt.receiveResourceMask;
-					b->sendResourceMask = bt.sendResourceMask;
+					b->minWorkerLevelToFlag=bt.minWorkerLevelToFlag;
+					b->explorersRequireBombing=bt.explorersRequireBombing;
+					b->receiveMaterialMask = bt.receiveMaterialMask;
+					b->sendMaterialMask = bt.sendMaterialMask;
 					b->priority = bt.priority;
 					b->unitStayRange = bt.unitStayRange;
-					for (int r = 0; r < MAX_NB_RESOURCES; r++)
-						b->resources[r] = bt.resources[r];
+					for (int r = 0; r < MaterialSlotCount; r++)
+						b->materials[r] = bt.materials[r];
+					b->constructionResultState=bt.constructionResultState;
+					b->constructionOriginTypeNum=bt.constructionOriginTypeNum;
+					b->constructionOriginRatios=bt.constructionOriginRatios;
+					b->repairInitialDeficit=bt.repairInitialDeficit; b->repairHealthGranted=bt.repairHealthGranted;
+					b->constructionBudget=bt.constructionBudget;
+					b->constructionReserved=bt.constructionReserved;
+					b->restoreConstructionReservations();
 					for (int u = 0; u < NB_UNIT_TYPE; u++)
 						b->ratio[u] = bt.ratio[u];
-					for (int r = 0; r < BASIC_COUNT; r++)
-						b->clearingResources[r] = bt.clearingResources[r];
-					if (!teams[k]->startPosSet && b->type->unitProductionTime)
+					for (int r = 0; r < MaterialCount; r++)
+						b->clearingMaterials[r] = bt.clearingMaterials[r];
+					if (!teams[k]->startPosSet && b->type->semantics.production.enabledUnitMask)
 					{
 						teams[k]->startPosX = b->posX;
 						teams[k]->startPosY = b->posY;
@@ -268,6 +289,7 @@ bool Game::tileForPlay(int rx, int ry, int teamCount, int coloniesPerTeam)
 					u->hungriness = ut.hungriness;
 					u->experience = ut.experience;
 					u->experienceLevel = ut.experienceLevel;
+					u->constructionLevel=ut.constructionLevel;
 					u->fruitMask = ut.fruitMask;
 					u->fruitCount = ut.fruitCount;
 					u->medical = ut.medical;

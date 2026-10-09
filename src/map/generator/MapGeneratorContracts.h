@@ -8,6 +8,7 @@
 #include <array>
 #include <algorithm>
 #include <utility>
+#include <memory>
 #include <cstdlib>
 #include <cstdint>
 #include <climits>
@@ -87,7 +88,7 @@ inline void emojiContracts()
 				assert(service.generate(alone, solo));
 				for (int y = 0; y < (1 << request.hDec); ++y)
 					for (int x = 0; x < (1 << request.wDec); ++x)
-						assert(world.map.getUMTerrain(x, y) == alone.map.getUMTerrain(x, y));
+						assert(world.map.vertexTerrainAt(x, y) == alone.map.vertexTerrainAt(x, y));
 			}
 	assert(variants.size() == 92);
 	// Playtest regression: dense deposits consumed the remaining construction room
@@ -257,7 +258,7 @@ inline void braidedDeltaChecks()
 		const auto overgrown = MapGeneration::cropSpreadEnvelope(game.map);
 		for (int i : overgrown.visited)
 			if (game.map.isResourceAllowed(i % torus.w, i / torus.w, WHEAT))
-				game.map.setResource(i % torus.w, i / torus.w, WHEAT, 1);
+				game.map.setResourceByIndex(i % torus.w, i / torus.w, WHEAT, 1);
 		assert(MapGeneration::walkFromFirstColony(game.map, request.nbTeams, "the overgrown delta",
 												  "over its ford approaches")
 				   .error.empty());
@@ -267,7 +268,7 @@ inline void braidedDeltaChecks()
 		for (int y = 0; y < game.map.getH(); ++y)
 			for (int x = 0; x < game.map.getW(); ++x)
 				if (game.map.isResourceAllowed(x, y, STONE))
-					game.map.setResource(x, y, STONE, 1);
+					game.map.setResourceByIndex(x, y, STONE, 1);
 		assert(!definition.validateWorld(game, context).empty());
 	}
 	// Restore the smallest layout for request-boundary checks after the large fixture.
@@ -328,7 +329,7 @@ inline void breachableHighlandsContracts()
 	std::printf("Breachable highlands seed 1: clearing saddles saves up to %d walking steps\n",
 				bestSaving);
 	for (int i : saddle)
-		game.map.setResource(i % game.map.getW(), i / game.map.getW(), WOOD, 1);
+		game.map.setResourceByIndex(i % game.map.getW(), i / game.map.getW(), WOOD, 1);
 	assert(definition.validateWorld(game, context).empty());
 	game.map.setNoResource(ridge % game.map.getW(), ridge / game.map.getW(), 1);
 	assert(definition.validateWorld(game, context).find("ridge") != std::string::npos);
@@ -341,11 +342,11 @@ inline void breachableHighlandsContracts()
 	MapGeneration::TerrainSketch terrain(farmTorus.size());
 	for (int i = 0; i < farmTorus.size(); ++i)
 	{
-		const int value = uncontained.map.getUMTerrain(i % farmTorus.w, i / farmTorus.w);
+		const int value = uncontained.map.vertexTerrainAt(i % farmTorus.w, i / farmTorus.w);
 		terrain[i] = value == SAND ? GRASS : value;
 	}
 	MapGeneration::layBeaches(terrain, farmTorus);
-	MapGeneration::writeUndermap(uncontained.map, terrain);
+	MapGeneration::writeVertices(uncontained.map, terrain);
 	assert(definition.validateWorld(uncontained, context).find("farm access lane") !=
 		   std::string::npos);
 	// Abundance changes the farms, never the stone or saddle geometry. Both extremes
@@ -626,10 +627,10 @@ inline void locustFoodChecks()
 	}
 	assert(rejected);
 	assert(
-		MapGeneration::startingAccessFailure(map, 2, {{WHEAT, 24, "wheat"}, {WOOD, 32, "wood"}})
+		MapGeneration::startingAccessFailure(map, 2, {{MaterialId::Food, 24, "food"}, {MaterialId::Wood, 32, "wood"}})
 			.empty());
 	// No fruit exists here: a required absent supply must fail, as must an impossible room budget.
-	assert(!MapGeneration::startingAccessFailure(map, 2, {{CHERRY, 24, "cherries"}}).empty());
+	assert(!MapGeneration::startingAccessFailure(map, 2, {{MaterialId::Cherries, 24, "cherries"}}).empty());
 	assert(
 		!MapGeneration::startingAccessFailure(map, 2, {}, map.getW() * map.getH(), 1).empty());
 	std::vector<unsigned char> food(map.getW() * map.getH(), 0);
@@ -780,7 +781,7 @@ inline void rebuiltLandscapeContracts()
 				if (!game.map.isGrass(x, y) || game.map.isResource(x, y) || game.map.getBuilding(x, y) != NOGBID)
 					continue;
 				++tries;
-				game.map.setResource(x, y, WHEAT, 1);
+				game.map.setResourceByIndex(x, y, WHEAT, 1);
 				if (definition.validateWorld(game, check).find("glacis") != std::string::npos)
 					planted = true;
 				else
@@ -1024,7 +1025,7 @@ inline void karstTowersContracts()
 					continue;
 				const int x = (team->startPosX + 6 + dx + 256) % 256, y = (team->startPosY + 2 + dy + 256) % 256;
 				if (game.map.isGrass(x, y) && !game.map.isResource(x, y))
-					game.map.setResource(x, y, STONE, 1);
+					game.map.setResourceByIndex(x, y, STONE, 1);
 			}
 		assert(!definition.validateWorld(game, check).empty());
 	}
@@ -1102,7 +1103,7 @@ inline void bajadaContracts()
 		for (int i = 0; i < 256 * 256 && !damaged; ++i)
 			if (zero.map.isResource(i % 256, i / 256) && zero.map.getResource(i % 256, i / 256).type == STONE)
 			{
-				zero.map.getResource(i % 256, i / 256).clear();
+				zero.map.replaceResource(i % 256, i / 256, Resource{});
 				damaged = true;
 			}
 		assert(damaged && !definition.validateWorld(zero, check).empty());
@@ -1139,7 +1140,7 @@ inline void bajadaContracts()
 				if (std::max(std::abs(dx), std::abs(dy)) >= 4 && game.map.isResourceAllowed(x, y, WHEAT) &&
 					game.map.isFreeForGroundUnit(x, y, false, 0))
 				{
-					game.map.setResource(x, y, WHEAT, 1);
+					game.map.setResourceByIndex(x, y, WHEAT, 1);
 					sown = true;
 				}
 			}
@@ -1251,7 +1252,7 @@ inline void evenGroundContracts()
 		for (int y = 0; y < 256; ++y)
 			for (int x = 0; x < 256; ++x)
 				if (g.map.isResource(x, y) && g.map.getResource(x, y).type == WHEAT)
-					g.map.getResource(x, y).clear();
+					g.map.replaceResource(x, y, Resource{});
 		assert(!definition.validateWorld(g, check).empty());
 	}
 	puts("PASS Even Ground: envelope including thin maps and refusal, water budget ordering, "
@@ -1492,7 +1493,7 @@ inline void encircledKingdomContracts()
 			// must reject it even though all original starting supplies remain intact.
 			const int x = t.w / 2 + 2, y = t.h / 2 - 20;
 			assert(game.map.isResourceAllowed(x, y, WHEAT));
-			game.map.setResource(x, y, WHEAT, 1);
+			game.map.setResourceByIndex(x, y, WHEAT, 1);
 			assert(!definition.validateWorld(game, check).empty());
 		}
 	// Retained random-study failures: a concave rectangular approach and a remote outer town.
@@ -1559,7 +1560,7 @@ inline void encircledKingdomContracts()
 			for (int x = 0; x < abundant.map.getW(); ++x)
 				if (abundant.map.getResource(x, y).type == STONE)
 				{
-					abundant.map.getResource(x, y).clear();
+					abundant.map.replaceResource(x, y, Resource{});
 					removed = true;
 				}
 		assert(removed && !definition.validateWorld(abundant, check).empty());
@@ -1632,7 +1633,7 @@ inline void faultedCityContracts()
 		Game low(nullptr), high(nullptr);
 		assert(service.generate(low, scarce) && service.generate(high, rich));
 		for (int y = 0; y < low.map.getH(); ++y) for (int x = 0; x < low.map.getW(); ++x)
-			assert(low.map.getUMTerrain(x, y) == high.map.getUMTerrain(x, y));
+			assert(low.map.vertexTerrainAt(x, y) == high.map.vertexTerrainAt(x, y));
 	}
 	{
 		Game world(nullptr);
@@ -1646,7 +1647,7 @@ inline void faultedCityContracts()
 		}
 		assert(x >= 0 && y >= 0);
 		// Leave the centre open, but obstruct its reserved gathering/circulation width.
-		world.map.setResource((x + 1) % world.map.getW(), y, STONE, 1);
+		world.map.setResourceByIndex((x + 1) % world.map.getW(), y, STONE, 1);
 		GenerationContext context(request);
 		assert(!definition.validateWorld(world, context).empty());
 	}
@@ -1690,7 +1691,7 @@ inline void eatenMapContracts()
 		assert(service.generate(sparse, zero));
 		for (int y = 0; y < 128; ++y)
 			for (int x = 0; x < 128; ++x)
-				assert(world.map.getUMTerrain(x, y) == sparse.map.getUMTerrain(x, y));
+				assert(world.map.vertexTerrainAt(x, y) == sparse.map.vertexTerrainAt(x, y));
 		GenerationContext check(request);
 		assert(definition.validateWorld(world, check).empty());
 		// Depleting the opening crops must be rejected even when the coastline survives.
@@ -1699,7 +1700,7 @@ inline void eatenMapContracts()
 				if (repeated.map.getResource(x, y).type == WHEAT)
 					repeated.map.setNoResource(x, y, 0);
 		assert(!definition.validateWorld(repeated, check).empty());
-		world.map.setUMTerrain(0, 0, GRASS);
+		world.map.setVertexTerrain(0, 0, GRASS);
 		assert(!definition.validateWorld(world, check).empty());
 	}
 	// A single greedy spread used to reject this usable crescent. Retry sites, not terrain.
@@ -1825,7 +1826,7 @@ inline void portageLakesContracts()
 		for (int x = 0; x < 256; ++x)
 			if (repeated.map.getResource(x, y).type == WOOD && !fertility.at(x, y))
 			{
-				repeated.map.getResource(x, y).clear();
+				repeated.map.replaceResource(x, y, Resource{});
 				removed = true;
 			}
 	assert(removed && !definition.validateWorld(repeated, context).empty());
@@ -1845,9 +1846,8 @@ inline void portageLakesContracts()
 		assert(result);
 	}
 	// A change to the lake/road terrain cannot silently validate as the original design.
-	const auto originalTerrain = compactGame.map.getUMTerrain(0, 0);
-	compactGame.map.setUMTerrain(0, 0, originalTerrain == WATER ? GRASS : WATER);
-	compactGame.map.rebuildTerrain();
+	const auto originalTerrain = compactGame.map.vertexTerrainAt(0, 0);
+	compactGame.map.setVertexTerrain(0, 0, originalTerrain == WATER ? GRASS : WATER);
 	GenerationContext compactContext(compact);
 	assert(!definition.validateWorld(compactGame, compactContext).empty());
 	// Failed neutral bays restore a working layout; that must not invalidate its candidate scan.
@@ -1969,7 +1969,11 @@ inline void drownedForestContracts()
 		assert(!definition.validateRequest(r).empty());
 	}
 	GenerationService service;
-	Game first(nullptr), warm(nullptr);
+	// Keep the retained regression worlds off Windows' small main-thread stack.
+	auto firstStorage = std::make_unique<Game>(nullptr);
+	Game &first = *firstStorage;
+	auto warmStorage = std::make_unique<Game>(nullptr);
+	Game &warm = *warmStorage;
 	assert(service.generate(first, request));
 	assert(service.generate(warm, request, true));
 	assert(mapFingerprint(first) == mapFingerprint(warm));
@@ -1982,7 +1986,8 @@ inline void drownedForestContracts()
 		first.map.growResources();
 	assert(definition.validateWorld(first, check).empty());
 	// Damage to a designated neck must be detected.
-	Game observedWorld(nullptr);
+	auto observedWorldStorage = std::make_unique<Game>(nullptr);
+	Game &observedWorld = *observedWorldStorage;
 	const auto observed = service.generate(observedWorld, request, true);
 	int neck = -1;
 	for (const auto &record : observed.telemetry.records())
@@ -1998,7 +2003,8 @@ inline void drownedForestContracts()
 	compact.wDec = compact.hDec = 7;
 	compact.nbTeams = 2;
 	compact.nbWorkers = 8;
-	Game crowded(nullptr);
+	auto crowdedStorage = std::make_unique<Game>(nullptr);
+	Game &crowded = *crowdedStorage;
 	assert(service.generate(crowded, compact));
 	for (int amount : {0, 300})
 	{
@@ -2007,7 +2013,8 @@ inline void drownedForestContracts()
 		for (const auto &control : definition.controls)
 			if (control.group == ControlGroup::Resources)
 				extreme.options[control.id] = amount;
-		Game world(nullptr);
+		auto worldStorage = std::make_unique<Game>(nullptr);
+		Game &world = *worldStorage;
 		assert(service.generate(world, extreme));
 		GenerationContext verify(extreme);
 		assert(definition.validateWorld(world, verify).empty());
@@ -2032,14 +2039,16 @@ inline void drownedForestContracts()
 	futureRoom.options["stone-amount"] = 250;
 	futureRoom.options["algae-amount"] = 75;
 	futureRoom.options["fruit-amount"] = 275;
-	Game roomRegression(nullptr);
+	auto roomRegressionStorage = std::make_unique<Game>(nullptr);
+	Game &roomRegression = *roomRegressionStorage;
 	assert(service.generate(roomRegression, futureRoom));
 	// Sparse woods on the smallest map still need useful destinations for both homes.
 	auto sparse = compact;
 	sparse.seed = 2;
 	sparse.nbWorkers = 4;
 	sparse.options["wood-amount"] = 0;
-	Game sparseRegression(nullptr);
+	auto sparseRegressionStorage = std::make_unique<Game>(nullptr);
+	Game &sparseRegression = *sparseRegressionStorage;
 	assert(service.generate(sparseRegression, sparse));
 	sparse.seed = 100260;
 	sparse.nbWorkers = 3;
@@ -2049,7 +2058,8 @@ inline void drownedForestContracts()
 	sparse.options["stone-amount"] = 50;
 	sparse.options["algae-amount"] = 75;
 	sparse.options["fruit-amount"] = 75;
-	Game scarceRegression(nullptr);
+	auto scarceRegressionStorage = std::make_unique<Game>(nullptr);
+	Game &scarceRegression = *scarceRegressionStorage;
 	assert(service.generate(scarceRegression, sparse));
 	// At full colony density, many alternate bars and thick necks need a longer
 	// bounded search while retaining the same useful-shortcut requirement.
@@ -2064,7 +2074,8 @@ inline void drownedForestContracts()
 	dense.options["stone-amount"] = 75;
 	dense.options["algae-amount"] = 275;
 	dense.options["fruit-amount"] = 275;
-	Game denseRegression(nullptr);
+	auto denseRegressionStorage = std::make_unique<Game>(nullptr);
+	Game &denseRegression = *denseRegressionStorage;
 	assert(service.generate(denseRegression, dense));
 	// Fully occupied rectangular maps need the same bounded tail as dense squares.
 	auto rectangle = request;
@@ -2077,12 +2088,15 @@ inline void drownedForestContracts()
 	rectangle.options["wood-amount"] = 0;
 	rectangle.options["stone-amount"] = 50;
 	rectangle.options["algae-amount"] = 200;
-	Game rectangularRegression(nullptr);
+	auto rectangularRegressionStorage = std::make_unique<Game>(nullptr);
+	Game &rectangularRegression = *rectangularRegressionStorage;
 	assert(service.generate(rectangularRegression, rectangle));
-	Game cold(nullptr);
+	auto coldStorage = std::make_unique<Game>(nullptr);
+	Game &cold = *coldStorage;
 	assert(service.generate(cold, request));
 	// The worker-sensitive compact request evicted the cache; reconstruction is identical.
-	Game original(nullptr);
+	auto originalStorage = std::make_unique<Game>(nullptr);
+	Game &original = *originalStorage;
 	assert(service.generate(original, request));
 	assert(mapFingerprint(cold) == fingerprint && mapFingerprint(original) == fingerprint);
 	puts("PASS Drowned Forest: envelope, repeatability, cache, growth containment, neck damage, "
@@ -2167,10 +2181,10 @@ inline void bastionKeysContracts()
 	TerrainSketch landBridge(t.size());
 	for (int i = 0; i < t.size(); ++i)
 	{
-		const int corner = bridged.map.getUMTerrain(i % t.w, i / t.w);
+		const int corner = bridged.map.vertexTerrainAt(i % t.w, i / t.w);
 		landBridge[i] = corner == WATER ? SAND : corner;
 	}
-	writeUndermap(bridged.map, landBridge);
+	writeVertices(bridged.map, landBridge);
 	GenerationContext check(request);
 	assert(definition.validateWorld(bridged, check).find("walking connection") !=
 		   std::string::npos);

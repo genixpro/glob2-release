@@ -3,14 +3,16 @@
 // Copyright (C) 2007 Bradley Arsenault
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "PowerOfTwo.h"
 #include <PerformanceTelemetry.h>
 #include "Minimap.h"
+#include "terrain/TerrainCatalogIO.h"
+#include "terrain/TerrainCompositor.h"
 #include "EngineTiming.h"
 #include "FixedPoint.h"
 #include "Ressource.h"
-#include "RessourceType.h"
 #include "GlobalContainer.h"
-#include "Unit.h"
+#include "scene/Scene.h"
 
 
 using namespace GAGCore;
@@ -44,11 +46,29 @@ Minimap::~Minimap()
 		delete surface;
 }
 
-void Minimap::setGame(Game& ngame)
+void Minimap::setMapSize(int width,int height)
 {
 	if (noX) return;
-	mapW = ngame.map.getW();
-	mapH = ngame.map.getH();
+	mapW = width;
+	mapH = height;
+}
+
+void Minimap::setPlacement(int x, int y, int size)
+{
+	placed = true;
+	placeX = x;
+	placeY = y;
+	size = std::max(1, size);
+	if (size != width || size != height)
+	{
+		width = height = size;
+		if (!noX)
+		{
+			delete surface;
+			surface = new DrawableSurface(width, height);
+		}
+		update_row = -1;
+	}
 }
 
 void Minimap::resizeViewport(int width)
@@ -59,7 +79,7 @@ void Minimap::resizeViewport(int width)
 
 
 
-void Minimap::draw(const Scene &drawn, int localteam, int viewportX, int viewportY, int viewportW, int viewportH)
+void Minimap::draw(const PresentationFrame &drawn, int localteam, int viewportX, int viewportY, int viewportW, int viewportH)
 {
 	PERF_SCOPE_TIME(Minimap);
 	if (noX || !drawn.map.getW()) return; // nothing extracted yet
@@ -91,17 +111,20 @@ void Minimap::draw(const Scene &drawn, int localteam, int viewportX, int viewpor
 	}
 	
 	// Fill the 4 sides of the menu around the minimap with the color above
+	if (!placed)
+	{
 	// left side
 	globalContainer->gfx->drawFilledRect(gameWidth-menuWidth, 0, xOffset, height+yOffset, borderR, borderG, borderB, borderA);
 	// right side
 	globalContainer->gfx->drawFilledRect(gameWidth-menuWidth+xOffset+width, 0, menuWidth-xOffset-width, height+yOffset, borderR, borderG, borderB, borderA);
 	// top side
 	globalContainer->gfx->drawFilledRect(gameWidth-menuWidth+xOffset, 0, width, yOffset, borderR, borderG, borderB, borderA);
+	}
 	// bottom side not needed, because the menu draws up to it
   
   // calculate the offset for the viewport square
-	offset_x = scene->entities.teams[localteam].startPosX - mapW / 2;
-	offset_y = scene->entities.teams[localteam].startPosY - mapH / 2;
+	offset_x = scene->entities.teams[localteam].startX - mapW / 2;
+	offset_y = scene->entities.teams[localteam].startY - mapH / 2;
 
 	//Render the colorMap and blit the surface
 	if(update_row == -1)
@@ -121,7 +144,7 @@ void Minimap::draw(const Scene &drawn, int localteam, int viewportX, int viewpor
 		update_row %= (mini_h);
 	}
 	//Draw the surface
-	globalContainer->gfx->drawSurface(gameWidth-menuWidth+xOffset, yOffset, surface);
+	globalContainer->gfx->drawSurface(originX(), originY(), surface);
 
 	//Draw the viewport square, taking into account that it may
 	//wrap around the sides of the minimap
@@ -153,8 +176,8 @@ void Minimap::draw(const Scene &drawn, int localteam, int viewportX, int viewpor
 	globalContainer->gfx->drawPixel(endx, endy, 255, 255, 255);
 
 	///Draw a 1 pixel border around the minimap
-	globalContainer->gfx->drawRect(gameWidth-menuWidth+xOffset-1,
-	                               yOffset-1, 
+	globalContainer->gfx->drawRect(originX()-1,
+	                               originY()-1,
 	                               width+2, 
 	                               height+2, 
 	                               200, 200, 200);
@@ -182,8 +205,8 @@ void Minimap::convertToMap(int nx, int ny, int& x, int& y)
 
 	int xpos = nx - mini_x;
 	int ypos = ny - mini_y;
-	x = (offset_x + (int)((float)(mapW) / (float)(mini_w) * (float)(xpos))) % mapW;
-	y = (offset_y + (int)((float)(mapH) / (float)(mini_h) * (float)(ypos))) % mapH;
+	x = powerOfTwoRemainder(offset_x + (int)((float)(mapW) / (float)(mini_w) * (float)(xpos)), mapW);
+	y = powerOfTwoRemainder(offset_y + (int)((float)(mapH) / (float)(mini_h) * (float)(ypos)), mapH);
 }
 
 
@@ -230,8 +253,8 @@ void Minimap::computeMinimapPositioning()
 		mini_offset_x = 0;
 		mini_offset_y = (height-mini_h)/2;
 		// Now set the position of it on the whole screen
-		mini_x = gameWidth-menuWidth+xOffset+mini_offset_x;
-		mini_y = yOffset + mini_offset_y;
+		mini_x = originX()+mini_offset_x;
+		mini_y = originY() + mini_offset_y;
 	}
 	else
 	{
@@ -242,8 +265,8 @@ void Minimap::computeMinimapPositioning()
 		mini_offset_x = (width - mini_w)/2;
 		mini_offset_y = 0;
 		// And set the position for the screen!
-		mini_x = gameWidth-menuWidth+xOffset+mini_offset_x;
-		mini_y = yOffset + mini_offset_y;
+		mini_x = originX()+mini_offset_x;
+		mini_y = originY() + mini_offset_y;
 	}
 }
 
@@ -270,15 +293,12 @@ void Minimap::refreshPixelRows(int start, int end, int localteam)
 void Minimap::computeColors(int row, int localTeam)
 {
 	if (noX) return;
+	const auto palette =
+		TerrainVisual::minimapPalette(globalContainer->terrainCompositor(scene->map.frozenAssetBundle()).catalog());
 
 	assert(localTeam>=0);
-	assert(localTeam<Team::MAX_COUNT);
+	assert(localTeam<SceneEntities::Teams);
 
-	const int terrainColor[3][3] = {
-		{ 0, 40, 120 }, // Water
-		{ 170, 170, 0 }, // Sand
-		{ 0, 90, 0 }, // Grass
-	};
 
 	const int buildingsUnitsColor[6][3] = {
 		{ 10, 240, 20 }, // self
@@ -289,7 +309,7 @@ void Minimap::computeColors(int row, int localTeam)
 		{ (220*3)/5, (25*3)/5, (30*3)/5 }, // enemy FOW
 	};
 
-	int pcol[3+MAX_RESOURCES];
+	int pcol[TERRAIN_COUNT];
 
 	// get data
 	int szX = mini_w;
@@ -303,13 +323,14 @@ void Minimap::computeColors(int row, int localTeam)
 	bool useMapDiscovered = (minimapMode == HideFOW);
 
 	const SceneEntities &entities = scene->entities;
-	Uint32 visibleTeams = entities.teams[localTeam].me;
+	Uint32 visibleTeams = entities.teams[localTeam].mask;
 	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
 
 	const int dy = row;
 	for (int dx=0; dx<szX; dx++)
 	{
 		memset(pcol, 0, sizeof(pcol));
+		int customR = 0, customG = 0, customB = 0;
 		int nCount = 0;
 		int UnitOrBuildingIndex = -1;
 		
@@ -329,7 +350,7 @@ void Minimap::computeColors(int row, int localTeam)
 					gid=scene->map.getBuilding(minidx, minidy);
 					if (gid!=NOGUID)
 					{
-						const SceneBuilding *building = entities.building(gid);
+						const SnapshotBuilding *building = entities.building(gid);
 						if (building && (building->seenByMask & visibleTeams))
 						{
 							seenUnderFOW = true;
@@ -338,7 +359,7 @@ void Minimap::computeColors(int row, int localTeam)
 				}
 				if (gid!=NOGUID)
 				{
-					int teamId=gid/Unit::MAX_COUNT;
+					int teamId=gid/SceneEntities::SlotsPerTeam;
 					if (useMapDiscovered || scene->map.isFOWDiscovered(minidx, minidy, visibleTeams))
 					{
 						if (teamId==localTeam)
@@ -365,14 +386,30 @@ void Minimap::computeColors(int row, int localTeam)
 				{
 					// get color to add
 					int pcolIndex;
+					TerrainColor customColor{};
 					const auto& r = scene->map.getResource(minidx, minidy);
 					if (r.type!=NO_RES_TYPE)
 					{
-						pcolIndex=r.type + 3;
+						const auto& color = scene->map.resourceRegistry().presentation(static_cast<ResourceId>(r.type)).minimap;
+						customColor = TerrainColor{color[0], color[1], color[2]};
+						pcolIndex = -1;
 					}
 					else
 					{
-						pcolIndex=scene->map.getUMTerrain(minidx,minidy);
+						// One sample per vertex, as in map thumbnails.
+						pcolIndex=static_cast<int>(scene->map.vertexTerrainAt(minidx,minidy));
+						if (pcolIndex >= TERRAIN_COUNT)
+						{
+							customColor =
+								scene->map.terrainPresentation(TerrainType(pcolIndex)).minimap;
+                            const auto& key = scene->map.terrainRegistry().key(TerrainType(pcolIndex));
+                            const auto& visuals = globalContainer->terrainCompositor(scene->map.frozenAssetBundle()).catalog();
+                            if (auto binding = visuals.bindings.find(key); binding != visuals.bindings.end()) {
+                                const auto& color = visuals.materials[binding->second].minimap;
+                                customColor = TerrainColor{color[0], color[1], color[2]};
+                            }
+							pcolIndex = -1;
+						}
 					}
 					
 					// get weight to add
@@ -382,7 +419,14 @@ void Minimap::computeColors(int row, int localTeam)
 					else
 						pcolAddValue=3;
 
-					pcol[pcolIndex]+=pcolAddValue;
+					if (pcolIndex >= 0)
+						pcol[pcolIndex] += pcolAddValue;
+					else
+					{
+						customR += customColor.r * pcolAddValue;
+						customG += customColor.g * pcolAddValue;
+						customB += customColor.b * pcolAddValue;
+					}
 				}
 
 				nCount++;
@@ -405,20 +449,16 @@ void Minimap::computeColors(int row, int localTeam)
 			nCount*=5;
 
 			int lr, lg, lb;
-			lr = lg = lb = 0;
-			for (int i=0; i<3; i++)
+			lr = customR;
+			lg = customG;
+			lb = customB;
+			for (int i=0; i<TERRAIN_COUNT; i++)
 			{
-				lr += pcol[i]*terrainColor[i][0];
-				lg += pcol[i]*terrainColor[i][1];
-				lb += pcol[i]*terrainColor[i][2];
+				lr += pcol[i]*palette[i].r;
+				lg += pcol[i]*palette[i].g;
+				lb += pcol[i]*palette[i].b;
 			}
-			for (int i=0; i<MAX_RESOURCES; i++)
-			{
-				const ResourceType *rt = globalContainer->resourcesTypes.get(i);
-				lr += pcol[i+3]*(rt->minimapR);
-				lg += pcol[i+3]*(rt->minimapG);
-				lb += pcol[i+3]*(rt->minimapB);
-			}
+
 
 			r = lr/nCount;
 			g = lg/nCount;

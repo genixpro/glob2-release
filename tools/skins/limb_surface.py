@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Authored four-socket surface, evaluated from named legacy component paths.
+"""Paint-compatible four-limb topology fitted to one connected rest surface.
 
 The two front/back torso panels share four socket rims with the limbs. Each
-limb owns its rings and end cap: no triangle can connect two feet. Ring radii
-follow only the torso and that limb's metaball field, never a neighbouring limb.
+limb owns its rings and end cap: no triangle can connect two feet. The existing
+paint chart and its seams are retained; connected_surface.py builds and carries
+the geometry without independently projected collars.
 """
 
 import math
@@ -21,6 +22,11 @@ class LimbSurface:
         self.divisions = definition["socketDivisions"]
         self.vertices, self.triangles, self.uv, self.regions = [], [], [], []
         self.virtual = []
+        # Which components a vertex's field may see (-1: the shared core). The
+        # socket rims belong to their limb's paint island but stay on the torso
+        # field, so the seam's two copies land on the same surface.
+        self.field_regions = []
+        self.welds = []
         self.cube = {}
         self.branches = []
         n = self.divisions
@@ -89,15 +95,18 @@ class LimbSurface:
                 + [(-n, n - 2 * j) for j in range(n)]
                 + [(-n + 2 * j, -n) for j in range(n)]
             )
-            rim = [
-                vertex(
-                    tuple(
-                        normal * body_grid
-                        + (np.array([x, 0, 0]) + side * t) * opening / n
-                    )
+            # The limb's own copy of the socket rim: identical geometry to the
+            # torso's rim vertices, welded to them, but with the limb island's
+            # paint coordinates so the limb unwraps on its own.
+            rim = []
+            for x, t in perimeter:
+                q = tuple(normal * body_grid + (np.array([x, 0, 0]) + side * t) * opening / n)
+                torso_vertex = vertex(q)
+                v = unit(np.array(q, dtype=float)) * 1.8
+                y, z = (v[1] - v[2]) / math.sqrt(2), (v[1] + v[2]) / math.sqrt(2)
+                rim.append(
+                    self.add_vertex(("rim", branch, v), (v[0], y, z), branch, -1, torso_vertex)
                 )
-                for x, t in perimeter
-            ]
             angles = np.array([math.atan2(t, x) for x, t in perimeter])
             # These rays lie exactly on the reflection folds, not across them.
             count = (len(path) + 1) * self.rings
@@ -154,13 +163,19 @@ class LimbSurface:
         self.triangles = np.array(self.triangles, dtype=np.uint32)
         self.uv = np.array(self.uv, dtype=np.float64)
         self.regions = np.array(self.regions)
+        self.field_regions = np.array(self.field_regions)
+        self.welds = np.array(self.welds)
 
-    def add_vertex(self, descriptor, virtual, region):
+    def add_vertex(self, descriptor, virtual, region, field_region=None, weld=None):
         i = len(self.vertices)
         self.vertices.append(descriptor)
         self.virtual.append(virtual)
+        # Provisional planar coordinates; the exporter replaces them with the
+        # conformal chart (see chart.py).
         self.uv.append((0.5 + 0.48 * virtual[1] / 9, 0.04 + 0.92 * abs(virtual[2]) / 9))
         self.regions.append(region)
+        self.field_regions.append(region if field_region is None else field_region)
+        self.welds.append(i if weld is None else weld)
         return i
 
     def quad(self, q):
@@ -168,7 +183,8 @@ class LimbSurface:
         # would choose opposite interpolation on the mirrored quad.
         virtual = np.mean([self.virtual[i] for i in q], axis=0)
         region = next((self.regions[i] for i in q if self.regions[i] >= 0), -1)
-        center = self.add_vertex(("average", tuple(q)), virtual, region)
+        field_region = next((self.field_regions[i] for i in q if self.field_regions[i] >= 0), -1)
+        center = self.add_vertex(("average", tuple(q)), virtual, region, field_region)
         self.triangles.extend(
             (q[k], q[(k + 1) % len(q)], center) for k in range(len(q))
         )
@@ -179,253 +195,110 @@ class LimbSurface:
             self.quad((a[k], a[j], b[j], b[k]))
 
     def contract(self):
-        lookup = {tuple(np.round(v, 8)): i for i, v in enumerate(self.virtual)}
+        lookup = {
+            (tuple(np.round(v, 8)), int(self.regions[i])): i for i, v in enumerate(self.virtual)
+        }
+        exchange = {0: 2, 1: 3, 2: 0, 3: 1}
         reflections = {}
         for name, axis in (("frontBack", 0), ("topBottom", 2)):
             pairs = []
-            for v in self.virtual:
+            for i, v in enumerate(self.virtual):
                 other = np.array(v, dtype=float)
                 other[axis] *= -1
-                pairs.append(lookup[tuple(np.round(other, 8))])
+                region = int(self.regions[i])
+                if name == "topBottom":
+                    region = exchange.get(region, -1)
+                pairs.append(lookup[(tuple(np.round(other, 8)), region)])
             reflections[name] = pairs
-        return {"reflections": reflections, "regions": self.regions.tolist()}
+        return {
+            "reflections": reflections,
+            "regions": self.regions.tolist(),
+            "welds": self.welds.tolist(),
+        }
 
     def evaluate(self, matrices, radii, stiffness, threshold, clip="walk"):
+        from connected_surface import fit_rest
+        return fit_rest(self, matrices, radii, stiffness, threshold, clip)
+
+    def body_basis(self, matrices, clip="walk"):
+        """Body front/lateral/vertical axes for a clip, as evaluate uses them."""
         root = matrices[0]
         rotation = root[:3, :3] / np.linalg.norm(root[:3, :3], axis=0)
-        axes = self.definition.get("clipBodyAxes", {}).get(
-            clip, self.definition["bodyAxes"]
-        )
-        basis = np.column_stack(
-            [rotation[:, abs(i) - 1] * (1 if i > 0 else -1) for i in axes]
-        )
-        # Transform our diagonal cube axes into body front/lateral/vertical axes.
-        cube_basis = basis @ np.array(
-            [
-                [1, 0, 0],
-                [0, 1 / math.sqrt(2), -1 / math.sqrt(2)],
-                [0, 1 / math.sqrt(2), 1 / math.sqrt(2)],
-            ]
-        )
-        scales = np.linalg.norm(matrices[:, :3, :3], axis=1).mean(axis=1)
-        support = radii * scales
-        isolated = support * np.sqrt(1 - (threshold / stiffness) ** (1 / 3))
-        body_radius = isolated[0] * self.definition["bodyRadiusScale"]
-        results = []
-        cache = {}
-        solved = {}
-        for b, (path, normal, side, angles) in enumerate(self.branches):
-            ids = [0] + path
-            center = root[:3, 3] + cube_basis @ normal * (
-                body_radius / math.sqrt(1 + (2 / 8) ** 2)
-            )
-            controls = np.vstack((center, matrices[path, :3, 3]))
+        axes = self.definition.get("clipBodyAxes", {}).get(clip, self.definition["bodyAxes"])
+        return np.column_stack([rotation[:, abs(i) - 1] * (1 if i > 0 else -1) for i in axes])
 
-            # Ring sections use a centripetal-free cubic Hermite path; each
-            # segment is parameterized separately so source joints keep identity.
-            def curve(s, controls=controls):
-                t = s * (len(controls) - 1)
-                i = min(int(t), len(controls) - 2)
-                t -= i
-                p0, p1 = controls[i : i + 2]
-                m0 = (
-                    controls[min(i + 1, len(controls) - 1)] - controls[max(i - 1, 0)]
-                ) / (1 if i == 0 else 2)
-                m1 = (controls[min(i + 2, len(controls) - 1)] - controls[i]) / (
-                    1 if i + 1 == len(controls) - 1 else 2
-                )
-                c = (
-                    (2 * t**3 - 3 * t * t + 1) * p0
-                    + (t**3 - 2 * t * t + t) * m0
-                    + (-2 * t**3 + 3 * t * t) * p1
-                    + (t**3 - t * t) * m1
-                )
-                tangent = unit(
-                    (6 * t * t - 6 * t) * p0
-                    + (3 * t * t - 4 * t + 1) * m0
-                    + (-6 * t * t + 6 * t) * p1
-                    + (3 * t * t - 2 * t) * m1
-                )
-                return c, tangent
+    def fair(self, positions):
+        """Relax strained torso triangles with nonshrinking welded fairing.
 
-            # Parallel transport around bends. Projecting the body's front axis
-            # independently at each ring flips the cross section when a fighting
-            # arm becomes parallel to that axis, making a bow-tie connection.
-            section_frames = {}
-            previous = cube_basis @ normal
-            front = basis[:, 0].copy()
-            count = (len(path) + 1) * self.rings
-            for sample in range(count * 4 + 1):
-                s = sample / (count * 4)
-                c, tangent = curve(s)
-                k = np.cross(previous, tangent)
-                cosine = float(np.dot(previous, tangent))
-                if cosine > -1 + 1e-8:
-                    front += np.cross(k, front) + np.cross(k, np.cross(k, front)) / (
-                        1 + cosine
-                    )
-                front = unit(front - tangent * np.dot(front, tangent))
-                previous = tangent
-                if sample % 4 == 0:
-                    section_frames[s] = (
-                        c,
-                        tangent,
-                        front.copy(),
-                        np.cross(tangent, front),
-                    )
-
-            def section(s, frames=section_frames):
-                return frames[s]
-
-            perimeter = (
-                [
-                    (self.divisions, -self.divisions + 2 * j)
-                    for j in range(self.divisions)
-                ]
-                + [
-                    (self.divisions - 2 * j, self.divisions)
-                    for j in range(self.divisions)
-                ]
-                + [
-                    (-self.divisions, self.divisions - 2 * j)
-                    for j in range(self.divisions)
-                ]
-                + [
-                    (-self.divisions + 2 * j, -self.divisions)
-                    for j in range(self.divisions)
-                ]
-            )
-            rim = np.array(
-                [
-                    root[:3, 3]
-                    + cube_basis
-                    @ unit(
-                        normal * 8
-                        + (np.array([x, 0, 0]) + side * t) * 2 / self.divisions
-                    )
-                    * body_radius
-                    for x, t in perimeter
-                ]
-            )
-            cache[b] = (ids, section, isolated[path[-1]], rim, center)
-        for descriptor in self.vertices:
-            kind = descriptor[0]
-            if kind == "average":
-                results.append(np.mean([results[i] for i in descriptor[1]], axis=0))
-                continue
-            if kind == "body":
-                results.append(
-                    root[:3, 3] + cube_basis @ descriptor[1] * (body_radius / 1.8)
-                )
-                continue
-            b = descriptor[1]
-            ids, section, tip_radius, rim, socket_center = cache[b]
-            if kind == "ring":
-                _, _, s, k = descriptor
-                if (b, s) not in solved:
-                    c, tangent, front, lateral = section(s)
-                    angles = self.branches[b][3]
-                    rays = (
-                        np.cos(angles)[:, None] * front
-                        + np.sin(angles)[:, None] * lateral
-                    )
-                    lo = np.zeros(len(angles))
-                    hi = np.full(len(angles), max(support[ids]) * 2)
-                    for _ in range(24):
-                        r = (lo + hi) / 2
-                        distance = (
-                            np.sum(
-                                (
-                                    c
-                                    + rays[:, None, :] * r[:, None, None]
-                                    - matrices[ids, :3, 3]
-                                )
-                                ** 2,
-                                axis=2,
-                            )
-                            / support[ids] ** 2
-                        )
-                        field = np.sum(
-                            stiffness[ids] * np.maximum(0, 1 - distance) ** 3, axis=1
-                        )
-                        lo = np.where(field > threshold, r, lo)
-                        hi = np.where(field > threshold, hi, r)
-                    # A branch can fold outside its own implicit field while
-                    # remaining joined in the all-limb legacy union. Keep an
-                    # authored neck there instead of a near-zero-radius spike.
-                    path = self.branches[b][0]
-                    t = s * len(path)
-                    segment = min(int(t), len(path) - 1)
-                    t -= segment
-                    necks = np.r_[body_radius * 0.25, isolated[path]]
-                    minimum = (
-                        (1 - t) * necks[segment] + t * necks[segment + 1]
-                    ) * self.definition["minimumSectionRadiusScale"]
-                    radius = np.maximum((lo + hi) / 2, minimum)
-                    solved[b, s] = c + rays * radius[:, None]
-                    blend = min(1.0, s * len(self.branches[b][0]))
-                    if blend < 1:
-                        # Start at the exact shared socket rim. This avoids an
-                        # instant field-radius jump intersecting adjacent sockets.
-                        solved[b, s] = (1 - blend) * (
-                            rim + c - socket_center
-                        ) + blend * solved[b, s]
-                results.append(solved[b, s][k])
-            else:
-                c, tangent, front, lateral = section(1.0)
-                if kind == "tip":
-                    results.append(c + tangent * tip_radius)
-                else:
-                    _, _, latitude, k = descriptor
-                    angle = self.branches[b][3][k]
-                    results.append(
-                        c
-                        + tangent * tip_radius * math.sin(latitude)
-                        + (front * math.cos(angle) + lateral * math.sin(angle))
-                        * tip_radius
-                        * math.cos(latitude)
-                    )
-        positions = np.array(results)
-        # Fit the shared core and each explicit limb to their local implicit
-        # surface. This removes the faceted/intersecting collar left by a radial
-        # sweep when joints fold against the torso, without welding two feet.
-        allowed = np.zeros((len(positions), len(matrices)), dtype=bool)
-        core = [0] + [path[0] for path, *_ in self.branches]
-        allowed[:, core] = True
-        for branch, (path, *_) in enumerate(self.branches):
-            allowed[np.ix_(self.regions == branch, path)] = True
-        self.field_centers = matrices[:, :3, 3]
-        self.field_support = support
-        self.field_stiffness = stiffness
-        self.field_allowed = allowed
-        for _ in range(10):
-            field, gradient = self.field(positions)
-            divisor = np.sum(gradient * gradient, axis=1)
-            delta = (
-                gradient * ((field - threshold) / np.maximum(divisor, 1e-12))[:, None]
-            )
-            length = np.linalg.norm(delta, axis=1)
-            delta *= np.minimum(1.0, body_radius * 0.12 / np.maximum(length, 1e-12))[
-                :, None
-            ]
-            positions -= delta
-        return positions
-
-    def field(self, positions):
-        delta = positions[:, None, :] - self.field_centers
-        distance = np.sum(delta * delta, axis=2) / self.field_support**2
-        falloff = np.maximum(0.0, 1 - distance) * self.field_allowed
-        field = np.sum(self.field_stiffness * falloff**3, axis=1)
-        gradient = np.sum(
-            (-6 * self.field_stiffness * falloff**2 / self.field_support**2)[:, :, None]
-            * delta,
-            axis=1,
-        )
-        return field, gradient
+        The limb rings and caps remain fixed. A shrink/expand pair smooths the
+        shared torso shell without shrinking its volume or splitting UV seams.
+        """
+        iterations = self.definition.get("torsoFairing", 0)
+        if not iterations:
+            return positions
+        if not hasattr(self, "fairing_graph"):
+            adjacency = [set() for _ in self.welds]
+            for a, b, c in self.welds[self.triangles]:
+                for x, y in ((a, b), (b, c), (c, a)):
+                    adjacency[x].add(y)
+                    adjacency[y].add(x)
+            rows = np.array([v for v, neighbours in enumerate(adjacency) for _ in neighbours])
+            columns = np.array([k for neighbours in adjacency for k in sorted(neighbours)])
+            degree = np.bincount(rows, minlength=len(self.welds))[:, None]
+            mask = (self.regions == -1)[:, None] * (degree > 0)
+            self.fairing_graph = rows, columns, degree, mask
+        rows, columns, degree, mask = self.fairing_graph
+        result = positions.copy()
+        for _ in range(iterations):
+            for rate in (0.5, -0.53):
+                total = np.zeros_like(result)
+                np.add.at(total, rows, result[columns])
+                result += rate * (total / np.maximum(degree, 1) - result) * mask
+                result = result[self.welds]
+        return result
 
     def normals(self, positions):
-        _, gradient = self.field(positions)
-        lengths = np.linalg.norm(gradient, axis=1)
+        """Shade the actual connected geometry, including welded paint seams."""
+        triangles = self.triangles
+        face = np.cross(positions[triangles[:, 1]] - positions[triangles[:, 0]],
+                        positions[triangles[:, 2]] - positions[triangles[:, 0]])
+        result = np.zeros_like(positions)
+        for corner in range(3):
+            np.add.at(result, self.welds[triangles[:, corner]], face)
+        result = result[self.welds]
+        lengths = np.linalg.norm(result, axis=1)
         if np.any(lengths < 1e-10):
-            raise ValueError("Invalid implicit surface normal")
-        return -gradient / lengths[:, None]
+            raise ValueError("Degenerate connected surface normal")
+        return result / lengths[:, None]
+
+
+class Tracker:
+    """Carry one connected rest surface through every legacy animation pose."""
+
+    def __init__(self, surface, rest, radii, stiffness, threshold, clip="walk"):
+        self.surface, self.radii = surface, radii
+        self.rest_basis = surface.body_basis(rest, clip)
+        self.rest_origin = rest[0, :3, 3]
+        self.rest_centers = (rest[:, :3, 3] - self.rest_origin) @ self.rest_basis
+        self.rest_scales = np.linalg.norm(rest[:, :3, :3], axis=1).mean(axis=1)
+        self.positions = surface.evaluate(rest, radii, stiffness, threshold, clip)
+        self.local = (self.positions - self.rest_origin) @ self.rest_basis
+        self.samples = {}
+
+    def evaluate(self, matrices, clip="walk", phase=None):
+        from connected_surface import carry
+        basis = self.surface.body_basis(matrices, clip)
+        origin = matrices[0, :3, 3]
+        centers = (matrices[:, :3, 3] - origin) @ basis
+        scales = np.linalg.norm(matrices[:, :3, :3], axis=1).mean(axis=1)
+        cached = self.samples.get((clip, phase)) if phase is not None else None
+        if cached is not None and np.allclose(centers, cached[0], atol=2e-4, rtol=0) and np.allclose(scales, cached[1], atol=2e-4, rtol=0):
+            local = cached[2]
+        else:
+            local = carry(self.local, self.rest_centers, centers, self.rest_scales, scales, self.radii)
+            if phase is not None:
+                # Headings differ only by the outer body transform. Reuse the
+                # body-space sample when float authoring noise is below 0.0002.
+                self.samples[(clip, phase)] = (centers.copy(), scales.copy(), local)
+
+        return self.surface.fair(origin + local @ basis.T)

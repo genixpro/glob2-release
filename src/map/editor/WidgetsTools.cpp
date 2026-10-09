@@ -6,8 +6,12 @@
 #include "Game.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
+#include "TerrainPresentation.h"
+#include "render/terrain/TerrainCompositor.h"
 #include "ScriptEditorScreen.h"
 #include "Unit.h"
+#include "render/UnitAnimation.h"
+#include "render/UnitSkin.h"
 #include "Utilities.h"
 #include <SDL3/SDL.h>
 
@@ -38,26 +42,25 @@ void UnitSelector::draw()
 {
 	// draw units
 	Sprite *unitSprite=globalContainer->units;
-	unitSprite->setBaseColor(me.game.teams[me.team]->color);
+	unitSprite->setBaseColor(presentationColor(me.view.scene->entities.teams[me.team].color));
 	bool drawSelection=false;
 	if(unitType==WORKER)
 	{
 		if(me.selectionMode==MapEdit::PlaceUnit && me.placingUnit==MapEdit::Worker)
 			drawSelection=true;
-		globalContainer->gfx->drawSprite(area.x, area.y, unitSprite, 64);
 	}
 	else if(unitType==EXPLORER)
 	{
 		if(me.selectionMode==MapEdit::PlaceUnit && me.placingUnit==MapEdit::Explorer)
 			drawSelection=true;
-		globalContainer->gfx->drawSprite(area.x, area.y, unitSprite, 0);
 	}
 	else if(unitType==WARRIOR)
 	{
 		if(me.selectionMode==MapEdit::PlaceUnit && me.placingUnit==MapEdit::Warrior)
 			drawSelection=true;
-		globalContainer->gfx->drawSprite(area.x, area.y, unitSprite, 256);
 	}
+	const int imgid=unitAnimationFrame(g_unitSkins[unitType].startImage[STOP_WALK], 0, 0);
+	globalContainer->gfx->drawSprite(area.x, area.y, unitSprite, imgid);
 	if(drawSelection)
 	{
 		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->gamegui, 23);
@@ -76,12 +79,13 @@ TerrainSelector::TerrainSelector(MapEdit& me, const widgetRectangle& area, const
 
 void TerrainSelector::draw()
 {
-	if(terrainType==Grass)
-		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->terrain, 0);
-	if(terrainType==Sand)
-		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->terrain, 128);
-	if(terrainType==Water)
-		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->terrain, 259);
+    if (TerrainSelector::isBaseTerrain(terrainType))
+    {
+        const auto type = TerrainSelector::baseTerrain(terrainType);
+		const auto [sprite, frame] = globalContainer->terrainCompositor().editorIcon(
+			me.view.scene->map.terrainRegistry().appearance(type));
+		globalContainer->gfx->drawSprite(area.x,area.y,sprite,frame);
+    }
 	if(terrainType==Wheat)
 		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->resources, 19);
 	if(terrainType==Trees)
@@ -98,14 +102,57 @@ void TerrainSelector::draw()
 		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->resources, 59);
 	if(terrainType==PruneTree)
 		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->resources, 64);
-	if (terrainType == Grass || terrainType == Sand || terrainType == Water)
-		globalContainer->gfx->finishDrawingSprite(globalContainer->terrain, 255);
+	if (TerrainSelector::isBaseTerrain(terrainType))
+		{
+        const auto type = TerrainSelector::baseTerrain(terrainType);
+		globalContainer->gfx->finishDrawingSprite(
+			globalContainer->terrainCompositor()
+				.editorIcon(me.view.scene->map.terrainRegistry().appearance(type))
+				.first,
+			255);
+	}
 	else
 		globalContainer->gfx->finishDrawingSprite(globalContainer->resources, 255);
-	if (me.terrainType == terrainType)
+	// Legacy and registry selectors for one resource are the same brush.
+	if (me.canonicalSelector(me.terrainType) == me.canonicalSelector(terrainType))
 	{
 		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->gamegui, 22);
 		globalContainer->gfx->finishDrawingSprite(globalContainer->gamegui, 255);
+	}
+}
+
+TerrainGroupSelector::TerrainGroupSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, TerrainGroup catalogueGroup, ::TerrainType fallback)
+	: MapEditorWidget(me, area, group, name, action), catalogueGroup(catalogueGroup), fallback(fallback)
+{
+}
+
+void TerrainGroupSelector::draw()
+{
+	::TerrainType shown = fallback;
+	bool active = false;
+	if (TerrainSelector::isBaseTerrain(me.terrainType))
+	{
+		const auto type = TerrainSelector::baseTerrain(me.terrainType);
+		if (unsigned(type) < TERRAIN_COUNT && terrainGroup(type) == catalogueGroup)
+		{
+			shown = type;
+			active = true;
+		}
+	}
+	const auto [sprite, frame] = globalContainer->terrainCompositor().editorIcon(
+		me.view.scene->map.terrainRegistry().appearance(shown));
+	globalContainer->gfx->drawSprite(area.x, area.y, sprite, frame);
+	globalContainer->gfx->finishDrawingSprite(sprite, 255);
+	if (active)
+	{
+		globalContainer->gfx->drawSprite(area.x, area.y, globalContainer->gamegui, 22);
+		globalContainer->gfx->finishDrawingSprite(globalContainer->gamegui, 255);
+	}
+	// Three stacked bars in the corner: this brush opens the group's palette section.
+	for (int i = 0; i < 3; ++i)
+	{
+		globalContainer->gfx->drawFilledRect(area.x + area.width - 11, area.y + area.height - 10 + i * 3, 8, 2, GAGCore::Color(20, 20, 24));
+		globalContainer->gfx->drawFilledRect(area.x + area.width - 10, area.y + area.height - 11 + i * 3, 8, 2, GAGCore::Color(236, 232, 220));
 	}
 }
 

@@ -6,7 +6,7 @@
 #include <GAGSys.h>
 #include <vector>
 
-class Game;
+struct PresentationFrame;
 
 /// Returns true if two ranges laid out on a wrapping (toroidal) map axis of
 /// length `modulus` share at least one cell. A range is the `len` consecutive
@@ -31,10 +31,8 @@ inline bool wrappedRangesOverlap(int aStart, int aLen, int bStart, int bLen, int
 /// tile of its top-left corner.
 struct GhostBuilding
 {
-	/// Index into globalContainer->buildingsTypes, resolved once by
-	/// BuildingsTypes::getPlaceableTypeNum at the moment the placement was
-	/// ordered. These IDs are positions in a const table, so they stay valid
-	/// for the life of the process.
+	/// Index into the owning game's immutable building catalog, resolved when
+	/// placement is ordered. Valid for that game's lifetime.
 	Sint32 typeNum;
 	/// Top-left corner of the footprint, in map tiles. Not wrapped — callers
 	/// wrap on use.
@@ -52,9 +50,6 @@ struct GhostBuilding
 class GameGUIGhostBuildingManager
 {
 public:
-	///Constructs the manager
-	GameGUIGhostBuildingManager(Game& game);
-
 	///Adds the building to be drawn, and the x and y positions on the map.
 	///typeNum must already be resolved by BuildingsTypes::getPlaceableTypeNum.
 	///Storing the resolved variant rather than its name keeps every later query
@@ -62,7 +57,7 @@ public:
 	void addBuilding(Sint32 typeNum, int x, int y);
 
 	///Returns true if there is a ghost building covering the given square
-	bool isGhostBuilding(int x, int y, int w, int h);
+	bool isGhostBuilding(const PresentationFrame& scene, int x, int y, int w, int h) const;
 
 	///Removes every ghost whose top-left corner is exactly (x, y). Ghosts are
 	///keyed on position alone — the type is not compared — because the only
@@ -71,8 +66,7 @@ public:
 	void removeBuilding(int x, int y);
 
 	///Draws to the map
-	void drawAll(int viewportX, int viewportY, int localTeamNo);
+	void drawAll(const PresentationFrame& scene, int viewportX, int viewportY, int localTeamNo, int displayW, int displayH);
 private:
-	Game& game;
 	std::vector<GhostBuilding> buildings;
 };

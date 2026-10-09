@@ -148,6 +148,8 @@ void ChooseMapScreen::selectFile(const std::string &mapFileName)
 			mapHeader.setFileNameOverride(mapFileName);
 			if (!parametersOnly)
 				mapHeader.setMapName(glob2FilenameToName(mapFileName));
+            if (validMapSelected && !mapHeader.requiredTerrainExperiments.empty())
+                mapExperiments = tr("[Experiments]") + ": " + experimentLabelList(mapHeader.requiredTerrainExperiments);
 			if (validMapSelected && activeType() == GAME)
 			{
 				// A save keeps the experiments it was started with, whatever the
@@ -156,7 +158,8 @@ void ChooseMapScreen::selectFile(const std::string &mapFileName)
 				try
 				{
 					GameHeader saved;
-					if (saved.load(stream.get(), mapHeader.getVersionMinor()) && !saved.getExperiments().empty())
+					mapHeader.resolveGrowthLayout(stream.get());
+					if (saved.load(stream.get(), mapHeader.loadingVersion(), mapHeader.historicalGrowthLayout ? mapHeader.getVersionMinor() : 0) && !saved.getExperiments().empty())
 						mapExperiments = tr("[Experiments]") + ": " + experimentLabelList(saved.getExperiments());
 				}
 				catch (std::exception &)

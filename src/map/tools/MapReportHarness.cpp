@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "MapReport.h"
+#include "MapImage.h"
 #include <string>
 #include <cstdio>
 #include <exception>
@@ -17,6 +18,7 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include <nlohmann/json.hpp>
 
 GlobalContainer *globalContainer = nullptr;
 
@@ -38,8 +40,8 @@ void emit(Game &game, const std::filesystem::path &path)
 {
 	game.mapHeader.setMapName("A \"quoted\" map\n\xc3\xa9");
 	// Deliberately non-derived cache values must survive analysis unchanged.
-	for (size_t p = 0; p < game.map.tiles.size(); ++p)
-		game.map.tiles[p].fertility = p % 50000;
+	for (size_t p = 0; p < game.map.cellCount(); ++p)
+		game.map.setFertility(p % game.map.getW(), p / game.map.getW(), p % 50000);
 	game.map.fertilityMaximum = 54321;
 	// First save establishes the map offset used by the serializer's content hash.
 	serialize(game);
@@ -48,8 +50,8 @@ void emit(Game &game, const std::filesystem::path &path)
 	const auto json = describeMap(game);
 	require(syncRandEngine() == rng, "Report consumed simulation RNG");
 	require(game.map.fertilityMaximum == 54321, "Report changed fertility maximum");
-	for (size_t p = 0; p < game.map.tiles.size(); ++p)
-		require(game.map.tiles[p].fertility == p % 50000, "Report changed stored fertility");
+	for (size_t p = 0; p < game.map.cellCount(); ++p)
+		require(game.map.getTile(p).fertility == p % 50000, "Report changed stored fertility");
 	require(serialize(game) == before, "Report changed serialized game state");
 	std::ofstream out(path);
 	out << json;
@@ -85,25 +87,51 @@ int main(int argc, char **argv)
 			game.map.setSize(6, 6, GRASS);
 			game.map.setGame(&game);
 			teams(game, 0, 63);
-			game.map.getResource(5, 5) = {WOOD, 0, 3, 0};
-			game.map.getResource(7, 5) = {WHEAT, 0, 7, 0};
+			game.map.replaceResource(5, 5, {WOOD, 0, 3, 0});
+			game.map.replaceResource(7, 5, {WHEAT, 0, 5, 0});
 			emit(game, std::filesystem::path(argv[1]) / "grass.json");
+			// Single vertices, far enough apart that each makes its own four
+			// mixed cells with the surrounding grass.
+			game.map.setVertexTerrain(20, 20, ICE);
+			game.map.setVertexTerrain(22, 20, TRAIL);
+			game.map.setVertexTerrain(24, 20, SAND);
+			game.map.setVertexTerrain(26, 20, WATER);
+			emit(game, std::filesystem::path(argv[1]) / "materials.json");
+		}
+		{
+			Game game(nullptr);
+			game.map.setSize(6, 6, GRASS);
+			game.map.setGame(&game);
+			teams(game, 0, 63);
+			auto catalog = nlohmann::json::parse(game.map.resourceRegistry().serialize());
+			auto mixed = catalog["resources"][0];
+			mixed["key"] = "wood"; // Deliberately collides with the legacy trees alias.
+			mixed["properties"]["primaryMaterial"] = "food";
+			mixed["yields"]["food"] = mixed["yields"]["wood"];
+			mixed["yields"]["food"]["initial"] = 2;
+			mixed["yields"]["wood"]["initial"] = 3;
+			catalog["resources"] = nlohmann::json::array({mixed});
+			game.map.installResourceDefinitions(catalog.dump());
+			const auto id = *game.map.resourceRegistry().find("wood");
+			game.map.replaceResource(5, 5, {static_cast<Uint16>(resourceIndex(id)), 0, 5, 0});
+			game.map.setMaterialAmount(5 + 5 * game.map.getW(), MaterialId::Food, 2);
+			game.map.setMaterialAmount(5 + 5 * game.map.getW(), MaterialId::Wood, 3);
+			emit(game, std::filesystem::path(argv[1]) / "compound.json");
 		}
 		{
 			Game game(nullptr);
 			game.map.setSize(6, 6, WATER);
 			game.map.setGame(&game);
-			for (int x : {1, 3})
-			{
-				game.map.setTerrain(x, 1, 0);
-				game.map.setUMTerrain(x, 1, GRASS);
-			}
+			// One grass corner makes cells (1,1) and (3,1) walkable; every corner
+			// of cell (2,1) between them stays water.
+			game.map.setVertexTerrain(1, 1, GRASS);
+			game.map.setVertexTerrain(4, 1, GRASS);
 			teams(game, 1, 3);
 			emit(game, std::filesystem::path(argv[1]) / "islands.json");
 			for (int y = 0; y < 3; ++y)
 				for (int x = 0; x < 3; ++x)
 					if (x != 1 || y != 1)
-						game.map.getResource(x, y) = {ALGA, 0, 1, 0};
+						game.map.replaceResource(x, y, {ALGA, 0, 1, 0});
 			emit(game, std::filesystem::path(argv[1]) / "algae-ring.json");
 		}
 		{
@@ -127,6 +155,37 @@ int main(int argc, char **argv)
 			std::ofstream out(std::filesystem::path(argv[1]) / "failure.json");
 			out << describeGenerationFailure(request, result);
 			require(bool(out), "Cannot write failure fixture");
+		}
+		{
+			Game source(nullptr);
+			source.map.setSize(6, 6, GRASS);
+			source.map.setGame(&source);
+			source.addTeam();
+			source.teams[0]->startPosSet = 1;
+			source.teams[0]->startPosX = source.teams[0]->startPosY = 32;
+			for (int y = 0; y < 64; ++y)
+				for (int x = 0; x < 64; ++x)
+					if ((x < 12 && y >= 8 && y < 16) || (x >= 52 && y >= 11 && y < 19))
+						source.map.replaceResource(x, y, {WOOD, 0, 3, 0});
+			const auto path = std::filesystem::path(argv[1]) / "configured-seams.png";
+			exportMapImage(source, path.string());
+			for (bool spreading : {true, false})
+			{
+				Game imported(nullptr);
+				auto catalog = nlohmann::json::parse(imported.map.resourceRegistry().serialize());
+				if (!spreading)
+				{
+					catalog["resources"][0]["properties"]["spreadRate"] = 0;
+					imported.map.installResourceDefinitions(catalog.dump());
+				}
+				GenerationRequest request;
+				request.wDec = request.hDec = 6;
+				MapImageImportReport report;
+				importMapImage(imported, path.string(), request, 1, report, 8);
+				require(!report.resourceSeamFallback, "Configured seam repair unexpectedly rolled back");
+				require(spreading ? report.seamResourceChanges > 0 : report.seamResourceChanges == 0,
+					"Image seam eligibility ignored configured spreading");
+			}
 		}
 		for (int variant = 0; variant < 4; ++variant)
 		{

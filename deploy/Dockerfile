@@ -4,6 +4,8 @@
 #
 #   target        image                         contents
 #   platform      glob2-platform                platform-api, platform-worker and the operator CLI
+#   skin-render-worker glob2-skin-render-worker   isolated OpenGL sprite generation
+#   music-worker  glob2-music-worker            isolated community audio conversion
 #   engine-agent  glob2-engine-agent:<simver>   engine-agent + headless glob2 + data (one per sim version)
 #   relay         glob2-relay                   glob2-relay
 #   caddy         glob2-caddy                   Caddy + Caddyfile + built apps/web
@@ -24,7 +26,7 @@ COPY . /
 
 FROM ${UBUNTU_IMAGE} AS cpp-deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git g++ make nasm python3 scons pkg-config cmake libfreetype-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev \
+    ca-certificates git g++ make nasm python3 python3-venv scons pkg-config cmake libfreetype-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev \
     libboost-dev libssl-dev zlib1g-dev \
     libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxfixes-dev libxss-dev libxtst-dev \
     libfribidi-dev libpcre3-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev \
@@ -73,7 +75,7 @@ RUN --mount=type=cache,id=glob2-engine-build-${TARGETARCH},target=/source/build,
     cp build/linux/client/release/src/glob2 /output/bin/ && strip /output/bin/glob2 && \
     cp -a build/sdl3/prefix/lib/libSDL3* /output/lib/glob2/ && \
     cp -a build/sdl3/prefix/share/licenses /output/licenses && \
-    cp -r data maps campaigns scripts /output/share/ && \
+    cp -a build/linux/client/release/runtime-assets/. /output/share/ && \
     find /output/share -name SConscript -delete && \
     python3 /usr/local/bin/glob2-sim-version /source --expect "${GLOB2_SIM_VERSION}" > /output/sim-version && \
     python3 /usr/local/bin/glob2-sim-version /source --hash-only > /output/sim-data-hash && \
@@ -93,6 +95,15 @@ COPY platform/packages/engine/package.json packages/engine/
 COPY platform/packages/hive/package.json packages/hive/
 COPY platform/packages/billing/package.json packages/billing/
 COPY platform/packages/map-studio/package.json packages/map-studio/
+COPY platform/packages/music/package.json packages/music/
+COPY platform/packages/music-studio/package.json packages/music-studio/
+COPY platform/packages/terrain-studio/package.json packages/terrain-studio/
+COPY platform/packages/building-studio/package.json packages/building-studio/
+COPY platform/apps/ai-building-worker/package.json apps/ai-building-worker/
+COPY platform/apps/ai-terrain-worker/package.json apps/ai-terrain-worker/
+COPY platform/apps/ai-music-worker/package.json apps/ai-music-worker/
+COPY platform/apps/music-worker/package.json apps/music-worker/
+COPY platform/apps/skin-render-worker/package.json apps/skin-render-worker/
 COPY platform/apps/ai-map-worker/package.json apps/ai-map-worker/
 COPY platform/apps/api/package.json apps/api/
 COPY platform/apps/worker/package.json apps/worker/
@@ -100,14 +111,28 @@ COPY platform/apps/engine-agent/package.json apps/engine-agent/
 COPY platform/apps/web/package.json apps/web/
 RUN --mount=type=cache,id=glob2-npm,target=/root/.npm npm ci --no-audit --no-fund
 
+FROM cpp-base AS music-web-build
+RUN apt-get update && apt-get install -y --no-install-recommends autoconf automake libtool xz-utils && rm -rf /var/lib/apt/lists/*
+RUN python3 tools/music/build_web.py
+
 FROM node-deps AS web-build
 # Optional links from the web app to a separately hosted public website and its
 # download page (docs/hosting/README.md); empty keeps the defaults.
 ARG GLOB2_WEBSITE_URL=
 ARG GLOB2_DOWNLOAD_URL=
 COPY platform/ ./
+COPY examples/javascript /app/examples/javascript
+COPY data/generators/toolkit.d.ts /app/data/generators/toolkit.d.ts
+# Colony Studio imports the game's material shader raw (materialShader.ts).
+COPY libgag/shaders /app/libgag/shaders
+# The navigation shares the game's Tabler icon sources (src/icons.tsx).
+COPY datasrc/icons/tabler /app/datasrc/icons/tabler
+# Set authoring and Terrain Studio import the shared resource registry.
+COPY data/resources/registry.json /app/data/resources/registry.json
+COPY --from=music-web-build /source/platform/apps/web/public/music/decoder.js apps/web/public/music/decoder.js
+COPY --from=music-web-build /source/platform/apps/web/public/music/decoder.wasm apps/web/public/music/decoder.wasm
 RUN VITE_WEBSITE_URL="$GLOB2_WEBSITE_URL" VITE_DOWNLOAD_URL="$GLOB2_DOWNLOAD_URL" \
-    npm run build --workspace @glob2/web
+    npm exec --workspace @glob2/web -- vite build
 
 FROM node-deps AS platform-runtime-deps
 RUN --mount=type=cache,id=glob2-npm,target=/root/.npm npm ci --omit=dev --no-audit --no-fund
@@ -115,8 +140,13 @@ COPY platform/tsconfig.base.json platform/tsconfig.json ./
 COPY platform/packages packages
 COPY platform/apps/api apps/api
 COPY platform/apps/worker apps/worker
+COPY platform/apps/music-worker apps/music-worker
+COPY platform/apps/skin-render-worker apps/skin-render-worker
 COPY platform/apps/engine-agent apps/engine-agent
 COPY platform/apps/ai-map-worker apps/ai-map-worker
+COPY platform/apps/ai-music-worker apps/ai-music-worker
+COPY platform/apps/ai-terrain-worker apps/ai-terrain-worker
+COPY platform/apps/ai-building-worker apps/ai-building-worker
 # Node strips types at run time; tests and the web sources are not needed.
 RUN rm -rf packages/*/test apps/*/test && \
     find packages apps -name '*.test.ts' -delete
@@ -132,6 +162,12 @@ RUN groupadd --gid 10001 glob2 && useradd --uid 10001 --gid 10001 --no-create-ho
     chown -R 10001:10001 /var/lib/glob2 && \
     chmod 700 /var/lib/glob2/keys /var/lib/glob2/relay /var/lib/glob2/engine-agent /var/lib/glob2/db/*
 COPY --from=platform-runtime-deps /app/platform /app/platform
+COPY examples/javascript /app/examples/javascript
+COPY data/resources/registry.json /app/data/resources/registry.json
+COPY docs/development/javascript.md docs/development/javascript-api.md /app/docs/development/
+COPY docs/map-generators/JAVASCRIPT.md /app/docs/map-generators/JAVASCRIPT.md
+COPY data/generators/toolkit.d.ts /app/data/generators/toolkit.d.ts
+COPY data/generators/examples/swamp /app/data/generators/examples/swamp
 COPY deploy/platform-init.sh /usr/local/bin/glob2-platform-init
 RUN printf '#!/bin/sh\nexec node /app/platform/apps/api/src/cli.ts "$@"\n' > /usr/local/bin/platform && \
     chmod 755 /usr/local/bin/platform /usr/local/bin/glob2-platform-init
@@ -166,7 +202,7 @@ CMD ["glob2-relay"]
 FROM ${NODE_IMAGE} AS node-binary
 FROM ${UBUNTU_IMAGE} AS engine-agent
 ARG GLOB2_SIM_VERSION=
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates bubblewrap \
     libfreetype6 libopusfile0 libopus0 libogg0 libspeex1 libfribidi0 libpcre3 libepoxy0 \
     libgl1 libglu1-mesa libssl3t64 zlib1g \
     && rm -rf /var/lib/apt/lists/* \
@@ -175,6 +211,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && chmod 700 /var/lib/glob2/engine-agent
 COPY --from=node-binary /usr/local/bin/node /usr/local/bin/node
 COPY --from=platform-runtime-deps /app/platform /app/platform
+COPY examples/javascript /app/examples/javascript
+COPY data/resources/registry.json /app/data/resources/registry.json
+COPY docs/development/javascript.md docs/development/javascript-api.md /app/docs/development/
 COPY --from=engine-build /output/bin/glob2 /opt/glob2/bin/glob2
 COPY --from=engine-build /output/lib/glob2 /opt/glob2/lib/glob2
 COPY --from=engine-build /output/licenses /usr/local/share/licenses
@@ -202,9 +241,94 @@ ENV GLOB2_SOURCE_DIR=/opt/glob2/share
 USER 10001:10001
 CMD ["node", "apps/ai-map-worker/src/main.ts"]
 
+# Terrain Studio shares the engine validator and pinned material production helpers.
+FROM engine-agent AS ai-terrain-worker
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -m venv /opt/terrain
+COPY tools/asset-requirements.txt /tmp/terrain-requirements.txt
+RUN /opt/terrain/bin/pip install --no-cache-dir -r /tmp/terrain-requirements.txt
+COPY tools/artwork/material_tiles.py tools/artwork/terrain_studio.py /opt/glob2/share/tools/artwork/
+ENV GLOB2_SOURCE_DIR=/opt/glob2/share TERRAIN_PYTHON=/opt/terrain/bin/python
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD node -e "const t=Number(require('fs').readFileSync('/tmp/glob2-ai-terrain-health','utf8'));process.exit(Date.now()-t<90000?0:1)"
+CMD ["node", "apps/ai-terrain-worker/src/main.ts"]
+
+# Building authoring uses the matching native catalog validator and source examples.
+FROM engine-agent AS ai-building-worker
+USER root
+COPY docs/features/building-catalogs.md /opt/glob2/share/docs/features/building-catalogs.md
+COPY data/gfx/inn0b0.png data/gfx/inn0b0r.png data/gfx/hosp0b0.png data/gfx/hosp0b0r.png data/gfx/defencetower0b0.png data/gfx/defencetower0b0r.png /opt/glob2/share/studio/building-references/
+ENV GLOB2_SOURCE_DIR=/opt/glob2/share
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD node -e "const t=Number(require('fs').readFileSync('/tmp/glob2-ai-building-health','utf8'));process.exit(Date.now()-t<90000?0:1)"
+CMD ["node", "apps/ai-building-worker/src/main.ts"]
+
 FROM ${CADDY_IMAGE} AS caddy
 RUN setcap -r /usr/bin/caddy && chown -R 10001:10001 /data /config
 USER 10001:10001
 COPY deploy/Caddyfile /etc/caddy/Caddyfile
 COPY --from=web-build /app/platform/apps/web/dist /srv/web
 # The WebAssembly client is mounted at /srv/play (see docs/hosting/README.md).
+
+# Community music conversion runs independently of simulation-version agents.
+FROM platform AS music-worker
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3 python3-numpy python3-scipy python3-soundfile python3-pip python3-venv && rm -rf /var/lib/apt/lists/*
+RUN python3 -m venv --system-site-packages /opt/music && /opt/music/bin/pip install --no-cache-dir pyloudnorm==0.1.1
+COPY tools/encode_music.py /app/tools/encode_music.py
+COPY tools/music/glob2music /app/tools/music/glob2music
+ENV MUSIC_PYTHON=/opt/music/bin/python
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD node -e "const t=Number(require('fs').readFileSync('/tmp/glob2-music-worker-health','utf8'));process.exit(Date.now()-t<90000?0:1)"
+CMD ["node", "apps/music-worker/src/main.ts"]
+
+# Presentation baking uses the production client GL renderer under llvmpipe.
+FROM engine-agent AS skin-render-worker
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglu1-mesa libepoxy0 libgl1-mesa-dri libx11-6 libxext6 libxcursor1 libxi6 libxrandr2 libxfixes3 libxss1 libxtst6 xvfb xauth && rm -rf /var/lib/apt/lists/*
+ENV LD_LIBRARY_PATH=/opt/glob2/lib/glob2 SDL_VIDEODRIVER=x11 LIBGL_ALWAYS_SOFTWARE=1 LP_NUM_THREADS=2
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s CMD node -e "const t=Number(require('fs').readFileSync('/tmp/glob2-skin-render-health','utf8'));process.exit(Date.now()-t<90000?0:1)"
+COPY deploy/skin-render-entrypoint.sh /usr/local/bin/glob2-skin-render-entrypoint
+ENTRYPOINT ["/usr/local/bin/glob2-skin-render-entrypoint"]
+CMD ["node", "apps/skin-render-worker/src/main.ts"]
+
+# Optional CPU-only composition service. No models, CUDA, or engine binary.
+FROM ${UBUNTU_IMAGE} AS ai-music-runtime
+USER root
+ARG TARGETARCH
+RUN test "$TARGETARCH" = amd64 && apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg python3 python3-pip python3-venv bubblewrap util-linux cmake g++ make pkg-config \
+    libsndfile1-dev libx11-6 libxext6 libfreetype6 libfontconfig1 libglib2.0-0 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY tools/music/requirements.txt tools/music/requirements-synth.txt /tmp/music-requirements/
+RUN python3 -m venv /opt/music && /opt/music/bin/pip install --no-cache-dir -r /tmp/music-requirements/requirements-synth.txt
+COPY tools/music/glob2music /app/tools/music/glob2music
+COPY tools/music/sets /app/tools/music/sets
+COPY tools/music/requirements.txt tools/music/requirements-synth.txt /app/tools/music/
+COPY tools/encode_music.py /app/tools/encode_music.py
+COPY docs/assets/music-style-guide.md /app/docs/assets/music-style-guide.md
+ENV PYTHONPATH=/app/tools/music MUSIC_ROOT=/app/tools/music MUSIC_ASSETS=/opt/music-assets MUSIC_PYTHON=/opt/music/bin/python
+RUN --mount=type=cache,id=glob2-music-assets,target=/var/cache/glob2music \
+    /opt/music/bin/python -m glob2music.studio.install_assets /var/cache/glob2music && \
+    cp -a /var/cache/glob2music /opt/music-assets
+
+# The child filesystem omits /etc. Canonicalize distro library alternatives so
+# FFmpeg's transitive BLAS/LAPACK dependencies resolve entirely beneath /usr.
+RUN find /usr/lib -type l -lname '/etc/alternatives/*' -exec sh -ec \
+    'for link do target="$(readlink -f "$link")"; case "$target" in /usr/*) ;; *) exit 1;; esac; ln -sf "$target" "$link"; done' sh {} +
+
+FROM ai-music-runtime AS ai-music-worker
+COPY --from=node-binary /usr/local/bin/node /usr/local/bin/node
+RUN groupadd --gid 10001 glob2 && useradd --uid 10001 --gid 10001 --no-create-home --home-dir /nonexistent glob2 && \
+    mkdir -p /var/lib/glob2/blobs && chown 10001:10001 /var/lib/glob2/blobs
+COPY --from=platform-runtime-deps /app/platform /app/platform
+# Shared protocol set-authoring imports the registry when the worker starts.
+COPY data/resources/registry.json /app/data/resources/registry.json
+ENV NODE_ENV=production BLOB_STORE=fs BLOB_DIR=/var/lib/glob2/blobs
+WORKDIR /app/platform
+USER 10001:10001
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s CMD node -e "const t=Number(require('fs').readFileSync('/tmp/glob2-ai-music-health','utf8'));process.exit(Date.now()-t<90000?0:1)"
+CMD ["node", "apps/ai-music-worker/src/main.ts"]

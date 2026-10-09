@@ -19,10 +19,10 @@ class Order;
 //! Malformed or truncated replay bodies are rejected, including partial recordings.
 
 //! Oldest replay format (the VERSION_MINOR the replay was written with) that
-//! the reader still accepts. Version 127 expands team capacity and serialized
-//! state/checksum layouts; older replay headers describe the previous capacity.
+//! the reader still accepts. Version 152 moves world/story decisions onto
+//! private salted PCG32 streams, changing all earlier replay trajectories.
 //! Save compatibility has a separate floor in Version.h.
-static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = 127;
+static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = 152;
 
 /// This class is used for reading replays.
 /// The replay stream is kept open and read every time you do retrieveOrder.

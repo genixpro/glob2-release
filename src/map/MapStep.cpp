@@ -4,7 +4,7 @@
 #include <PerformanceTelemetry.h>
 #include "Map.h"
 #include "gradient/GradientRuntime.h"
-#include "field/GradientPropagation.h"
+#include "field/RuntimeTerrainGradient.h"
 #include "Game.h"
 #include "Utilities.h"
 #include "GlobalContainer.h"
@@ -14,87 +14,72 @@
 
 #include <algorithm>
 #include <tuple>
+#include <utility>
 
 
 // growResources, syncStep, fog of war, discovery, explored area
 
+void Fertility::applyGrowthOpportunities(Map& map,int x,int y,std::uint32_t rate,int scarcity)
+{
+    static_assert(MersenneTwister::min()==0 && MersenneTwister::max()==UINT32_MAX);
+    assert(scarcity>=1);
+    const unsigned opportunities=growthOpportunities(rate,[&]{return map.privateRandom(RandomDomain::ReferenceGrowth).nextU32();});
+    for(unsigned attempt=0;attempt<opportunities;++attempt)
+    {
+        if(scarcity!=1 && map.privateRandom(RandomDomain::ReferenceGrowth).nextU32()%scarcity!=0) continue;
+        // Re-read the source after each attempt: growth can change its amount.
+        const Resource& resource=map.getResource(x,y);
+        if(resource.type==NO_RES_TYPE) break;
+        const auto& properties=map.resourcePropertiesByIndex(resource.type);
+        const bool growsHere=!properties.stockDependentGrowth || resource.amount <= map.privateRandom(RandomDomain::ReferenceGrowth).nextU32()%properties.stockBranchDivisor;
+        if(growsHere)
+        {
+            if(map.canResourcesGrow(x,y))
+            {
+                const int type=resource.type;
+                const auto stocks=map.materialStocksAt(map.coordToIndex(x,y));
+                if (map.incResourceByIndex(x,y,type,resource.variety))
+                    map.recordNaturalGrowth(x,y,type,type,stocks);
+            }
+        }
+        if(properties.spreadRate && (!properties.stockDependentGrowth || !growsHere))
+        {
+            const auto spreads=Fertility::growthOpportunities(properties.spreadRate,[&]{return map.privateRandom(RandomDomain::ReferenceGrowth).nextU32();});
+            for (unsigned spread=0;spread<spreads;++spread)
+            {
+                int dx,dy;
+                Unit::dxDyFromDirection(map.privateRandom(RandomDomain::ReferenceGrowth).nextU32()&7,&dx,&dy);
+                const int nx=x+dx,ny=y+dy;
+                if(map.canResourcesGrow(nx,ny))
+                {
+                    const auto& before=map.getResource(nx,ny);
+                    const int oldType=before.type,type=resource.type;
+                    const auto stocks=map.materialStocksAt(map.coordToIndex(nx,ny));
+                    if (map.incResourceByIndex(nx,ny,type,resource.variety))
+                        map.recordNaturalGrowth(nx,ny,type,oldType,stocks);
+                }
+            }
+        }
+    }
+}
+
+// Immediate reference path for tests and benchmarks. Production ticks use the
+// snapshot pipeline; calling both would apply growth twice.
 void Map::growResources(void)
 {
-	if (game->gameHeader.isResourceGrowthDisabled())
-		return;
-	rebuildGrowthCoverage();
-	// Custom-game "scarce resources" rule: an extra grow/extend probability
-	// divisor, stacking with (not replacing) corn's own CORN_GROWTH_DIVISOR
-	// roll below, applied uniformly to every resource type.
-	static constexpr int scarcityDivisor[] = {1, 2, 4, 8};
-	const int scarcity = scarcityDivisor[game->gameHeader.getResourceScarcityLevel()];
-
-	int dy=(syncRand()&0x3);
-	for (int y=dy; y<h; y+=4)
-	{
-		for (int x=(syncRand()&0xF); x<w; x+=(syncRand()&0x1F))
-		{
-			const Resource &r = getResource(x, y);
-			if (r.type!=NO_RES_TYPE)
-			{
-				// we look around to see if there is any water :
-				// TODO: uses UnderMap.
-				int dwax=(syncRand()&0xF)-(syncRand()&0xF);
-				int dway=(syncRand()&0xF)-(syncRand()&0xF);
-				int wax1=x+dwax;
-				int way1=y+dway;
-
-				int wax2=x+dway*2;
-				int way2=y+dwax*2;
-
-				int wax3=x-dwax;
-				int way3=y-dway;
-
-				// alga, wood and wheat are limited by near underground. Others are not.
-				bool expand=true;
-				if (r.type == ALGA)
-					expand = isWater(wax1, way1) && isSand(wax2, way2);
-				else if (r.type == WOOD)
-					expand = isWater(wax1, way1) && (!isSand(wax3, way3));
-				else if (r.type == WHEAT)
-					expand = isWater(wax1, way1) && (!isSand(wax3, way3));
-
-				// Growth rate of wheat is 1/WHEAT_GROWTH_DIVISOR
-				if(r.type == WHEAT && expand)
-					if(syncRand() % WHEAT_GROWTH_DIVISOR != 0)
-						expand = false;
-
-				if (expand && (scarcity==1 || syncRand()%scarcity==0))
-				{
-					if (r.amount<=(syncRand()&7))
-					{
-						// we grow resource:
-						if(canResourcesGrow(x, y))
-						{
-							const int beforeType = r.type, beforeAmount = r.amount;
-							incResource(x, y, beforeType, r.variety);
-							recordNaturalGrowth(x,y,beforeType,beforeType,beforeAmount);
-						}
-					}
-					else if (globalContainer->resourcesTypes.get(r.type)->expendable)
-					{
-						// we extend resource:
-						int dx, dy;
-						Unit::dxDyFromDirection((syncRand()&7), &dx, &dy);
-						int nx=x+dx;
-						int ny=y+dy;
-						if(canResourcesGrow(nx, ny))
-						{
-							const Resource &before = getResource(nx, ny);
-							const int beforeType = before.type, beforeAmount = before.amount;
-							incResource(nx, ny, r.type, r.variety);
-							recordNaturalGrowth(nx,ny,r.type,beforeType,beforeAmount);
-						}
-					}
-				}
-			}
-		}
-	}
+    if(game->gameHeader.isResourceGrowthDisabled()) return;
+    rebuildGrowthCoverage();
+    static constexpr int scarcityDivisor[]={1,2,4,8};
+    const int scarcity=scarcityDivisor[game->gameHeader.getResourceScarcityLevel()];
+    const int firstY=privateRandom(RandomDomain::ReferenceGrowth).nextU32()&3;
+    for(int y=firstY;y<h;y+=4)
+        for(int x=privateRandom(RandomDomain::ReferenceGrowth).nextU32()&15;x<w;x+=privateRandom(RandomDomain::ReferenceGrowth).nextU32()&31)
+        {
+            const auto& resource=getResource(x,y);
+            if(resource.type!=NO_RES_TYPE)
+                Fertility::applyGrowthOpportunities(*this,x,y,
+                    resourceGrowthRateAt(coordToIndex(x,y),resource.type),scarcity);
+        }
 }
 
 void Map::rebuildGrowthCoverage()
@@ -196,34 +181,47 @@ void Map::rebuildGrowthCoverage()
 	}
 }
 
-void Map::recordNaturalGrowth(int x, int y, int resourceType, int oldType, int oldAmount)
+void Map::recordNaturalGrowth(int x,int y,int resourceType,int oldType,int oldAmount)
 {
-	const Resource &after = getResource(x,y);
-	if (resourceType < 0 || resourceType >= MAX_NB_RESOURCES) return;
-	const int tiles = oldType == NO_RES_TYPE && after.type == resourceType;
-	const int delta = after.amount - (tiles ? 0 : oldAmount);
-	if (!tiles && !delta) return;
-	const size_t index = size_t(y & hMask) * w + (x & wMask);
-	const Uint64 packed = growthCoverage[index];
-	Uint32 masks[GROWTH_COVERAGE_BANDS];
-	for (int band = 0; band < GROWTH_COVERAGE_BANDS; ++band)
-		masks[band] = Uint32(packed >> (band * Team::MAX_COUNT));
-	for (int t = 0; t < game->mapHeader.getNumberOfTeams(); ++t)
-	{
-		Team *team = game->teams[t];
-		if (!team) continue;
-		auto &m = team->stats.measurements;
-		m.growthGlobal[0][resourceType] += tiles;
-		m.growthGlobal[1][resourceType] += std::max(0,delta);
-		m.growthGlobal[2][resourceType] += std::max(0,-delta);
-		for (int band = 0; band < GROWTH_COVERAGE_BANDS; ++band)
-			if (masks[band] & (Uint32(1) << t))
-			{
-				m.growthTiles[band][resourceType] += tiles;
-				m.growthAmount[band][resourceType] += std::max(0,delta);
-				m.growthReduction[band][resourceType] += std::max(0,-delta);
-			}
-	}
+    std::array<Uint16,MaterialCount> stocks{};
+    if (oldType!=NO_RES_TYPE && resourceRegistry().valid(unsigned(oldType)))
+        stocks[materialIndex(resourcePropertiesByIndex(oldType).primaryMaterial)]=oldAmount;
+    recordNaturalGrowth(x,y,resourceType,oldType,stocks);
+}
+
+void Map::recordNaturalGrowth(int x,int y,int resourceType,int oldType,const std::array<Uint16,MaterialCount>& oldStocks)
+{
+    if (!game || !resourceRegistry().valid(unsigned(resourceType))) return;
+    const auto index=coordToIndex(x,y);
+    const auto& after=resourceCells[index].resource;
+    const bool newTile=oldType==NO_RES_TYPE && after.type==resourceType;
+    const auto stocks=materialStocksAt(index);
+    if (growthCoverage.size()!=size) rebuildGrowthCoverage();
+    const auto packed=growthCoverage[index];
+    MaterialMask changedMaterials=resourcePropertiesByIndex(resourceType).materialMask;
+    if (oldType!=NO_RES_TYPE) changedMaterials|=resourcePropertiesByIndex(oldType).materialMask;
+    for (unsigned mask=changedMaterials;mask;mask&=mask-1)
+    {
+        const auto material=std::countr_zero(mask);
+        const int delta=int(stocks[material])-oldStocks[material];
+        const int added=newTile && stocks[material]>0;
+        if (!delta && !added) continue;
+        for (int t=0;t<game->mapHeader.getNumberOfTeams();++t)
+        {
+            Team* team=game->teams[t]; if (!team) continue;
+            auto& m=team->stats.measurements;
+            m.growthGlobal[0][material]+=added;
+            m.growthGlobal[1][material]+=std::max(0,delta);
+            m.growthGlobal[2][material]+=std::max(0,-delta);
+            for (int band=0;band<GROWTH_COVERAGE_BANDS;++band)
+                if ((packed>>(band*Team::MAX_COUNT))&(Uint64(1)<<t))
+                {
+                    m.growthTiles[band][material]+=added;
+                    m.growthAmount[band][material]+=std::max(0,delta);
+                    m.growthReduction[band][material]+=std::max(0,-delta);
+                }
+        }
+    }
 }
 
 
@@ -235,34 +233,111 @@ Map::GradientPipelineStatus Map::gradientPipelineStatus() const
 	const auto &metrics = pipeline.metrics;
 	return {pipeline.enabled(), pipeline.workerCount(), pipeline.delayTicks(),
 		pipeline.pendingCount(), metrics.jobs, metrics.published, metrics.discarded,
-		metrics.maxPending, metrics.waitNs, pipeline.activeElapsedNs()};
+		metrics.maxPending, metrics.waitNs, pipeline.activeElapsedNs(), metrics.preparationNs};
 }
 
-void Map::advanceGradientPipeline() { gradientRuntime->pipeline.advance(); }
-void Map::finishGradientPipeline() { gradientRuntime->pipeline.finish(); }
-void Map::setGradientWorkerCount(unsigned workers) { gradientRuntime->pipeline.setWorkerCount(workers); }
+bool Map::hasPendingGradientPreparation() const
+{
+	return gradientRuntime->preparation.job != nullptr || !gradientRuntime->stagedBuildings.empty();
+}
+namespace {
+gradient_preparation::Request gradientRequest(const GradientRuntime::Preparation& p, const Map& map)
+{
+    gradient_preparation::Request request;
+    request.kind=p.kind; request.team=p.team; request.material=p.material; request.swim=p.swim;
+    request.terrainBuckets=map.terrainQueueBuckets();
+    if (p.kind == gradient_preparation::Kind::Guard) {
+        request.allies=map.game->teams[p.team]->allies;
+        request.crowding=map.game->gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing);
+    }
+    return request;
+}
+}
+SimulationSnapshot::Requirements Map::pendingGradientRequirements() const
+{
+    // One capture serves the periodic job and every staged building job.
+    const auto periodic=gradientRuntime->preparation.job ? gradientRequest(gradientRuntime->preparation, *this).requirements() : 0;
+    return periodic | pendingBuildingRequirements();
+}
+void Map::preparePendingGradient()
+{
+    if (const auto requirements=pendingGradientRequirements()) {
+        auto& store=game->snapshotStore();
+        store.invalidateBoundary(); // Direct map stepping may not advance Game's tick.
+        preparePendingGradient(store.captureBoundary(*game, requirements));
+    }
+}
+void Map::preparePendingGradient(const SimulationSnapshot::Handle& foundation)
+{
+    if (!hasPendingGradientPreparation()) return;
+    if (!foundation.terrain || foundation.terrain->revision != terrainGeneration() ||
+        foundation.worldIdentity != identity() || foundation.tick != game->stepCounter ||
+        foundation.width != getW() || foundation.height != getH())
+        throw std::invalid_argument("Gradient preparation requires the current observation boundary");
+    prepareStagedBuildingGradients(foundation);
+    if (!gradientRuntime->preparation.job) return;
+    const auto request=gradientRequest(gradientRuntime->preparation, *this);
+    auto projected=foundation.project(request.requirements());
+    auto* job=std::exchange(gradientRuntime->preparation, {}).job;
+    job->request=request;
+    job->snapshotLease=std::move(projected);
+    gradientRuntime->pipeline.prepare(job, [](GradientPipeline::Job& job) {
+        gradient_preparation::seed(job.request, *job.snapshotLease, job.data.get(), *job.crowding);
+    });
+}
+
+void Map::advanceGradientPipeline()
+{
+	preparePendingGradient();
+	ensureBuildingGradientPipeline();
+	gradientRuntime->pipeline.advance();
+	// Building fields publish after the periodic planes, before teams step.
+	if (gradientRuntime->buildings.enabled()) gradientRuntime->buildings.advance();
+}
+void Map::finishGradientPipeline()
+{
+	preparePendingGradient();
+	gradientRuntime->pipeline.finish();
+	gradientRuntime->buildings.finish();
+}
+void Map::resetGradientPipeline() noexcept
+{
+	gradientRuntime->preparation={};
+	gradientRuntime->pipeline.reset();
+	resetBuildingGradientPipeline();
+}
+void Map::setGradientWorkerCount(unsigned workers)
+{
+	preparePendingGradient();
+	gradientRuntime->pipeline.setWorkerCount(workers);
+	gradientRuntime->buildingShared = workers != 0;
+	gradientRuntime->buildings.setWorkerCount(workers);
+}
 
 void Map::configureGradientPipeline(unsigned workers, unsigned delay)
 {
 	if (workers>16 || delay<1 || delay>16) throw std::invalid_argument("Invalid gradient pipeline configuration");
-	gradientRuntime->pipeline.configure(workers, delay, size, [this](GradientPipeline::Job &job, GradientWorkspace &scratch) {
-		const field::Grid geometry{getW(), getH()};
-		if (!job.water)
-			gradient_kernel::propagateField(job.data.get(), job.swim, GRADIENT_COST_LIMIT,
-				geometry, scratch, [this](size_t i) { return isWater(static_cast<unsigned>(i)); });
-		else
-		{
-			const auto *water = job.water->data();
-			gradient_kernel::propagateField(job.data.get(), job.swim, GRADIENT_COST_LIMIT,
-				geometry, scratch, [water](size_t i) { return water[i] != 0; });
-		}
-	});
+	preparePendingGradient();
+	gradientRuntime->buildingShared = workers != 0;
+	if (gradientRuntime->buildings.enabled()) gradientRuntime->buildings.setWorkerCount(workers);
+	ensureBuildingGradientPipeline();
+	gradientRuntime->pipeline.onPublished = [this](Uint16** slot) { publishPlane(slot); };
+	// Staged after tick c-1's step counter advanced to c, a job published
+	// `remaining` advances later is joined at the start of step c+remaining-1.
+	gradientRuntime->pipeline.deadline = [this](unsigned remaining) {
+		return ComputeExecutor::advanceDue(std::uint64_t(game ? game->stepCounter : 0) + remaining - 1);
+	};
+	gradientRuntime->pipeline.configure(compute, workers != 0, delay, size,
+        [](GradientPipeline::Job &job, GradientWorkspace &scratch) {
+            gradient_preparation::propagate(job.request, *job.snapshotLease, job.data.get(), scratch);
+        });
 }
 
-void Map::syncStep(Uint32 stepCounter)
+void Map::syncStep(Uint32 stepCounter, bool preparePeriodic)
 {
+	preparePendingGradient();
 	PERF_SCOPE_TIME(Map);
-	growResources();
+	gradientRuntime->growth.publish(*this, stepCounter);
 	for (int i=0; i<sizeSector; i++)
 		sectors[i].step();
 	game->animations->step();
@@ -296,17 +371,16 @@ void Map::syncStep(Uint32 stepCounter)
 			// MapGradientField.cpp statically asserts EVEN water cost equals land.
 			// Other swimmers can change costs without changing these markers, so
 			// conservatively refresh their scheduled fields unconditionally.
-			bool changed = escapeSwim != 0 && escapeSwim != SWIM_CLASS_EVEN;
+			bool changed = hasTerrainMovementModifiers() || (escapeSwim != 0 && escapeSwim != SWIM_CLASS_EVEN);
 			if (!changed)
 			{
 				const Uint32 teamMask = Team::teamNumberToMask(escapeTeam);
 				for (size_t i = 0; i < size; ++i)
 				{
-					const Tile& tile = tiles[i];
-					const bool blocked = tile.resource.type != NO_RES_TYPE
-						|| tile.building != NOGBID || (escapeSwim == 0 && isWater((unsigned)i))
-						|| immobileUnits[i] != IMMOBILE_UNIT_NONE;
-					const bool goal = !blocked && !(tile.forbidden & teamMask);
+					const bool blocked = resourceBlocksGround(i)
+						|| occupancyCells[i].building != NOGBID || (!terrainPropertiesAt(i).walkable && !(escapeSwim > 0 && terrainPropertiesAt(i).swimmable))
+						|| occupancyCells[i].immobileUnit != IMMOBILE_UNIT_NONE;
+					const bool goal = !blocked && !(areaCells[i].forbidden & teamMask);
 					if ((field[i] == GRADIENT_FORBIDDEN) != blocked
 						|| (field[i] == GRADIENT_AT_GOAL) != goal)
 					{
@@ -322,13 +396,21 @@ void Map::syncStep(Uint32 stepCounter)
 		}
 	}
 
-	auto dispatch = [&](Uint16 **slot, int swim, auto seed) {
-		gradientRuntime->pipeline.submit(slot, swim, [&](GradientPipeline::Job &job) {
-			seed(job.data.get());
-			if (swim != 0 && swim != SWIM_CLASS_EVEN) {
-				job.water = frozenWaterSnapshot();
-			} else job.water.reset();
-		});
+	if (preparePeriodic) { stagePeriodicGradientPreparation(); preparePendingGradient(); }
+}
+
+void Map::stagePeriodicGradientPreparation()
+{
+	preparePendingGradient();
+	// Building requests are admitted first; the periodic job below may return early.
+	stageBuildingGradientPreparation();
+	using Kind = GradientRuntime::Preparation::Kind;
+	// Queue membership and round-robin flags belong to the simulation owner.
+	// Reserve before AI lazy refreshes so invalidation can supersede this job
+	// regardless of which read-phase task starts first.
+	auto dispatch = [&](Uint16 **slot, Kind kind, int team, int material, int swim) {
+		auto *job = gradientRuntime->pipeline.reserve(slot, swim);
+		gradientRuntime->preparation = {job, kind, team, material, swim};
 	};
 	// We only update one gradient per step, round robin over the gradients in use.
 	// Fields are allocated lazily: the second pass runs on freshly reset flags,
@@ -337,20 +419,35 @@ void Map::syncStep(Uint32 stepCounter)
 	{
 		int numberOfTeam=game->mapHeader.getNumberOfTeams();
 		for (int t=0; t<numberOfTeam; t++)
-			for (int r=0; r<MAX_RESOURCES; r++)
+			for (int r=0; r<MaterialCount; r++)
 				for (int s=0; s<SWIM_CLASS_COUNT; s++)
-					if (resourcesGradient[t][r][s] && !gradientUpdated[t][r][s])
+					if (hasMaterialSourceSlot(r) && materialGradients[t][r][s] && !gradientUpdated[t][r][s])
 					{
-						if (gradientRuntime->pipeline.enabled()) dispatch(&resourcesGradient[t][r][s], s, [&](Uint16 *field) { seedResourcesGradient(t, r, s, field); });
-						else updateResourcesGradient(t, r, s);
+						if (gradientRuntime->pipeline.enabled()) dispatch(&materialGradients[t][r][s], Kind::Materials, t, r, s);
+						else updateMaterialGradient(t, r, s);
 						gradientUpdated[t][r][s]=true;
+						return;
+					}
+		// Market fields participate in the same fixed-tick pipeline and round robin.
+		// A stock transition also requests an early refresh.
+		for (int t=0; t<numberOfTeam; t++)
+			for (int r=0; r<MaterialCount; r++)
+				for (int s=0; s<SWIM_CLASS_COUNT; s++)
+					if (marketsV2Enabled() && marketMaterialGradients[t][r][s] && (marketGradientDirty[t][r][s] || !marketGradientUpdated[t][r][s]))
+					{
+						// Stock transitions already invalidate stale snapshots. Regular refreshes
+						// must let earlier jobs publish, even when this is the only field.
+						if (gradientRuntime->pipeline.enabled()) dispatch(&marketMaterialGradients[t][r][s], Kind::Markets, t, r, s);
+						else updateMaterialGradient(t, r, s, true);
+						marketGradientDirty[t][r][s]=false;
+						marketGradientUpdated[t][r][s]=true;
 						return;
 					}
 		for (int t=0; t<numberOfTeam; t++)
 			for(int s=0; s<SWIM_CLASS_COUNT; s++)
 				if(guardAreasGradient[t][s] && !guardGradientUpdated[t][s])
 				{
-					if (gradientRuntime->pipeline.enabled()) dispatch(&guardAreasGradient[t][s], s, [&](Uint16 *field) { seedGuardAreasGradient(t, s, field); });
+					if (gradientRuntime->pipeline.enabled()) dispatch(&guardAreasGradient[t][s], Kind::Guard, t, 0, s);
 					else updateGuardAreasGradient(t, s);
 					guardGradientUpdated[t][s]=true;
 					return;
@@ -359,7 +456,7 @@ void Map::syncStep(Uint32 stepCounter)
 			for(int s=0; s<SWIM_CLASS_COUNT; s++)
 				if(clearAreasGradient[t][s] && !clearGradientUpdated[t][s])
 				{
-					if (gradientRuntime->pipeline.enabled()) dispatch(&clearAreasGradient[t][s], s, [&](Uint16 *field) { seedClearAreasGradient(t, s, field); });
+					if (gradientRuntime->pipeline.enabled()) dispatch(&clearAreasGradient[t][s], Kind::Clear, t, 0, s);
 					else updateClearAreasGradient(t, s);
 					clearGradientUpdated[t][s]=true;
 					return;
@@ -367,9 +464,12 @@ void Map::syncStep(Uint32 stepCounter)
 				
 
 		for (int t=0; t<numberOfTeam; t++)
-			for (int r=0; r<MAX_RESOURCES; r++)
+			for (int r=0; r<MaterialCount; r++)
 				for (int s=0; s<SWIM_CLASS_COUNT; s++)
+				{
 					gradientUpdated[t][r][s]=false;
+					if (marketsV2Enabled()) marketGradientUpdated[t][r][s]=false;
+				}
 		for (int t=0; t<numberOfTeam; t++)
 			for(int s=0; s<SWIM_CLASS_COUNT; s++)
 			{
@@ -381,6 +481,7 @@ void Map::syncStep(Uint32 stepCounter)
 
 void Map::switchFogOfWar(void)
 {
+	visibilityChanges.markAll();
 	PERF_SCOPE_TIME(Fog);
 	memset(fogOfWar, 0, size*sizeof(Uint32));
 	if (fogOfWar == &fogOfWarA[0])
@@ -392,6 +493,11 @@ void Map::switchFogOfWar(void)
 void Map::setMapDiscovered(int x, int y, Uint32 sharedVision)
 {
 	size_t index = coordToIndex(x, y);
+	// The snapshot observes discovery and the active fog plane. Updating only
+	// the inactive plane becomes visible after switchFogOfWar invalidates it.
+	if ((mapDiscovered[index] & sharedVision) != sharedVision
+		|| (fogOfWar && (fogOfWar[index] & sharedVision) != sharedVision))
+		markVisibility(index);
 	mapDiscovered[index] |= sharedVision;
 	fogOfWarA[index] |= sharedVision;
 	fogOfWarB[index] |= sharedVision;
@@ -406,7 +512,7 @@ void Map::setMapDiscovered(int x, int y, int w, int h,  Uint32 sharedVision)
 
 void Map::setMapBuildingsDiscovered(int x, int y, Uint32 sharedVision, Team *teams[Team::MAX_COUNT])
 {
-	Uint16 bgid = tiles[coordToIndex(x, y)].building;
+	Uint16 bgid = occupancyCells[coordToIndex(x, y)].building;
 	if (bgid != NOGBID)
 	{
 		int id = Building::GIDtoID(bgid);
@@ -444,6 +550,7 @@ void Map::setMapExploredByBuilding(int x, int y, int w, int h, int team)
 void Map::unsetMapDiscovered(void)
 {
 	fill(mapDiscovered, 0u);
+	visibilityChanges.markAll();
 }
 
 bool Map::isMapPartiallyDiscovered(int x1, int y1, int x2, int y2, Uint32 visionMask) const
@@ -465,34 +572,35 @@ bool Map::isMapPartiallyDiscovered(int x1, int y1, int x2, int y2, Uint32 vision
 void Map::setMapDiscovered(void)
 {
 	fill(mapDiscovered, ~0u);
+	visibilityChanges.markAll();
 }
 
 void Map::computeDisplayedForbidden(int teamNumber)
 {
 	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
 	for (size_t i=0; i<size; i++)
-		displayedForbiddenView.set(i, (tiles[i].forbidden & teamMask) != 0);
+		displayedForbiddenView.set(i, (areaCells[i].forbidden & teamMask) != 0);
 }
 
 void Map::computeDisplayedGuardArea(int teamNumber)
 {
 	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
 	for (size_t i=0; i<size; i++)
-		displayedGuardAreaView.set(i, (tiles[i].guardArea & teamMask) != 0);
+		displayedGuardAreaView.set(i, (areaCells[i].guard & teamMask) != 0);
 }
 
 void Map::computeDisplayedClearArea(int teamNumber)
 {
 	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
 	for (size_t i=0; i<size; i++)
-		displayedClearAreaView.set(i, (tiles[i].clearArea & teamMask) != 0);
+		displayedClearAreaView.set(i, (areaCells[i].clear & teamMask) != 0);
 }
 
 void Map::computeDisplayedFarmArea(int teamNumber)
 {
 	Uint32 teamMask = Team::teamNumberToMask(teamNumber);
 	for (size_t i=0; i<size; i++)
-		displayedFarmAreaView.set(i, (tiles[i].farmArea & teamMask) != 0);
+		displayedFarmAreaView.set(i, (areaCells[i].farm & teamMask) != 0);
 }
 
 

@@ -1,3 +1,5 @@
+#include "render/ResourceSprites.h"
+#include "BuildingPresentation.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <FormatableString.h>
 #include <algorithm>
@@ -185,7 +187,7 @@ void GameGUITouch::drawHUD()
 											   : stroke;
 	if (!pending.points.empty() && gui.selectionMode == GameGUI::BRUSH_SELECTION)
 	{
-		const auto &map = gui.game.map;
+		const auto &map = gui.drawnScene().map;
 		std::vector<BrushCoverage::Cell> centres;
 		for (const auto &p : pending.points)
 			centres.push_back({(int(p.x) >> 5) & map.getMaskW(), (int(p.y) >> 5) & map.getMaskH()});
@@ -229,11 +231,11 @@ void GameGUITouch::drawHUD()
 	}
 	stats.push_back(
 		{GAGCore::FormattableString(GAGCore::Toolkit::getStringTable()->getString("[P %0/%1/%2]"))
-			 .arg(gui.drawnScene().panels.local.prestige)
-			 .arg(gui.drawnScene().panels.hud.totalPrestige)
-			 .arg(gui.drawnScene().panels.hud.prestigeToReach)});
-	stats.push_back({"+" + std::to_string(gui.drawnScene().panels.local.unitConversionGained) + " / −" +
-					 std::to_string(gui.drawnScene().panels.local.unitConversionLost)});
+			 .arg(gui.drawnScene().panels.local.state().prestige)
+			 .arg(gui.drawnScene().panels.hud.totalPrestige())
+			 .arg(gui.drawnScene().panels.hud.state().prestigeToReach)});
+	stats.push_back({"+" + std::to_string(gui.drawnScene().panels.local.state().unitConversionGained) + " / −" +
+					 std::to_string(gui.drawnScene().panels.local.state().unitConversionLost)});
 	// The last cell holds the speed chevrons and the simulation tick rate; where
 	// the speed is fixed (network games) the rate has the cell to itself.
 	const auto rate = gui.tickRate.rate();
@@ -251,7 +253,7 @@ void GameGUITouch::drawHUD()
 		{
 			SDL_Rect clip{int(r.x), int(r.y), int(r.w), int(r.h)};
 			gfx->setUITransform(unit, r.x + 2 * unit, r.y + 3 * unit, &clip);
-			globalContainer->unitmini->setBaseColor(gui.drawnScene().panels.local.color);
+			globalContainer->unitmini->setBaseColor(presentationColor(gui.drawnScene().panels.local.state().color));
 			gfx->drawSprite(0, 0, globalContainer->unitmini, stat.icon);
 			gfx->setUITransform();
 			gfx->setClipRect();
@@ -346,7 +348,7 @@ ViewRect GameGUITouch::tutorialRect() const
 }
 void GameGUITouch::prepareTutorial()
 {
-	std::string text = gui.drawnScene().panels.hud.legacyScriptText;
+	std::string text = gui.drawnScene().panels.hud.state().legacyScriptText;
 	if (!gui.scriptText.empty())
 	{
 		if (!text.empty())
@@ -460,8 +462,8 @@ const SceneBuildingPanel *GameGUITouch::allocationBuilding() const
 	if (gui.selectionMode != GameGUI::BUILDING_SELECTION || globalContainer->isViewingGame())
 		return nullptr;
 	auto *building = inspectedBuilding();
-	return building && building->owner.teamNumber == gui.localTeamNo &&
-				   building->type->maxUnitWorking && building->buildingState == Building::ALIVE
+	return building && building->owner().number == gui.localTeamNo &&
+				   building->type->maxUnitWorking && building->state().buildingState == Building::ALIVE
 			   ? building
 			   : nullptr;
 }
@@ -540,7 +542,7 @@ void GameGUITouch::drawAllocation()
 	auto *sprite = type->miniSpriteImage >= 0 ? type->miniSpritePtr : type->gameSpritePtr;
 	const int frame = type->miniSpriteImage >= 0 ? type->miniSpriteImage : type->gameSpriteImage;
 	SDL_Rect clip{int(rect.x), int(rect.y), int(rect.w), int(rect.h)};
-	sprite->setBaseColor(building->owner.color);
+	sprite->setBaseColor(presentationColor(building->owner().color));
 	const bool compact = !layout().persistentPanel;
 	const double factor = compact ? std::min({unit, 32 * unit / sprite->getW(frame),
 		(rect.h - 8 * unit) / sprite->getH(frame)}) : unit;
@@ -549,24 +551,23 @@ void GameGUITouch::drawAllocation()
 	gfx->drawSprite(0, 0, sprite, frame);
 	gfx->setUITransform();
 	gfx->setClipRect();
-	const std::string name = Toolkit::getStringTable()->getString("[" + type->type + "]");
+	const std::string name = buildingDisplayName(*type);
 	drawPointLabel(
 		{rect.x + (compact ? 40 : 60) * unit, rect.y,
 		 std::max(0.0, rect.w - (compact ? 88 : 108) * unit), rect.h},
-		GAGCore::FormattableString(Toolkit::getStringTable()->getString("[%0 · %1]"))
-				.arg(name)
-				.arg(type->level + 1) +
+		(building->showLevel ? std::string(GAGCore::FormattableString(Toolkit::getStringTable()->getString("[%0 · %1]"))
+				.arg(name).arg(type->level + 1)) : name) +
 			"\n" +
 			GAGCore::FormattableString(
 				GAGCore::Toolkit::getStringTable()->getString("[%0 / %1 HP · %2]"))
-				.arg(building->hp)
+				.arg(building->state().hp)
 				.arg(type->hpMax)
-				.arg(building->owner.teamNumber == gui.drawnScene().panels.local.teamNumber
+				.arg(building->owner().number == gui.drawnScene().panels.local.state().number
 						 ? std::string(
 							   GAGCore::Toolkit::getStringTable()->getString("[Your colony]"))
 						 : GAGCore::FormattableString(
 							   GAGCore::Toolkit::getStringTable()->getString("[Team %0]"))
-							   .arg(building->owner.teamNumber + 1)),
+							   .arg(building->owner().number + 1)),
 		compact ? .8 : .85);
 	drawPointLabel({rect.x + rect.w - 48 * unit, rect.y, 48 * unit, rect.h}, "×", 1.2);
 }
@@ -736,12 +737,21 @@ std::optional<GameGUITouch::ResourceInfo> GameGUITouch::resourceInfo() const
 	if (!inspectingResource()) return {};
 	const auto &r = gui.drawnScene().map.getResource(size_t(gui.selectionResource()));
 	if (r.type == NO_RES_TYPE) return {};
-	const auto *type = globalContainer->resourcesTypes.get(r.type);
+	const auto id = static_cast<ResourceId>(r.type);
+	const auto& catalog = gui.drawnScene().map.resourceRegistry();
 	ResourceInfo info;
-	info.name = getResourceName(r.type);
-	info.sprite = type->gfxId + r.variety * type->sizesCount + r.amount - (type->eternal ? 0 : 1);
-	if (type->granular)
-		info.amount = std::to_string(r.amount) + "/" + std::to_string(type->sizesCount);
+	info.resource = r.type;
+	info.name = getResourceDisplayName(catalog.presentation(id).name);
+	info.sprite = catalog.presentation(id).frame(r.amount, 0, 0);
+	for (unsigned m=0; m<MaterialCount; ++m)
+	{
+		const auto& yield = catalog.yields(id)[m];
+		if (!yield.capacity) continue;
+		if (!info.amount.empty()) info.amount += "\n";
+		const auto amount = gui.drawnScene().map.materialAmountAt(size_t(gui.selectionResource()),m);
+		info.amount += getMaterialName(m) + ": " + (yield.consumption == ResourceConsumption::Infinite && amount > 0 ? std::string("∞") :
+			std::to_string(amount)+"/"+std::to_string(yield.capacity));
+	}
 	return info;
 }
 
@@ -767,7 +777,10 @@ void GameGUITouch::drawResourceInfo()
 	drawPointLabel({panel.x + 8 * unit, panel.y, panel.w - 56 * unit, 48 * unit}, info->name, .9);
 	drawPointLabel(readOnlyCloseRect(), "×");
 	const ViewRect icon{panel.x + 16 * unit, panel.y + 52 * unit, 48 * unit, 48 * unit};
-	auto *sprite = globalContainer->resources;
+	auto *sprite = ResourceSprites::resolve(gui.drawnScene().map.frozenResourceRegistry()).sprites[info->resource];
+	if (sprite && info->sprite < sprite->getFrameCount() &&
+        sprite->getW(info->sprite) > 0 && sprite->getH(info->sprite) > 0)
+    {
 	const double factor = std::min(icon.w / sprite->getW(info->sprite), icon.h / sprite->getH(info->sprite));
 	SDL_Rect clip{int(panel.x), int(panel.y), int(panel.w), int(panel.h)};
 	gfx->setUITransform(factor, icon.x + (icon.w - sprite->getW(info->sprite) * factor) / 2,
@@ -775,6 +788,12 @@ void GameGUITouch::drawResourceInfo()
 	gfx->drawSprite(0, 0, sprite, info->sprite);
 	gfx->setUITransform();
 	gfx->setClipRect();
+    }
+    else
+    {
+        gfx->drawFilledRect(int(icon.x), int(icon.y), int(icon.w), int(icon.h), 255, 0, 255);
+        gfx->drawFilledRect(int(icon.x + icon.w/4), int(icon.y + icon.h/4), int(icon.w/2), int(icon.h/2), 0, 0, 0);
+    }
 	if (!info->amount.empty())
 		drawPointLabel({icon.x + icon.w + 8 * unit, icon.y, panel.w - 88 * unit, icon.h}, info->amount);
 }
@@ -803,30 +822,30 @@ std::vector<std::string> GameGUITouch::unitInfoRows() const
 	const auto &u = gui.drawnScene().panels.unit;
 	if (!u.valid) return {};
 	auto *strings = Toolkit::getStringTable();
-	std::vector<std::string> rows{displayPlayerName(u.owner.firstPlayerName)};
+	std::vector<std::string> rows{displayPlayerName(u.owner().firstPlayerName)};
 	auto value = [&](const char *key, std::string text) {
 		rows.push_back(std::string(strings->getString(key)) + ": " + text);
 	};
-	value("[hp]", std::to_string(u.hp) + " / " + std::to_string(u.performance[HP]));
-	value("[food]", std::to_string(u.hungry * 100 / Unit::HUNGRY_MAX) + "% (" + std::to_string(u.fruitCount) + ")");
-	value("[current speed]", std::to_string(u.speed));
-	if (u.performance[ARMOR]) value("[armor]", std::to_string(u.realArmor));
-	if (u.performance[HARVEST]) {
-		if (u.carriedResource < 0) rows.push_back(strings->getString("[don't carry anything]"));
-		else value("[carry]", getResourceName(u.carriedResource));
+	value("[hp]", std::to_string(u.state().hp) + " / " + std::to_string(u.state().performance[HP]));
+	value("[food]", std::to_string(u.state().hungry * 100 / Unit::HUNGRY_MAX) + "% (" + std::to_string(u.state().fruitCount) + ")");
+	value("[current speed]", std::to_string(u.state().speed));
+	if (u.state().performance[ARMOR]) value("[armor]", std::to_string(u.realArmor));
+	if (u.state().performance[HARVEST]) {
+		if (u.state().carriedMaterial < 0) rows.push_back(strings->getString("[don't carry anything]"));
+		else value("[carry]", getMaterialName(u.state().carriedMaterial));
 	}
 	const std::pair<int, const char *> abilities[] = {{WALK,"[Walk]"}, {SWIM,"[Swim]"}, {BUILD,"[Build]"},
 		{HARVEST,"[Harvest]"}, {ATTACK_SPEED,"[At. speed]"}, {ATTACK_STRENGTH,"[At. strength]"},
 		{MAGIC_ATTACK_AIR,"[Magic At. Air]"}, {MAGIC_ATTACK_GROUND,"[Magic At. Ground]"}};
 	for (const auto &[ability,key] : abilities)
-		if (u.performance[ability]) {
+		if (u.state().performance[ability]) {
 			const bool attack = ability == ATTACK_STRENGTH || ability == MAGIC_ATTACK_AIR || ability == MAGIC_ATTACK_GROUND;
-			const int strength = (u.performance[ability] + (attack ? u.experienceLevel : 0)) *
+			const int strength = (u.state().performance[ability] + (attack ? u.state().experienceLevel : 0)) *
 				(ability == ATTACK_STRENGTH ? u.glassCannonScale : 1);
-			value(key, "(" + std::to_string(u.level[ability] + (ability == SWIM ? 0 : 1)) + ") " + std::to_string(strength));
+			value(key, "(" + std::to_string(u.state().level[ability] + (ability == SWIM ? 0 : 1)) + ") " + std::to_string(strength));
 		}
-	if (u.performance[ATTACK_STRENGTH] || u.performance[MAGIC_ATTACK_AIR] || u.performance[MAGIC_ATTACK_GROUND])
-		rows.push_back("XP: " + std::to_string(u.experience) + " / " + std::to_string(u.nextLevelThreshold));
+	if (u.state().performance[ATTACK_STRENGTH] || u.state().performance[MAGIC_ATTACK_AIR] || u.state().performance[MAGIC_ATTACK_GROUND])
+		rows.push_back("XP: " + std::to_string(u.state().experience) + " / " + std::to_string(u.nextLevelThreshold));
 	return rows;
 }
 
@@ -843,6 +862,6 @@ void GameGUITouch::drawUnitPanel()
 	labelClip.reset();
 	globalContainer->gfx->setClipRect();
 	if (gui.drawnScene().panels.unit.valid)
-		drawPointLabel({panel.x, panel.y, panel.w - 48 * unit, 48 * unit}, getUnitName(gui.drawnScene().panels.unit.typeNum), 1.0, true);
+		drawPointLabel({panel.x, panel.y, panel.w - 48 * unit, 48 * unit}, getUnitName(gui.drawnScene().panels.unit.state().typeNum), 1.0, true);
 	drawPointLabel(readOnlyCloseRect(), "×", 1.2);
 }

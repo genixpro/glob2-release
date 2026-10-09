@@ -25,6 +25,7 @@
 #include <memory>
 #include <string>
 #include <sstream>
+#include <set>
 
 
 namespace
@@ -102,7 +103,11 @@ TEST_CASE("copies colonies, painted areas and clearing settings [save-format]")
 	require(flagType >= 0, "clearing flag type exists");
 	Building* flag = game.addBuilding(20, 40, flagType, 0);
 	require(flag != nullptr, "place a clearing flag");
-	flag->clearingResources[WOOD] = false;
+	flag->clearingMaterials[WOOD] = false;
+	flag->minWorkerLevelToFlag=2;
+	for (int i=0; i<Unit::MAX_COUNT; ++i)
+		if (auto* unit=game.teams[0]->myUnits[i]; unit && unit->typeNum==WORKER)
+			unit->constructionLevel=2;
 
 	int anchorX[2], anchorY[2];
 	for (int t = 0; t < mapTeams; ++t)
@@ -132,6 +137,14 @@ TEST_CASE("copies colonies, painted areas and clearing settings [save-format]")
 	require(game.tileForPlay(rx, ry, teams, 1), "tileForPlay succeeds");
 	require(game.map.getW() == w0 * rx && game.map.getH() == h0 * ry, "the map is repeated 2 x 2");
 	require(game.mapHeader.getNumberOfTeams() == teams, "one team per colony");
+	std::set<std::uint64_t> selectors;
+	for (int t = 0; t < teams; ++t) {
+		for (const auto* unit : game.teams[t]->liveUnits.entries())
+			require(selectors.insert(unit->entityRandom.exportState().increment).second, "tiled units have distinct streams");
+		for (const auto* building : game.teams[t]->liveBuildings.entries())
+			require(selectors.insert(building->entityRandom.exportState().increment).second, "tiled buildings have distinct streams");
+	}
+
 
 	int n = 0;
 	for (int j = 0; j < ry; j++)
@@ -155,10 +168,14 @@ TEST_CASE("copies colonies, painted areas and clearing settings [save-format]")
 						if (copy && copy->typeNum == flagType)
 						{
 							flags++;
-							require(!copy->clearingResources[WOOD] && copy->clearingResources[WHEAT], "the clearing flag keeps its choice");
+							require(!copy->clearingMaterials[WOOD] && copy->clearingMaterials[WHEAT], "the clearing flag keeps its choice");
+							require(copy->minWorkerLevelToFlag==2,"the clearing flag keeps independent worker qualification");
 						}
 					}
 					require(flags == 1, "the copy has its clearing flag");
+					for (int u=0; u<Unit::MAX_COUNT; ++u)
+						if (const auto* unit=game.teams[k]->myUnits[u]; unit && unit->typeNum==WORKER)
+							require(unit->constructionLevel==2,"workers keep independent construction qualification");
 				}
 			}
 	std::puts("PASS a repeated map deals each colony, its areas and its flag settings to one team");
@@ -240,7 +257,7 @@ TEST_CASE("wraps swimmers, buildings and team areas together across the source s
 	glob2test::HeadlessGame world({.wDec = 6, .hDec = 6, .loadDefaultRace = true});
 	auto &game = world.game;
 	REQUIRE(world.addBuilding("swarm", 2, 10));
-	game.map.setTerrain(63, 10, 256);
+	game.map.paintCell(63, 10, WATER);
 	auto *swimmer = game.addUnit(63, 10, 0, WORKER, 3, 0, 0, 0);
 	REQUIRE(swimmer);
 	swimmer->level[WALK] = 0;

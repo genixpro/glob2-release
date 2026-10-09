@@ -8,6 +8,18 @@ The game-side bindings in `src/ui/FrontendUI.h` (namespace `Glob2UI`) add the
 two themes, translation and shared page builders. Screens contain a model and a
 `build()` function, nothing else.
 
+The shared screen stack separates updates from painting. `frame(tick, events,
+false)` dispatches input and advances screen work without drawing;
+`draw()` paints when the graphics context's render ceiling permits it. Native
+hosts normally use the combined `frame()` call. Browser hosts call `Loop::draw()`
+on animation frames separately from timer-driven updates; render deadlines never
+shorten browser update timers. Screen logic must not
+require a paint to advance loading, networking, input handling or persistence.
+DOM text-field changes and actions are delivered in `frame()` before transitions
+and SDL events; `draw()` must not dispatch input or admit screen transitions.
+The **Target render FPS** preference applies to screen and dialog drawing as well
+as matches and the editor; see [render pacing](reference.md#target-render-fps).
+
 ## Rules
 
 1. **Build, do not lay out.** A screen implements
@@ -121,7 +133,11 @@ is the same for frontend modals; `Glob2UI::InGameDialog` takes a `Surface`
 `themeFor()` maps it to, on every host. On big
 desktop windows whose interface scale follows a 100 % desktop, `Glob2UI::Screen`
 enlarges points and text up to 1.5x (`ui::comfortScale`, via
-`UIScreen::adjustPresentation`); gameplay and dialogs keep their sizes. `endExecute(code)` and the
+`UIScreen::adjustPresentation`); gameplay and dialogs keep their sizes. A screen holding unsaved work overrides `interceptsQuit()`: while
+it is the running top screen, `SDL_EVENT_QUIT` (window close, Cmd+Q) reaches its
+`handleExecutionEvent()` instead of stopping the stack, and the screen ends with
+`QUIT_APPLICATION` once the player decides; `SDL_EVENT_TERMINATING` is never
+vetoed. `endExecute(code)` and the
 `ScreenStack` completion callback remain the navigation contract; push child
 screens onto the stack rather than running them inline.
 
@@ -165,6 +181,27 @@ desktop layouts are unchanged at 100% (`applyTextSize()` holds the rule).
 - A control's measured size must hold the text it paints at every text size.
   `libgag/src/ui/UILayoutHarness.cpp` and the presentation harness check that no
   painted line crosses a control's edge, at 100% and 150%.
+
+### Building assignment preferences
+
+Settings > Buildings enumerates variants from the installed building catalog;
+construction and upgrade controls follow explicit variant links. Assignment and
+attraction-radius bounds come from each descriptor. Initial assignments come
+from `presentation.defaultAssigned`, and initial radii from the descriptor's
+`defaultUnitStayRange`. Remembered choices are stored by catalog fingerprint and
+stable variant key, so custom catalogs that reuse stock names cannot overwrite
+stock preferences. A changed catalog starts from its authored defaults. Version
+1 preferences import their historical family/level slots through the frozen
+stock catalog; current preferences and per-game overrides use stable keys.
+
+The desktop building panel records metric row positions while drawing. Upgrade
+values reuse those positions inside the scrollable body; newly introduced
+metrics and construction costs appear after the current controls. Repair costs
+use the same body area. The mouse wheel remains active over a hovered upgrade
+or repair button, so long previews stay accessible. Physical attraction buildings
+put their attraction counts below the HP/inside header; drawing and click handling
+share the additional height. A zero initial attraction radius still exposes the
+range control when the configured maximum permits adjustment.
 
 ### Map scrolling preferences
 
@@ -287,10 +324,12 @@ compiled `light` and `dark` themes (`ThemeCatalog::builtinLight()` and
 - `backdrop.kind` is `colony` (the live colony), `image` (`backdrop.image`,
   cropped to cover), `terrain` (the original tiled grass) or `solid`
   (`palette.backdrop` only). `veil` washes over it. `wordmark` replaces the main
-  menu wordmark with an image shown as drawn; without it the shipped wordmark is
+  menu wordmark with an image shown as drawn. Backdrop and wordmark overrides
+  must name `.webp` artwork under `data/`; lookup retains user-directory priority.
+  Without an override the shipped wordmark is
   recoloured with `ink` and `accent`.
 - `buttons.kind` `sprite` paints bordered buttons with a three-slice sprite set
-  (`<sprite>0..5.png`, left, middle and right with their highlights, as
+  (`<sprite>0..5.webp`, left, middle and right with their highlights, as
   `data/gfx/guitheme`); their labels use `ink`. Flat buttons keep the palette.
 - Asset paths must stay under `data/`. Unknown tokens and invalid values are
   reported on standard error and leave the inherited value.
@@ -357,9 +396,9 @@ numeric choices remain readable. The gameplay action strip retains its
 game-specific sprites and labels, which distinguish construction, flags and team tools.
 
 Original SVGs and a source manifest live in `datasrc/icons/tabler/`, pinned to
-Tabler v3.48.0. Generated PNGs live in `data/gui/`; the distributed MIT notice is
-`data/tabler-icons-license.txt`. Ordinary builds use the committed PNGs and need
-no SVG renderer or network access. To regenerate with the pinned development tool:
+Tabler v3.48.0. Generated PNG sources live in `data/gui/`; the distributed MIT notice is
+`data/tabler-icons-license.txt`. Ordinary builds convert the committed sources to
+WebP in the runtime tree and need no SVG renderer or network access. To regenerate with the pinned development tool:
 
 ```sh
 npm install --prefix artifacts/tabler/tooling --no-audit --no-fund @resvg/resvg-js@2.6.2
@@ -369,6 +408,11 @@ NODE_PATH=artifacts/tabler/tooling/node_modules node tools/icons/export_tabler.c
 The exporter verifies source hashes and writes 20- and 24-point icons at 1×, 2×
 and 3×. Add new assets deliberately to the manifest and semantic bindings, retain
 upstream notices, and capture desktop and phone views when introducing them.
+
+The online web app (`platform/apps/web/src/icons.tsx`) imports the same SVGs for its
+navigation and other interface glyphs, so the game and the website share one icon set.
+A web-only icon still goes through this manifest; do not add a separate web icon
+library. Game sprites remain the web app's decorative art (`platform/apps/web/art/README.md`).
 
 ### Hosting a dialog
 
@@ -386,6 +430,17 @@ Dialogs override `onEscape()`, `available()`/`place()` for non-centered
 placement (the chat composer sits at the bottom), `maxWidth()`, `fillHeight()`
 and `scrim()`. `resume()` reopens a dialog whose result was consumed but must
 retry (a failed save).
+
+A dialog can also be a permanent docked panel. The map editor's brush browser
+(`src/map/editor/EditorDock.h`) is an `InGameDialog` that never finishes and has
+no scrim: `available()` returns a full-height column at the right edge
+(`clamp(300pt, 240, 40%)` wide, so it follows the interface scale), `place()`
+fills it and `paintPanel()` paints the column. Its owner draws it beneath any
+modal dialog, sends it pointer events inside its rectangle or while
+`host().interacting()`, and keys only while a text field is editing; strokes that
+started on the map keep their events. `onUpdate()` compares the model (catalogue
+revision, selection, panel mode) with what the last `build()` saw and invalidates
+on change. Its controls publish under `dock/...` and `brush/<catalogue id>`.
 
 ### Focus, keyboard and touch
 

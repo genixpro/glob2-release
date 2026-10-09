@@ -1,11 +1,14 @@
+#include "CortexSnapshotQueries.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 The Globulation 2 Authors
 
+#include "Material.h"
 #include <PerformanceTelemetry.h>
 #include "CortexObservation.h"
 #include "CortexPlacement.h"
+#include "CortexPolicy.h"
 #include "CortexPlacementGeo.h"
-#include "CortexWheat.h"
+#include "CortexFoodSources.h"
 #include "CortexWater.h"
 
 #include "Player.h"
@@ -14,7 +17,7 @@
 #include "TeamStat.h"
 #include "unit/UnitConsts.h"
 #include "unit/Unit.h"
-#include "IntBuildingType.h"
+#include "CortexBuildings.h"
 #include "building/Building.h"
 #include "BuildingType.h"
 #include "map/Map.h"
@@ -22,7 +25,7 @@
 
 namespace Cortex
 {
-	CortexObservation observe(Player* player, int openMargin, Uint16 offenseFlagGid)
+	CortexObservation observeWorld(MersenneTwister& random, const AIEngine::AIWorldView* game, const AIEngine::TeamView* team, QueryScratch& scratch, const PlanningIntent& intents, std::ostream* diagnostics, int openMargin, Uint16 offenseFlagGid)
 	{
 		PERF_SCOPE_TIME(AIObserve);
 		CortexObservation obs = makeEmptyObservation();
@@ -31,22 +34,22 @@ namespace Cortex
 		// observation carries it, and decide() ignores invalid observations anyway.
 		obs.wheatOpenMargin = openMargin;
 
-		if (player == NULL || player->team == NULL)
+		if (!game || !team)
 			return obs; // valid stays 0 — caller treats as "no observation".
 
-		Team* team = player->team;
-		Game* game = team->game;
+
+
 		// Capabilities belong to the effective match header, not saved policy state.
 		// Include them in the observation so scorers, facts and ML masks agree.
-		obs.upgradesDisabled=game->gameHeader.isUnitUpgradesDisabled();
-		obs.hungerDisabled=game->gameHeader.isHungerDisabled();
-		obs.combatDisabled=game->gameHeader.isPeacefulModeEnabled();
-		obs.growthDisabled=game->gameHeader.isResourceGrowthDisabled();
+		obs.upgradesDisabled=game->rules.upgradesDisabled;
+		obs.hungerDisabled=game->rules.hungerDisabled;
+		obs.combatDisabled=game->rules.peaceful;
+		obs.growthDisabled=game->rules.resourceGrowthDisabled;
 
-		obs.tick = (game != NULL) ? static_cast<Sint32>(game->stepCounter) : 0;
+		obs.tick = (game != NULL) ? static_cast<Sint32>(game->tick) : 0;
 
 		// --- own economy: read straight from the latest team stat snapshot ---
-		const TeamStat* stat = team->stats.getLatestStat();
+		const TeamStat* stat = &team->statistics;
 
 		// population
 		obs.totalUnit         = stat->totalUnit;
@@ -61,7 +64,7 @@ namespace Cortex
 
 		// food / health pressure
 		obs.totalBuilding     = stat->totalBuilding;
-		obs.starvingUnits     = team->stats.getStarvingUnits();
+		obs.starvingUnits     = team->starving;
 		obs.needFood          = stat->needFood;
 		obs.needFoodCritical  = stat->needFoodCritical;
 		obs.needFoodNoInns    = stat->needFoodNoInns;
@@ -71,18 +74,18 @@ namespace Cortex
 		obs.prestige          = team->prestige;
 
 		// --- upgrade-decision signals (Phase-2 v4) ---
-		// maxBuildLevel is the highest BUILD level among our workers and is the
-		// engine's own gate on whether a finished building may be upgraded: a
-		// building at type->level L is upgradable only when maxBuildLevel > L.
+		// maxBuildLevel is the highest construction qualification among workers
+		// able to build. Upgrade eligibility compares it with the target
+		// descriptor's requiredWorkerLevel, independently of display level.
 		// C++: Team::maxBuildLevel(), team/TeamRouting.cpp:245-259.
 		// Cached once here; the per-building Upgradable predicate below reuses it
 		// rather than re-scanning every worker per building.
-		const int maxBuildLevel = team->maxBuildLevel();
+		const int maxBuildLevel = Cortex::maxBuildLevel(*game,*team);
 		obs.maxBuildLevel = maxBuildLevel;
 
 		// production / food-supply: one live pass over the colony's buildings.
 		// The TeamStat snapshot carries neither signal, so both are computed
-		// here directly from team->myBuildings (iterated by index, never a set).
+		// here directly from game->buildingSlots(team->number) (iterated by index, never a set).
 		//   feedCapacity   = units the colony's inns can feed: sum of
 		//                    type->maxUnitInside over working, feeding buildings.
 		//                    Mirrors AICastor's foodSum (ai/castor/Control.cpp:36-43);
@@ -92,12 +95,12 @@ namespace Cortex
 		//                    site/dead) whose production ratio is nonzero, i.e.
 		//                    actually producing units right now.
 		//   warFlagsActive = count of our own live WAR_FLAG virtual buildings.
-		//                    Virtual flags are registered in team->myBuildings too
+		//                    Virtual flags are registered in game->buildingSlots(team->number) too
 		//                    (Game::addBuilding sets myBuildings[id]=b regardless of
 		//                    isVirtual, Game_editor.cpp:261), so they show up in this
 		//                    same index scan — no separate virtualBuildings pass.
 		//                    Reading our OWN state is not a fog-of-war cheat.
-		//   upgradableCount = per IntBuildingType, the count of FINISHED instances
+		//   upgradableCount = per semantic role, the count of FINISHED instances
 		//                    that pass the full engine "Upgradable" predicate right
 		//                    now. The predicate mirrors Runtime's
 		//                    (ai/shared_runtime/Conditions.cpp:112-129) and the GUI enable-gate
@@ -124,18 +127,18 @@ namespace Cortex
 		Sint32 warFlagX     = 0;
 		Sint32 warFlagY     = 0;
 		Sint32 warFlagRange = 0;
-		// Single index pass over team->myBuildings filling the building-derived
+		// Single index pass over game->buildingSlots(team->number) filling the building-derived
 		// signals and capturing the live war flag's footprint. Split into a helper
 		// (CortexObservation.cpp) only to keep each .cpp under the file-size cap;
 		// the call sits exactly where the loop ran inline, so the determinism-
 		// critical iteration order is unchanged.
-		observeBuildings(obs, team, game, maxBuildLevel, offenseFlagGid,
+		observeBuildings(obs, team, game, intents, maxBuildLevel, offenseFlagGid,
 			warFlagFound, warFlagX, warFlagY, warFlagRange);
 
 		// training / upgrade level buckets (one slice per array)
 		for (int lvl = 0; lvl < CORTEX_UNIT_LEVELS; lvl++)
 		{
-			obs.buildLevel[lvl]               = stat->upgradeState[BUILD][lvl];
+			obs.buildLevel[lvl] = stat->workersByConstructionLevel[lvl];
 			// WALK == 3 (unit/UnitConsts.h:13). Any-type row == workers+warriors:
 			// explorers have performance[WALK]==0 at every level (game/entities/Race.cpp),
 			// so they never enter this bucket. Racetrack expand-vs-upgrade gate.
@@ -162,11 +165,6 @@ namespace Cortex
 		for (int lvl = 1; lvl < CORTEX_UNIT_LEVELS; lvl++)
 			obs.swimWarriors += obs.warriorSwimLevel[lvl];
 
-		// full per-type, per-long-level building histogram (verbatim mirror;
-		// the long-level encoding is decoded by the cortex* helpers, not here).
-		for (int t = 0; t < CORTEX_BUILDING_TYPES; t++)
-			for (int l = 0; l < CORTEX_BUILDING_LONG_LEVELS; l++)
-				obs.buildingCountPerLevel[t][l] = stat->numberBuildingPerTypePerLevel[t][l];
 
 		// --- defense triggers: our own entities currently taking fire ---
 		// Reading our OWN units/buildings is not a fog cheat. underAttackTimer is
@@ -180,10 +178,10 @@ namespace Cortex
 		// K * MAX_COUNT stays trivially cheap. Iterate by index, never a std::set.
 		obs.buildingsUnderAttack = 0;
 		obs.unitsUnderAttack     = 0;
-		for (int i = 0; i < Building::MAX_COUNT; i++)
+		for (int i = 0; i < ::Building::MAX_COUNT; i++)
 		{
-			Building* b = team->myBuildings[i];
-			if (b == NULL || b->buildingState == Building::DEAD)
+			const AIEngine::BuildingView* b = game->buildingSlots(team->number)[i];
+			if (b == NULL || b->buildingState == ::Building::DEAD)
 				continue;
 			// C++: Building::underAttackTimer (Uint8), building/Building.h:526
 			if (b->underAttackTimer > 0)
@@ -191,12 +189,12 @@ namespace Cortex
 		}
 		for (int k = 0; k < CORTEX_MAX_DEFENSE_FLAGS; k++)
 		{
-			Building* pick  = NULL;
+			const AIEngine::BuildingView* pick  = NULL;
 			Uint8 pickTimer = 0;
-			for (int i = 0; i < Building::MAX_COUNT; i++)
+			for (int i = 0; i < ::Building::MAX_COUNT; i++)
 			{
-				Building* b = team->myBuildings[i];
-				if (b == NULL || b->buildingState == Building::DEAD)
+				const AIEngine::BuildingView* b = game->buildingSlots(team->number)[i];
+				if (b == NULL || b->buildingState == ::Building::DEAD)
 					continue;
 				if (b->underAttackTimer == 0)
 					continue;
@@ -205,7 +203,7 @@ namespace Cortex
 				// degenerate no-game observation, where separation can't be measured.)
 				bool nearEarlier = false;
 				for (int j = 0; game != NULL && j < k; j++)
-					if (game->map.warpDistMax(b->posX, b->posY,
+					if (warpDistMax(*game,plannedX(intents,*b), plannedY(intents,*b),
 					        obs.defenseTargets[j].x, obs.defenseTargets[j].y)
 					    < CORTEX_DEFENSE_TARGET_SEPARATION)
 					{
@@ -225,13 +223,13 @@ namespace Cortex
 				break; // no further separated threat point.
 			obs.defenseTargets[k].valid = 1;
 			// C++: Building::posX/posY, building/Building.h:523
-			obs.defenseTargets[k].x     = pick->posX;
-			obs.defenseTargets[k].y     = pick->posY;
+			obs.defenseTargets[k].x     = plannedX(intents,*pick);
+			obs.defenseTargets[k].y     = plannedY(intents,*pick);
 			obs.defenseTargets[k].score = pick->underAttackTimer;
 		}
-		for (int i = 0; i < Unit::MAX_COUNT; i++)
+		for (int i = 0; i < ::Unit::MAX_COUNT; i++)
 		{
-			Unit* u = team->myUnits[i];
+			const AIEngine::UnitView* u = game->unitSlots(team->number)[i];
 			if (u == NULL)
 				continue;
 			// C++: Unit::underAttackTimer (Uint8), unit/Unit.h:241
@@ -242,7 +240,7 @@ namespace Cortex
 			// medical == MED_FREE). A warrior already on a flag is ACT_FLAG and is never
 			// poached, so this counts only the immediately-recruitable reserve.
 			if (u->typeNum == WARRIOR
-			 && u->activity == Unit::ACT_RANDOM && u->medical == Unit::MED_FREE)
+			 && u->activity == ::Unit::ACT_RANDOM && u->medical == ::Unit::MED_FREE)
 				obs.freeWarriors++;
 		}
 
@@ -255,15 +253,15 @@ namespace Cortex
 			// (AISharedRuntime/MapInfo::is_resource -> Map::isResourceTakeable) so the
 			// direct binding carries no Runtime dependency. Any takeable fruit
 			// (CHERRY/ORANGE/PRUNE) anywhere on the map flips this on.
-			Map& map = game->map;
-			const int w = map.getW();
-			const int h = map.getH();
+			const auto& map = *game;
+			const int w = map.width;
+			const int h = map.height;
 			// This is an existence query; row order follows the map storage.
 			for (int y = 0; y < h && obs.fruitOnMap == 0; y++)
 				for (int x = 0; x < w; x++)
-					if (map.isResourceTakeable(x, y, CHERRY)
-					 || map.isResourceTakeable(x, y, ORANGE)
-					 || map.isResourceTakeable(x, y, PRUNE))
+					if (MapState::hasMaterial(map.state(),map.tileIndex(x,y),MaterialId::Cherries)
+					 || MapState::hasMaterial(map.state(),map.tileIndex(x,y),MaterialId::Oranges)
+					 || MapState::hasMaterial(map.state(),map.tileIndex(x,y),MaterialId::Prunes))
 					{
 						obs.fruitOnMap = 1;
 						break;
@@ -273,19 +271,51 @@ namespace Cortex
 			// phase reasons about. Other types keep valid==0 from the empty
 			// observation. placeCandidates writes exactly CORTEX_BUILD_CANDIDATES
 			// slots (zero-filling unused trailing ones).
-			placeCandidates(game, team, IntBuildingType::FOOD_BUILDING,    0, obs.buildCandidates[IntBuildingType::FOOD_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::SWARM_BUILDING,   0, obs.buildCandidates[IntBuildingType::SWARM_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::HEAL_BUILDING,    0, obs.buildCandidates[IntBuildingType::HEAL_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::SCIENCE_BUILDING, 0, obs.buildCandidates[IntBuildingType::SCIENCE_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::WALKSPEED_BUILDING, 0, obs.buildCandidates[IntBuildingType::WALKSPEED_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::SWIMSPEED_BUILDING, 0, obs.buildCandidates[IntBuildingType::SWIMSPEED_BUILDING]);
-			placeCandidates(game, team, IntBuildingType::ATTACK_BUILDING,  0, obs.buildCandidates[IntBuildingType::ATTACK_BUILDING]);
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_FOOD,    0, obs.buildCandidates[Cortex::CORTEX_BUILD_FOOD], -1, maxBuildLevel);
+            for (const auto& project:game->buildProjects) {
+                if(project.teamNumber!=team->number)continue;
+                const auto* type=catalogType(*game,project.typeNum);
+                if(type->isBuildingSite)type=catalogType(*game,type->nextLevel);
+                obs.productionPlannedMask|=type->semantics.production.enabledUnitMask;
+            }
+            Sint32 productionTargets[CORTEX_UNIT_TYPES];
+            CortexPolicy::productionTargets(obs, productionTargets);
+            auto productionChoice = selectBuilding(*game,*team,CORTEX_BUILD_SWARM,WORKER,maxBuildLevel);
+            for (int unit=0;unit<CORTEX_UNIT_TYPES;++unit) {
+                if (!productionTargets[unit] || (obs.productionPlannedMask & (1u<<unit))) continue;
+                const auto candidate=selectBuilding(*game,*team,CORTEX_BUILD_SWARM,unit,maxBuildLevel);
+                if(candidate.placementType<0) continue;
+                obs.productionMissingMask|=1u<<unit;
+                if(obs.productionPlacementType<0) {
+                    productionChoice=candidate;
+                    obs.productionPlacementType=candidate.placementType;
+                }
+            }
+            obs.productionPlacementType=productionChoice.placementType;
+            if(productionChoice.placementType>=0)
+                placeCandidates(random, game,team,scratch,intents,CORTEX_BUILD_SWARM,0,obs.buildCandidates[CORTEX_BUILD_SWARM],productionChoice.placementType,maxBuildLevel);
+            for(int id=0;id<::Building::MAX_COUNT;++id) {
+                const auto* building=game->buildingSlots(team->number)[id];
+                if(!building || building->buildingState!=::Building::ALIVE || buildingType(*game,*building)->isBuildingSite)continue;
+                const auto mask=buildingType(*game,*building)->semantics.production.enabledUnitMask;
+                if(!mask)continue;
+                for(int unit=0;unit<CORTEX_UNIT_TYPES;++unit)
+                    // Strategy changes output presence, not the exact positive weight.
+                    // Recipe masking also lets a deliberately paused specialist settle.
+                    obs.productionNeedsRetune |= (plannedRatio(intents,*building,unit)>0) !=
+                        bool((mask&(1u<<unit)) && productionTargets[unit]>0);
+            }
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_HEAL,    0, obs.buildCandidates[Cortex::CORTEX_BUILD_HEAL], -1, maxBuildLevel);
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_SCIENCE, 0, obs.buildCandidates[Cortex::CORTEX_BUILD_SCIENCE], -1, maxBuildLevel);
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_WALKSPEED, 0, obs.buildCandidates[Cortex::CORTEX_BUILD_WALKSPEED], -1, maxBuildLevel);
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_SWIMSPEED, 0, obs.buildCandidates[Cortex::CORTEX_BUILD_SWIMSPEED], -1, maxBuildLevel);
+			placeCandidates(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_ATTACK,  0, obs.buildCandidates[Cortex::CORTEX_BUILD_ATTACK], -1, maxBuildLevel);
 
 			// OFFENSE targets: discovered enemy buildings, nearest-first. Filled
 			// ONLY from buildings we have legitimately seen (Building::seenByMask),
 			// never from unfogged truth — implemented (with the same visibility
 			// gating discipline as the enemy-intel pass below) by placeFlagTargets.
-			placeFlagTargets(game, team, obs.flagTargets, obs.flagTargetTeam);
+			placeFlagTargetsWorld(random, game, team, intents, obs.flagTargets, obs.flagTargetTeam);
 
 			// Per-target SUPPORT DISTANCE (v18): how far each offense target sits
 			// from our nearest FINISHED inn — the attack-range gate's input. Food is
@@ -300,16 +330,16 @@ namespace Cortex
 				if (!obs.flagTargets[t].valid)
 					continue;
 				int innDist = -1;
-				for (int i = 0; i < Building::MAX_COUNT; i++)
+				for (int i = 0; i < ::Building::MAX_COUNT; i++)
 				{
-					Building* b = team->myBuildings[i];
-					if (b == NULL || b->buildingState != Building::ALIVE
-					 || b->type->isBuildingSite)
+					const AIEngine::BuildingView* b = game->buildingSlots(team->number)[i];
+					if (b == NULL || b->buildingState != ::Building::ALIVE
+					 || buildingType(*game,*b)->isBuildingSite)
 						continue;
-					if (b->type->shortTypeNum != IntBuildingType::FOOD_BUILDING)
+					if (!Cortex::servesRole(*game, *buildingType(*game,*b), Cortex::CORTEX_BUILD_FOOD))
 						continue;
-					const int d = map.warpDistMax(obs.flagTargets[t].x, obs.flagTargets[t].y,
-					                              b->posX, b->posY);
+					const int d = warpDistMax(map,obs.flagTargets[t].x, obs.flagTargets[t].y,
+					                              plannedX(intents,*b), plannedY(intents,*b));
 					if (innDist < 0 || d < innDist)
 						innDist = d;
 				}
@@ -335,8 +365,8 @@ namespace Cortex
 						standoffY[standoffCount] = obs.flagTargets[t].y;
 						standoffCount++;
 					}
-				const Cortex::AmphibiousAssessment amp = Cortex::assessAmphibious(
-					player, obs.flagTargets[0].x, obs.flagTargets[0].y,
+				const Cortex::AmphibiousAssessment amp = Cortex::assessAmphibiousWorld(
+                    game,team,scratch,intents,diagnostics, obs.flagTargets[0].x, obs.flagTargets[0].y,
 					standoffX, standoffY, standoffCount,
 					Cortex::cortexTuning().landingStandoffTiles,
 					Cortex::cortexTuning().forwardRallyPathDist);
@@ -391,16 +421,16 @@ namespace Cortex
 						minD = CORTEX_FORWARD_MIN_ENEMY_DIST;
 						maxD = range - CORTEX_FORWARD_RANGE_SLACK;
 					}
-					placeForwardCandidate(game, team, IntBuildingType::FOOD_BUILDING,
+					placeForwardCandidate(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_FOOD,
 					                      tx, ty, minD, maxD,
-					                      obs.forwardInn);
+					                      obs.forwardInn, maxBuildLevel);
 					// A forward hospital is surfaced only when a finished hospital
 					// already exists (advisory support; the inn binds the envelope);
 					// the forward inn always leads.
 					if (cortexFinishedBuildings(obs, CORTEX_BUILD_HEAL) > 0)
-						placeForwardCandidate(game, team, IntBuildingType::HEAL_BUILDING,
+						placeForwardCandidate(random, game, team, scratch, intents, Cortex::CORTEX_BUILD_HEAL,
 						                      tx, ty, minD, maxD,
-						                      obs.forwardHeal);
+						                      obs.forwardHeal, maxBuildLevel);
 				}
 			}
 
@@ -414,7 +444,7 @@ namespace Cortex
 			const bool noPoolYet =
 			    cortexFinishedBuildings(obs, CORTEX_BUILD_SWIMSPEED) == 0
 			 && cortexBuildingSites(obs, CORTEX_BUILD_SWIMSPEED) == 0;
-			const Cortex::SwimAssessment sw = Cortex::assessSwim(player, noPoolYet);
+			const Cortex::SwimAssessment sw = Cortex::assessSwimWorld(game,team,scratch,intents,diagnostics, noPoolYet);
 			obs.algaeDiscovered = sw.algaeDiscovered;
 			obs.swimLandReach   = sw.landReach;
 			obs.swimWaterReach  = sw.waterReach;
@@ -434,31 +464,31 @@ namespace Cortex
 		if (game != NULL)
 		{
 			int slot = 0;
-			for (int i = 0; i < game->teamsCount() && slot < MAX_ENEMY_SLOTS; i++)
+			for (int i = 0; i < game->teams.size() && slot < MAX_ENEMY_SLOTS; i++)
 			{
-				Team* other = game->teams[i];
+				const AIEngine::TeamView* other = &game->teams[i];
 				if (other == NULL)
 					continue;
-				const bool isEnemy = (team->attackableTeams() & other->me) != 0;
-				if (!isEnemy || !other->isAlive)
+				const bool isEnemy = (team->enemies & other->mask) != 0;
+				if (!isEnemy || !other->alive)
 					continue;
 
 				EnemySlot& es = obs.enemies[slot];
 				es.active = 1;
-				es.teamNumber = other->teamNumber;
+				es.teamNumber = other->number;
 
 				// totalBuilding: enemy buildings we have DISCOVERED. seenByMask is
 				// the engine's own per-team "this team has seen this building"
 				// record (in the sync checksum), so it is the correct non-cheating
-				// signal. team->me is our vision bit (1<<teamNumber).
+				// signal. team->mask is our vision bit (1<<teamNumber).
 				// C++: Building::seenByMask (Uint32), building/Building.h:560
 				es.totalBuilding = 0;
-				for (int j = 0; j < Building::MAX_COUNT; j++)
+				for (int j = 0; j < ::Building::MAX_COUNT; j++)
 				{
-					Building* b = other->myBuildings[j];
-					if (b == NULL || b->buildingState == Building::DEAD)
+					const AIEngine::BuildingView* b = game->buildingSlots(other->number)[j];
+					if (b == NULL || b->buildingState == ::Building::DEAD)
 						continue;
-					if ((b->seenByMask & team->me) != 0)
+					if ((b->seenByMask & team->mask) != 0)
 						es.totalBuilding++;
 				}
 
@@ -467,19 +497,19 @@ namespace Cortex
 				// FOW — we do NOT scan the whole map.
 				// C++: Map::isFOWDiscovered(int x,int y,int visionMask), map/Map.h:202
 				es.totalUnit = 0;
-				for (int j = 0; j < Unit::MAX_COUNT; j++)
+				for (int j = 0; j < ::Unit::MAX_COUNT; j++)
 				{
-					Unit* u = other->myUnits[j];
+					const AIEngine::UnitView* u = game->unitSlots(other->number)[j];
 					if (u == NULL)
 						continue;
 					// C++: Unit::posX/posY, unit/Unit.h:220
-					if (!game->map.isFOWDiscovered(u->posX, u->posY, team->me))
+					if (!isFOWDiscovered(*game,u->posX, u->posY, team->mask))
 						continue;
 					es.totalUnit++;
 					// Straggler grace: visible enemy still inside our flag's stay-range.
 					// Same warp-safe Chebyshev metric placeFlagTargets/ensureFlagAt use.
 					if (warFlagFound
-					 && game->map.warpDistMax(u->posX, u->posY, warFlagX, warFlagY) <= warFlagRange)
+					 && warpDistMax(*game,u->posX, u->posY, warFlagX, warFlagY) <= warFlagRange)
 						obs.enemyUnitsNearFlag++;
 					// Threat sizing, per defense point: visible enemy near each building
 					// taking fire. defenseTargets[] is already resolved (the building scan
@@ -487,7 +517,7 @@ namespace Cortex
 					// point's flag must match.
 					for (int k = 0; k < CORTEX_MAX_DEFENSE_FLAGS; k++)
 						if (obs.defenseTargets[k].valid
-						 && game->map.warpDistMax(u->posX, u->posY,
+						 && warpDistMax(*game,u->posX, u->posY,
 						        obs.defenseTargets[k].x, obs.defenseTargets[k].y)
 						    <= CORTEX_THREAT_SCAN_RADIUS)
 							obs.defenseThreatCount[k]++;
@@ -507,22 +537,39 @@ namespace Cortex
 			obs.enemyCount = slot;
 		}
 
-		// --- wheat sustainability: counts-only reconcile over the colony region ---
+		// --- food sustainability: counts-only reconcile over the colony region ---
 		// The full per-tile masks are rebuilt in the action layer (which has the
 		// Map to paint into); the observation carries only the cheap diff counts so
-		// the pure policy (CortexPolicy::wantWheatProtection) can tell whether the
+		// the pure policy (CortexPolicy::wantFoodSourceProtection) can tell whether the
 		// per-cycle wheat-forbidden pass has real work to do.
-		const bool farms = player->team->game->map.farmAreasEnabled()
-			&& !player->game->gameHeader.isResourceGrowthDisabled();
-		const Cortex::WheatReconcile wr = Cortex::reconcileWheatForbidden(
-			player, openMargin, /*buildMasks=*/false, /*liftAll=*/false, farms);
+		const bool farms = game->farmAreasEnabled
+			&& !game->rules.resourceGrowthDisabled;
+		const Cortex::FoodSourceReconcile wr = Cortex::reconcileFoodSourcesForbiddenWorld(
+            game,team,scratch,intents,diagnostics, openMargin, /*buildMasks=*/false, /*liftAll=*/false, farms);
 		obs.wheatProtectAddCount = wr.addCount;
 		obs.wheatProtectDelCount = wr.delCount;
 		if (farms)
-			obs.wheatProtectDelCount += Cortex::reconcileWheatForbidden(
-				player, openMargin, /*buildMasks=*/false, /*liftAll=*/true).delCount;
+			obs.wheatProtectDelCount += Cortex::reconcileFoodSourcesForbiddenWorld(
+                game,team,scratch,intents,diagnostics, openMargin, /*buildMasks=*/false, /*liftAll=*/true).delCount;
 
 		obs.valid = 1;
 		return obs;
 	}
+}
+
+namespace Cortex {
+CortexObservation observe(MersenneTwister& random, ::Player* player, int margin, Uint16 gid)
+{
+    if(!player || !player->team)return makeEmptyObservation();
+    const auto view=AIEngine::AIWorldView::capture(*player->game, AIEngine::AIWorldView::captureCatalog(*player->game));
+    QueryScratch scratch; PlanningIntent intents;
+    return observeWorld(random, view.get(),&view->teams[player->teamNumber],scratch,intents,nullptr,margin,gid);
+}
+void observeBuildings(CortexObservation& observation, ::Team* team, ::Game* game,
+    int level,Uint16 gid,bool& found,Sint32& x,Sint32& y,Sint32& range)
+{
+    const auto view=AIEngine::AIWorldView::capture(*game, AIEngine::AIWorldView::captureCatalog(*game));
+    QueryScratch scratch; PlanningIntent intents;
+    observeBuildings(observation,&view->teams[team->teamNumber],view.get(),intents,level,gid,found,x,y,range);
+}
 }

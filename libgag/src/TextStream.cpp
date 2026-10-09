@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <stack>
+#include <stdexcept>
 #if defined(_MSC_VER) && _MSC_VER < 1900
 #define snprintf _snprintf
 #define vsnprintf _vsnprintf
@@ -116,6 +117,7 @@ namespace GAGCore
 		};
 		
 		int next;
+		bool pendingColon = false;
 		StreamBackend *stream;
 		Token token;
 		size_t line, column;
@@ -148,6 +150,11 @@ namespace GAGCore
 		
 		Token nextToken(void)
 		{
+			if (pendingColon)
+			{
+				pendingColon = false;
+				return token = Token(Token::COLON);
+			}
 			if (!stream->isEndOfStream())
 			{
 				switch (next)
@@ -228,12 +235,20 @@ namespace GAGCore
 						if (isalnum(next) || (next == '_') || (next == '.') || (next == '-') || (next == '[') || (next == ']'))
 						{
 							std::string tempValue;
-							do
+							for (;;)
 							{
 								tempValue += static_cast<std::string::value_type>(next);
 								nextChar();
+								if (next == ':')
+								{
+									// Save fields use C++ names; a single colon still denotes inheritance.
+									nextChar();
+									if (next != ':') { pendingColon = true; break; }
+									tempValue += ':';
+									continue;
+								}
+								if (!(isalnum(next) || next == '_' || next == '.' || next == '[' || next == ']')) break;
 							}
-							while (isalnum(next) || (next == '_') || (next == '.') || (next == '[') || (next==']'));
 							token = Token(Token::VAL, tempValue);
 						}
 						else
@@ -503,21 +518,17 @@ namespace GAGCore
 	{
 		std::string s;
 		readFromTableToString(name, &s);
-		size_t serializedLength = s.length() >> 1;
-		if (serializedLength != size)
-			std::cerr << "TextInputStream::read : requested length " << size << " differs from serialized size " << serializedLength << std::endl;
-		size_t toReadLength = std::min(size, serializedLength);
-		char *destBuffer = static_cast<char *>(data);
-		for (size_t i=0; i<toReadLength; i++)
-		{
-			char buffer[3];
-			unsigned val;
-			buffer[0] = s[i*2];
-			buffer[1] = s[(i*2)+1];
-			buffer[2] = 0;
-			sscanf(buffer, "%02x", &val);
-			destBuffer[i] = val;
-		}
+		if ((s.size() & 1) || s.size()/2 != size)
+			throw std::runtime_error("Invalid hexadecimal field length: " + name);
+		auto digit=[](unsigned char c) -> unsigned {
+			if (c>='0' && c<='9') return c-'0';
+			if (c>='a' && c<='f') return c-'a'+10;
+			if (c>='A' && c<='F') return c-'A'+10;
+			throw std::runtime_error("Invalid hexadecimal field digit");
+		};
+		auto* bytes=static_cast<unsigned char*>(data);
+		for (size_t i=0; i<size; ++i)
+			bytes[i]=static_cast<unsigned char>((digit(s[i*2])<<4) | digit(s[i*2+1]));
 	}
 	
 	void TextInputStream::getSubSections(const std::string &root, std::set<std::string> *sections)

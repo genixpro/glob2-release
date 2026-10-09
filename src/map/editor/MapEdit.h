@@ -7,8 +7,13 @@
 #include <BackgroundFileWriter.h>
 #include <InputState.h>
 #include <utility>
+#include <functional>
 
 #include "Brush.h"
+#include "BrushCatalog.h"
+#include "BrushSwatches.h"
+#include "MapEditPresentation.h"
+#include "TerrainPresentation.h"
 #include "GAGSys.h"
 #include "LoadSaveDialog.h"
 #include <memory>
@@ -16,10 +21,14 @@
 #include "KeyboardManager.h"
 #include "MapEditDialog.h"
 #include "WidgetRectangle.h"
+#include <algorithm>
 #include <optional>
+#include <set>
 #include "render/Minimap.h"
 #include "OverlayAreas.h"
 #include "ScriptEditorScreen.h"
+#include "EditorDialogs.h"
+#include "SetLibraryDialog.h"
 #include <string>
 #include <vector>
 
@@ -38,6 +47,8 @@ constexpr int mapEditZoneButtonX(int index, int count)
 
 class MapEdit;
 class PhoneEditor;
+class EditorDock;
+struct InspectorModel;
 
 ///This is a map editor widget, which is a widget that works within the map editor. Now to answer the crucial question, why not
 ///use libgag? Indeed, I had pondered on the use of libgag for quite some time, considering all of the odds and ends that would
@@ -116,11 +127,13 @@ public:
 class SingleLevelSelector : public MapEditorWidget
 {
 public:
-	SingleLevelSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, int level, int& levelNum);
+	SingleLevelSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, int level, int& levelNum, bool catalogPages=false);
 	void draw();
+	void handleClick(int relMouseX,int relMouseY) override;
 private:
 	int level;
 	int& levelNum;
+	bool catalogPages;
 };
 
 
@@ -194,7 +207,7 @@ private:
 class TerrainSelector : public MapEditorWidget
 {
 public:
-	enum TerrainType
+	enum TerrainType : int
 	{
 		Grass,
 		Sand,
@@ -207,12 +220,65 @@ public:
 		CherryTree,
 		OrangeTree,
 		PruneTree,
-		NoTerrain,
-	};
+        NoTerrain,
+        RegisteredBegin,
+        // Compatibility aliases for callers selecting the example materials.
+        Ice = RegisteredBegin + ICE,
+        Trail = RegisteredBegin + TRAIL,
+        ResourceBegin = RegisteredBegin + TerrainRegistry::Capacity,
+    };
+    static bool isBaseTerrain(TerrainType type)
+    {
+		return (type >= Grass && type <= Water) ||
+			   (type >= RegisteredBegin &&
+				type < int(RegisteredBegin) + int(TerrainRegistry::Capacity));
+	}
+    static ::TerrainType baseTerrain(TerrainType type)
+    {
+        constexpr ::TerrainType legacy[] = {GRASS,SAND,WATER};
+        assert(isBaseTerrain(type));
+        return type <= Water ? legacy[type] : static_cast<::TerrainType>(type - RegisteredBegin);
+    }
+    static TerrainType selectorFor(::TerrainType type)
+    {
+        if (type == GRASS) return Grass;
+        if (type == SAND) return Sand;
+        if (type == WATER) return Water;
+        return static_cast<TerrainType>(int(RegisteredBegin) + int(type));
+    }
+    static bool isResource(TerrainType type)
+    {
+        return (type >= Wheat && type <= PruneTree) ||
+            (type >= ResourceBegin && type < int(ResourceBegin) + int(ResourceRegistry::Capacity));
+    }
+    static TerrainType selectorForResource(ResourceId type)
+    {
+        return static_cast<TerrainType>(int(ResourceBegin) + int(resourceIndex(type)));
+    }
+    static ResourceId resourceType(TerrainType type, const ResourceRegistry& registry)
+    {
+        if (type >= ResourceBegin) return static_cast<ResourceId>(int(type) - int(ResourceBegin));
+        static constexpr const char* legacyKeys[] = {"wheat", "trees", "rocks", "algae", "papyrus", "cherry-tree", "orange-tree", "prune-tree"};
+        if (type < Wheat || type > PruneTree) return NoResource;
+        return registry.find(legacyKeys[type - Wheat]).value_or(NoResource);
+    }
 	TerrainSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, TerrainType terrainType);
 	void draw();
 private:
 	TerrainType terrainType;
+};
+
+/// Opens the terrain palette filtered to one catalogue group. Its icon follows the
+/// active brush while that brush belongs to the group, otherwise the group's first
+/// enabled member, and it carries the selection frame whenever a member is active.
+class TerrainGroupSelector : public MapEditorWidget
+{
+public:
+	TerrainGroupSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, TerrainGroup catalogueGroup, ::TerrainType fallback);
+	void draw();
+	TerrainGroup catalogueGroup;
+private:
+	::TerrainType fallback;
 };
 
 
@@ -255,11 +321,8 @@ public:
 class UnitInfoTitle : public MapEditorWidget
 {
 public:
-	UnitInfoTitle(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, Unit* unit);
+	UnitInfoTitle(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action);
 	void draw();
-	void setUnit(Unit* unit);
-private:
-	Unit* unit;
 };
 
 
@@ -268,17 +331,16 @@ private:
 class UnitPicture : public MapEditorWidget
 {
 public:
-	UnitPicture(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, Unit* unit);
+	UnitPicture(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action);
 	void draw();
-	void setUnit(Unit* unit);
-private:
-	Unit* unit;
 };
 
 
 
 ///This is a small text object. It shows two values and a label, like "label 1/2". The denominator can be fixed or variable. Either way, the numerator is done 
 ///by pointer because this class is used for the convenient editing of values in a Unit or Building
+using EditorValueReader=std::function<Sint32(const PresentationFrame&)>;
+
 class FractionValueText : public MapEditorWidget
 {
 public:
@@ -286,11 +348,12 @@ public:
 	FractionValueText(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, const std::string& label, Sint32* numerator, Sint32 denominator);
 	~FractionValueText();
 	void draw();
-	void setValues(Sint32* numerator, Sint32* denominator);
-	void setValues(Sint32* numerator);
+	void setValues(Sint32* numerator, Sint32* denominator, EditorValueReader readValue, EditorValueReader readMax);
+	void setValues(Sint32* numerator, EditorValueReader readValue);
 private:
 	std::string label;
 	Sint32* numerator;
+    EditorValueReader readValue,readMax;
 	Sint32* denominator;
 	bool isDenominatorPreset;
 };
@@ -306,14 +369,15 @@ public:
 	~ValueScrollBox();
 	void draw();
 	void handleClick(int relMouseX, int relMouseY);
-	void setValues(Sint32* value, Sint32* max);
+	void setValues(Sint32* value, Sint32* max, EditorValueReader readValue, EditorValueReader readMax);
     // Semantic value access shared by desktop and touch presentations.
-    int currentValue() const { return *value; }
-    int maximumValue() const { return *max; }
+    int currentValue() const;
+    int maximumValue() const;
     void setValue(int requested);
-	void setValues(Sint32* value);
+	void setValues(Sint32* value, EditorValueReader readValue);
 private:
 	Sint32* value;
+    EditorValueReader readValue,readMax;
 	Sint32* max;
 	bool isMaxPreset;
 };
@@ -324,11 +388,8 @@ private:
 class BuildingInfoTitle : public MapEditorWidget
 {
 public:
-	BuildingInfoTitle(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, Building* building);
+	BuildingInfoTitle(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action);
 	void draw();
-	void setBuilding(Building* building);
-private:
-	Building* building;
 };
 
 
@@ -337,11 +398,8 @@ private:
 class BuildingPicture : public MapEditorWidget
 {
 public:
-	BuildingPicture(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, Building* building);
+	BuildingPicture(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action);
 	void draw();
-	void setBuilding(Building* building);
-private:
-	Building* building;
 };
 
 
@@ -368,6 +426,9 @@ public:
 	NumberCycler(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action, int maxNumber);
 	void draw();
 	int getIndex();
+	// Selects number `index`+1, clamped to 1..maxNumber.
+	void setIndex(int index) { currentNumber = std::clamp(index + 1, 1, maxNumber); }
+	int maximum() const { return maxNumber; }
 	void handleClick(int relMouseX, int relMouseY);
 private:
 	int maxNumber;
@@ -398,8 +459,7 @@ class MapEdit
     friend class GameGUITouchHarness;
 	friend class MobileGalleryGameplay;
 	std::unique_ptr<PhoneEditor> phone;
-    int menuWidth() const { return phone ? 0 : RIGHT_MENU_WIDTH; }
-    bool editing = false, quitDecision = false;
+    bool editing = false;
     int editingResult = 0;
     GAGCore::InputState inputState;
     bool fertilityRequested = false;
@@ -438,7 +498,7 @@ public:
 	void drawDialog();
     bool needsFertility() const { return fertilityRequested; }
     bool finishFertility(bool completed);
-    bool needsQuitDecision() const { return quitDecision; }
+    bool needsQuitDecision() const { return confirmPurpose == ConfirmPurpose::Quit || confirmPurpose == ConfirmPurpose::QuitApplication; }
     void resolveQuitDecision(int choice);
     int editingReturnCode() const { return editingResult; }
 
@@ -454,6 +514,97 @@ public:
 	///The editor only ever uses selectedUnit.
 	Game::ViewState view;
 
+	// --- WS-A brush catalogue ---
+	// One brush model for every presentation; see BrushCatalog.h for entry ids
+	// and actions. The catalogue is rebuilt lazily whenever the map's terrain or
+	// resource definitions, the enabled experiments or the building catalog change.
+	const std::vector<BrushGroup>& brushCatalog();
+	// Increases whenever brushCatalog() content may have changed; presentations
+	// rebuild their cards when it differs from the value they last saw.
+	std::uint64_t catalogRevision();
+	// The catalogue entry with this id, or nullptr.
+	const BrushEntry* findBrush(std::string_view id);
+	// Catalogue id of the active brush ("terrain/grass", "resource/wheat",
+	// "building/swarm", "zone/guard", "tool/delete", ...), empty when nothing is
+	// selected. Presentations highlight the entry whose id matches.
+	std::string currentBrushId() const;
+	// Whether the edited map may use an experiment: switched on in the player's
+	// settings or already carried by the map's game header.
+	bool experimentEnabled(const std::string& key) const;
+	// Carries the experiment in this map's game header, marks the map modified and
+	// refreshes the catalogue. Returns false for keys the map cannot carry.
+	bool enableExperimentForMap(const std::string& key);
+	// The shared swatch cache, bound to the map's current registries.
+	BrushSwatches& brushSwatches();
+private:
+	ExperimentGate experimentGate() const;
+	BrushCatalogInputs brushCatalogInputs() const;
+	std::string brushCatalogSignature() const;
+	// Maps legacy resource selectors (Wheat..PruneTree) and terrain aliases to the
+	// canonical selector, so equal brushes compare equal.
+	TerrainSelector::TerrainType canonicalSelector(TerrainSelector::TerrainType type) const;
+	std::vector<BrushGroup> brushCatalogCache;
+	std::string brushCatalogKey;
+	std::uint64_t brushCatalogRevision = 0;
+	std::unique_ptr<BrushSwatches> swatches;
+public:
+	// --- end WS-A brush catalogue ---
+
+	// --- WS-C dock ---
+	// The desktop/tablet brush browser (EditorDock.h). Presentations without a
+	// dock (the phone editor) report width 0. createDock() replaces any existing
+	// dock; destroyDock() drops it and returns the map to the full width.
+	bool hasDock() const { return bool(dock); }
+	void createDock();
+	void destroyDock();
+	// Logical width the dock takes from the right of the editor surface; the
+	// legacy sidebar width when neither dock nor phone presentation exists.
+	int dockWidth() const;
+	EditorDock *editorDock() const { return dock.get(); }
+	// Map status strip (bottom-left of the map): pointer coordinates plus the
+	// transient status from showStatus().
+	const std::string &coordinatesText() const { return coordinates; }
+private:
+	friend class EditorDock;
+	friend InspectorModel buildInspectorModel(MapEdit &editor);
+	std::unique_ptr<EditorDock> dock;
+	// Dock sections the author collapsed ("<section>/<group>"), kept across
+	// dock rebuilds and presentation switches.
+	std::set<std::string> dockCollapsed;
+	std::string coordinates;
+	// Dock navigation for "open terrain palette [group]" and "open resource palette".
+	void revealBrushGroup(BrushSection section, const std::string &group);
+	// Whether the pointer is over the dock or a dialog (no map brush preview).
+	bool pointerOverInterface() const;
+	// Centres the map view on the map cell under a point of the placed minimap.
+	void centerViewOnMinimap(int x, int y);
+	// Sends a pointer or key event to the dock when it owns it; false for the map.
+	bool routeToDock(SDL_Event &event);
+	bool swallowSearchKeyText = false;
+	// Updates and paints the dock over the map (beneath any dialog).
+	void drawDock(Uint32 tick);
+public:
+	// --- end WS-C dock ---
+	// --- WS-D presentation ---
+	// The phone tray or the dock, chosen live from the window and input
+	// (MapEditPresentation.h).
+	EditorPresentation presentation() const;
+	// Re-chooses the presentation (viewportResized and construction call it). On a
+	// change, unfinished strokes and drags are cancelled and the brush, panel
+	// mode, team and levels kept. Returns whether the presentation changed.
+	bool syncPresentation();
+	// The dock sizes its targets for touch.
+	bool presentationTouchTargets() const;
+	// MapEditorScreen requests a point-sized (responsive) viewport.
+	bool wantsResponsiveViewport() const;
+private:
+	EditorPresentation wantedPresentation() const;
+	// Seam for the EditorDock (WS-C): createDock()/destroyDock().
+	void enterDockPresentation();
+	void leaveDockPresentation();
+public:
+	// --- end WS-D presentation ---
+
 	friend class MapEditorWidget;
 	friend class BuildingSelectorWidget;
 	friend class TeamColorSelector;
@@ -464,6 +615,7 @@ public:
 	friend class BrushSelector;
 	friend class UnitSelector;
 	friend class TerrainSelector;
+	friend class TerrainGroupSelector;
 	friend class BlueButton;
 	friend class PlusIcon;
 	friend class MinusIcon;
@@ -585,27 +737,18 @@ private:
 
 	///Building view
 	///@{
-	BuildingSelectorWidget* swarm;
-	BuildingSelectorWidget* inn;
-	BuildingSelectorWidget* hospital;
-	BuildingSelectorWidget* racetrack;
-	BuildingSelectorWidget* swimmingpool;
-	BuildingSelectorWidget* barracks;
-	BuildingSelectorWidget* school;
-	BuildingSelectorWidget* defencetower;
-	BuildingSelectorWidget* stonewall;
-	BuildingSelectorWidget* market;
+	std::vector<BuildingSelectorWidget*> buildingSelectors;
+	std::vector<BuildingSelectorWidget*> flagSelectors;
 	TeamColorSelector* building_view_tcs;
 	SingleLevelSelector* building_view_level1;
 	SingleLevelSelector* building_view_level2;
 	SingleLevelSelector* building_view_level3;
+	TextLabel* buildingLevelNextPage=nullptr;
+	int buildingLevelCount=1;
 	///@}
 
 	///Flag, zone, and unit view
 	///@{
-	BuildingSelectorWidget* warflag;
-	BuildingSelectorWidget* explorationflag;
-	BuildingSelectorWidget* clearingflag;
 	ZoneSelector* forbiddenZone;
 	ZoneSelector* guardZone;
 	ZoneSelector* clearingZone;
@@ -628,6 +771,9 @@ private:
 	TerrainSelector* grass;
 	TerrainSelector* sand;
 	TerrainSelector* water;
+    // One per enabled catalogue group: a TerrainSelector when the group has a
+    // single enabled member, otherwise a TerrainGroupSelector opening the palette.
+    std::vector<MapEditorWidget*> additionalTerrainSelectors;
 	TerrainSelector* wheat;
 	TerrainSelector* trees;
 	TerrainSelector* stone;
@@ -675,10 +821,18 @@ private:
 	///@{
 	BuildingInfoTitle* buildingInfoTitle;
 	BuildingPicture* buildingPicture;
+	std::array<FractionValueText*, MaterialCount> buildingResourceLabels{};
+	std::array<ValueScrollBox*, MaterialCount> buildingResourceControls{};
+	std::vector<std::pair<FractionValueText*,ValueScrollBox*>> buildingEditRows;
+	int buildingEditFirstRow=0;
+	Sint32 buildingBombingRequirement=0;
+	FractionValueText* buildingWorkerLevelLabel;
+	ValueScrollBox* buildingWorkerLevelScrollBox;
+	FractionValueText* buildingBombingLabel;
+	ValueScrollBox* buildingBombingScrollBox;
+	void layoutBuildingEditRows();
 	FractionValueText* buildingHPLabel;
 	ValueScrollBox* buildingHPScrollBox;
-	FractionValueText* buildingFoodQuantityLabel;
-	ValueScrollBox* buildingFoodQuantityScrollBox;
 	FractionValueText* buildingAssignedLabel;
 	ValueScrollBox* buildingAssignedScrollBox;
 	FractionValueText* buildingWorkerRatioLabel;
@@ -687,14 +841,6 @@ private:
 	ValueScrollBox* buildingExplorerRatioScrollBox;
 	FractionValueText* buildingWarriorRatioLabel;
 	ValueScrollBox* buildingWarriorRatioScrollBox;
-	FractionValueText* buildingCherryLabel;
-	ValueScrollBox* buildingCherryScrollBox;
-	FractionValueText* buildingOrangeLabel;
-	ValueScrollBox* buildingOrangeScrollBox;
-	FractionValueText* buildingPruneLabel;
-	ValueScrollBox* buildingPruneScrollBox;
-	FractionValueText* buildingStoneLabel;
-	ValueScrollBox* buildingStoneScrollBox;
 	FractionValueText* buildingBulletsLabel;
 	ValueScrollBox* buildingBulletsScrollBox;
 	FractionValueText* buildingMinimumLevelLabel;
@@ -709,7 +855,12 @@ private:
     ///changed by the buttons at the bottom of the building menu
 	int buildingLevel;
 	///Returns whether the particular type of building is upgradable
-	bool isUpgradable(int buildingType);
+	int buildingSelectionType(const std::string& key);
+    int displayedBuildingSelectionType(const std::string& key) const;
+	void rebuildBuildingSelectors();
+	void layoutBuildingSelectors();
+	bool scrollBuildingSelectors(double delta);
+	int buildingSelectorRow=0, flagSelectorRow=0;
 
 	///A pointer to the editor sprites
 	Sprite *menu;
@@ -762,12 +913,18 @@ private:
 	///Tells whether the menu screen is being drawn right now
 	bool showingMenuScreen;
 	std::unique_ptr<MapEditMenuScreen> menuScreen;
+    std::unique_ptr<SetLibraryDialog> setLibraryDialog;
+    bool importingSet = false;
 
 	///Tells whether the load-game menu screen is being drawn right now
 	bool showingLoad;
 	///Tells whether the save-game menu screen is being drawn right now
 	bool showingSave;
 	std::unique_ptr<LoadSaveDialog> loadSaveScreen;
+	bool importingResources = false;
+	void importResourceFile(const std::string& filename);
+	bool importingTerrain = false;
+	void importTerrainFile(const std::string &filename);
 
 	///Tells whether the script editor is being drawn
 	bool showingScriptEditor;
@@ -813,6 +970,41 @@ private:
 	void handleTerrainClick(int mx, int my);
 	///Tells whether the terrain is being dragged, continually placing more
 	bool isDraggingTerrain;
+	// --- WS-B brush painting ---
+public:
+	//! A point of the brush lattice: a map cell, or a vertex for terrain brushes.
+	using BrushCell = std::pair<int, int>;
+	//! Terrain is stored per vertex, so base-terrain brushes stamp vertices
+	//! (the smallest figure is a single vertex); resource brushes stamp cells.
+	bool brushOnVertices() const;
+	//! Lattice point under a map-local pointer position: the cell under it, or
+	//! for a vertex brush the nearest vertex. Preview and commit share it.
+	BrushCell brushCellAt(int mx, int my) const;
+	//! Pixels a lattice point's square starts at, relative to its cell's origin:
+	//! a vertex's square is centred on the vertex.
+	int brushSquareOffset() const { return brushOnVertices() ? -16 : 0; }
+	//! The brush figure's lattice points centred on one, in unwrapped coordinates
+	//! around it, aligned to the current stroke's checkerboard origin.
+	std::vector<BrushCell> terrainBrushCells(int mapX, int mapY) const;
+	//! The cells of a footprint where the selected resource cannot be placed.
+	std::vector<BrushCell> invalidResourceCells(const std::vector<BrushCell> &footprint);
+	//! "<Resource> can only be placed on: <terrains>" for the selected resource.
+	std::string resourcePlacementHint() const;
+	//! A short non-interactive message at the bottom left of the map.
+	void showStatus(std::string text, Uint32 durationMs = 4000);
+	const std::string &lastStatus() const { return statusText; }
+private:
+	std::string statusText;
+	Uint64 statusUntil = 0;
+	int strokeCoveredCells = 0, strokePlacedResources = 0;
+	void finishTerrainStroke();
+	void drawTerrainBrushPreview();
+public:
+    // Explicit owner observation for editor drawing and standalone editor tools.
+    void preparePresentation();
+private:
+	void drawStatus();
+	// --- end WS-B brush painting ---
 	///Handles a click or drag of the mouse when removing objects
 	void handleDeleteClick(int mx, int my);
 	///Tells whether the delete tool is being dragged
@@ -830,7 +1022,7 @@ private:
 	void beginTerrainPlacement(TerrainSelector::TerrainType type, TerrainPlacementMode mode);
 	void resetPlacementTracking();
 	void refreshSelectedUnitPerformance(int stat);
-	void layoutOrDisableRow(FractionValueText* label, ValueScrollBox* scrollBox, bool shown, int& ypos);
+	void addBuildingEditRow(FractionValueText* label, ValueScrollBox* scrollBox, bool shown);
 
 	///This vector of the keys on the team view. It allows one to choose between AI and human teams for campaign games
 	std::vector<std::string> teamViewSelectorKeys;
@@ -864,4 +1056,76 @@ private:
 	///Handles a click or drag of the no resource growth area placement tool
 	void handleNoResourceGrowthClick(int mx, int my);
 
+	// --- WS-E flows ---
+	// Saving, loading, sharing and quitting stay inside the editor: decisions
+	// are EditorConfirmDialog cards and fertility runs in an EditorProgressDialog
+	// over the live map (implemented in MapEditFlows.cpp).
+public:
+	bool hasUnsavedChanges() const { return hasMapBeenModified; }
+	// A window close or application quit (SDL_EVENT_QUIT, Cmd+Q, Alt+F4).
+	void requestApplicationQuit();
+	// MapShareScreen returned with this result.
+	void finishShare(bool shared);
+	bool fertilityOverlayStale() const { return isFertilityOn && fertilityStale; }
+	enum class ConfirmPurpose
+	{
+		None,
+		Quit,
+		QuitApplication,
+		LoadUnsaved,
+		ShareSaveFirst,
+		RerollTerrain
+	};
+	ConfirmPurpose pendingConfirm() const { return confirmPurpose; }
+	EditorConfirmDialog *confirmation() const { return confirmDialog.get(); }
+	EditorProgressDialog *fertilityProgress() const { return progressDialog.get(); }
+	// The map file this editor last loaded or saved; empty for a map never saved.
+	const std::string &savedMapFile() const { return savedFilename; }
+
+private:
+	enum FlowChoice
+	{
+		ChoiceSave,
+		ChoiceDiscard,
+		ChoiceCancel,
+		ChoiceShareSaved,
+		ChoiceConfirm
+	};
+	std::unique_ptr<EditorConfirmDialog> confirmDialog;
+	ConfirmPurpose confirmPurpose = ConfirmPurpose::None;
+	std::vector<FlowChoice> confirmChoices;
+	void openConfirm(ConfirmPurpose purpose);
+	void resolveConfirm(int index);
+	std::unique_ptr<EditorProgressDialog> progressDialog;
+	void openFertilityProgress();
+	void finishFertilityProgress();
+	bool fullQuitAfterSave = false, shareAfterSave = false, loadAfterSave = false;
+	bool fertilityStale = false, fertilityChipPressed = false;
+	std::string savedFilename;
+	// The load picker, after any unsaved-changes decision.
+	void openLoadDialog();
+	// Close menus and pickers before a flow opens the save dialog.
+	void closeDialogsForFlow();
+	void saveSucceeded();
+	void clearSaveFollowUps();
+	// Device file picker for definition imports.
+	std::unique_ptr<GAGCore::ApplicationHost::FileSelection> deviceSelection;
+	void beginDeviceImport();
+	void pollDeviceImport();
+	void importTerrainJson(const std::string &json);
+    void importSetJson(const std::string& json, const std::vector<std::string>& selected = {});
+    void importSetFile(const std::string& filename);
+	void importResourceJson(const std::string &json);
+	// Snapshots taken when the teams or scenario editor opens; OK marks the map
+	// modified only when the result differs.
+	std::vector<TeamsEditor::Slot> teamSlotsAtOpen;
+	std::vector<BaseTeam> baseTeamsAtOpen;
+	std::string scenarioAtOpen;
+	std::string scenarioFingerprint();
+	bool teamSlotsChanged() const;
+	// The "refresh fertility" chip shown over the map while the overlay is stale.
+	bool handleFlowEvent(const SDL_Event &event);
+	void drawFlowOverlays();
+	widgetRectangle fertilityChipRect() const;
+	// --- end WS-E flows ---
 };

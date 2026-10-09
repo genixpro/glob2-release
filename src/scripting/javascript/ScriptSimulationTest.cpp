@@ -10,6 +10,7 @@
 #include <FileManager.h>
 #include <Toolkit.h>
 #include <map>
+#include <zlib.h>
 
 namespace
 {
@@ -86,8 +87,8 @@ void prepareConversion(Engine &engine, const std::filesystem::path &directory)
 			inn = building;
 	}
 	REQUIRE(inn);
-	inn->resources[WHEAT] = 10;
-	inn->resources[CHERRY] = 10;
+	inn->materials[WHEAT] = 10;
+	inn->materials[CHERRY] = 10;
 	inn->updateCallLists();
 	inn->canNotConvertUnitTimer = 0;
 	game.teams[1]->sharedVisionFood |= game.teams[0]->me;
@@ -123,7 +124,7 @@ Run execute(const std::filesystem::path &input, const std::filesystem::path &dir
         // Normalize that metadata after the real loader has validated the input:
         // a new save version must not masquerade as simulation divergence.
         engine.gui.game.mapHeader.versionMinor = 125;
-		engine.gui.game.map.configureCompute(workers, Map::ComputeAI);
+		engine.gui.game.map.configureCompute(workers);
 		if (conversion)
 			prepareConversion(engine, directory);
 		if (!playback)
@@ -147,6 +148,8 @@ Run execute(const std::filesystem::path &input, const std::filesystem::path &dir
 			if (checkpoints && tick != previous && (tick == 32 || tick == 128))
 				save(engine, directory / ("checkpoint-" + std::to_string(tick) + ".game"));
 		}
+		// Delayed decisions own private controller state until their jobs finish.
+		engine.gui.game.drainAI();
 		REQUIRE(engine.gui.game.stepCounter == 256);
 		if (!playback)
 			for (int p = 0; p < engine.gui.game.gameHeader.getNumberOfPlayers(); ++p)
@@ -199,12 +202,12 @@ void fixture(const std::string &name)
 		glob2test::inflated("test/fixtures/javascript/" + name + "-initial.game.gz");
 	const auto released = glob2test::readFile(
 		glob2test::inflated("test/fixtures/javascript/" + name + "-256.checksums.gz"));
-	const auto expected = glob2test::readFile(
+	const auto expanded = glob2test::readFile(
 		glob2test::inflated("test/fixtures/javascript/" + name + "-256-teams16.checksums.gz"));
 	// Expanding the generation table changes its aggregate hash, even when the
 	// extra slots are unused. Keep every released team/entity field pinned too.
 	const auto releasedRecords = records(released);
-	const auto expandedRecords = records(expected);
+	const auto expandedRecords = records(expanded);
 	REQUIRE(releasedRecords.size() == expandedRecords.size());
 	for (const auto& [tick, record] : releasedRecords)
 	{
@@ -214,12 +217,25 @@ void fixture(const std::string &name)
 	}
 	const auto directory = glob2test::artifactDir();
 	const auto serial = execute(initial, directory / "workers1", 1, false, true);
+	// Runtime resources have their own trace; retain released traces above and
+	// the terrain trace as historical migration evidence.
+	const auto resourceFixture = "test/fixtures/javascript/" + name + "-256-resources.checksums.gz";
+	if (glob2test::updatingFixtures())
+	{
+		gzFile output = gzopen((glob2test::sourceRoot() / resourceFixture).string().c_str(), "wb9");
+		REQUIRE(output != nullptr);
+		const auto written = gzwrite(output, serial.trace.data(), unsigned(serial.trace.size()));
+		const auto closed = gzclose(output);
+		REQUIRE(written == int(serial.trace.size()));
+		REQUIRE(closed == Z_OK);
+	}
+	const auto expected = glob2test::readFile(glob2test::inflated(resourceFixture));
 	CHECK(serial.trace == expected);
 	const auto parallel = execute(initial, directory / "workers4", 4, false, true);
-	CHECK(parallel.trace == expected);
+	CHECK(parallel.trace == serial.trace);
 	CHECK(parallel.finalSave == serial.finalSave);
 	CHECK(parallel.replay == serial.replay);
-	const auto expectedRecords = records(expected);
+	const auto expectedRecords = records(serial.trace);
 	for (int boundary : {32, 128})
 	{
 		CAPTURE(boundary);
@@ -238,7 +254,7 @@ void fixture(const std::string &name)
 	}
 	const auto playback =
 		execute(directory / "workers1/game.replay", directory / "playback", 1, true);
-	CHECK(playback.trace == expected);
+	CHECK(playback.trace == serial.trace);
 }
 } // namespace
 TEST_CASE("JavaScript original fixture executes, resumes and replays 256 ticks" *

@@ -4,32 +4,49 @@
 #pragma once
 
 #include <cstdint>
+#include <cassert>
+#include <cstddef>
 #include <vector>
+#include <array>
+#include "ResourceProperties.h"
 
 class Map;
+struct TerrainProperties;
 
-/// Exact per-tile growth probability for the resources whose spread is limited by
-/// nearby underground, scaled by kScale.
-///
-/// Map::growResources decides whether a wheat or wood tile expands with
-///
-///     dwax = (syncRand()&0xF) - (syncRand()&0xF);   // likewise dway
-///     expand = isWater(x+dwax, y+dway) && !isSand(x-dwax, y-dway);
-///
-/// The difference of two uniform draws from {0..15} has PMF (16-|d|)/256, so the
-/// chance a tile expands is the triangular kernel below summed over every water tile
-/// whose mirror through the tile is not sand. That sum is what this computes, in
-/// closed form, over the whole map.
+/// Deterministic terrain ecology. Contributions and inhibition are averaged by
+/// a weighted coupled kernel; runtime growth samples the resulting exact rates
+/// rather than probing neighboring terrain on every visit.
 namespace Fertility
 {
 	/// A tile surrounded entirely by qualifying water reaches exactly this.
 	constexpr std::uint32_t kScale = 65536;
 
+    // Fields retain Q16, but rates use a common denominator divisible by three
+    // so even a one-point fertile wheat tile has positive exact probability.
+    constexpr std::uint32_t kRateScale=3u*kScale;
+    constexpr std::uint32_t kRateDrawLimit=std::uint32_t((std::uint64_t{1}<<32)/kRateScale*kRateScale);
+
+    /// Draw must return a uniform full-width uint32. Reject the incomplete top
+    /// bucket (1/65536 of draws) before modulo; fractional rates are unbiased.
+    template<class Draw> unsigned growthOpportunities(std::uint32_t rate,Draw&& draw)
+    {
+        assert(rate<=4u*kRateScale);
+        unsigned result=rate/kRateScale;
+        const auto fraction=rate%kRateScale;
+        if(fraction)
+        {
+            std::uint32_t random;
+            do { random=draw(); } while(random>=kRateDrawLimit);
+            result+=(random%kRateScale)<fraction;
+        }
+        return result;
+    }
+
 	enum class Path
 	{
-		Adaptive,           ///< whichever of the two below costs less on this map
-		SandCorrection,     ///< convolve water, then subtract the sand-blocked pairs
-		WaterSplat          ///< accumulate straight from the water tiles
+		Adaptive,           ///< choose the cheaper sparse correction or donor accumulation
+		SandCorrection,     ///< linear donor convolution minus opposite inhibition
+		WaterSplat          ///< accumulate coupled weights from nonzero donors
 	};
 
 	/// Masks are row-major y*width+x. Toroidal, matching the engine's wrapping.
@@ -44,34 +61,64 @@ namespace Fertility
 
 		std::uint32_t at(int x, int y) const;
 		const std::vector<std::uint32_t>& values() const { return fertility; }
+		std::size_t capacity() const { return fertility.capacity(); }
 		int getW() const { return width; }
 		int getH() const { return height; }
 		Path pathUsed() const { return usedPath; }
 		int waterCount() const { return waterTiles; }
 		int sandCount() const { return sandTiles; }
 
+		void rebuildWeighted(int width, int height,
+			const std::vector<std::int16_t>& contributionQ8,
+			const std::vector<std::uint16_t>& inhibitionQ8,Path path=Path::Adaptive);
+		void multiplyLocal(const std::vector<std::uint16_t>& growthQ8);
+
 	private:
 		int width = 0, height = 0;
 		int waterTiles = 0, sandTiles = 0;
-		Path usedPath = Path::Adaptive;
-		// first/second hold single-axis triangular-kernel partial sums (0-water inputs, so the
-		// 1D triangular kernel's own weight sum of 256 bounds them at 256, or 4096 once a second,
-		// unweighted 16-wide box pass runs over that): both fit uint16_t with no precision loss.
-		// fertility is the full 2D result and can reach 256*256 = 65536, one past uint16_t's
-		// range, so it stays 32-bit.
+		Path usedPath = Path::SandCorrection;
 		std::vector<std::uint32_t> fertility;
-		std::vector<std::uint16_t> first, second;
-		std::vector<int> wrappedX, wrappedY;
-		int wx(int x, int offset) const;
-		int wy(int y, int offset) const;
-		void buildWrappedIndexes();
-		void buildWaterConvolution(const std::vector<std::uint8_t>& water);
 	};
 
-	/// Builds the masks from the undermap and computes the field. Tiles that no wheat
-	/// or wood deposit can reach over grass score 0 whatever their surroundings: growth
+	/// Same triangular offsets as land growth, pairing each donor with shoreline
+	/// at the rotated doubled offset. Weighted inputs are Q8; results are Q16.
+	std::vector<std::uint32_t> shoreGrowthField(int width,int height,
+		const std::vector<std::int16_t>& contributionQ8,
+		const std::vector<std::uint16_t>& supportQ8);
+
+	class GrowthCache
+	{
+	public:
+		void invalidate() { ready = false; }
+		/// Preserve cached fields when only habitat permissions or non-ecology
+		/// capabilities change. Map replacement always calls invalidate().
+		void terrainChanged(std::size_t index, const TerrainProperties& before,
+			const TerrainProperties& after);
+		bool validFor(const Map& map) const;
+		void rebuild(const Map& map);
+		/// Expected opportunities per visit divided by kRateScale for a deposit of
+		/// this ecology and growth rate; bonuses permit up to four. Habitat and
+		/// terrain gating is the caller's (MapState::resourceGrowthRate), so a
+		/// frozen copy never reads the live map.
+		std::uint32_t rate(std::size_t index, ResourceEcology ecology, std::uint32_t growthRate) const;
+		const Field& landField() const { return land; }
+		const std::vector<std::uint32_t>& aquaticField() const { return aquatic; }
+		std::array<std::size_t,3> storageCapacities() const { return {land.capacity(),aquatic.capacity(),localGrowth.capacity()}; }
+		std::array<std::size_t,3> storageSizes() const { return {land.values().size(),aquatic.size(),localGrowth.size()}; }
+	private:
+		bool ready = false;
+		Field land;
+		std::vector<std::uint32_t> aquatic;
+		std::vector<std::uint16_t> localGrowth;
+	};
+
+	/// Uses canonical terrain properties and the shared cached field. Tiles that no wheat
+	/// or wood deposit can reach over crop habitat score 0 whatever their surroundings: growth
 	/// spreads from an existing deposit, so a tile none can reach never grows anything.
 	Field forMap(const Map& map, bool gateOnReachableDeposits = true);
+
+	/// Executes a selected tile's bounded rate, including the fractional draw.
+	void applyGrowthOpportunities(Map& map,int x,int y,std::uint32_t rate,int scarcity);
 
 	/// Throughput a tile can actually sustain: the growth chance, the deposit already
 	/// there and the room it has to spread into, all of which must be non-zero to matter.

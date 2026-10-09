@@ -1,8 +1,13 @@
 /* Maxima farming and clearing policy. */
 
+#include "PowerOfTwo.h"
+#include "Material.h"
+#include "AIResourcePolicy.h"
 #include "field/UniformTraversal.h"
 #include "AITelemetryFields.h"
 #include "AIMaxima.h"
+#include "AIMaximaFarmGeometry.h"
+#include "AIMaximaBuildings.h"
 #include "GlobalContainer.h"
 #include "Game.h"
 #include "Unit.h"
@@ -33,37 +38,37 @@ namespace
 	// both policies; zero keeps the optimizer's unlimited control setting.
 	std::vector<Uint8> farm_management_area(Context& runtime, int radius)
 	{
-		Map* map=runtime.player->map;
-		const int w=map->getW(), h=map->getH();
+		const AIEngine::AIWorldView* map=&runtime.observation();
+		const int w=(*map).width, h=(*map).height;
 		if(radius<=0)return std::vector<Uint8>(w*h,1);
 		std::vector<Uint8> nearby(w*h,0);
 		for(int team=0;team<Team::MAX_COUNT;++team)
 		{
-			if(!((runtime.player->team->allies|runtime.player->team->me)&(Uint32(1)<<team)))continue;
-			Team* ally=runtime.player->game->teams[team];
+			if(!((runtime.observedTeam().allies|runtime.observedTeam().mask)&(Uint32(1)<<team)))continue;
+			const auto* ally=std::size_t(team)<runtime.observation().teams.size() ? &runtime.observation().teams[team] : nullptr;
 			if(!ally)continue;
 			for(int b=0;b<Building::MAX_COUNT;++b)
 			{
-				Building* building=ally->myBuildings[b];
-				if(!building || building->type->isVirtual)continue;
+				const AIEngine::BuildingView* building=runtime.observation().buildingSlots(team)[b];
+				if(!building || !AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.occupiesGround)continue;
 				for(int dy=-radius;dy<=radius;++dy)for(int dx=-radius;dx<=radius;++dx)
 					if(dx*dx+dy*dy<=radius*radius)
-						nearby[map->normalizeY(building->posY+dy)*w
-							+map->normalizeX(building->posX+dx)]=1;
+						nearby[(*map).normalizeY(building->posY+dy)*w
+							+(*map).normalizeX(building->posX+dx)]=1;
 			}
 		}
 		return nearby;
 	}
 
-	std::vector<Uint8> shoreline_backing(Map* map)
+	std::vector<Uint8> shoreline_backing(const AIEngine::AIWorldView* map)
 	{
-		const int w=map->getW(), h=map->getH();
+		const int w=(*map).width, h=(*map).height;
 		std::vector<Uint8> backing(w*h, 0);
 		std::vector<int> queue;
 		queue.reserve(w*h);
 		for(int y=0; y<h; ++y)
 			for(int x=0; x<w; ++x)
-				if(map->isWater(x, y))
+				if(terrainProvidesFertility(AIEngine::ObservationQueries::terrain((*map),x, y)))
 				{
 					backing[y*w+x]=1;
 					queue.push_back(y*w+x);
@@ -73,8 +78,8 @@ namespace
 		// This excludes isolated inland sand without depending on crop density.
 		field::traverse(queue,{w,h},field::Surrounding,[](int){return field::Visit::Expand;},
 			[&](int,int x,int y) {
-				const int nx=(x+w)%w,ny=(y+h)%h,next=ny*w+nx;
-				if(!backing[next] && map->hasSand(nx,ny)){backing[next]=1;queue.push_back(next);}
+				const int nx=powerOfTwoRemainder(x+w, w),ny=powerOfTwoRemainder(y+h, h),next=ny*w+nx;
+				if(!backing[next] && AIEngine::ObservationQueries::terrain((*map),nx,ny).shoreline){backing[next]=1;queue.push_back(next);}
 			});
 		return backing;
 	}
@@ -87,37 +92,57 @@ namespace
 			{
 				if((!dx && !dy) || (cardinal_only && std::abs(dx)+std::abs(dy)!=1))
 					continue;
-				if(backing[((y+dy+h)%h)*w+(x+dx+w)%w]) return true;
+				if(backing[(powerOfTwoRemainder(y+dy+h, h))*w+powerOfTwoRemainder(x+dx+w, w)]) return true;
 			}
 		return false;
 	}
 
-	bool is_empty_growth_cell(const Tile& cell)
+    // Whole-tile seed protection only helps finite yields that can reproduce
+    // into another tile. Infinite and in-place-only producers remain harvestable;
+    // FarmArea's per-material seed reserve is a separate engine policy.
+    bool is_spreading_seed(const AIEngine::AIWorldView& map, int x, int y, int material)
+    {
+        return AIResourcePolicy::needsSeedReserve(map.state(),map.tileIndex(x,y),static_cast<MaterialId>(material));
+    }
+
+    bool uses_land_fertility(const AIEngine::AIWorldView& map,int x,int y)
+    {
+        return map.state().resourceProperties(map.resourceAt(map.tileIndex(x,y)).resource.type).ecology==ResourceEcology::Land;
+    }
+
+    bool is_empty_growth_cell(const AIEngine::AIWorldView& map, int x, int y)
+    {
+        return AIResourcePolicy::emptyGrowthCell(map.state(),map.tileIndex(x,y));
+    }
+
+    bool cached_seed(const std::vector<Uint8>& eligibility,const AIEngine::AIWorldView& map,int x,int y,int material)
+    {
+        return eligibility[map.tileIndex(x,y)] & (material==materialIndex(MaterialId::Food)?1:2);
+    }
+
+    bool can_seed_target(const std::vector<Uint8>& eligibility,const AIEngine::AIWorldView& map,
+        int sx,int sy,int tx,int ty,int material)
+    {
+        return cached_seed(eligibility,map,sx,sy,material)
+            && AIResourcePolicy::emptyGrowthCell(map.state(),map.tileIndex(tx,ty))
+            && MapState::terrainSupportsResourceSlot(map.state(),map.tileIndex(tx,ty),map.resourceAt(map.tileIndex(sx,sy)).resource.type);
+    }
+
+	bool is_empty_growth_cell(const AIEngine::AIWorldView* map, std::size_t index)
 	{
-		return cell.terrain<16 && cell.canResourcesGrow
-			&& cell.resource.type==NO_RES_TYPE && cell.building==NOGBID;
+		const auto resource=map->resourceAt(index);
+		const auto& terrain=AIEngine::ObservationQueries::terrain((*map),index);
+		return (terrain.allowedResources & (1u<<WHEAT)) && terrain.resourcesGrow && resource.mayGrow
+			&& resource.resource.type==NO_RES_TYPE && map->occupancyAt(index).building==NOGBID;
 	}
 
 	// Close one-cell harvest gaps before identifying the outer farm boundary.
 	// Otherwise routine harvesting would turn the entire interior into an edge.
-	std::vector<Uint8> wheat_farm_exterior(Map* map)
+	std::vector<Uint8> wheat_farm_exterior(const AIEngine::AIWorldView* map)
 	{
-		const int w=map->getW(), h=map->getH();
-		std::vector<Uint8> dilated(w*h, 0), exterior(w*h, 0);
-		for(int y=0; y<h; ++y) for(int x=0; x<w; ++x)
-		{
-			if(map->getResource(x,y).type!=WHEAT) continue;
-			for(int dy=-1; dy<=1; ++dy) for(int dx=-1; dx<=1; ++dx)
-				dilated[map->normalizeY(y+dy)*w+map->normalizeX(x+dx)]=1;
-		}
-		for(int y=0; y<h; ++y) for(int x=0; x<w; ++x)
-		{
-			bool inside=true;
-			for(int dy=-1; dy<=1; ++dy) for(int dx=-1; dx<=1; ++dx)
-				inside=inside && dilated[map->normalizeY(y+dy)*w+map->normalizeX(x+dx)];
-			exterior[y*w+x]=!inside;
-		}
-		return exterior;
+        return FarmGeometry::foodExterior(map->width,map->height,[map](int index) {
+            return MapState::materialAmountAt(map->state(),index,MaterialId::Food)>0;
+        });
 	}
 
 	///Semantic roles a single resource tile can play in the shared wheat/wood
@@ -139,52 +164,51 @@ namespace
 		}
 	};
 
-	FarmTileClassification classify_farm_tile(MapInfo& mi, Map* map,
+	FarmTileClassification classify_farm_tile(MapInfo& mi, const AIEngine::AIWorldView* map,
 		const Farming::ExactFertilityCache& fertility_cache,
-		const std::vector<Uint8>& wheat_exterior,
+		const std::vector<Uint8>& wheat_exterior, const std::vector<Uint8>& seedEligibility,
 		bool shoreline_backed, int x, int y, int resource_type, Uint32 minimum_fertility)
 	{
 		FarmTileClassification pattern;
-		const int w=map->getW();
-		const int h=map->getH();
+		const int w=(*map).width;
+		const int h=(*map).height;
 		const int index=y*w+x;
-		const Tile& cell=map->getTile(x, y);
 		const bool seed_lattice=Farming::isInteriorSeed(x, y);
 		const bool expansion_lattice=Farming::isExpansionCell(x, y);
 		const Uint32 fertility=fertility_cache.at(x, y);
-		const bool resource=mi.is_resource(x, y, resource_type);
+		const bool resource=cached_seed(seedEligibility,*map,x,y,resource_type);
 		// A coastal wheat wall must cross local fertility dips. Only the
 		// immediate frontier of a live crop qualifies below, so this cannot
 		// reserve unrelated empty coast. Keep the exemption after growth too:
 		// protecting an empty tile then exposing its new wheat would defeat it.
 		const bool fertile=fertility>=minimum_fertility
-			|| (resource_type==WHEAT && shoreline_backed);
-		if(is_empty_growth_cell(cell)
-		   && fertile)
+			|| (resource_type==materialIndex(MaterialId::Food) && shoreline_backed);
+		if(is_empty_growth_cell(*map,x,y))
 		{
 			bool adjacent_resource=false;
 			for(int dy=-1; dy<=1; ++dy)
 				for(int dx=-1; dx<=1; ++dx)
 				{
 					if(!dx && !dy) continue;
-					if(mi.is_resource(x+dx, y+dy, resource_type))
+					if(can_seed_target(seedEligibility,*map,x+dx,y+dy,x,y,resource_type)
+                        && (fertile || !uses_land_fertility(*map,x+dx,y+dy)))
 						adjacent_resource=true;
 				}
 			// Protection follows the expansion lattice only. A shoreline run
 			// must stay porous by construction; it is never a sealed contour.
 			pattern.frontier=adjacent_resource && expansion_lattice
-				&& (resource_type!=WHEAT || wheat_exterior[index] || seed_lattice);
+				&& (resource_type!=materialIndex(MaterialId::Food) || wheat_exterior[index] || seed_lattice);
 		}
-		if(resource && fertile)
+		if(resource && (fertile || !uses_land_fertility(*map,x,y)))
 		{
 			for(int dy=-1; dy<=1; ++dy)
 				for(int dx=-1; dx<=1; ++dx)
 				{
 					if(!dx && !dy) continue;
-					const Tile& neighbor=map->getTile(x+dx, y+dy);
-					const bool eligible=is_empty_growth_cell(neighbor)
-						&& fertility_cache.at(x+dx, y+dy)>=minimum_fertility
-						&& (resource_type!=WHEAT
+					const auto neighborIndex=map->tileIndex(x+dx, y+dy);
+					const bool eligible=can_seed_target(seedEligibility,*map,x,y,x+dx,y+dy,resource_type)
+						&& (fertility_cache.at(x+dx,y+dy)>=minimum_fertility || !uses_land_fertility(*map,x,y))
+						&& (resource_type!=materialIndex(MaterialId::Food)
 							|| wheat_exterior[map->normalizeY(y+dy)*w+map->normalizeX(x+dx)]);
 					pattern.edge_candidate=pattern.edge_candidate || eligible;
 				}
@@ -197,9 +221,9 @@ namespace
 				for(int dy=-1; dy<=1; ++dy)
 					for(int dx=-1; dx<=1; ++dx)
 					{
-						const int nx=(x+dx+w)%w;
-						const int ny=(y+dy+h)%h;
-						if(!mi.is_resource(nx, ny, resource_type)) continue;
+						const int nx=powerOfTwoRemainder(x+dx+w, w);
+						const int ny=powerOfTwoRemainder(y+dy+h, h);
+						if(!cached_seed(seedEligibility,*map,nx,ny,resource_type)) continue;
 						nearby_lattice_resource=nearby_lattice_resource
 							|| Farming::isInteriorSeed(nx, ny);
 						local_anchor=std::min(local_anchor, ny*w+nx);
@@ -260,12 +284,13 @@ struct Maxima::WoodClearingTarget
 
 Maxima::WoodClearingTarget Maxima::select_wood_clearing_target(Context& runtime) const
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	MapInfo mi(runtime);
-	Map* map=runtime.player->map;
-	const int w=map->getW();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
 	AIMaximaRuntime::Gradients::GradientInfo settlement_info;
 	settlement_info.add_source(new Entities::AnyTeamBuilding(
-		runtime.player->team->teamNumber, CompletedBuildings));
+		runtime.teamNumber(), CompletedBuildings));
 	Gradient& settlement=runtime.get_gradient_manager().get_gradient(settlement_info);
 	const WoodReserve wood_reserve=select_wood_reserve(runtime);
 	WoodClearingTarget best;
@@ -280,7 +305,7 @@ Maxima::WoodClearingTarget Maxima::select_wood_clearing_target(Context& runtime)
 				&& maintenance_circulation_mask[index];
 			if(!mi.is_discovered(x, y)
 				|| (mi.is_clearing_area(x, y) && !owned_maintenance)
-				|| !mi.is_grass(x, y))
+				|| !mi.is_crop_habitat(x, y))
 				continue;
 			const int distance=settlement.get_height(x, y);
 			if(distance<0 || distance>14)
@@ -292,12 +317,11 @@ Maxima::WoodClearingTarget Maxima::select_wood_clearing_target(Context& runtime)
 			{
 				for(int dy=-4; dy<=4; ++dy)
 				{
-					if(dx*dx+dy*dy<=16 && wood_reserve.cells[map->normalizeY(y+dy)*w+map->normalizeX(x+dx)])
+					if(dx*dx+dy*dy<=16 && wood_reserve.cells[(*map).normalizeY(y+dy)*w+(*map).normalizeX(x+dx)])
 						reserve_overlap=true;
-					if(mi.is_resource(x+dx, y+dy, WOOD))
+					if(mi.is_resource(x+dx, y+dy, materialIndex(MaterialId::Wood)))
 					{
-						const int resource_index=((y+dy+map->getH())
-							%map->getH())*w+((x+dx+w)%w);
+						const int resource_index=(dimensionRemainder(y+dy+(*map).height, (*map).height))*w+(powerOfTwoRemainder(x+dx+w, w));
 						wood+=1;
 						if(resource_index<int(maintenance_circulation_mask.size())
 						   && maintenance_circulation_mask[resource_index])
@@ -324,8 +348,9 @@ Maxima::WoodClearingTarget Maxima::select_wood_clearing_target(Context& runtime)
 void Maxima::retire_clearing_campaign(Context& runtime, const char* reason,
 	const std::string& details)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	telemetry.count(AITrace::AI7::Maxima_retire_clearing_campaign_calls);
-	runtime.add_management_order(new DestroyBuilding(proactive_clearing_flag));
+	runtime.add_management_order(new RetireAttraction(proactive_clearing_flag,1u<<WORKER));
 	emit_telemetry(runtime, "land_clearing_finished",
 		"\tflag="+telemetryText(proactive_clearing_flag)
 		+details+"\treason="+reason);
@@ -334,28 +359,29 @@ void Maxima::retire_clearing_campaign(Context& runtime, const char* reason,
 
 bool Maxima::continue_clearing_campaign(Context& runtime)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	telemetry.count(AITrace::AI7::Maxima_continue_clearing_campaign_calls);
 	MapInfo mi(runtime);
 	if(proactive_clearing_flag!=-1)
 	{
 		if(runtime.get_building_register().is_building_found(proactive_clearing_flag))
 		{
-			Building* flag=runtime.get_building_register().get_building(proactive_clearing_flag);
-			bool clearing_resources[BASIC_COUNT]={false};
-			clearing_resources[WOOD]=true;
+			const AIEngine::BuildingView* flag=runtime.get_building_register().get_building(proactive_clearing_flag);
+			bool clearing_resources[MaterialCount]={false};
+			clearing_resources[materialIndex(MaterialId::Wood)]=true;
 			runtime.push_order(std::shared_ptr<Order>(new OrderModifyClearingFlag(
 				flag->gid, clearing_resources)));
 
 			const WoodReserve wood_reserve=select_wood_reserve(runtime);
 			bool reserve_overlap=false;
 			for(size_t i=0;i<wood_reserve.cells.size();++i)
-				if(wood_reserve.cells[i] && runtime.player->map->warpDistSquare(
-					int(i)%runtime.player->map->getW(),int(i)/runtime.player->map->getW(),
+				if(wood_reserve.cells[i] && runtime.observation().distanceSquared(
+					dimensionRemainder(int(i), runtime.observation().width),int(i)/runtime.observation().width,
 					flag->posX,flag->posY)<=16) reserve_overlap=true;
 			int nearby_wood=0;
 			for(int dx=-4; dx<=4; ++dx)
 				for(int dy=-4; dy<=4; ++dy)
-					if(mi.is_resource(flag->posX+dx, flag->posY+dy, WOOD))
+					if(mi.is_resource(flag->posX+dx, flag->posY+dy, materialIndex(MaterialId::Wood)))
 						nearby_wood+=1;
 			const bool clearing_quota_met=
 				proactive_clearing_initial_wood-nearby_wood
@@ -396,6 +422,7 @@ bool Maxima::continue_clearing_campaign(Context& runtime)
 
 void Maxima::manage_land_clearing(Context& runtime)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	telemetry.count(AITrace::AI7::Maxima_manage_land_clearing_calls);
 	if(!budget.farming_enabled)
 	{
@@ -404,22 +431,22 @@ void Maxima::manage_land_clearing(Context& runtime)
 				proactive_clearing_flag)
 			||runtime.get_building_register().is_building_pending(
 				proactive_clearing_flag)))
-			runtime.add_management_order(new DestroyBuilding(proactive_clearing_flag));
+			runtime.add_management_order(new RetireAttraction(proactive_clearing_flag,1u<<WORKER));
 		proactive_clearing_flag=-1;
 		farming_urgent=false;
 		return;
 	}
 	MapInfo mi(runtime);
-	Map* map=runtime.player->map;
-	const int w=map->getW();
-	TeamStat* stat=runtime.player->team->stats.getLatestStat();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
+	const TeamStat* stat=&runtime.observedTeam().statistics;
 	if(continue_clearing_campaign(runtime)) return;
 
 	int maintenance_wood_tiles=0;
-	for(int index=0; index<w*map->getH(); ++index)
+	for(int index=0; index<w*(*map).height; ++index)
 		if(index<int(maintenance_circulation_mask.size())
 		   && maintenance_circulation_mask[index]
-		   && mi.is_resource(index%w, index/w, WOOD))
+		   && mi.is_resource(powerOfTwoRemainder(index, w), index/w, materialIndex(MaterialId::Wood)))
 			maintenance_wood_tiles+=1;
 	const bool maintenance_clearing_allowed=
 		budget.farming_maintenance_clearing_enabled
@@ -449,7 +476,7 @@ void Maxima::manage_land_clearing(Context& runtime)
 	// Start unstaffed so the WOOD-only selector is installed before a worker can
 	// touch an overlapping wheat farm.
 	BuildingOrder* flag_order=new BuildingOrder(
-		IntBuildingType::CLEARING_FLAG, 0);
+		AIMaximaBuildings::WorkerAttraction, 0);
 	flag_order->add_constraint(new Construction::SinglePosition(best_x, best_y));
 	proactive_clearing_flag=runtime.add_building_order(flag_order);
 	proactive_clearing_started_tick=timer;
@@ -460,8 +487,8 @@ void Maxima::manage_land_clearing(Context& runtime)
 	{
 		for(int dy=-4; dy<=4; ++dy)
 		{
-			if(mi.is_resource(best_x+dx, best_y+dy, WOOD)
-				&& !mi.is_resource(best_x+dx, best_y+dy, WHEAT))
+			if(mi.is_resource(best_x+dx, best_y+dy, materialIndex(MaterialId::Wood))
+				&& !mi.is_resource(best_x+dx, best_y+dy, materialIndex(MaterialId::Food)))
 				release_wood->add_location(best_x+dx, best_y+dy);
 		}
 	}
@@ -501,8 +528,9 @@ struct Maxima::MaintenanceClearingPlan
 
 std::vector<Uint8> Maxima::worker_reachable_circulation(Context& runtime, bool after_harvest) const
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW(), h=map->getH(), size=w*h;
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width, h=(*map).height, size=w*h;
 	// Empty pockets beside a building are not necessarily connected to workers.
 	// Ignore transient units. Reserve selection may include approaches workers
 	// can open by harvesting; circulation clearing needs currently empty routes.
@@ -513,37 +541,37 @@ std::vector<Uint8> Maxima::worker_reachable_circulation(Context& runtime, bool a
 		std::vector<int> queue;
 		for(int id=0;id<Unit::MAX_COUNT;++id)
 		{
-			const Unit* worker=runtime.player->team->myUnits[id];
+			const AIEngine::UnitView* worker=runtime.observation().unitSlots(runtime.teamNumber())[id];
 			if(!worker||worker->typeNum!=WORKER
 			   ||int(worker->performance[SWIM]>0)!=swimming)continue;
-			const int index=map->normalizeY(worker->posY)*w+map->normalizeX(worker->posX);
+			const int index=(*map).normalizeY(worker->posY)*w+(*map).normalizeX(worker->posX);
 			if(!visited[index]){visited[index]=1;queue.push_back(index);}
 		}
 		field::traverse(queue,{w,h},field::Surrounding,
 			[&](int index) {
-				const int x=index%w,y=index/w;
-				const Tile& current=map->getTile(x,y);
+				const int x=powerOfTwoRemainder(index, w),y=index/w;
+				const auto current=AIEngine::ObservationQueries::spatialTile((*map),x,y);
 				const bool current_farm_area=after_harvest
 					&& index<int(applied_farm_protection_mask.size())
 					&& applied_farm_protection_mask[index];
-				if(current.building==NOGBID && (current.resource.type==NO_RES_TYPE
+				if(current.building==NOGBID && (!MapState::resourceBlocksGround(map->state(),index)
 				   || current_farm_area
-				   || (after_harvest && (current.resource.type==WOOD || current.resource.type==WHEAT))))
+				   || (after_harvest && (MapState::hasMaterial(map->state(),map->tileIndex(x,y),MaterialId::Wood) || MapState::hasMaterial(map->state(),map->tileIndex(x,y),MaterialId::Food)))))
 					reachable[index]=1;
 
 				return field::Visit::Expand;
 			},[&](int,int px,int py) {
-				const int nx=map->normalizeX(px),ny=map->normalizeY(py),next=ny*w+nx;
-				const Tile& tile=map->getTile(nx,ny);
+				const int nx=(*map).normalizeX(px),ny=(*map).normalizeY(py),next=ny*w+nx;
+				const auto tile=AIEngine::ObservationQueries::spatialTile((*map),nx,ny);
 				const bool farm_area=after_harvest
 					&& next<int(applied_farm_protection_mask.size())
 					&& applied_farm_protection_mask[next];
 				if(visited[next]||tile.building!=NOGBID
-				   ||(tile.resource.type!=NO_RES_TYPE && !farm_area && !(after_harvest
-				      && (tile.resource.type==WOOD || tile.resource.type==WHEAT)))
-				   ||(!swimming&&map->isWater(nx,ny))
-				   ||!map->isMapDiscovered(nx,ny,runtime.player->team->allies)
-				   ||(map->isForbidden(nx,ny,runtime.player->team->me)
+				   ||(MapState::resourceBlocksGround(map->state(),next) && !farm_area && !(after_harvest
+				      && (MapState::hasMaterial(map->state(),map->tileIndex(nx,ny),MaterialId::Wood) || MapState::hasMaterial(map->state(),map->tileIndex(nx,ny),MaterialId::Food))))
+				   ||(!map->state().terrainProperties(map->tileIndex(nx,ny)).walkable && !(swimming && map->state().terrainProperties(map->tileIndex(nx,ny)).swimmable))
+				   ||!((map->visibilityAt(map->tileIndex(nx,ny)).discovered&(runtime.observedTeam().allies))!=0)
+				   ||(((map->areasAt(map->tileIndex(nx,ny)).forbidden&(runtime.observedTeam().mask))!=0)
 				      && !farm_area && !development_planner.isCirculationReserved(next)))return;
 				visited[next]=1;queue.push_back(next);
 			});
@@ -555,27 +583,28 @@ std::vector<Uint8> Maxima::worker_reachable_circulation(Context& runtime, bool a
 std::vector<std::vector<int> > Maxima::reservation_member_footprints(
 	Context& runtime, const AIMaximaPlacement::Reservation& contract) const
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW();
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
 	std::vector<std::vector<int> > members;
 	auto add_member=[&](int buildingId,
 		const AIMaximaPlacement::DevelopmentAction* action)
 	{
-		Building* building=runtime.get_building_register().get_building(buildingId);
+		const AIEngine::BuildingView* building=runtime.get_building_register().get_building(buildingId);
 		int x,y,width,height;
 		if(building&&action&&action->type==AIMaximaPlacement::UpgradeBuilding
 		   &&action->state==AIMaximaPlacement::ParcelReserved)
 		{
-			const BuildingType* target=globalContainer->buildingsTypes.getByType(
-				building->type->type,action->targetLevel-1,true);
-			if(!target)return;
+			const int targetId=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).nextLevel;
+			if(targetId<0)return;
+			const BuildingType* target=&runtime.observation().catalog->at(targetId).resolvedType;
 			x=action->centerX+target->decLeft;y=action->centerY+target->decTop;
 			width=target->width;height=target->height;
 		}
 		else if(building)
 		{
 			x=building->posX;y=building->posY;
-			width=building->type->width;height=building->type->height;
+			width=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).width;height=AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).height;
 		}
 		else if(action)
 		{
@@ -586,7 +615,7 @@ std::vector<std::vector<int> > Maxima::reservation_member_footprints(
 		else return;
 		std::vector<int> footprint;
 		for(int dy=0;dy<height;++dy)for(int dx=0;dx<width;++dx)
-			footprint.push_back(map->normalizeY(y+dy)*w+map->normalizeX(x+dx));
+			footprint.push_back((*map).normalizeY(y+dy)*w+(*map).normalizeX(x+dx));
 		std::sort(footprint.begin(),footprint.end());
 		if(std::find(members.begin(),members.end(),footprint)==members.end())
 			members.push_back(footprint);
@@ -613,9 +642,10 @@ std::vector<std::vector<int> > Maxima::reservation_member_footprints(
 Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 	Context& runtime)
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW();
-	const int h=map->getH();
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
+	const int h=(*map).height;
 	const int size=w*h;
 	MaintenanceClearingPlan plan(size);
 	const WoodReserve wood_reserve=select_wood_reserve(runtime);
@@ -628,10 +658,10 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 	std::vector<int> resource_burden(size, 0);
 	for(int index=0; index<size; ++index)
 	{
-		const Tile& cell=map->getTile(index%w, index/w);
+		const auto resource=map->resourceAt(index).resource;
 		grandfathered_resource[index]=!applied_maintenance_clearing_mask[index]
-			&& (cell.resource.type==WHEAT || cell.resource.type==WOOD);
-		resource_burden[index]=std::max(1, int(cell.resource.amount));
+			&& ((MapState::materialAmountAt(map->state(),index,MaterialId::Food)>0) || (MapState::materialAmountAt(map->state(),index,MaterialId::Wood)>0));
+		resource_burden[index]=std::max(1, int(resource.amount));
 	}
 	auto retain_circulation=[&](const std::vector<int>& tiles)
 	{
@@ -669,7 +699,7 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 				// protect an entrance at its current boundary as well as the outer ring.
 				for(int index:member)for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx)
 				{
-					const int neighbor=map->normalizeY(index/w+dy)*w+map->normalizeX(index%w+dx);
+					const int neighbor=(*map).normalizeY(index/w+dy)*w+(*map).normalizeX(powerOfTwoRemainder(index, w)+dx);
 					if(std::binary_search(contract.footprintTiles.begin(),
 						contract.footprintTiles.end(),neighbor))circulation.push_back(neighbor);
 				}
@@ -677,11 +707,11 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 			std::sort(circulation.begin(),circulation.end());
 			circulation.erase(std::unique(circulation.begin(),circulation.end()),circulation.end());
 			circulation.erase(std::remove_if(circulation.begin(),circulation.end(),
-				[&](int index){const Tile& cell=map->getTile(index%w,index/w);
-					return memberMask[index]||cell.building!=NOGBID||cell.terrain>=16
-						||!map->isMapDiscovered(index%w,index/w,runtime.player->team->allies)
-						||(cell.resource.type!=NO_RES_TYPE
-						   &&globalContainer->resourcesTypes.get(cell.resource.type)->eternal);
+				[&](int index){const auto cellType=map->resourceAt(index).resource.type;
+					return memberMask[index]||map->occupancyAt(index).building!=NOGBID||!map->state().terrainProperties(index).walkable
+						||!((map->visibilityAt(map->tileIndex(powerOfTwoRemainder(index, w),index/w)).discovered&(runtime.observedTeam().allies))!=0)
+						||(MapState::resourceBlocksGround(map->state(),index)
+						   &&!map->state().resourceProperties(cellType).clearable);
 				}),circulation.end());
 			if(budget.farming_resource_preserving_circulation_enabled)
 			{
@@ -690,8 +720,7 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 				// grandfather those destructive clearing obligations into this plan.
 				for(int index:contract.footprintTiles)if(!memberMask[index])
 				{
-					const int resource=map->getTile(index%w,index/w).resource.type;
-					preserved[index]=resource==WHEAT||resource==WOOD;
+					preserved[index]=(MapState::materialMaskAt(map->state(),index)&((1u<<materialIndex(MaterialId::Food))|(1u<<materialIndex(MaterialId::Wood))))!=0;
 				}
 				for(const auto& member:members)
 				{
@@ -717,11 +746,11 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 		budget.farming_management_radius);
 	for(int index=0; index<size; ++index)
 	{
-		const int x=index%w;
+		const int x=powerOfTwoRemainder(index, w);
 		const int y=index/w;
-		const Tile& cell=map->getTile(x, y);
-		const bool discovered=map->isMapDiscovered(x, y,
-			runtime.player->team->me);
+		const auto cell=AIEngine::ObservationQueries::spatialTile((*map),x, y);
+		const bool discovered=AIEngine::ObservationQueries::discovered((*map),x, y,
+			runtime.observedTeam().mask);
 		if(wheat_invasion_clearing_required(runtime, index,
 			wheat_farm_protection_mask, wood_reserve))
 		{
@@ -729,14 +758,16 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 			++plan.wheat_invasion_wood;
 		}
 		const bool permanent_resource=cell.resource.type!=NO_RES_TYPE
-			&& globalContainer->resourcesTypes.get(cell.resource.type)->eternal;
+			&& !map->state().resourceProperties(cell.resource.type).clearable;
 		const bool wants_firebreak=enabled
 			&& !wood_reserve.cells[index]
 			&& managed[index]
 			&& budget.farming_wood_firebreak_enabled
-			&& discovered && cell.terrain<16
-			&& cell.canResourcesGrow && cell.building==NOGBID
-			&& !permanent_resource && cell.resource.type==WOOD
+			&& discovered && MapState::terrainSupportsMaterial(map->state(),map->tileIndex(powerOfTwoRemainder(index, w),index/w),MaterialId::Wood)
+			&& cell.building==NOGBID
+			&& !permanent_resource && !MapState::materialAmountAt(map->state(),size_t(index),MaterialId::Food)
+            && MapState::materialAmountAt(map->state(),size_t(index),MaterialId::Wood)>0
+            && MapState::materialExpansionRate(map->state(),size_t(index),MaterialId::Wood)>0
 			&& Farming::fertilityWithinPercentBand(fertility_cache.at(x, y),
 				strategy.farming.wood_firebreak_fertility_min_percent,
 				strategy.farming.wood_firebreak_fertility_max_percent);
@@ -744,7 +775,7 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 		if(wants_firebreak)
 		{
 			++plan.firebreak_tiles;
-			plan.firebreak_wood+=cell.resource.type==WOOD;
+			plan.firebreak_wood+=(MapState::materialAmountAt(map->state(),size_t(index),MaterialId::Wood)>0);
 		}
 	}
 	return plan;
@@ -753,9 +784,10 @@ Maxima::MaintenanceClearingPlan Maxima::build_maintenance_clearing_plan(
 void Maxima::apply_maintenance_clearing_plan(Context& runtime,
 	const MaintenanceClearingPlan& plan)
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW();
-	const int size=w*map->getH();
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
+	const int size=w*(*map).height;
 	maintenance_circulation_mask=plan.circulation;
 	wood_firebreak_mask=plan.firebreak;
 	AddArea* additions=new AddArea(ClearingArea);
@@ -767,16 +799,16 @@ void Maxima::apply_maintenance_clearing_plan(Context& runtime,
 	int retained=0;
 	for(int index=0; index<size; ++index)
 	{
-		const int x=index%w;
+		const int x=powerOfTwoRemainder(index, w);
 		const int y=index/w;
-		const bool discovered=map->isMapDiscovered(x, y,
-			runtime.player->team->me);
-		const bool building_footprint=map->getTile(x, y).building!=NOGBID;
+		const bool discovered=AIEngine::ObservationQueries::discovered((*map),x, y,
+			runtime.observedTeam().mask);
+		const bool building_footprint=(*map).occupancyAt((*map).tileIndex(x, y)).building!=NOGBID;
 		const bool contract_desired=plan.circulation[index]
 			&& !building_footprint && discovered;
 		const bool desired=!building_footprint
 			&& (contract_desired || plan.firebreak[index]);
-		const bool actual=map->isClearArea(x, y, runtime.player->team->me);
+		const bool actual=AIEngine::ObservationQueries::clearing(*map,x, y, runtime.observedTeam().mask);
 		if(desired)
 		{
 			++retained;
@@ -787,8 +819,8 @@ void Maxima::apply_maintenance_clearing_plan(Context& runtime,
 			}
 			// Hard circulation contracts outrank farming. A firebreak alone
 			// never removes a farm's ForbiddenArea protection.
-			if(contract_desired && map->isForbidden(x, y,
-				runtime.player->team->me))
+			if(contract_desired && AIEngine::ObservationQueries::forbidden(*map,x, y,
+				runtime.observedTeam().mask))
 			{
 				forbidden_releases->add_location(x, y);
 				++released;
@@ -826,16 +858,18 @@ void Maxima::apply_maintenance_clearing_plan(Context& runtime,
 
 void Maxima::update_maintenance_clearing_areas(Context& runtime)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	initialize_farming_cache(runtime);
 	const MaintenanceClearingPlan plan=build_maintenance_clearing_plan(runtime);
 	apply_maintenance_clearing_plan(runtime, plan);
 }
 void Maxima::initialize_farming_cache(Context& runtime)
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW();
-	const int h=map->getH();
-	if(fertility_cache.validFor(w, h)
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
+	const int h=(*map).height;
+	if(fertility_cache.validFor(w, h, (*map).terrainRevision)
 	   && farming_shoreline_mask.size()==size_t(w*h)
 	   && farming_cardinal_shoreline_mask.size()==size_t(w*h)
 	   && applied_farm_protection_mask.size()==size_t(w*h)
@@ -845,16 +879,7 @@ void Maxima::initialize_farming_cache(Context& runtime)
 		return;
 	const std::chrono::steady_clock::time_point started=
 		std::chrono::steady_clock::now();
-	std::vector<Uint8> water(w*h, 0);
-	std::vector<Uint8> sand(w*h, 0);
-	for(int y=0; y<h; ++y)
-		for(int x=0; x<w; ++x)
-		{
-			const Uint16 terrain=map->getTile(x, y).terrain;
-			water[y*w+x]=terrain>=256 && terrain<272;
-			sand[y*w+x]=terrain>=128 && terrain<144;
-		}
-	fertility_cache.rebuild(w, h, water, sand);
+    fertility_cache.assign(map->growth->landField(), (*map).terrainRevision);
 	// Terrain does not change during a game. Compute the whole connected
 	// beach once, then keep final adjacency masks for constant-time queries.
 	const std::vector<Uint8> backing=shoreline_backing(map);
@@ -877,11 +902,11 @@ void Maxima::initialize_farming_cache(Context& runtime)
 	for(int y=0; y<h; ++y)
 		for(int x=0; x<w; ++x)
 		{
-			if(map->isMapDiscovered(x, y, runtime.player->team->me)
-			   && map->isForbidden(x, y, runtime.player->team->me))
+			if(AIEngine::ObservationQueries::discovered((*map),x, y, runtime.observedTeam().mask)
+			   && AIEngine::ObservationQueries::forbidden(*map,x, y, runtime.observedTeam().mask))
 				applied_farm_protection_mask[y*w+x]=1;
-			if(map->isMapDiscovered(x, y, runtime.player->team->me)
-			   && map->isClearArea(x, y, runtime.player->team->me))
+			if(AIEngine::ObservationQueries::discovered((*map),x, y, runtime.observedTeam().mask)
+			   && AIEngine::ObservationQueries::clearing(*map,x, y, runtime.observedTeam().mask))
 				applied_maintenance_clearing_mask[y*w+x]=1;
 		}
 	const long long elapsed=std::chrono::duration_cast<std::chrono::microseconds>(
@@ -903,16 +928,18 @@ void Maxima::initialize_farming_cache(Context& runtime)
 
 int Maxima::available_expansion_neighbors(Context& runtime, int x, int y) const
 {
-	Map* map=runtime.player->map;
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
 	int available=0;
 	for(int dy=-1; dy<=1; ++dy)
 		for(int dx=-1; dx<=1; ++dx)
 		{
 			if(!dx && !dy) continue;
-			const Tile& cell=map->getTile(x+dx, y+dy);
-			if(cell.terrain<16 && cell.canResourcesGrow
-			   && cell.resource.type==NO_RES_TYPE && cell.building==NOGBID
-			   && cell.groundUnit==NOGUID && cell.airUnit==NOGUID)
+			const auto cellIndex=map->tileIndex(x+dx, y+dy);
+			if(map->resourceAt(map->tileIndex(x,y)).resource.type!=NO_RES_TYPE
+               && MapState::terrainSupportsResource(map->state(),map->tileIndex(x+dx,y+dy),static_cast<ResourceId>(map->resourceAt(map->tileIndex(x,y)).resource.type)) && MapState::resourcesMayGrow(map->state(),map->tileIndex(x+dx,y+dy))
+			   && map->resourceAt(cellIndex).resource.type==NO_RES_TYPE && map->occupancyAt(cellIndex).building==NOGBID
+			   && map->occupancyAt(cellIndex).groundUnit==NOGUID && map->occupancyAt(cellIndex).airUnit==NOGUID)
 				available+=1;
 		}
 	return available;
@@ -920,24 +947,29 @@ int Maxima::available_expansion_neighbors(Context& runtime, int x, int y) const
 
 int Maxima::growth_absorbing_neighbors(Context& runtime, int x, int y) const
 {
-	Map* map=runtime.player->map;
-	const ResourceType* corn=globalContainer->resourcesTypes.get(WHEAT);
-	const int full=corn ? corn->sizesCount : 0;
+	const AIEngine::AIWorldView* map=&runtime.observation();
+
+    const auto& donor=map->resourceAt(map->tileIndex(x,y)).resource;
+    if(donor.type==NO_RES_TYPE || !AIResourcePolicy::canPropagate(map->state(),map->tileIndex(x,y),MaterialId::Food)) return 0;
+    const auto id=static_cast<ResourceId>(donor.type);
+    const auto& yield=(*map->state().resourceRegistry).yields(id)[materialIndex(MaterialId::Food)];
+
 	int available=0;
 	for(int dy=-1; dy<=1; ++dy)
 		for(int dx=-1; dx<=1; ++dx)
 		{
 			if(!dx && !dy) continue;
-			const Tile& cell=map->getTile(x+dx, y+dy);
-			if(cell.terrain>=16 || !cell.canResourcesGrow
-			   || cell.building!=NOGBID) continue;
+			const auto cellIndex=map->tileIndex(x+dx, y+dy);
+			if(!MapState::terrainSupportsResource(map->state(),map->tileIndex(x+dx,y+dy),id) || !MapState::resourcesMayGrow(map->state(),map->tileIndex(x+dx,y+dy))
+			   || map->occupancyAt(cellIndex).building!=NOGBID) continue;
 			// Growth either seeds empty ground or tops up a partly harvested
 			// stack beside it. A full stack absorbs nothing, so a protected
 			// cell hemmed in by full wheat yields nothing either.
 			// Passing units are deliberately ignored: they move every tick and
 			// would make a standing supply estimate flicker.
-			if(cell.resource.type==NO_RES_TYPE
-			   || (cell.resource.type==WHEAT && cell.resource.amount<full))
+			if(map->resourceAt(cellIndex).resource.type==NO_RES_TYPE
+			   || (map->resourceAt(cellIndex).resource.type==donor.type && yield.growthRate>0
+                   && MapState::materialAmountAt(map->state(),map->tileIndex(x+dx,y+dy),MaterialId::Food)<yield.capacity))
 				available+=1;
 		}
 	return available;
@@ -945,25 +977,26 @@ int Maxima::growth_absorbing_neighbors(Context& runtime, int x, int y) const
 
 void Maxima::release_farming_protection(Context& runtime)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	MapInfo map_info(runtime);
-	Map* map=runtime.player->map;
+	const AIEngine::AIWorldView* map=&runtime.observation();
 	std::fill(farm_protection_mask.begin(), farm_protection_mask.end(), 0);
 	std::fill(wheat_farm_protection_mask.begin(),
 		wheat_farm_protection_mask.end(), 0);
 	RemoveArea* removals=new RemoveArea(ForbiddenArea);
-	RemoveArea* farm_removals=map->farmAreasEnabled() ? new RemoveArea(FarmArea) : nullptr;
+	RemoveArea* farm_removals=map->farmAreasEnabled ? new RemoveArea(FarmArea) : nullptr;
 	int farms_removed=0;
 	int removed=0;
-	for(int index=0; index<map->getW()*map->getH(); ++index)
+	for(int index=0; index<(*map).width*(*map).height; ++index)
 	{
-		const int x=index%map->getW();
-		const int y=index/map->getW();
+		const int x=dimensionRemainder(index, (*map).width);
+		const int y=index/(*map).width;
 		if(applied_farm_protection_mask[index] && map_info.is_forbidden_area(x, y))
 		{
 			removals->add_location(x, y);
 			++removed;
 		}
-		if(farm_removals && map->isFarmArea(x, y, runtime.player->team->me))
+		if(farm_removals && AIEngine::ObservationQueries::farmed(*map,x, y, runtime.observedTeam().mask))
 		{
 			farm_removals->add_location(x, y);
 			++farms_removed;
@@ -981,56 +1014,52 @@ bool Maxima::has_hard_farming_contract(int index) const
 		|| development_planner.isCirculationReserved(index);
 }
 
-Maxima::WoodReserve Maxima::select_wood_reserve(Context& runtime) const
+Maxima::WoodReserve Maxima::select_wood_reserve(Context& runtime, const std::vector<Uint8>* seedEligibility) const
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW(), h=map->getH();
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width, h=(*map).height;
 	WoodReserve reserve(w*h);
 	// No regrowth: protecting seed cells would permanently withhold finite wheat.
-	if(runtime.player->game->gameHeader.isResourceGrowthDisabled()
+	if(runtime.observation().configuration->isResourceGrowthDisabled()
 		|| !budget.farming_enabled || !budget.farming_protection_enabled) return reserve;
 	// Placement can query before the farming cache has been rebuilt on load.
 	// Derive the same exact fertility without retaining new simulation state.
 	Farming::ExactFertilityCache rebuilt;
 	const Farming::ExactFertilityCache* fertility=&fertility_cache;
-	if(!fertility_cache.validFor(w,h))
+	if(!fertility_cache.validFor(w,h,(*map).terrainRevision))
 	{
-		std::vector<Uint8> water(w*h,0),sand(w*h,0);
-		for(int i=0;i<w*h;++i)
-		{
-			const int terrain=map->getTile(i%w,i/w).terrain;
-			water[i]=terrain>=256 && terrain<272;
-			sand[i]=terrain>=128 && terrain<144;
-		}
-		rebuilt.rebuild(w,h,water,sand);fertility=&rebuilt;
+        rebuilt.assign(map->growth->landField(), (*map).terrainRevision);
+        fertility=&rebuilt;
 	}
 	const auto managed=farm_management_area(runtime,budget.farming_management_radius);
 	const auto reachable=worker_reachable_circulation(runtime,true);
-	auto eligible=[&](int i)
+	auto eligible=[&](int i,bool donor=false)
 	{
-		const Tile& cell=map->getTile(i%w,i/w);
-		return managed[i] && cell.terrain<16 && cell.canResourcesGrow
-			&& cell.building==NOGBID && !has_hard_farming_contract(i)
-			&& map->isMapDiscovered(i%w,i/w,runtime.player->team->me)
-			&& (cell.resource.type==NO_RES_TYPE || cell.resource.type==WOOD
-				|| cell.resource.type==WHEAT);
+		const auto cellIndex=map->tileIndex(powerOfTwoRemainder(i, w),i/w);
+		return managed[i] && MapState::terrainSupportsMaterial(map->state(),map->tileIndex(powerOfTwoRemainder(i, w),i/w),MaterialId::Wood) && (donor || MapState::resourcesMayGrow(map->state(),map->tileIndex(powerOfTwoRemainder(i, w),i/w)))
+			&& map->occupancyAt(cellIndex).building==NOGBID && !has_hard_farming_contract(i)
+			&& ((map->visibilityAt(map->tileIndex(powerOfTwoRemainder(i, w),i/w)).discovered&(runtime.observedTeam().mask))!=0)
+			&& (map->resourceAt(cellIndex).resource.type==NO_RES_TYPE || (MapState::materialAmountAt(map->state(),size_t(i),MaterialId::Wood)>0)
+				|| (MapState::materialAmountAt(map->state(),size_t(i),MaterialId::Food)>0));
 	};
 	auto externally_forbidden=[&](int i)
 	{
-		return map->isForbidden(i%w,i/w,runtime.player->team->me)
+		return AIEngine::ObservationQueries::forbidden(*map,powerOfTwoRemainder(i, w),i/w,runtime.observedTeam().mask)
 			&& !applied_farm_protection_mask[i];
 	};
 	std::vector<int> candidates;
 	for(int i=0;i<w*h;++i)
-		if(eligible(i) && map->isResourceTakeable(i%w,i/w,WOOD)
-		   && !externally_forbidden(i) && fertility->at(i%w,i/w)>0)
+		if(eligible(i,true) && MapState::hasMaterial(map->state(),map->tileIndex(powerOfTwoRemainder(i, w),i/w),MaterialId::Wood)
+		   && (seedEligibility ? ((*seedEligibility)[i]&2)!=0 : is_spreading_seed(*map,powerOfTwoRemainder(i, w),i/w,materialIndex(MaterialId::Wood)))
+		   && !externally_forbidden(i) && (fertility->at(powerOfTwoRemainder(i, w),i/w)>0 || !uses_land_fertility(*map,powerOfTwoRemainder(i, w),i/w)))
 			candidates.push_back(i);
 	// Fixed terrain scores avoid moving the reserve on every harvest or refill.
 	// A better candidate must already contain live wood before replacing one.
 	std::sort(candidates.begin(),candidates.end(),[&](int a,int b) {
-		const bool al=Farming::isExpansionCell(a%w,a/w),bl=Farming::isExpansionCell(b%w,b/w);
+		const bool al=Farming::isExpansionCell(powerOfTwoRemainder(a, w),a/w),bl=Farming::isExpansionCell(powerOfTwoRemainder(b, w),b/w);
 		if(al!=bl) return al;
-		const Uint32 af=fertility->at(a%w,a/w),bf=fertility->at(b%w,b/w);
+		const Uint32 af=fertility->at(powerOfTwoRemainder(a, w),a/w),bf=fertility->at(powerOfTwoRemainder(b, w),b/w);
 		return af!=bf ? af>bf : a<b;
 	});
 	for(int seed:candidates)
@@ -1040,7 +1069,7 @@ Maxima::WoodReserve Maxima::select_wood_reserve(Context& runtime) const
 		uint16_t ring=0;
 		for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx)
 		{
-			const int next=map->normalizeY(seed/w+dy)*w+map->normalizeX(seed%w+dx);
+			const int next=(*map).normalizeY(seed/w+dy)*w+(*map).normalizeX(powerOfTwoRemainder(seed, w)+dx);
 			if(reachable[next] && reserve.cells[next]!=1) ring|=1<<((dy+1)*3+dx+1);
 		}
 		if(!Farming::canProtectWithoutSplittingAccess(ring)) continue;
@@ -1048,16 +1077,17 @@ Maxima::WoodReserve Maxima::select_wood_reserve(Context& runtime) const
 		for(int dy=-1;dy<=1;++dy)for(int dx=-1;dx<=1;++dx)
 		{
 			if(!dx && !dy) continue;
-			const int x=map->normalizeX(seed%w+dx),y=map->normalizeY(seed/w+dy),i=y*w+x;
+			const int x=(*map).normalizeX(powerOfTwoRemainder(seed, w)+dx),y=(*map).normalizeY(seed/w+dy),i=y*w+x;
 			// Keep harvest outlets off the seed lattice. This also prevents
 			// an outlet growing wood from displacing its own aligned donor.
 			if(Farming::isExpansionCell(x,y) || reserve.cells[i]
-			   || !eligible(i) || externally_forbidden(i)) continue;
+			   || !eligible(i) || externally_forbidden(i)
+                   || !MapState::terrainSupportsResource(map->state(),size_t(i),static_cast<ResourceId>(map->resourceAt(size_t(seed)).resource.type))) continue;
 			bool access=false;
 			for(int ay=-1;ay<=1;++ay)for(int ax=-1;ax<=1;++ax)
 				if(ax || ay)
 				{
-					const int next=map->normalizeY(y+ay)*w+map->normalizeX(x+ax);
+					const int next=(*map).normalizeY(y+ay)*w+(*map).normalizeX(x+ax);
 					if(next!=seed && reserve.cells[next]!=1 && reachable[next]) access=true;
 				}
 			if(access && (outlet<0 || i<outlet)) outlet=i;
@@ -1073,25 +1103,49 @@ Maxima::WoodReserve Maxima::select_wood_reserve(Context& runtime) const
 bool Maxima::wheat_invasion_clearing_required(Context& runtime, int index,
 	const std::vector<Uint8>& protected_wheat, const WoodReserve& wood_reserve) const
 {
-	Map* map=runtime.player->map;
-	const int w=map->getW(), h=map->getH();
-	const int x=index%w, y=index/w;
-	return budget.farming_enabled && budget.farming_maintenance_clearing_enabled
-		&& budget.farming_wheat_invasion_clearing_enabled
-		&& map->isMapDiscovered(x, y, runtime.player->team->me)
-		&& map->getTile(x, y).resource.type==WOOD
-		&& !wood_reserve.cells[index]
-		&& Farming::hasAdjacentProtectedWheat(protected_wheat, w, h, x, y);
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width, h=(*map).height;
+	const int x=powerOfTwoRemainder(index, w), y=index/w;
+    if(!budget.farming_enabled || !budget.farming_maintenance_clearing_enabled
+        || !budget.farming_wheat_invasion_clearing_enabled
+        || !((map->visibilityAt(map->tileIndex(x,y)).discovered&(runtime.observedTeam().mask))!=0)
+        || !MapState::hasMaterial(map->state(),map->tileIndex(x,y),MaterialId::Wood) || wood_reserve.cells[index]
+        || !MapState::materialExpansionRate(map->state(),size_t(index),MaterialId::Wood)) return false;
+    const auto id=static_cast<ResourceId>(map->resourceAt(map->tileIndex(x,y)).resource.type);
+    if(!map->state().resourceProperties(resourceIndex(id)).clearable
+        || MapState::materialAmountAt(map->state(),size_t(index),MaterialId::Food)) return false;
+    for(int dy=-1;dy<=1;++dy) for(int dx=-1;dx<=1;++dx)
+        if((dx || dy) && protected_wheat[map->tileIndex(x+dx,y+dy)]
+            && MapState::resourcesMayGrow(map->state(),map->tileIndex(x+dx,y+dy))
+            && MapState::terrainSupportsResource(map->state(),map->tileIndex(x+dx,y+dy),id)) return true;
+    return false;
 }
 
 Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtime)
 {
-	Map* map=runtime.player->map;
+    auto ownerObservation=runtime.scopeOwnerObservation();
+	const AIEngine::AIWorldView* map=&runtime.observation();
 	MapInfo map_info(runtime);
-	const int w=map->getW();
-	const int h=map->getH();
+	const int w=(*map).width;
+	const int h=(*map).height;
 	FarmProtectionPlan plan(w*h);
-	plan.wood_reserve=select_wood_reserve(runtime);
+	// The plan is read-only with respect to deposits and ecology. Snapshot the
+    // two relevant eligibility bits once, rather than querying growth for every
+    // neighboring classifier and component edge. This cache never survives a plan.
+    std::vector<Uint8> seedEligibility(w*h,0);
+    for(int index=0;index<w*h;++index)
+    {
+        const auto& deposit=map->resourceAt(size_t(index)).resource;
+        if(deposit.type==NO_RES_TYPE || !deposit.amount) continue;
+        const auto& properties=map->state().resourceProperties(deposit.type);
+        if(!properties.spreadRate) continue;
+        if((properties.materialMask&materialBit(MaterialId::Food))
+            && is_spreading_seed(*map,powerOfTwoRemainder(index, w),index/w,materialIndex(MaterialId::Food))) seedEligibility[index]|=1;
+        if((properties.materialMask&materialBit(MaterialId::Wood))
+            && is_spreading_seed(*map,powerOfTwoRemainder(index, w),index/w,materialIndex(MaterialId::Wood))) seedEligibility[index]|=2;
+    }
+    plan.wood_reserve=select_wood_reserve(runtime,&seedEligibility);
 	plan.wood_pressure=budget.farming_wood_pressure;
 	plan.wood_fertility=budget.farming_minimum_wood_fertility;
 	int clearing_x=0, clearing_y=0;
@@ -1103,49 +1157,30 @@ Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtim
 
 	// Record which empty tiles can extend a live wheat or wood resource. This
 	// avoids running the more expensive classifier for unrelated map cells.
-	std::vector<Uint8> adjacent_resource_mask(w*h, 0);
-	for(int y=0; y<h; ++y)
-		for(int x=0; x<w; ++x)
-		{
-			const Tile& resource=map->getTile(x, y);
-			Uint8 bit=0;
-			if(resource.resource.amount>0)
-			{
-				if(resource.resource.type==WHEAT) bit=1;
-				else if(resource.resource.type==WOOD) bit=2;
-			}
-			if(!bit) continue;
-			for(int dy=-1; dy<=1; ++dy)
-				for(int dx=-1; dx<=1; ++dx)
-					if(dx || dy)
-						adjacent_resource_mask[((y+dy+h)%h)*w
-							+((x+dx+w)%w)]|=bit;
-		}
+    const auto adjacent_resource_mask=FarmGeometry::adjacentSeeds(seedEligibility,w,h);
 
 	for(int y=0; y<h; ++y)
 		for(int x=0; x<w; ++x)
 		{
 			const int index=y*w+x;
-			const Tile& cell=map->getTile(x, y);
-			const bool wheat=cell.resource.type==WHEAT
-				&& cell.resource.amount>0;
-			const bool wood=cell.resource.type==WOOD
-				&& cell.resource.amount>0;
-			const bool empty_growth=is_empty_growth_cell(cell);
+            // Cells without either a seed or an adjacent seed cannot acquire a
+            // role below. Reject them before touching tile/ecology properties.
+            const Uint8 seeds=seedEligibility[index];
+            const Uint8 adjacent=adjacent_resource_mask[index];
+            if(!(seeds|adjacent)) continue;
+            const bool wheat=seeds&1;
+            const bool wood=seeds&2;
+            const bool empty_growth=adjacent && is_empty_growth_cell(*map,x,y);
 
 			FarmTileClassification wheat_role;
 			FarmTileClassification wood_role;
-			if(wheat || (empty_growth && (adjacent_resource_mask[index]&1)
-			   && (farming_shoreline_mask[index]
-				|| fertility_cache.at(x, y)>=
-				Uint32(budget.farming_wheat_fertility_min))))
-				wheat_role=classify_farm_tile(map_info, map,
-					fertility_cache, wheat_exterior, farming_shoreline_mask[index]!=0, x, y, WHEAT,
-					Uint32(budget.farming_wheat_fertility_min));
-			if(wood || (empty_growth && (adjacent_resource_mask[index]&2)
-			   && fertility_cache.at(x, y)>=plan.wood_fertility))
-				wood_role=classify_farm_tile(map_info, map,
-					fertility_cache, wheat_exterior, farming_shoreline_mask[index]!=0, x, y, WOOD, plan.wood_fertility);
+            if(wheat || (empty_growth && (adjacent&1)))
+                wheat_role=classify_farm_tile(map_info,map,fertility_cache,wheat_exterior,seedEligibility,
+                    farming_shoreline_mask[index]!=0,x,y,materialIndex(MaterialId::Food),
+                    Uint32(budget.farming_wheat_fertility_min));
+            if(wood || (empty_growth && (adjacent&2)))
+                wood_role=classify_farm_tile(map_info,map,fertility_cache,wheat_exterior,seedEligibility,
+                    farming_shoreline_mask[index]!=0,x,y,materialIndex(MaterialId::Wood),plan.wood_fertility);
 			const bool wheat_farm=wheat_role.protected_tile();
 			const bool wood_farm=wood_role.protected_tile();
 			if(!wheat && !wood && !wheat_farm && !wood_farm) continue;
@@ -1160,7 +1195,7 @@ Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtim
 			// Keep the authorized wood campaign's working area open for its
 			// entire lifetime, including while its exact-position flag is queued.
 			else if(wood && clearing_wood
-				&& map->warpDistSquare(x,y,clearing_x,clearing_y)<=4*4)
+				&& (*map).distanceSquared(x,y,clearing_x,clearing_y)<=4*4)
 				protect=false;
 			else if(budget.farming_wood_firebreak_enabled && wood
 			   && index<int(wood_firebreak_mask.size())
@@ -1188,9 +1223,7 @@ Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtim
 				plan.protected_seeds+=(x&1) && (y&1);
 				const int available=available_expansion_neighbors(runtime, x, y);
 				plan.blocked_directions+=8-available;
-				plan.expected_capacity+=Farming::usefulExpansionCapacity(
-					fertility_cache.at(x, y),
-					map_info.get_ammount_resource(x, y), available, wheat);
+				plan.expected_capacity+=std::uint64_t(MapState::materialExpansionRate(map->state(),map->tileIndex(x,y),wheat?materialIndex(MaterialId::Food):materialIndex(MaterialId::Wood)))*available/24;
 			}
 		}
 	// Empty frontier protection cannot regrow a patch after its last live crop
@@ -1198,54 +1231,54 @@ Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtim
 	// while that same cell suppresses its neighbor's local bootstrap. Select one
 	// eligible anchor only in components with no protected live resource.
 	std::vector<Uint8> visited(w*h,0);
-	for(int start=0;start<w*h;++start)
+	for(const int resource:{materialIndex(MaterialId::Food),materialIndex(MaterialId::Wood)})
+    for(int start=0;start<w*h;++start)
 	{
-		const int resource=map->getTile(start%w,start/w).resource.type;
-		if(visited[start] || (resource!=WHEAT && resource!=WOOD)) continue;
+        const Uint8 visitBit=resource==materialIndex(MaterialId::Food)?1:2;
+        if((visited[start]&visitBit) || !cached_seed(seedEligibility,*map,powerOfTwoRemainder(start, w),start/w,resource)) continue;
 		std::vector<int> component(1,start);
-		visited[start]=1;
+		visited[start]|=visitBit;
 		bool protected_live=false;
 		int anchor=-1;
 		field::traverse(component,{w,h},field::Surrounding,
 			[&](int index) {
-				const int x=index%w,y=index/w;
-				const Tile& cell=map->getTile(x,y);
+				const int x=powerOfTwoRemainder(index, w),y=index/w;
+				const auto cell=AIEngine::ObservationQueries::spatialTile((*map),x,y);
 				if(cell.resource.amount>0)
 				{
 					protected_live|=plan.forbidden[index]!=0;
-					const Uint32 minimum=resource==WHEAT
+					const Uint32 minimum=resource==materialIndex(MaterialId::Food)
 						? Uint32(budget.farming_wheat_fertility_min) : plan.wood_fertility;
-					if(fertility_cache.at(x,y)>=minimum
+					if((fertility_cache.at(x,y)>=minimum || !uses_land_fertility(*map,x,y))
 					   && !has_hard_farming_contract(index)
-					   && !(resource==WOOD && ((budget.farming_wood_firebreak_enabled
+					   && !(resource==materialIndex(MaterialId::Wood) && ((budget.farming_wood_firebreak_enabled
 						   && wood_firebreak_mask[index]) || (clearing_wood
-						   && map->warpDistSquare(x,y,clearing_x,clearing_y)<=4*4)))
+						   && (*map).distanceSquared(x,y,clearing_x,clearing_y)<=4*4)))
 					   && (anchor<0 || index<anchor))
 						anchor=index;
 				}
 
 				return field::Visit::Expand;
 			},[&](int,int px,int py) {
-				const int nx=map->normalizeX(px), ny=map->normalizeY(py);
+				const int nx=(*map).normalizeX(px), ny=(*map).normalizeY(py);
 				const int next=ny*w+nx;
-				if(!visited[next]
-				   && map->getTile(nx,ny).resource.type==resource)
+				if(!(visited[next]&visitBit)
+				   && cached_seed(seedEligibility,*map,nx,ny,resource))
 				{
-					visited[next]=1;
+					visited[next]|=visitBit;
 					component.push_back(next);
 				}
 			});
 		if(protected_live || anchor<0) continue;
-		const int x=anchor%w, y=anchor/w;
+		const int x=powerOfTwoRemainder(anchor, w), y=anchor/w;
 		plan.forbidden[anchor]=1;
-		plan.protected_wheat[anchor]=resource==WHEAT;
-		if(resource==WHEAT) ++plan.protected_wheat_bootstraps;
+		plan.protected_wheat[anchor]=resource==materialIndex(MaterialId::Food);
+		if(resource==materialIndex(MaterialId::Food)) ++plan.protected_wheat_bootstraps;
 		else ++plan.protected_wood_bootstraps;
 		plan.protected_seeds+=(x&1) && (y&1);
 		const int available=available_expansion_neighbors(runtime,x,y);
 		plan.blocked_directions+=8-available;
-		plan.expected_capacity+=Farming::usefulExpansionCapacity(
-			fertility_cache.at(x,y),map_info.get_ammount_resource(x,y),available,resource==WHEAT);
+		plan.expected_capacity+=std::uint64_t(MapState::materialExpansionRate(map->state(),map->tileIndex(x,y),resource))*available/24;
 	}
 	// The reserve precedes ordinary wheat/wood patterns and clearing campaigns.
 	for(int i=0;i<w*h;++i)if(plan.wood_reserve.cells[i])
@@ -1259,6 +1292,7 @@ Maxima::FarmProtectionPlan Maxima::build_farming_protection_plan(Context& runtim
 void Maxima::resolve_wheat_invasion_clearing(Context& runtime,
 	FarmProtectionPlan& plan)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	// Use this pass's final wheat mask, including fallback seeds and coastal
 	// openings. Reading last pass's maintenance mask would lag both new and
 	// revoked obligations and allow the two reconcilers to undo each other.
@@ -1272,13 +1306,14 @@ void Maxima::resolve_wheat_invasion_clearing(Context& runtime,
 void Maxima::apply_farming_protection(Context& runtime,
 	const FarmProtectionPlan& plan, int& added, int& removed)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	MapInfo map_info(runtime);
-	Map* map=runtime.player->map;
-	const int w=map->getW();
-	const int size=w*map->getH();
+	const AIEngine::AIWorldView* map=&runtime.observation();
+	const int w=(*map).width;
+	const int size=w*(*map).height;
 	AddArea* additions=new AddArea(ForbiddenArea);
 	RemoveArea* removals=new RemoveArea(ForbiddenArea);
-	const bool farms=map->farmAreasEnabled();
+	const bool farms=map->farmAreasEnabled;
 	AddArea* farm_additions=farms ? new AddArea(FarmArea) : nullptr;
 	RemoveArea* farm_removals=farms ? new RemoveArea(FarmArea) : nullptr;
 	bool farm_added=false, farm_removed=false, forbidden_added=false, forbidden_removed=false;
@@ -1286,14 +1321,24 @@ void Maxima::apply_farming_protection(Context& runtime,
 	removed=0;
 	for(int index=0; index<size; ++index)
 	{
-		const int x=index%w;
+		const int x=powerOfTwoRemainder(index, w);
 		const int y=index/w;
 		if(!map_info.is_discovered(x, y)) continue;
-		const bool wheat=plan.protected_wheat[index];
+		bool wheat=false, preserveWood=false;
+        if(farms && plan.protected_wheat[index])
+        {
+            const auto& deposit=map->resourceAt(map->tileIndex(x,y)).resource;
+            const bool empty=deposit.type==NO_RES_TYPE;
+            const auto foodYield=empty ? YieldProperties{} : (*map->state().resourceRegistry).yields(static_cast<ResourceId>(deposit.type))[materialIndex(MaterialId::Food)];
+            wheat=(empty || (map->state().resourceProperties(deposit.type).farmable
+                && foodYield.consumption==ResourceConsumption::One && !foodYield.destroysDeposit))
+                && MapState::canPaintFarmArea(map->state(),x,y);
+            preserveWood=wheat && is_spreading_seed(*map,x,y,materialIndex(MaterialId::Wood));
+        }
 		if(farms)
 		{
-			const bool wanted=plan.forbidden[index] && wheat && map->canPaintFarmArea(x, y);
-			const bool farmed=map->isFarmArea(x, y, runtime.player->team->me);
+			const bool wanted=plan.forbidden[index] && wheat && map->canPaintFarmAt(map->tileIndex(x,y));
+			const bool farmed=AIEngine::ObservationQueries::farmed(*map,x, y, runtime.observedTeam().mask);
 			if(wanted && !farmed)
 			{
 				farm_additions->add_location(x, y);
@@ -1309,7 +1354,7 @@ void Maxima::apply_farming_protection(Context& runtime,
 		}
 		const bool actual=map_info.is_forbidden_area(x, y);
 		const bool forbidden=plan.forbidden[index]
-			&& !(farms && wheat);
+			&& !(farms && wheat && !preserveWood);
 		if(forbidden && !actual)
 		{
 			additions->add_location(x, y);
@@ -1337,12 +1382,13 @@ void Maxima::apply_farming_protection(Context& runtime,
 
 void Maxima::update_farming(Context& runtime)
 {
+    auto ownerObservation=runtime.scopeOwnerObservation();
 	telemetry.count(AITrace::AI7::Maxima_update_farming_calls);
 	const std::chrono::steady_clock::time_point started=
 		std::chrono::steady_clock::now();
 	initialize_farming_cache(runtime);
 	// No regrowth: protecting seed cells would permanently withhold finite wheat.
-	if(runtime.player->game->gameHeader.isResourceGrowthDisabled()
+	if(runtime.observation().configuration->isResourceGrowthDisabled()
 		|| !budget.farming_enabled || !budget.farming_protection_enabled)
 	{
 		release_farming_protection(runtime);
@@ -1355,16 +1401,16 @@ void Maxima::update_farming(Context& runtime)
 	// This is an establishment limit, not an override for tactical clearing.
 	if(budget.farming_management_radius>0)
 	{
-		Map* map=runtime.player->map;
-		const int w=map->getW(), h=map->getH();
+		const AIEngine::AIWorldView* map=&runtime.observation();
+		const int w=(*map).width, h=(*map).height;
 		const int radius=budget.farming_management_radius;
 		const std::vector<Uint8> nearby=farm_management_area(runtime,radius);
 		for(int i=0;i<w*h;++i)
 		{
 			if(nearby[i])continue;
 			const bool established= farm_protection_mask[i]
-				&& Farming::isInteriorSeed(i%w,i/w)
-				&& map->isResourceTakeable(i%w,i/w,WHEAT);
+				&& Farming::isInteriorSeed(powerOfTwoRemainder(i, w),i/w)
+				&& MapState::hasMaterial(map->state(),map->tileIndex(powerOfTwoRemainder(i, w),i/w),MaterialId::Food);
 			if(established)continue;
 			plan.forbidden[i]=0;
 			plan.protected_wheat[i]=0;

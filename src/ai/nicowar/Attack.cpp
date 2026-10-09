@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2006 Bradley Arsenault
 
+#include "PowerOfTwo.h"
+#include "Material.h"
 #include "AITelemetryFields.h"
 #include "AINicowar.h"
 #include <string>
@@ -24,13 +26,14 @@ int NewNicowar::choose_building_to_attack(Runtime& runtime)
 	buildings_to_attack.reserve(100);
 
 	AISharedRuntime::Gradients::GradientInfo gi_building;
-	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.player->team->teamNumber, false));
-	gi_building.add_obstacle(new Entities::AnyResource);
+    gi_building.terrainTravel=field::TerrainTravel::Swim;
+	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.teamNumber(), false));
+	gi_building.add_obstacle(new Entities::ResourceGroundObstacle);
 	Gradient& gradient=runtime.get_gradient_manager().get_gradient(gi_building);
 
 	for(enemy_building_iterator ebi(runtime, target, -1, -1, indeterminate); ebi!=enemy_building_iterator(); ++ebi)
 	{
-		Building* b=runtime.player->game->teams[target]->myBuildings[Building::GIDtoID(*ebi)];
+		const AIEngine::BuildingView* b=runtime.observation().buildingSlots(target)[Building::GIDtoID(*ebi)];
 		if(gradient.get_height(b->posX, b->posY) != AI_NICOWAR_GRADIENT_UNREACHABLE)
 			buildings_to_attack.push_back(*ebi);
 	}
@@ -56,19 +59,19 @@ void NewNicowar::attack_building(Runtime& runtime)
 			}
 		return;
 	}
-	BuildingOrder* bo = new BuildingOrder(IntBuildingType::WAR_FLAG, strategy.war_phase_war_flag_units_assigned);
+	BuildingOrder* bo = new BuildingOrder(runtime, BuildingDemand::AttractWarriors, strategy.war_phase_war_flag_units_assigned);
 	bo->add_constraint(new CenterOfBuilding(building));
 	unsigned int id=runtime.add_building_order(bo);
 
-	ManagementOrder* mo_minimum=new ChangeFlagMinimumLevel(runtime.player->game->gameHeader.isUnitUpgradesDisabled() ? 1 : AI_NICOWAR_WAR_FLAG_MIN_LEVEL,id);
+	ManagementOrder* mo_minimum=new ChangeFlagMinimumLevel(runtime.observation().configuration->isUnitUpgradesDisabled() ? 1 : AI_NICOWAR_WAR_FLAG_MIN_LEVEL,id);
 	runtime.add_management_order(mo_minimum);
 
-	ManagementOrder* mo_destroyed_1=new DestroyBuilding(id);
+	ManagementOrder* mo_destroyed_1=new RetireAttraction(id,1u<<WARRIOR);
 	mo_destroyed_1->add_condition(new EnemyBuildingDestroyed(runtime, building));
 	runtime.add_management_order(mo_destroyed_1);
 
 	ManagementOrder* mo_destroyed_2=new SendMessage("attack finished "+std::to_string(id));
-	mo_destroyed_2->add_condition(new BuildingDestroyed(id));
+	mo_destroyed_2->add_condition(new AttractionRetiredOrDestroyed(id,1u<<WARRIOR));
 	runtime.add_management_order(mo_destroyed_2);
 	
 	attack_flags.push_back(id);
@@ -78,7 +81,7 @@ void NewNicowar::attack_building(Runtime& runtime)
 void NewNicowar::control_attacks(Runtime& runtime)
 {
 	// Combat cannot damage opponents here; military work must not reserve economic labour.
-	if (runtime.player->game->gameHeader.isPeacefulModeEnabled()) return;
+	if (runtime.observation().configuration->isPeacefulModeEnabled()) return;
 	telemetry.count(AITrace::AI5::NewNicowar_control_attacks_calls);
 	choose_enemy_target(runtime);
 
@@ -97,24 +100,28 @@ void NewNicowar::control_attacks(Runtime& runtime)
 	}
 
 	BuildingSearch bs_pool(runtime);
-	bs_pool.add_condition(new SpecificBuildingType(IntBuildingType::SWIMSPEED_BUILDING));
+	bs_pool.add_condition(new ProvidesBuildingCapability(BuildingDemand::TrainSwim));
 	int num_pool=bs_pool.count_buildings();
 	
 	AISharedRuntime::Gradients::GradientInfo gi_building;
-	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.player->team->teamNumber, false));
-	gi_building.add_obstacle(new Entities::AnyResource);
+    gi_building.terrainTravel=field::TerrainTravel::Swim;
+	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.teamNumber(), false));
+	gi_building.add_obstacle(new Entities::ResourceGroundObstacle);
 	if(num_pool == 0)
-		gi_building.add_obstacle(new Entities::Water);
+    {
+        gi_building.terrainTravel=field::TerrainTravel::Walk;
+		gi_building.add_obstacle(new Entities::Unwalkable);
+    }
 	Gradient& gradient=runtime.get_gradient_manager().get_gradient(gi_building);
 	
 	for(unsigned i=0; i<attack_flags.size(); ++i)
 	{
 		if(runtime.get_building_register().is_building_found(attack_flags[i]))
 		{
-			Building* b = runtime.get_building_register().get_building(attack_flags[i]);
+			const AIEngine::BuildingView* b = runtime.get_building_register().get_building(attack_flags[i]);
 			if(b && gradient.get_height(b->posX, b->posY) == AI_NICOWAR_GRADIENT_UNREACHABLE)
 			{
-				ManagementOrder* mo_destroy=new DestroyBuilding(attack_flags[i]);
+				ManagementOrder* mo_destroy=new RetireAttraction(attack_flags[i],1u<<WARRIOR);
 				runtime.add_management_order(mo_destroy);
 			}
 		}
@@ -127,17 +134,18 @@ void NewNicowar::choose_enemy_target(Runtime& runtime)
 {
 	telemetry.count(AITrace::AI5::NewNicowar_choose_enemy_target_calls);
 	AISharedRuntime::Gradients::GradientInfo gi_building;
-	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.player->team->teamNumber, false));
-	gi_building.add_obstacle(new Entities::AnyResource);
+    gi_building.terrainTravel=field::TerrainTravel::Swim;
+	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.teamNumber(), false));
+	gi_building.add_obstacle(new Entities::ResourceGroundObstacle);
 	Gradient& gradient=runtime.get_gradient_manager().get_gradient(gi_building);
 
-	if(target==AI_NICOWAR_NO_TARGET || !runtime.player->game->teams[target]->isAlive)
+	if(target==AI_NICOWAR_NO_TARGET || !runtime.observation().teams[target].alive)
 	{
 		std::vector<int> available_reachable_targets;
 		std::vector<int> available_targets;
 		for(enemy_team_iterator i(runtime); i!=enemy_team_iterator(); ++i)
 		{
-			if(runtime.player->game->teams[*i]->isAlive)
+			if(runtime.observation().teams[*i].alive)
 			{
 				available_targets.push_back(*i);
 				enemy_building_iterator ebi(runtime, *i, -1, -1, indeterminate);
@@ -150,7 +158,7 @@ void NewNicowar::choose_enemy_target(Runtime& runtime)
 				   cheating and has been fixed. */
 				for(; ebi != enemy_building_iterator(); ++ebi)
 				{
-					Building* b=runtime.player->game->teams[*i]->myBuildings[Building::GIDtoID(*ebi)];
+					const AIEngine::BuildingView* b=runtime.observation().buildingSlots(*i)[Building::GIDtoID(*ebi)];
 					if(gradient.get_height(b->posX, b->posY) != AI_NICOWAR_GRADIENT_UNREACHABLE)
 					{
 						available_reachable_targets.push_back(*i);
@@ -180,15 +188,16 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 	MapInfo mi(runtime);
 
 	AISharedRuntime::Gradients::GradientInfo gi_building;
-	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.player->team->teamNumber, false));
-	gi_building.add_obstacle(new Entities::AnyResource);
+    gi_building.terrainTravel=field::TerrainTravel::Swim;
+	gi_building.add_source(new Entities::AnyTeamBuilding(runtime.teamNumber(), false));
+	gi_building.add_obstacle(new Entities::ResourceGroundObstacle);
 	Gradient& gradient=runtime.get_gradient_manager().get_gradient(gi_building);
 
 	for(enemy_building_iterator ebi(runtime, target, -1, -1, indeterminate); ebi!=enemy_building_iterator(); ++ebi)
 	{
-		Building* b=runtime.player->game->teams[target]->myBuildings[Building::GIDtoID(*ebi)];
-		int bx = (b->posX + mi.get_width()) % mi.get_width();
-		int by = (b->posY + mi.get_height()) % mi.get_height();
+		const AIEngine::BuildingView* b=runtime.observation().buildingSlots(target)[Building::GIDtoID(*ebi)];
+		int bx = dimensionRemainder(b->posX + mi.get_width(), mi.get_width());
+		int by = dimensionRemainder(b->posY + mi.get_height(), mi.get_height());
 		if(gradient.get_height(bx, by) == AI_NICOWAR_GRADIENT_UNREACHABLE)
 			buildings_to_attack.push_back(*ebi);
 	}
@@ -201,12 +210,13 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 
 
 	int building=buildings_to_attack[num];
-	const int bx=(runtime.player->game->teams[target]->myBuildings[Building::GIDtoID(building)]->posX) % mi.get_width();
-	const int by=(runtime.player->game->teams[target]->myBuildings[Building::GIDtoID(building)]->posY) % mi.get_height();
+	const int bx=dimensionRemainder(runtime.observation().buildingSlots(target)[Building::GIDtoID(building)]->posX, mi.get_width());
+	const int by=dimensionRemainder(runtime.observation().buildingSlots(target)[Building::GIDtoID(building)]->posY, mi.get_height());
 
 	AISharedRuntime::Gradients::GradientInfo gi_pathfind;
+    gi_pathfind.terrainTravel=field::TerrainTravel::Swim;
 	gi_pathfind.add_source(new Entities::Position(bx, by));
-	gi_pathfind.add_obstacle(new Entities::Resource(STONE));
+	gi_pathfind.add_obstacle(new Entities::MaterialSource(materialIndex(MaterialId::Stone)));
 	Gradient& gradient_pathfind=runtime.get_gradient_manager().get_gradient(gi_pathfind);
 
 	///Next, find the closest point manhattan distance wise, to the building that is accessible
@@ -245,10 +255,10 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 	{
 		int nxpos = xpos;
 		int nypos = ypos;
-		int rx=(xpos+1+w) % w;
-		int lx=(xpos-1+w) % w;
-		int dy=(ypos+1+h) % h;
-		int uy=(ypos-1+h) % h;
+		int rx=powerOfTwoRemainder(xpos+1+w, w);
+		int lx=powerOfTwoRemainder(xpos-1+w, w);
+		int dy=powerOfTwoRemainder(ypos+1+h, h);
+		int uy=powerOfTwoRemainder(ypos-1+h, h);
 		int lowest_entity=gradient_pathfind.get_height(xpos, ypos)+AI_NICOWAR_PATHFIND_TOLERANCE;
 
 		if(lowest_entity == 0)
@@ -313,13 +323,13 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 		{
 			flag_dist_count=0;
 			//The main order for the clearing flag
-			BuildingOrder* bo_flag = new BuildingOrder(IntBuildingType::CLEARING_FLAG, AI_NICOWAR_DIG_CLEARING_WORKERS);
+			BuildingOrder* bo_flag = new BuildingOrder(runtime, BuildingDemand::ClearResources, AI_NICOWAR_DIG_CLEARING_WORKERS);
 			//Place it on the current point
 			bo_flag->add_constraint(new Construction::SinglePosition(xpos, ypos));
 			//Add the building order to the list of orders
 			unsigned int id_flag=runtime.add_building_order(bo_flag);
 
-			ManagementOrder* mo_destroyed=new DestroyBuilding(id_flag);
+			ManagementOrder* mo_destroyed=new RetireAttraction(id_flag,1u<<WORKER);
 			mo_destroyed->add_condition(new EnemyBuildingDestroyed(runtime, building));
 			runtime.add_management_order(mo_destroyed);
 

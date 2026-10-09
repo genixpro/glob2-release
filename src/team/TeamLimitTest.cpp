@@ -87,6 +87,7 @@ TEST_CASE("alliance and chat controls include the sixteenth controller")
     world.game.gameHeader.setAllyTeamsFixed(false);
     world.gui.localTeamNo = world.gui.localPlayer = 0;
     world.gui.adjustLocalTeam();
+    world.gui.prepareLocalPresentation();
     InGameAllianceScreen dialog(&world.gui);
     REQUIRE(dialog.entries().size() == size_t(Team::MAX_COUNT - 1));
     CHECK(dialog.entries().back().player == Team::MAX_COUNT - 1);
@@ -110,6 +111,7 @@ TEST_CASE("enemy team searches terminate when every team slot is occupied")
     auto *player = world.game.players[0];
     AISharedRuntime::Runtime runtime(nullptr, player);
     const auto enemies = [&]() {
+        AISharedRuntime::Runtime::OwnerObservationScope observationScope(runtime);
         std::vector<int> teams;
         using AISharedRuntime::SearchTools::enemy_team_iterator;
         for (enemy_team_iterator it(runtime); it != enemy_team_iterator(); ++it)
@@ -147,7 +149,7 @@ TEST_CASE("growth bands attribute overlapping coverage to all sixteen teams")
     for (int distance : {8, 9, 16, 17, 32, 33})
     {
         const int x = 8 + distance;
-        REQUIRE(game.map.incResource(x, 8, WHEAT, 0));
+        REQUIRE(game.map.incResourceByIndex(x, 8, WHEAT, 0));
         game.map.recordNaturalGrowth(x, 8, WHEAT, NO_RES_TYPE, 0);
     }
     for (int t = 0; t < Team::MAX_COUNT; ++t)

@@ -1,4 +1,5 @@
 """Browser data packages: what ships, where it goes, and how it is installed."""
+import ast
 import json
 from pathlib import Path
 import subprocess
@@ -50,7 +51,7 @@ class WebAssetPlanTests(unittest.TestCase):
 
     def test_in_game_sprites_follow_the_main_menu(self):
         # GlobalContainer::loadGameGraphics, including every building's artwork.
-        for path in ('data/gfx/unit0r.png', 'data/gfx/unit1000.png', 'data/gfx/terrain0.png', 'data/gfx/water0.png', 'data/gfx/gamegui0.png',
+        for path in ('data/gfx/unit0r.png', 'data/gfx/unit1000.png', 'data/gfx/terrain0.png', 'data/gfx/terrain333.png', 'data/gfx/terrain-water0.png', 'data/gfx/gamegui0.png',
                      'data/gfx/ressource0.png', 'data/gfx/particle0.png', 'data/gfx/swarm0b0.png',
                      'data/gfx/inn0b0r.png', 'data/gfx/racetrack2b0.png', 'data/gfx/minibuildingsite5.png',
                      'data/gfx/explorationflag0r.png', 'data/gfx/wallc0.png'):
@@ -60,11 +61,95 @@ class WebAssetPlanTests(unittest.TestCase):
         # Nothing else ends up there: every game file is a frame of a game sprite.
         self.assertTrue(all(p.startswith('data/gfx/') and p.endswith('.png') for p in self.packages['game']))
         self.assertFalse(web_assets.game_files(['data/gfx/unitmini0.png'], {'unit'}))
+        self.assertEqual(web_assets.game_files(['data/terrain/compiled/atlas.json', 'data/terrain/compiled/textures-0-mip0.webp'],
+                                               {'data/terrain/compiled/'}),
+                         {'data/terrain/compiled/atlas.json', 'data/terrain/compiled/textures-0-mip0.webp'})
         self.assertTrue(web_assets.game_files(['data/gfx/inn0b12r.png'], {'inn0b'}))
         # The runtime export's sheets (tools/package_assets.py) replace a sprite's frames.
         self.assertEqual(web_assets.game_files(['data/gfx/unit.sheet', 'data/gfx/unit-sheet-3.webp',
                                                 'data/gfx/unitmini.sheet', 'data/gfx/unitmini-sheet-0.png'], {'unit'}),
                          {'data/gfx/unit.sheet', 'data/gfx/unit-sheet-3.webp'})
+
+    def test_terrain_registry_atlases_and_decor_are_game_sprites(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'src/app').mkdir(parents=True)
+            (root / 'src/map').mkdir(parents=True)
+            (root / 'src/app/GlobalContainer.cpp').write_text(
+                'void GlobalContainer::loadGameGraphics() {\n'
+                'sprite("data/gfx/unit"); sprite("data/gfx/terrain");\n'
+                'sprite("data/gfx/gamegui"); sprite("data/gfx/swarm0b");\n}\n')
+            (root / 'src/map/TerrainPresentation.h').write_text(
+                'constexpr auto atlas = "data/gfx/future-terrain";\n'
+                'constexpr auto backdrop = "data/gfx/future-backdrop";\n')
+            (root / 'data/terrain').mkdir(parents=True)
+            (root / 'data/terrain/tileset.json').write_text(json.dumps({'materials': [
+                {'sprite': 'data/materials/rock', 'decor': {'sprite': 'data/gfx/glow'}}]}))
+            names = web_assets.game_sprites(root)
+            self.assertEqual(names, {'unit', 'terrain', 'gamegui', 'swarm0b',
+                                     'future-terrain', 'future-backdrop', 'data/materials/rock', 'glow'})
+            self.assertEqual(web_assets.game_files(
+                ['data/gfx/future-terrain0.png', 'data/gfx/future-backdrop.sheet', 'data/materials/rock12.png'], names),
+                {'data/gfx/future-terrain0.png', 'data/gfx/future-backdrop.sheet', 'data/materials/rock12.png'})
+
+    def test_building_definition_artwork_including_experiments_is_packaged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'src/app').mkdir(parents=True)
+            (root / 'src/map').mkdir(parents=True)
+            (root / 'src/app/GlobalContainer.cpp').write_text(
+                'void GlobalContainer::loadGameGraphics() {\n'
+                'sprite("data/gfx/unit"); sprite("data/gfx/terrain");\n'
+                'sprite("data/gfx/gamegui"); sprite("data/gfx/swarm0b");\n}\n')
+            (root / 'src/map/TerrainPresentation.h').write_text('')
+            definitions = root / 'data/buildings/experimental'
+            definitions.mkdir(parents=True)
+            (definitions / 'manifest.json').write_text('{"files":["refuge.json"]}')
+            (definitions / 'refuge.json').write_text(json.dumps({'variants': [{
+                'requiredExperiment': 'refuge', 'properties': {
+                    'gameSprite': 'data/custom/refuge', 'miniSprite': 'data/gfx/refuge-icon'}}]}))
+            names = web_assets.game_sprites(root)
+            self.assertIn('data/custom/refuge', names)
+            self.assertIn('refuge-icon', names)
+            self.assertEqual(web_assets.game_files(
+                ['data/custom/refuge0.png', 'data/gfx/refuge-icon3r.png', 'data/custom/unrelated0.png'], names),
+                {'data/custom/refuge0.png', 'data/gfx/refuge-icon3r.png'})
+
+    def test_resource_catalog_artwork_is_in_game_package(self):
+        for resource in json.loads((ROOT / 'data/resources/registry.json').read_text())['resources']:
+            prefix = resource['presentation']['sprite']
+            self.assertIn(prefix.removeprefix('data/gfx/'), web_assets.game_sprites(ROOT))
+            if prefix != 'data/gfx/ressource':
+                frames = sorted((ROOT / 'data/gfx').glob(Path(prefix).name + '[0-9]*.png'))
+                self.assertTrue(frames, prefix)
+                for frame in frames:
+                    self.assertEqual(self.owner[frame.relative_to(ROOT).as_posix()], 'game')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'src/app').mkdir(parents=True)
+            (root / 'src/map').mkdir(parents=True)
+            (root / 'src/app/GlobalContainer.cpp').write_text(
+                'void GlobalContainer::loadGameGraphics() {\n'
+                'sprite("data/gfx/unit"); sprite("data/gfx/terrain");\n'
+                'sprite("data/gfx/gamegui"); sprite("data/gfx/swarm0b");\n}\n')
+            (root / 'src/map/TerrainPresentation.h').write_text('')
+            (root / 'data/resources').mkdir(parents=True)
+            (root / 'data/resources/custom.json').write_text(json.dumps({'resources': [
+                {'presentation': {'sprite': 'data/custom/ore'}}]}))
+            names = web_assets.game_sprites(root)
+            self.assertIn('data/custom/ore', names)
+            self.assertEqual(web_assets.game_files(['data/custom/ore0.png', 'data/custom/ore.sheet'], names),
+                             {'data/custom/ore0.png', 'data/custom/ore.sheet'})
+
+    def test_terrain_registry_changes_invalidate_browser_asset_plan(self):
+        tree = ast.parse((ROOT / 'scons/web_build.py').read_text())
+        inputs = [node.value for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                  and any(isinstance(target, ast.Name) and target.id == 'plan_inputs'
+                          for target in node.targets)]
+        self.assertEqual(len(inputs), 1)
+        self.assertIn('data/terrain/tileset.json', ast.literal_eval(inputs[0]))
+        self.assertIn('data/resources/registry.json', ast.literal_eval(inputs[0]))
+        self.assertEqual(self.owner['data/terrain/tileset.json'], 'core')
 
     def test_core_ships_the_browser_copies_and_font_cjk_the_full_font(self):
         self.assertEqual(sorted(self.substitutes), ['data/fonts/sans.ttf', 'data/gfx/menu-colony.png',
@@ -148,9 +233,9 @@ class BrowserCopyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             texts = [p.relative_to(ROOT).as_posix() for p in (ROOT / 'data').glob('texts.*.txt')]
-            for path in texts + ['browser/derive_assets.py', 'browser/assets/sources.json',
+            for path in texts + ['browser/derive_assets.py', 'tools/package_assets.py', 'browser/assets/sources.json',
                          'data/gfx/menu-colony.png', 'data/gfx/menu-wordmark.png', 'data/fonts/sans.ttf',
-                         'browser/assets/sans-core.ttf', 'browser/assets/menu-colony.jpg', 'browser/assets/menu-wordmark.png']:
+                         'browser/assets/sans-core.ttf', 'browser/assets/menu-colony.webp', 'browser/assets/menu-wordmark.webp']:
                 (root / path).parent.mkdir(parents=True, exist_ok=True)
                 (root / path).write_bytes((ROOT / path).read_bytes())
             self.assertEqual(len(web_assets.derived_assets(root)), 3)
@@ -166,8 +251,41 @@ class BrowserCopyTests(unittest.TestCase):
             files = ['data/gfx/menu-wordmark.webp', 'data/gfx/menu-colony.webp', 'data/fonts/sans.ttf']
             derived = web_assets.derived_assets(ROOT)
             self.assertEqual(web_assets.exported_substitutes(ROOT, source, files, derived),
-                             {'data/gfx/menu-wordmark.webp': 'browser/assets/menu-wordmark.png',
+                             {'data/gfx/menu-wordmark.webp': 'browser/assets/menu-wordmark.webp',
                               'data/fonts/sans.ttf': 'browser/assets/sans-core.ttf'})
+
+    def test_png_derivative_is_rejected_and_original_profile_keeps_font(self):
+        from unittest.mock import patch
+        current = json.loads((ROOT / 'browser/assets/sources.json').read_text())
+        entry = current.pop('browser/assets/menu-colony.webp')
+        current['browser/assets/menu-colony.png'] = entry
+        exists = Path.is_file
+        def selected_file(path):
+            return str(path).endswith('browser/assets/menu-colony.png') or exists(path)
+        derive = web_assets.load_module(ROOT, 'selected_derive', 'browser/derive_assets.py')
+        digest = derive.digest
+        def selected_digest(path):
+            return entry['output_sha256'] if str(path).endswith('browser/assets/menu-colony.png') else digest(path)
+        with patch.object(web_assets.json, 'loads', return_value=current), \
+                patch.object(Path, 'is_file', selected_file), \
+                patch.object(derive, 'digest', selected_digest), \
+                patch.object(web_assets, 'load_module', return_value=derive):
+            self.assertNotIn('data/gfx/menu-colony.png', web_assets.derived_assets(ROOT))
+        self.assertEqual(list(web_assets.derived_assets(ROOT, images=False)), ['data/fonts/sans.ttf'])
+
+    def test_q85_or_corrupt_derivatives_are_rejected(self):
+        import json
+        current = json.loads((ROOT / 'browser/assets/sources.json').read_text())
+        stale = json.loads(json.dumps(current))
+        stale['browser/assets/menu-colony.webp']['image_recipe']['lossy_quality'] = 85
+        from unittest.mock import patch
+        with patch.object(web_assets.json, 'loads', return_value=stale):
+            self.assertNotIn('data/gfx/menu-colony.png', web_assets.derived_assets(ROOT))
+        self.assertNotIn('data/gfx/menu-colony.png', web_assets.derived_assets(ROOT, lossy=False))
+        stale = json.loads(json.dumps(current))
+        stale['browser/assets/menu-colony.webp']['output_sha256'] = 'bad'
+        with patch.object(web_assets.json, 'loads', return_value=stale):
+            self.assertNotIn('data/gfx/menu-colony.png', web_assets.derived_assets(ROOT))
 
     def test_the_core_font_has_every_glyph_but_the_appended_cjk_ones(self):
         try:
@@ -209,7 +327,7 @@ class InstallWebClientTests(unittest.TestCase):
                 path = base / name
                 (path / 'assets').mkdir(parents=True)
                 (path / 'threaded').mkdir()
-                for file in ('index.html', 'index.js', 'index.wasm', 'loader.js', 'threaded/index.js', 'threaded/index.wasm'):
+                for file in ('index.html', 'studio.html', 'generator-studio.html', 'index.js', 'index.wasm', 'loader.js', 'threaded/index.js', 'threaded/index.wasm'):
                     (path / file).write_text(name + file)
                     if compressed and file != 'index.html':
                         (path / (file + '.br')).write_text(name + file + '.br')
@@ -228,6 +346,10 @@ class InstallWebClientTests(unittest.TestCase):
                     self.assertFalse((served / 'index.data').exists())
             self.assertEqual((served / 'index.js.br').read_text(), 'threeindex.js.br')
             self.assertEqual((served / 'index.html').read_text(), 'threeindex.html')
+            self.assertEqual((served / 'studio.html').read_text(), 'threestudio.html')
+            self.assertEqual((served / 'studio.html.br').read_text(), 'threestudio.html.br')
+            self.assertEqual((served / 'generator-studio.html').read_text(), 'threegenerator-studio.html')
+            self.assertEqual((served / 'generator-studio.html.br').read_text(), 'threegenerator-studio.html.br')
             self.assertEqual(sorted(p.name for p in (served / 'assets').iterdir()),
                              ['core.2222222222222222.data', 'core.3333333333333333.data'])
             self.assertEqual(json.loads((served / '.installed-assets.json').read_text()), ['core.3333333333333333.data'])

@@ -1,4 +1,6 @@
+#include <utility>
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "PowerOfTwo.h"
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 
@@ -17,6 +19,7 @@
 #include "GlobalContainer.h"
 #include "Order.h"
 #include "Unit.h"
+#include "UnitTiming.h"
 #include "Utilities.h"
 #include "GameGUI.h"
 #include <SDL3/SDL.h>
@@ -47,7 +50,7 @@ int Game::unitsCount(int team, int type)
 		(team >= 0) && (team < mapHeader.getNumberOfTeams()) &&
 		(type >= 0) && (type < NB_UNIT_TYPE)
 	)
-		return teams[team]->stats.getLatestStat()->numberUnitPerType[type];
+		return std::as_const(teams[team]->stats).getLatestStat()->numberUnitPerType[type];
 	else
 		return 0;
 }
@@ -60,7 +63,7 @@ int Game::unitsUpgradesCount(int team, int type, int ability, int level)
 		(ability >= 0) && (ability < NB_ABILITY) &&
 		(level >= 0) && (level < NB_UNIT_LEVELS)
 	)
-		return teams[team]->stats.getLatestStat()->upgradeStatePerType[type][ability][level];
+		return std::as_const(teams[team]->stats).getLatestStat()->upgradeStatePerType[type][ability][level];
 	else
 		return 0;
 }
@@ -72,7 +75,7 @@ int Game::buildingsCount(int team, int type, int level)
 		(type >= 0) && (type < IntBuildingType::NB_BUILDING) &&
 		(level >= 0) && (level < MAX_BUILDING_LEVELS)
 	)
-		return teams[team]->stats.getLatestStat()->numberBuildingPerTypePerLevel[type][level];
+		return std::as_const(teams[team]->stats).getLatestStat()->numberBuildingPerTypePerLevel[type][level];
 	else
 		return 0;
 }
@@ -176,8 +179,8 @@ Unit *Game::addUnit(int x, int y, int team, Sint32 typeNum, int level, int delta
 
 	UnitType *ut=teams[team]->race.getUnitType(typeNum, level);
 
-	x = (x + map.getW()) % map.getW();
-	y = (y + map.getH()) % map.getH();
+	x = powerOfTwoRemainder(x + map.getW(), map.getW());
+	y = powerOfTwoRemainder(y + map.getH(), map.getH());
 
 	bool fly=ut->performance[FLY];
 	bool free;
@@ -206,16 +209,29 @@ Unit *Game::addUnit(int x, int y, int team, Sint32 typeNum, int level, int delta
 		map.setGroundUnit(x, y, gid);
 
 	teams[team]->myUnits[id]= new Unit(x, y, gid, typeNum, teams[team], level);
+	teams[team]->attachUnit(id);
 	teams[team]->myUnits[id]->dx=dx;
 	teams[team]->myUnits[id]->dy=dy;
 	teams[team]->myUnits[id]->directionFromDxDy();
 	teams[team]->myUnits[id]->delta=delta;
 	teams[team]->myUnits[id]->selectPreferredMovement();
+    const auto &terrain = map.terrainPropertiesAt(x,y);
+    auto *unit = teams[team]->myUnits[id];
+    unit->speed = unitTerrainMovementSpeed(unit->speed,fly ? terrain.airSpeedQ8 : terrain.groundSpeedQ8);
+	snapshots().invalidateBoundary();
 	return teams[team]->myUnits[id];
+}
+
+bool Game::isBuildingTypeAvailable(int typeNum) const
+{
+	if (typeNum < 0 || static_cast<size_t>(typeNum) >= buildingsTypes.size()) return false;
+	const BuildingType *type = buildingsTypes.get(typeNum);
+	return type->runtimeAvailable;
 }
 
 Building *Game::addBuilding(int x, int y, int typeNum, int teamNumber, Sint32 unitWorking, Sint32 unitWorkingFuture)
 {
+	if (!isBuildingTypeAvailable(typeNum)) return nullptr;
 	Team *team=teams[teamNumber];
 	assert(team);
 
@@ -235,18 +251,29 @@ Building *Game::addBuilding(int x, int y, int typeNum, int teamNumber, Sint32 un
 	//ok, now we can safely deposit an building.
 	int gid=Building::GIDfrom(id, teamNumber);
 
-	int w=globalContainer->buildingsTypes.get(typeNum)->width;
-	int h=globalContainer->buildingsTypes.get(typeNum)->height;
+	int w=buildingsTypes.get(typeNum)->width;
+	int h=buildingsTypes.get(typeNum)->height;
 
-	Building *b=new Building(x&map.getMaskW(), y&map.getMaskH(), gid, typeNum, team, &globalContainer->buildingsTypes, unitWorking, unitWorkingFuture);
+	Building *b=new Building(x&map.getMaskW(), y&map.getMaskH(), gid, typeNum, team, &buildingsTypes, unitWorking, unitWorkingFuture);
 
+	if (b->type->runtimeSuppliesDirectStock) team->directStockSuppliers.push_back(b);
+	if (b->type->zonable[WARRIOR]) team->combatFlags.push_back(b);
 	if (b->type->canExchange)
 		team->canExchange.push_front(b);
+	if (b->type->runtimeSuppliesStock)
+	{
+		team->stockSuppliers.push_front(b);
+		map.invalidateSupplierLocations();
+		for (int resource=0; resource<MaterialCount; ++resource) map.dirtyMarketGradientsSlot(teamNumber,resource);
+	}
 	if (b->type->isVirtual)
 		team->virtualBuildings.push_front(b);
 	else
 		map.setBuilding(x, y, w, h, gid);
 	team->myBuildings[id]=b;
+	areaEffects.changed(gid);
+	team->attachBuilding(id);
+	snapshots().invalidateBoundary();
 	return b;
 }
 
@@ -263,6 +290,7 @@ bool Game::removeUnitAndBuildingAndFlags(int x, int y, unsigned flags)
 			map.setAirUnit(x, y, NOGUID);
 			delete (teams[team]->myUnits[id]);
 			teams[team]->myUnits[id]=NULL;
+			teams[team]->detachUnit(id);
 			found=true;
 		}
 	}
@@ -276,6 +304,7 @@ bool Game::removeUnitAndBuildingAndFlags(int x, int y, unsigned flags)
 			map.setGroundUnit(x, y, NOGUID);
 			delete (teams[team]->myUnits[id]);
 			teams[team]->myUnits[id]=NULL;
+			teams[team]->detachUnit(id);
 			found=true;
 		}
 	}
@@ -291,6 +320,7 @@ bool Game::removeUnitAndBuildingAndFlags(int x, int y, unsigned flags)
 				map.setBuilding(b->posX, b->posY, b->type->width, b->type->height, NOGBID);
 			delete b;
 			teams[team]->myBuildings[id]=NULL;
+			teams[team]->detachBuilding(id);
 			found=true;
 		}
 	}
@@ -301,12 +331,14 @@ bool Game::removeUnitAndBuildingAndFlags(int x, int y, unsigned flags)
 				if ((*bi)->posX==x && (*bi)->posY==y)
 				{
 					teams[ti]->myBuildings[Building::GIDtoID((*bi)->gid)]=NULL;
+					teams[ti]->detachBuilding(Building::GIDtoID((*bi)->gid));
 					delete *bi;
 					teams[ti]->virtualBuildings.erase(bi);
 					found=true;
 					break;
 				}
 	}
+	if (found) snapshots().invalidateBoundary();
 	return found;
 }
 
@@ -331,11 +363,14 @@ void Game::removeUnallowedUnitsAndBuildings(int x, int y, int w, int h)
 		{
 			int cx=dx&map.getMaskW();
 			int cy=dy&map.getMaskH();
-			if (!map.isGrass(cx, cy))
-				removeUnitAndBuildingAndFlags(cx, cy, 1, DEL_BUILDING);
-			Uint16 guid=map.getGroundUnit(cx, cy);
-			if (guid!=NOGUID && map.isWater(cx, cy) && !getUnit(guid)->performance[SWIM])
-				removeUnitAndBuildingAndFlags(cx, cy, 1, DEL_GROUND_UNIT);
+			const auto &terrain = map.terrainPropertiesAt(cx,cy);
+            if (!terrain.buildable)
+                removeUnitAndBuildingAndFlags(cx,cy,1,DEL_BUILDING);
+            Uint16 guid=map.getGroundUnit(cx,cy);
+            if (guid!=NOGUID && !terrain.walkable && !(terrain.swimmable && getUnit(guid)->performance[SWIM]))
+                removeUnitAndBuildingAndFlags(cx,cy,1,DEL_GROUND_UNIT);
+            if (!terrain.flyable && map.getAirUnit(cx,cy)!=NOGUID)
+                removeUnitAndBuildingAndFlags(cx,cy,1,DEL_AIR_UNIT);
 		}
 }
 

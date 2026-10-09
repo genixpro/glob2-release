@@ -54,6 +54,7 @@
 #include <numeric>
 #include <set>
 #include <optional>
+#include <nlohmann/json.hpp>
 #include <unistd.h>
 
 namespace
@@ -66,12 +67,40 @@ struct CountingAI : AIImplementation {
     ++calls;
     return std::make_shared<NullOrder>();
   }
+  bool supportsObservation() const override { return true; }
+  std::shared_ptr<Order> getOrder(const AIEngine::DecisionContext&) override { return getOrder(); }
 };
 } // namespace
 
 // Named in friend declarations, so it stays at global scope.
 struct CustomGameSetupHarness
 {
+    static void catalogExperimentsInPreview()
+    {
+        glob2test::HeadlessGame world({.teams=2, .header=true});
+        auto json = nlohmann::json::parse(world.game.buildingsTypes.snapshotJson());
+        json["experiments"].push_back({{"key", "preview-building"}, {"label", "Preview"}, {"help", "Fixture"}});
+        world.game.buildingsTypes.loadSnapshotJson(json.dump());
+        world.game.configureBuildingCatalog();
+        const auto path = glob2test::artifactDir() / "experiment-preview.map";
+        {
+            GAGCore::BinaryOutputStream out(Toolkit::getFileManager()->openOutputStreamBackend(path.string()));
+            world.game.save(&out, true, "Preview experiment");
+        }
+        globalContainer->settings.experiments.set("preview-building", true, {"preview-building"});
+        GAGGUI::ScreenStack stack(*globalContainer->gfx);
+        CustomGameScreen screen(stack);
+        for (int load=0; load<2; ++load)
+        {
+            REQUIRE(screen.loadMap(path.string()));
+            CHECK(screen.getGameHeader().getExperiments().has("preview-building"));
+            CHECK(screen.getGameHeader().getBuildingCatalogSnapshot() == world.game.buildingsTypes.snapshotJson());
+        }
+        REQUIRE(screen.loadMap((glob2test::sourceRoot() / "maps/FourSquares1.map.gz").string()));
+        CHECK_FALSE(screen.getGameHeader().getExperiments().has("preview-building"));
+        globalContainer->settings.experiments.clear();
+    }
+
     static void catalogLaunch()
     {
         Online::ServicesOwner online;
@@ -93,6 +122,16 @@ struct CustomGameSetupHarness
         REQUIRE(screen.setup.premadeMap == screen.sourceFile());
         REQUIRE(screen.getMapHeader().getNumberOfTeams() == 4);
         REQUIRE(!screen.generatedSnapshot);
+        const auto catalogBefore=screen.getGameHeader().getBuildingCatalogSnapshot();
+        screen.buildingSelectionChanged();
+        CHECK(screen.validMap);
+        CHECK_FALSE(screen.previewPending);
+        CHECK(screen.getGameHeader().getBuildingCatalogSnapshot()==catalogBefore);
+        screen.setup.random=true;
+        screen.buildingSelectionChanged();
+        CHECK_FALSE(screen.validMap);
+        CHECK(screen.previewPending);
+        screen.setup.random=false;
         const auto brokenHash = Online::Sha256::hex("not a map");
         REQUIRE(services.maps.insert(brokenHash, "not a map"));
         screen.loadCatalogMap({{"5f6a7b8c-9d0e-4f1a-8b2c-3d4e5f6a7b8c", brokenHash, "Broken map"}, Online::OFFICIAL_INSTANCE_ORIGIN, Online::MapPlayRequest::Mode::Local});
@@ -110,8 +149,8 @@ struct CustomGameSetupHarness
             world.game.players[t]->name = "Long colony name " + std::to_string(t + 1);
             world.game.teams[t]->stats.getLatestStat()->totalUnit = 10 + t;
         }
-        Scene scene;
-        world.gui.extractScene(scene);
+        PresentationFrame scene;
+        world.gui.prepareLocalPresentation(scene);
         world.gui.setPublishedScene(&scene);
         globalContainer->liveSpectating = true;
         world.gui.measurementPage = world.gui.statisticsPages() - 1;
@@ -207,10 +246,22 @@ struct CustomGameSetupHarness
 		checkExtraRules(restored.setup);
 		REQUIRE(restored.setup.mapRevision == 0);
 		REQUIRE(restored.landscapeSortOrder == 1);
-		// Format 5 retains custom AI identities but predates probability victory.
+		// Versions 1–7 predate the custom-generator identity row. Synthesized
+		// historical fixtures must omit it, rather than only changing the header.
+		const auto previousFormat = [&](int version)
 		{
 			auto old = encoded;
-			old.replace(0, std::string("glob2-custom-game 6").size(), "glob2-custom-game 5");
+			const auto identity = old.find("\ncustom-generator ");
+			REQUIRE(identity != std::string::npos);
+			const auto end = old.find('\n', identity + 1);
+			REQUIRE(end != std::string::npos);
+			old.erase(identity, end - identity);
+			old.replace(0, old.find('\n'), "glob2-custom-game " + std::to_string(version));
+			return old;
+		};
+		// Format 5 retains custom AI identities but predates probability victory.
+		{
+			auto old = previousFormat(5);
 			const auto at = old.find("probability ");
 			REQUIRE(at != std::string::npos);
 			old.erase(at, old.find('\n', at) - at + 1);
@@ -222,7 +273,7 @@ struct CustomGameSetupHarness
 		// Older formats omit library identities; their rules retain their defaults.
 		for (int version : {1, 2, 3, 4})
 		{
-			auto old = encoded;
+			auto old = previousFormat(version);
 			auto removeLine = [&](const std::string &prefix)
 			{
 				const auto at = old.find("\n" + prefix), eol = old.find('\n', at + 1);
@@ -234,8 +285,6 @@ struct CustomGameSetupHarness
 				removeLine("rules ");
 			if (version == 1)
 				removeLine("picker ");
-			old.replace(0, std::string("glob2-custom-game 6").size(),
-						"glob2-custom-game " + std::to_string(version));
 			// Reproduce the old twelve-record wire layout, including its draft capacity.
 			const auto coloniesAt = old.find("colonies 16\n");
 			REQUIRE(coloniesAt != std::string::npos);
@@ -280,8 +329,7 @@ struct CustomGameSetupHarness
 				 {"6", "Open book", "open-book"}, {"6", "Standard", "standard"},
 				 {"6", "Custom", "standard"}, {"7", "blitz", "blitz"}, {"7", "no-such-ruleset", "standard"}})
 		{
-			auto old = encoded;
-			old.replace(0, std::string("glob2-custom-game 7").size(), "glob2-custom-game " + version);
+			auto old = previousFormat(std::stoi(version));
 			const auto at = old.find("\"quick-clash\"");
 			REQUIRE(at != std::string::npos);
 			old.replace(at, std::string("\"quick-clash\"").size(), "\"" + label + "\"");
@@ -295,7 +343,7 @@ struct CustomGameSetupHarness
 			REQUIRE(restored.encode() == encoded);
 		}
 		for (const auto &replacement : std::vector<std::pair<std::string, std::string>>{
-				 {"glob2-custom-game 7", "glob2-custom-game 8"},
+				 {"glob2-custom-game 8", "glob2-custom-game 9"},
 				 {"rules 1 3", "rules 2 3"},
 				 {"rules 1 3", "rules 1 4"},
 				 {"2 3 90\nprobability", "2 4 90\nprobability"},
@@ -579,7 +627,7 @@ struct CustomGameSetupHarness
 		map.setSize(8, 8, GRASS);
 		for (int y = 0; y < 256; ++y)
 			for (int x = 128; x < 256; ++x)
-				map.setUMatPos(x, y, WATER, 1);
+				map.paintVertexSquare(x, y, WATER, 1);
 		MapThumbnail image;
 		image.loadFromMap(map);
 		{
@@ -896,7 +944,7 @@ struct CustomGameSetupHarness
 			engine.run();
 			{
 				FrontendScope gameplay(false);
-				engine.gui.drawAll(engine.gui.localTeamNo);
+				glob2test::drawGUI(engine.gui,engine.gui.localTeamNo);
 				globalContainer->gfx->printScreen(output + "/live-control-" +
 												  std::to_string(control) + ".bmp");
 			}
@@ -1844,6 +1892,8 @@ struct CustomGameSetupHarness
       pickAction("randomize", 1);
       settle();
       seedsShown();
+      // Exercise the already-selected tile: its click confirms and ends execution.
+      picker.select(other);
       // Using a randomized landscape hands the lobby the parameters it was shown with.
       {
         pick("landscape/" + std::to_string(other));
@@ -1853,6 +1903,10 @@ struct CustomGameSetupHarness
         REQUIRE((screen.setup.generator.method == entries[other].first &&
                screen.setup.generator.options == rolled.options &&
                screen.setup.generator.nbTeams == 4));
+        REQUIRE(!picker.run);
+        REQUIRE(picker.returnCode == other);
+        picker.finishExecution();
+        picker.beginExecution(globalContainer->gfx);
         // Back to the landscapes' own parameters for the checks below. Reset, not Regenerate:
         // regenerating keeps the random draw, and a random ridge layout can fail validation
         // once the map is resized below.
@@ -1860,13 +1914,20 @@ struct CustomGameSetupHarness
         settle();
         seedsShown();
       }
-      // Return confirms the selection, as does clicking the selected tile.
-      pick("landscape/" + std::to_string(other));
+      // Each confirmation needs a live execution, so a stale return code cannot pass.
+      REQUIRE(picker.selection() == other);
       pickerKey(SDLK_RETURN);
+      REQUIRE(!picker.run);
       REQUIRE(picker.returnCode == other);
+      picker.finishExecution();
+      picker.beginExecution(globalContainer->gfx);
       pick("landscape/" + std::to_string(other));
+      REQUIRE(!picker.run);
       REQUIRE(picker.returnCode == other);
+      picker.finishExecution();
+      picker.beginExecution(globalContainer->gfx);
       pick("landscape/use");
+      REQUIRE(!picker.run);
       REQUIRE(picker.returnCode == other);
       globalContainer->gfx->printScreen(output + "/landscape-picker-selected.bmp");
       // The lobby then rolls the very seed the picker showed: same starts, same map header.
@@ -2284,10 +2345,13 @@ struct CustomGameSetupHarness
 				   !globalContainer->replayShowFog));
 		}
 		e.gatherAndAdvanceOrders(true);
+		// Delayed decisions may still be running; join before reading the test counters.
+		e.gui.game.drainAI();
 		for (auto ai : counters)
 			REQUIRE(ai->calls == 1);
 		// Repeating a not-ready tick must not ask any AI twice.
 		e.gatherAndAdvanceOrders(false);
+		e.gui.game.drainAI();
 		for (auto ai : counters)
 			REQUIRE(ai->calls == 1);
 		std::cout << "PASS order routing: mode " << control
@@ -2462,6 +2526,43 @@ static void commonChecks()
 
 TEST_SUITE("CustomGameSetup")
 {
+    TEST_CASE("map previews retain embedded experimental catalogs through cache hits")
+    {
+        glob2test::HeadlessGlobals globals(setupOptions(false));
+        CustomGameSetupHarness::catalogExperimentsInPreview();
+    }
+
+    TEST_CASE("local building experiments are filtered by the destination catalog while saves retain theirs")
+    {
+        glob2test::HeadlessGlobals globals;
+        const std::vector<std::string> localKeys{"fixture-local", "fixture-foreign"};
+        auto& settings = globalContainer->settings.experiments;
+        settings.set(ExperimentId::GuardAreaBalancing);
+        for (const auto& key : localKeys) settings.set(key, true, localKeys);
+        BuildingsTypes catalog;
+        catalog.initLegacy();
+        auto json = nlohmann::json::parse(catalog.snapshotJson());
+        json["experiments"].push_back({{"key", localKeys[0]}, {"label", "Local"}, {"help", "Fixture"}});
+        GameHeader header;
+        header.setBuildingCatalogSnapshot(json.dump());
+        MapHeader map;
+        map.setIsSavedGame(false);
+        Engine::applyLocalExperiments(header, map);
+        CHECK(header.getExperiments().has(ExperimentId::GuardAreaBalancing));
+        CHECK(header.getExperiments().has(localKeys[0]));
+        CHECK_FALSE(header.getExperiments().has(localKeys[1]));
+        header.setBuildingCatalogSnapshot(catalog.snapshotJson());
+        Engine::applyLocalExperiments(header, map);
+        CHECK(header.getExperiments().size() == 1);
+        header.setBuildingCatalogSnapshot(json.dump());
+        header.getExperiments().set(localKeys[0], true, localKeys);
+        const auto saved = header.getExperiments();
+        settings.clear();
+        map.setIsSavedGame(true);
+        Engine::applyLocalExperiments(header, map);
+        CHECK(header.getExperiments() == saved);
+    }
+
     TEST_CASE("catalog local launch loads the exact cached version and rejects invalid maps [writes-preferences]")
     {
         glob2test::HeadlessGlobals globals(setupOptions(false));
@@ -2516,7 +2617,7 @@ TEST_SUITE("CustomGameSetup")
 	static_assert(AI::ECONO == 4, "Econo must retain its save ID");
 	REQUIRE(AINames::parseAIName("Econo") == AI::ECONO);
 	REQUIRE(AINames::getAISelectorText(AI::ECONO) == "Econo - Easy (" + std::to_string(AINames::getAIStrength(AI::ECONO)) + ") - No warriors");
-	REQUIRE(AINames::getAIProfile(AI::CORTEX).find("wheat") != std::string::npos);
+	REQUIRE(AINames::getAIProfile(AI::CORTEX).find("food") != std::string::npos);
 	REQUIRE(AINames::getAIProfile(AI::CORTEX).find("\n\nStrengths and weaknesses:") != std::string::npos);
 	const auto dir =
 		std::filesystem::temp_directory_path() / ("glob2-setup-test-" + std::to_string(getpid()));
@@ -2567,7 +2668,7 @@ TEST_SUITE("CustomGameSetup")
 		for (int y = 0; y < g.map.getH(); ++y)
 			for (int x = 0; x < g.map.getW(); ++x)
 			{
-				REQUIRE(g.map.getTerrain(x, y) == loaded.map.getTerrain(x, y));
+				REQUIRE(g.map.vertexTerrainAt(x, y) == loaded.map.vertexTerrainAt(x, y));
 				REQUIRE(g.map.getResource(x, y).type == loaded.map.getResource(x, y).type);
 			}
 		for (int i = 0; i < 4; ++i)

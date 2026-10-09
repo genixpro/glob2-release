@@ -3,12 +3,18 @@
 
 #pragma once
 
+#include <array>
+#include <bit>
 #include <list>
 #include <memory>
+#include <map>
 #include <string>
 
-#include "IntBuildingType.h"
+#include "BuildingCapabilities.h"
 #include "AIImplementation.h"
+#include "ai/observation/AIWorldView.h"
+#include "ai/observation/ResourceInitializationCache.h"
+namespace AIEngine { class WorldQueries; }
 #include "AICastorTuning.h"
 
 struct Tile;
@@ -23,7 +29,31 @@ class AICastor : public AIImplementation
 {
 	static const bool verbose = false;
 public:
-	static const int NB_HARD_BUILDING=8;
+	// Independent strategic budgets: a mixed building may satisfy several.
+ enum Demand { ProduceWorkers, FeedUnits, HealUnits, TrainWalking, TrainSwimming,
+  TrainAttack, TrainConstruction, DefendWithProjectiles, AttractExplorers,
+  AttractWarriors, ClearResources, ExchangeResources, DemandCount };
+ static const int NB_HARD_BUILDING=8;
+ // Exact strategy projection: extra production classes and unrelated training
+ // do not introduce additional Castor staffing demands.
+ using Intent = AIPlanning::BuildingIntent;
+ inline static constexpr auto demandIntents = std::to_array<Intent>({
+  Intent::ProduceWorker,Intent::Feed,Intent::Heal,Intent::TrainWalk,Intent::TrainSwim,
+  Intent::TrainAttackStrength,Intent::TrainConstruction,Intent::ProjectileDefense,
+  Intent::AttractExplorers,Intent::AttractWarriors,Intent::ClearResources,Intent::ExchangeResources});
+ static_assert(demandIntents.size() == DemandCount);
+ static_assert(static_cast<unsigned>(Intent::Count) <= 64);
+ inline static constexpr std::uint64_t demandIntentMask = [] {
+  std::uint64_t mask=0;
+  for (const auto intent:demandIntents) mask |= std::uint64_t{1} << static_cast<unsigned>(intent);
+  return mask;
+ }();
+ static_assert(std::popcount(demandIntentMask) == DemandCount);
+ static AIPlanning::BuildingIntent intentForDemand(int demand);
+ bool provides(const AIEngine::BuildingView& building, int demand) const;
+ bool demandAvailable(int demand) const;
+ int selectBuilding(int demand) const;
+ int desiredWorkers(const AIEngine::BuildingView& building, int request) const;
 
 	// "Never run yet" for the per-map computation timers. All-ones compares as
 	// "in the future" against ">timer+N", so a zero would not do.
@@ -52,12 +82,12 @@ public:
 	class Project
 	{
 	public:
-		Project(IntBuildingType::Number shortTypeNum, const char *suffix);
-		Project(IntBuildingType::Number shortTypeNum, int amount, Sint32 mainWorkers, const char *suffix);
+		Project(int demand, const char *suffix);
+		Project(int demand, int amount, Sint32 mainWorkers, const char *suffix);
 		void init(const char *suffix);
 
 	public:
-		IntBuildingType::Number shortTypeNum;
+		int demand;
 		int amount; // number of buildings wanted
 		bool food; // place closer to wheat
 		bool defense; // place at incoming places
@@ -91,17 +121,17 @@ public:
 	public:
 		struct Build
 		{
-			int baseOrder;
-			int base;
-			int baseWorkers;
-			int baseUpgrade;
+			int baseOrder = -1;
+			int base = 0;
+			int baseWorkers = 0;
+			int baseUpgrade = 0;
 			
-			int finalWorkers;
+			int finalWorkers = -1;
 			
-			int newOrder;
-			int news;
-			int newWorkers;
-			int newUpgrade;
+			int newOrder = -1;
+			int news = 0;
+			int newWorkers = 0;
+			int newUpgrade = 0;
 		};
 		
 	public:
@@ -112,7 +142,7 @@ public:
 		Sint32 successWait;
 		Sint32 isFreePart;
 		
-		Build build[IntBuildingType::NB_BUILDING];
+		Build build[AICastor::DemandCount];
 		
 		Uint32 warTimeTrigger;
 		Sint32 warLevelTrigger;
@@ -145,8 +175,42 @@ public:
 	void save(GAGCore::OutputStream *stream);
 	
 	std::shared_ptr<Order>getOrder(void);
+ bool supportsObservation() const override { return true; }
+ // Farm recovery reads material growth rates, so the growth field is required.
+ SimulationSnapshot::Requirements observationRequirements() const override { return SimulationSnapshot::Simulation; }
+ std::optional<Uint64> retainedQueryVectorBytes() const override
+ {
+  Uint64 bytes = 0;
+  for (const auto& [key, field] : resourceInitializations)
+   if (field.values) bytes += Uint64(field.values->capacity()) * sizeof(Uint16);
+  return bytes;
+ }
+ std::shared_ptr<Order> getOrder(const AIEngine::DecisionContext&) override;
+	void orderExecutionCompleted(const Order& order, bool accepted) override;
+
+private:
+ struct PendingCreate { Uint32 tick;Uint64 sequence;int type,x,y; };
+ std::vector<PendingCreate> pendingCreates;
+ Uint64 decisionSequence=0;
+ const AIEngine::TeamView* observedTeam=nullptr;
+ const AIEngine::TeamView* teamAt(int index) const;
+ int teamNumber=0;
+ const AIEngine::AIWorldView* observation=nullptr;
+ AIEngine::WorldQueries* queries=nullptr;
+ AIEngine::ResourceInitializations resourceInitializations;
+ std::shared_ptr<Order> decide();
+	struct PendingWorkers { Uint32 generation; Sint32 workers; Uint32 tick=0;Uint64 sequence=0; };
+	struct PendingRatios { Uint32 generation; std::array<Sint32, NB_UNIT_TYPE> ratios; Uint32 tick=0;Uint64 sequence=0; };
+	std::map<Uint16, PendingWorkers> pendingWorkers;
+	std::map<Uint16, PendingRatios> pendingRatios;
+	int requestedWorkers(const AIEngine::BuildingView& building) const;
+	Sint32 requestedRatio(const AIEngine::BuildingView& building, int unit) const;
+	std::shared_ptr<Order> requestWorkers(const AIEngine::BuildingView& building, Sint32 workers);
+	std::shared_ptr<Order> requestRatios(const AIEngine::BuildingView& building, const Sint32* ratios);
+	void reconcilePendingAssignments();
 	
 private:
+	friend struct CastorResourcePolicyAccess;
 	void init(Player *player);
 	void defineStrategy();
 	
@@ -192,14 +256,16 @@ public:
 	void updateGlobalGradient(Uint8 *gradient);
 	//! The map's wheat gradient for Castor's workers, on Castor's 8-bit scale.
 	Uint8 wheatGradientAt(size_t index);
+	//! Copy one stable resource field without reacquiring its lazy lookup per cell.
+	void copyWheatGradient(Uint8* destination);
 	
 	std::list<Project *> projects;
 	
 	Uint32 timer;
 	bool canSwim;
 	bool needSwim;
-	int buildingSum[IntBuildingType::NB_BUILDING][2]; // [shortTypeNum][isBuildingSite]
-	int buildingLevels[IntBuildingType::NB_BUILDING][2][4]; // [shortTypeNum][isBuildingSite][level]
+	int buildingSum[AICastor::DemandCount][2]; // [demand][isBuildingSite]
+	int buildingLevels[AICastor::DemandCount][2][4]; // [demand][isBuildingSite][level]
 	int warLevel; // 0: no war
 	int warTimeTriggerLevel;
 	int warLevelTriggerLevel;

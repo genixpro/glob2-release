@@ -52,7 +52,7 @@ inline void landscapeGrass(Game &game, int wDec, int hDec)
 {
 	game.map.setSize(wDec, hDec);
 	game.map.setGame(&game);
-	game.map.makeHomogenMap(GRASS);
+	game.map.fillTerrain(GRASS);
 }
 
 // Orbits: the point symmetries are the arena's; translation groups exist only for orders dividing the
@@ -119,14 +119,14 @@ inline void orbitChecks()
 	for (int e = 0; e < lattice.order(); ++e)
 	{
 		const int i = lattice.tile(e, 10, 12);
-		game.map.setResource(i % 64, i / 64, WOOD, 1);
+		game.map.setResourceByIndex(i % 64, i / 64, WOOD, 1);
 	}
 	std::string detail;
 	assert(equaliseDeposits(game.map, lattice, detail) && detail.empty());
-	game.map.setResource(40, 40, WHEAT, 1);
+	game.map.setResourceByIndex(40, 40, WHEAT, 1);
 	assert(!equaliseDeposits(game.map, lattice, detail) && !detail.empty());
 	game.map.setNoResource(40, 40, 1);
-	game.map.setResource(40, 40, STONE, 1);
+	game.map.setResourceByIndex(40, 40, STONE, 1);
 	assert(orbitMismatch(game, lattice, 4).find("Deposit") == 0);
 }
 
@@ -207,7 +207,7 @@ inline void growthChecks()
 	// The finished-map overload must agree with sketch corner arithmetic, including beaches.
 	Game written(nullptr);
 	landscapeGrass(written, 6, 6);
-	writeUndermap(written.map, sketch);
+	writeVertices(written.map, sketch);
 	for (const auto type : {GRASS, SAND, WATER})
 		assert(pureTiles(written.map, type) == pureTiles(sketch, t, type));
 	Fertility::Field field = cropGrowthField(sketch, t);
@@ -236,17 +236,17 @@ inline void growthChecks()
 		for (int x = 20; x <= 40; ++x)
 			if (x <= 22 || x >= 38 || y <= 22 || y >= 38)
 				enclosed[t.at(x, y)] = SAND;
-	writeUndermap(game.map, enclosed);
-	game.map.setResource(5, 5, STONE, 1);
+	writeVertices(game.map, enclosed);
+	game.map.setResourceByIndex(5, 5, STONE, 1);
 	assert(cropSpreadEnvelope(game.map).visited.empty());
-	game.map.setResource(0, 0, WHEAT, 1);
+	game.map.setResourceByIndex(0, 0, WHEAT, 1);
 	const auto spread = cropSpreadEnvelope(game.map);
 	assert(spread.steps[t.at(63, 63)] == 1); // Diagonal wrapping is a growth route too.
 	assert(spread.steps[t.at(30, 30)] < 0);
 	std::vector<unsigned char> reserved(t.size(), 0);
 	reserved[t.at(30, 30)] = 1;
 	assert(cropSeedsIn(game.map, reserved) == 0);
-	game.map.setResource(30, 30, WOOD, 1);
+	game.map.setResourceByIndex(30, 30, WOOD, 1);
 	assert(cropSeedsIn(game.map, reserved) == 1);
 	assert(cropSpreadEnvelope(game.map).steps[t.at(31, 31)] == 1);
 	reserved[t.at(0, 0)] = reserved[t.at(5, 5)] = 1;
@@ -262,7 +262,7 @@ inline void contactChecks()
 	Map &map = game.map;
 	const Torus t(map);
 	for (int y = 0; y < t.h; ++y)
-		map.setResource(16, y, WOOD, 1);
+		map.setResourceByIndex(16, y, WOOD, 1);
 	assert(stepCost(map, 16, 3, StepCosts::walking()) == -1 &&
 		   stepCost(map, 16, 3, StepCosts::chopping(5)) == 5);
 	// The wall wraps, so the torus is still open round the other side: walkers go round.
@@ -287,7 +287,7 @@ inline void contactChecks()
 			if ((x >= 20 && x < 26) || (x >= 52 && x < 58))
 				sketch[s.at(x, y)] = WATER;
 	layBeaches(sketch, s);
-	writeUndermap(strait.map, sketch);
+	writeVertices(strait.map, sketch);
 	GenerationRequest request;
 	request.nbTeams = 2;
 	GenerationContext context(request);
@@ -508,7 +508,7 @@ inline void roomChecks()
 	Game game(nullptr);
 	landscapeGrass(game, 4, 4);
 	assert(count(buildableTiles(game.map)) == 256);
-	game.map.setResource(3, 3, WOOD, 1);
+	game.map.setResourceByIndex(3, 3, WOOD, 1);
 	assert(count(buildableTiles(game.map)) == 255);
 }
 
@@ -570,7 +570,7 @@ inline void biomeChecks()
 		for (int i = 0; i < t.size(); ++i)
 			assert(!terrain.wall[i] || !doors[i]);
 		layBeaches(sketch, t);
-		writeUndermap(game.map, sketch);
+		writeVertices(game.map, sketch);
 		furnishBiome(game.map, t, context, region, terrain, kit, keep, "biome");
 		int stone = 0, wood = 0, fruit = 0, outside = 0;
 		for (int i = 0; i < t.size(); ++i)
@@ -856,11 +856,11 @@ inline void lavaPrimitiveChecks()
 	int attempts = 0;
 	const auto rejected = chooseScoredSettlements(
 		context, {{}, {1}, {2}},
-		[&](Game &, GenerationContext &probe, const std::vector<int> &)
+		[&](Game &world, GenerationContext &probe, const std::vector<int> &)
 		{
 			assert(probe.bounded("builder", 10000) == expectedDraw);
 			assert(syncRandEngine() == engine);
-			syncRand();
+			world.privateRandom(RandomDomain::ResourcePlacement).nextU32();
 			++attempts;
 			probe.detail = "retained rejection";
 			return false;
@@ -872,9 +872,9 @@ inline void lavaPrimitiveChecks()
 	{
 		chooseScoredSettlements(
 			context, {{1}},
-			[](Game &, GenerationContext &, const std::vector<int> &) -> bool
+			[](Game &world, GenerationContext &, const std::vector<int> &) -> bool
 			{
-				syncRand();
+				world.privateRandom(RandomDomain::ResourcePlacement).nextU32();
 				throw std::runtime_error("builder failed");
 			},
 			[](const StartQualityReport &) { return std::string{}; });
@@ -886,14 +886,14 @@ inline void lavaPrimitiveChecks()
 	assert(syncRandEngine() == engine);
 	const auto build = [](Game &world, GenerationContext &c, const std::vector<int> &proposal)
 	{
-		world.map.makeHomogenMap(GRASS);
+		world.map.fillTerrain(GRASS);
 		world.addTeam();
 		std::vector<unsigned char> home(world.map.getW() * world.map.getH(), 1);
 		const int x = proposal[0];
 		if (!placeSettlement(world, c, 0, home, {x, 12}, "trial-settle"))
 			return false;
-		world.map.setResource(x + 7, 12, WHEAT, 1);
-		world.map.setResource(x + 7, 16, WOOD, 1);
+		world.map.setResourceByIndex(x + 7, 12, WHEAT, 1);
+		world.map.setResourceByIndex(x + 7, 16, WOOD, 1);
 		return true;
 	};
 	const auto selected = chooseScoredSettlements(

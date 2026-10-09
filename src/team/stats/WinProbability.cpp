@@ -1,3 +1,4 @@
+#include <utility>
 /*
   Copyright (C) 2026 Globulation2 contributors
 
@@ -25,6 +26,7 @@
 #include "TeamStat.h"
 #include "Unit.h"
 #include "BuildingType.h"
+#include "ai/model/BuildingProjection.h"
 #include <algorithm>
 
 namespace WinProbability
@@ -183,6 +185,12 @@ namespace WinProbability
 				allianceOf[t] = (int)(found - alliances.begin());
 		}
 		std::vector<Slot> slots(alliances.size());
+        std::vector<int> combatProviders;
+        for(size_t variant=0;variant<game.buildingsTypes.size();++variant)
+        {
+            if(ModelBuildingProjection::trainsWarriorCombat(ModelBuildingProjection::completed(game.buildingsTypes,*game.buildingsTypes.get(variant))))
+                combatProviders.push_back(int(variant));
+        }
 		for (int t = 0; t < count; ++t)
 		{
 			const Team *team = game.teams[t];
@@ -193,11 +201,12 @@ namespace WinProbability
 			// alliance alive on its own; a surviving ally still can.
 			if (!team->isAlive || (team->hasLost && !(ignoreLostTeams & (1u << t))))
 				continue;
-			const TeamStat *stat = team->stats.getLatestStat();
+			const TeamStat *stat = std::as_const(team->stats).getLatestStat();
 			slot.alive = true;
 			slot.units += stat->totalUnit;
 			slot.prestige += team->prestige;
-			slot.barracks += stat->numberBuildingPerType[IntBuildingType::ATTACK_BUILDING];
+			for(int variant:combatProviders)
+                if(size_t(variant)<stat->buildingCountByVariant.size())slot.barracks+=stat->buildingCountByVariant[variant];
 			slot.explorers += stat->numberUnitPerType[EXPLORER];
 			slot.foodCritical += stat->needFoodCritical;
 			slot.attack += stat->totalAttackPower;

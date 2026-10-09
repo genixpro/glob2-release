@@ -45,12 +45,15 @@ def install(staged):
             for path_key, hash_key in (
                 ("tools/skins/export_units.py", "exporterSha256"),
                 ("tools/skins/limb_surface.py", "surfaceBuilderSha256"),
+                ("tools/skins/chart.py", "surfaceChartSha256"),
                 (exported["surfaceDefinition"], "surfaceDefinitionSha256"),
             ):
                 assert (
                     hashlib.sha256((ROOT / path_key).read_bytes()).hexdigest()
                     == exported[hash_key]
                 ), "Staged export has stale surface sources"
+        for dependency, digest in exported.get("surfaceDependencies", {}).items():
+            assert hashlib.sha256((ROOT / dependency).read_bytes()).hexdigest() == digest, "Staged export has stale surface dependency"
         exports[model] = exported
     for model, exported in exports.items():
         for clip in exported["clips"].values():
@@ -73,9 +76,16 @@ def install(staged):
                     "exporterSha256": exported["exporterSha256"],
                     "builder": "tools/skins/limb_surface.py",
                     "builderSha256": exported["surfaceBuilderSha256"],
+                    "chart": "tools/skins/chart.py",
+                    "chartSha256": exported["surfaceChartSha256"],
                     "contract": exported["surfaceContract"],
                     "contractSha256": exported["surfaceContractSha256"],
+                    "dependencies": exported["surfaceDependencies"],
                 }
+            if "detailUV" in clip:
+                record["detailUV"] = clip["detailUV"]
+                for folder in (destination, designer):
+                    shutil.copyfile(staged / clip["detailUV"]["file"], folder / clip["detailUV"]["file"])
             manifest["meshes"][name] = record
             shutil.copyfile(staged / name, destination / name)
             shutil.copyfile(staged / name, designer / name)

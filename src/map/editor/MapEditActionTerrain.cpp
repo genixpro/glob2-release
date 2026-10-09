@@ -1,12 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "Game.h"
+#include "ExperimentalFeatures.h"
+#include "TerrainExperiments.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
 #include "ScriptEditorScreen.h"
 #include "Unit.h"
 #include "Utilities.h"
+#include "GenerationContext.h"
 #include <SDL3/SDL.h>
+#include <charconv>
 
 void MapEdit::beginZonePlacement(BrushType type)
 {
@@ -20,13 +24,36 @@ void MapEdit::beginZonePlacement(BrushType type)
 
 void MapEdit::beginTerrainPlacement(TerrainSelector::TerrainType type, TerrainPlacementMode mode)
 {
+    const bool isTerrain = TerrainSelector::isBaseTerrain(type);
+    const bool isResourceSelector = TerrainSelector::isResource(type);
+    // Reject stale/invalid selector IDs and incompatible modes before changing
+    // the current selection. Normalize legacy aliases to retain corner alignment.
+    if (mode == TerrainPlacementMode::BaseTerrain ? !isTerrain : !isResourceSelector) return;
+    if (isTerrain) {
+        const auto material = TerrainSelector::baseTerrain(type);
+		if (!game.map.validTerrainType(material) ||
+			!game.map.terrainPresentation(material).editorSelectable)
+			return;
+		if (const auto requirement=terrainExperimentKey(material);
+            requirement && !experimentEnabled(*requirement)) return;
+        type = TerrainSelector::selectorFor(material);
+    }
+    else
+    {
+        const auto resource = TerrainSelector::resourceType(type, game.map.resourceRegistry());
+        if (!game.map.resourceRegistry().valid(resource)) return;
+        if (!experimentEnabled(game.map.resourceRegistry().requiredExperiment(resource))) return;
+        // Legacy selectors (Wheat..PruneTree) and registry selectors name the same
+        // brush: keep one canonical value so every presentation highlights it.
+        type = TerrainSelector::selectorForResource(resource);
+    }
 	performAction("unselect");
 	terrainType=type;
 	selectionMode=PlaceTerrain;
-	const bool isResource = mode == TerrainPlacementMode::Resource;
-	if (!isResource || brush.getType() == BrushTool::MODE_NONE)
+	// Every terrain and resource brush starts in Add and offers Del.
+	if (brush.getType() == BrushTool::MODE_NONE)
 		brush.defaultSelection();
-	brush.setAddRemoveEnabledState(isResource);
+	brush.setAddRemoveEnabledState(true);
 }
 
 void MapEdit::resetPlacementTracking()
@@ -38,19 +65,71 @@ void MapEdit::resetPlacementTracking()
 
 bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, float relMouseY)
 {
+    if (action.starts_with("select resource "))
+    {
+        const auto id = game.map.resourceRegistry().find(action.substr(16));
+        if (id) beginTerrainPlacement(TerrainSelector::selectorForResource(*id), TerrainPlacementMode::Resource);
+        return true;
+    }
+    if (action.starts_with("select terrain "))
+    {
+        // Registry keys address built-in and imported types alike.
+        if (const auto type = game.map.terrainRegistry().find(action.substr(15)))
+            beginTerrainPlacement(TerrainSelector::selectorFor(*type), TerrainPlacementMode::BaseTerrain);
+        return true;
+    }
+    // Legacy resource aliases first: an imported terrain named "stone" or "wheat"
+    // must not take over these actions.
+    {
+        static constexpr std::pair<const char*, TerrainSelector::TerrainType> legacyResources[] = {
+            {"select wheat", TerrainSelector::Wheat}, {"select trees", TerrainSelector::Trees},
+            {"select stone", TerrainSelector::Stone}, {"select algae", TerrainSelector::Algae},
+            {"select papyrus", TerrainSelector::Papyrus},
+            {"select cherry tree", TerrainSelector::CherryTree}, {"select cherry", TerrainSelector::CherryTree},
+            {"select orange tree", TerrainSelector::OrangeTree}, {"select orange", TerrainSelector::OrangeTree},
+            {"select prune tree", TerrainSelector::PruneTree}, {"select prune", TerrainSelector::PruneTree}};
+        for (const auto& [name, selector] : legacyResources)
+            if (action == name)
+            {
+                beginTerrainPlacement(selector, TerrainPlacementMode::Resource);
+                return true;
+            }
+    }
+    // "select <name>" for the built-in types only (grass, sand, water, road, ...);
+    // imported types are addressed by "select terrain <key>".
+    if (action.starts_with("select "))
+    {
+        for (unsigned id=0; id<TERRAIN_COUNT && id<game.map.terrainRegistry().size(); ++id)
+        {
+            const auto type = static_cast<::TerrainType>(id);
+			const auto &presentation = game.map.terrainPresentation(type);
+			if (presentation.editorSelectable && action == std::string("select ")+presentation.name)
+            {
+                beginTerrainPlacement(TerrainSelector::selectorFor(type), TerrainPlacementMode::BaseTerrain);
+                return true;
+            }
+        }
+    }
 	if(action.substr(0, 29)=="set place building selection ")
 	{
 		performAction("unselect");
 		std::string type=action.substr(29, action.size()-29);
+		if (game.buildingsTypes.getFinishedTypeNum(type)<0) return false;
 		selectionName=type;
 		selectionMode=PlaceBuilding;
 	}
+	else if(action=="reroll terrain look")
+	{
+		// Presentation only: the next scene extraction carries the new seed and
+		// every terrain page recomposes. Not undoable, like team edits.
+		game.map.setTerrainSeed(GenerationContext::randomSeed());
+		mapHasBeenModified();
+	}
 	else if(action=="place building")
 	{
-		int typeNum=globalContainer->buildingsTypes.getTypeNum(selectionName, buildingLevel, false);
-		if(!isUpgradable(IntBuildingType::shortNumberFromType(selectionName)))
-			typeNum = globalContainer->buildingsTypes.getTypeNum(selectionName, 0, false);
-		BuildingType *bt = globalContainer->buildingsTypes.get(typeNum);
+		int typeNum=buildingSelectionType(selectionName);
+		if (!game.isBuildingTypeAvailable(typeNum)) return false;
+		BuildingType *bt = game.buildingsTypes.get(typeNum);
 		int tempX, tempY, x, y;
 		game.map.cursorToBuildingPos(mapMouseX(mouseX), mapMouseY(mouseY), bt->width, bt->height, &tempX, &tempY, viewportX, viewportY);
 
@@ -60,7 +139,7 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 				game.addBuilding(x, y, typeNum, team, 1, 0);
 			else
 				game.addBuilding(x, y, typeNum, team, 0, 0);
-			if (selectionName=="swarm")
+			if (typeNum==game.buildingsTypes.getStartingBuildingTypeNum())
 			{
 				if (game.teams[team]->startPosSet<Team::START_POS_FROM_SWARM)
 				{
@@ -82,17 +161,18 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 			hasMapBeenModified = true;
 		}
 	}
-	else if(action=="switch to building level 1")
+	else if(action=="next building level page")
 	{
-		buildingLevel=0;
+		const int next=(buildingLevel/3+1)*3;
+		buildingLevel=next<buildingLevelCount ? next : 0;
 	}
-	else if(action=="switch to building level 2")
+	else if(action.starts_with("switch to building level "))
 	{
-		buildingLevel=1;
-	}
-	else if(action=="switch to building level 3")
-	{
-		buildingLevel=2;
+		const auto text=std::string_view(action).substr(25);
+		int value=0;
+		const auto result=std::from_chars(text.data(),text.data()+text.size(),value);
+		if (result.ec==std::errc{} && result.ptr==text.data()+text.size() && value>=1 && value<=buildingLevelCount)
+			buildingLevel=value-1;
 	}
 	else if(action=="select forbidden zone")
 	{
@@ -108,7 +188,7 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 	}
 	else if(action=="select farm zone")
 	{
-		if(farmingZone)
+		if(experimentEnabled(experimentDefinition(ExperimentId::FarmAreas).key))
 			beginZonePlacement(FarmAreaBrush);
 	}
 	else if(action=="handle zone click")
@@ -136,50 +216,7 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 		isDraggingZone=false;
 		resetPlacementTracking();
 	}
-	else if(action=="select grass")
-	{
-		beginTerrainPlacement(TerrainSelector::Grass, TerrainPlacementMode::BaseTerrain);
-	}
-	else if(action=="select sand")
-	{
-		beginTerrainPlacement(TerrainSelector::Sand, TerrainPlacementMode::BaseTerrain);
-	}
-	else if(action=="select water")
-	{
-		beginTerrainPlacement(TerrainSelector::Water, TerrainPlacementMode::BaseTerrain);
-	}
-	else if(action=="select wheat")
-	{
-		beginTerrainPlacement(TerrainSelector::Wheat, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select trees")
-	{
-		beginTerrainPlacement(TerrainSelector::Trees, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select stone")
-	{
-		beginTerrainPlacement(TerrainSelector::Stone, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select algae")
-	{
-		beginTerrainPlacement(TerrainSelector::Algae, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select papyrus")
-	{
-		beginTerrainPlacement(TerrainSelector::Papyrus, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select cherry tree")
-	{
-		beginTerrainPlacement(TerrainSelector::CherryTree, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select orange tree")
-	{
-		beginTerrainPlacement(TerrainSelector::OrangeTree, TerrainPlacementMode::Resource);
-	}
-	else if(action=="select prune tree")
-	{
-		beginTerrainPlacement(TerrainSelector::PruneTree, TerrainPlacementMode::Resource);
-	}
+
 	else if(action=="select delete objects")
 	{
 		performAction("unselect");
@@ -200,13 +237,13 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 	}
 	else if(action=="handle terrain click")
 	{
-		if(terrainType==TerrainSelector::NoTerrain && selectionMode!=RemoveObject && selectionMode!=ChangeAreas && selectionMode!=ChangeNoResourceGrowthAreas)
-			performAction("select grass");
+		// Choosing a shape or mode never picks a terrain; the next brush keeps the shape.
 		brush.handleClick(relMouseX, relMouseY);
 	}
 	else if(action=="terrain drag start")
 	{
 		isDraggingTerrain=true;
+		strokeCoveredCells=strokePlacedResources=0;
 		handleTerrainClick(mapMouseX(mouseX), mapMouseY(mouseY));
 		hasMapBeenModified = true;
 	}
@@ -218,6 +255,7 @@ bool MapEdit::performTerrainAction(const std::string& action, float relMouseX, f
 	else if(action=="terrain drag end")
 	{
 		isDraggingTerrain=false;
+		finishTerrainStroke();
 		resetPlacementTracking();
 	}
 	else if(action=="delete drag start")

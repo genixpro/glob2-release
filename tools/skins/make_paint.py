@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Create reproducible colony-v2 paint fixtures without image dependencies.
+"""Create reproducible colony-v2 source fixtures and WebP preview assets.
 
 A colony-v2 skin is a 512px colour atlas (paint.png) and a 512px greyscale
 material map (material.png). Each holds four 256px quadrants, one per model:
@@ -8,13 +8,16 @@ worker top-left, warrior top-right, explorer bottom-left, swarm bottom-right.
 Material map values are material ids (see MATERIALS).
 """
 import argparse
+import io
+import json
 from pathlib import Path
 import struct
 import zlib
 
 SIZE = 512
 QUADRANT = 256
-MATERIALS = {'glossy': 0, 'matte': 1, 'metallic': 2, 'hairy': 3}
+REGISTRY = json.loads((Path(__file__).resolve().parents[2] / 'libgag/shaders/skin-materials.json').read_text())
+MATERIALS = {m['key']: m['id'] for m in REGISTRY['materials']}
 # Distinct per-model colours make quadrant mix-ups visible in previews.
 MODEL_COLORS = (((45, 115, 180), (240, 190, 50)),   # worker
                 ((180, 40, 40), (235, 235, 235)),   # warrior
@@ -58,14 +61,14 @@ def paint(pattern, color=None):
 
 
 def material(name, pattern, only_pattern=False):
-    """'mixed' gives each model glossy/matte/metallic/hairy bands on the pattern.
+    """'mixed' gives each model vertical bands of every material on the pattern.
     only_pattern applies the material to the pattern's marks over a glossy body."""
     rows = []
     for y in range(SIZE):
         row = bytearray()
         for x in range(SIZE):
             if name == 'mixed':
-                band = (x % QUADRANT) * 4 // QUADRANT
+                band = (x % QUADRANT) * len(MATERIALS) // QUADRANT
                 row.append(band if pattern_index(pattern, x % QUADRANT, y % QUADRANT) else 0)
             elif only_pattern and not pattern_index(pattern, x % QUADRANT, y % QUADRANT):
                 row.append(MATERIALS['glossy'])
@@ -77,7 +80,7 @@ def material(name, pattern, only_pattern=False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('output', type=Path, help='directory for paint.png and material.png')
+    parser.add_argument('output', type=Path, help='directory for WebP assets and PNG source copies')
     parser.add_argument('--pattern', choices=('checker', 'stripes', 'spots', 'solid'), default='checker')
     parser.add_argument('--color', help='solid RGB colour as RRGGBB, replacing the pattern colours')
     parser.add_argument('--material', choices=(*MATERIALS, 'mixed'), default='glossy')
@@ -86,5 +89,14 @@ if __name__ == '__main__':
     args = parser.parse_args()
     args.output.mkdir(parents=True, exist_ok=True)
     color = tuple(bytes.fromhex(args.color)) if args.color else None
-    (args.output / 'paint.png').write_bytes(paint(args.pattern, color))
-    (args.output / 'material.png').write_bytes(material(args.material, args.pattern, args.material_on_pattern))
+    from PIL import Image, features
+    if not features.check('webp'):
+        parser.error('Pillow must include WebP support')
+    for name, source in [('paint', paint(args.pattern, color)),
+                         ('material', material(args.material, args.pattern, args.material_on_pattern))]:
+        # Source copies support image editing and the existing offline pixel
+        # analysis tools. Native previews load only the lossless WebP pair.
+        (args.output / (name + '.png')).write_bytes(source)
+        with Image.open(io.BytesIO(source)) as image:
+            image.convert('RGB').save(args.output / (name + '.webp'), format='WEBP',
+                                      lossless=True, quality=75, method=4, exact=True)

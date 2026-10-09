@@ -2,6 +2,7 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #pragma once
+namespace AIEngine { class AIWorldView; }
 
 #include "shared_runtime/Construction.h"
 
@@ -144,6 +145,7 @@ namespace AISharedRuntime
 		{
 		public:
 			MapInfo(Runtime& runtime);
+			MapInfo(const AIEngine::AIWorldView& world, Uint32 teamMask);
 			int get_width();
 			int get_height();
 			bool is_forbidden_area(int x, int y);
@@ -161,10 +163,15 @@ namespace AISharedRuntime
 			bool is_water(int x, int y);
 			bool is_sand(int x, int y);
 			bool is_grass(int x, int y);
+			bool is_crop_habitat(int x, int y);
+			bool is_resource_habitat(int x, int y, int resource);
 			bool backs_onto_sand(int x, int y);
 			int get_amount_resource(int x, int y);
 		private:
-			Runtime& runtime;
+			const AIEngine::AIWorldView& observation() const;
+			Runtime* runtime=nullptr;
+			const AIEngine::AIWorldView* world=nullptr;
+			Uint32 teamMask=0;
 		};
 	};
 }

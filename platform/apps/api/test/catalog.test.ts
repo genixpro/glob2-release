@@ -21,6 +21,8 @@ import {
 } from './playSupport.ts';
 import { SIM, createHarness, json, type Harness, type Instance } from './support.ts';
 
+import { SET_CREDITS_FIXTURE } from './setCreditsFixture.ts';
+
 const ORIGIN = 'http://play.test';
 const sha256 = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 
@@ -169,7 +171,9 @@ describe('creating maps and uploading versions', () => {
       .execute();
     expect(jobs.map((j) => j.kind).sort()).toEqual(['render-preview', 'validate-map']);
 
+    engine.setCredits = SET_CREDITS_FIXTURE;
     expect(await engine.runPending()).toBe(2);
+    engine.setCredits = [];
     const detail = await json(await api('GET', `/api/v1/maps/${map.id}`, owner));
     expect(check('MapDetail', detail).stage).toBe('ok');
     const info = detail['map'] as Record<string, unknown>;
@@ -182,9 +186,13 @@ describe('creating maps and uploading versions', () => {
       minVersionMinor: SIM.versionMinor,
       simVersion: SIM,
       fileTitle: 'Uploaded map',
+      setCredits: SET_CREDITS_FIXTURE,
       preview: 'ready',
-      previewUrl: `${ORIGIN}/api/v1/maps/${map.id}/versions/${pending['hash']}/preview.png`,
+      previewUrl: `${ORIGIN}/api/v1/maps/${map.id}/versions/${pending['hash']}/preview.webp`,
     });
+    expect((detail['versions'] as { setCredits: unknown }[])[0]?.setCredits).toEqual(
+      SET_CREDITS_FIXTURE,
+    );
     expect(detail['viewer']).toEqual({
       owner: true,
       moderator: false,
@@ -200,10 +208,10 @@ describe('creating maps and uploading versions', () => {
     // The preview and the file are served.
     const preview = await api(
       'GET',
-      `/api/v1/maps/${map.id}/versions/${pending['hash']}/preview.png`,
+      `/api/v1/maps/${map.id}/versions/${pending['hash']}/preview.webp`,
     );
     expect(preview.status).toBe(200);
-    expect(preview.headers.get('content-type')).toBe('image/png');
+    expect(preview.headers.get('content-type')).toBe('image/webp');
     const file = await api('GET', `/api/v1/maps/${map.id}/versions/${pending['hash']}/file`);
     expect(file.status).toBe(200);
     expect(Buffer.from(await file.arrayBuffer()).equals(bytes)).toBe(true);
@@ -398,7 +406,7 @@ describe('visibility', () => {
     const file = (m: { id: string; hash: string }) =>
       `/api/v1/maps/${m.id}/versions/${m.hash}/file`;
     const preview = (m: { id: string; hash: string }) =>
-      `/api/v1/maps/${m.id}/versions/${m.hash}/preview.png`;
+      `/api/v1/maps/${m.id}/versions/${m.hash}/preview.webp`;
     const blob = (m: { hash: string }) => `/api/v1/blobs/maps/${m.hash}`;
     for (const path of [
       file(maps.unlisted),

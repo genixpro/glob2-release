@@ -14,7 +14,9 @@ struct Tile
 	bool passable=false;
 	bool visible=false;
 	bool buildingVision=false;
-	int variety=-1;
+	int variety=-1; // Legacy fixture adapter; live maps populate varieties.
+    unsigned varieties=0;
+    unsigned mask() const { return varieties ? varieties : variety>=0 ? 1u<<variety : 0; }
 };
 
 struct Supply
@@ -35,7 +37,7 @@ struct Field
 
 	int index(int x,int y) const
 	{
-		return ((y%height+height)%height)*width+(x%width+width)%width;
+		return field::Grid(width,height).index(x,y);
 	}
 
 	void build()
@@ -48,7 +50,7 @@ struct Field
 			// Row-major sources and neighbour order make equal routes stable.
 			for(int at=0;at<int(tiles.size());++at)
 			{
-				if(tiles[at].variety!=variety)continue;
+				if(!(tiles[at].mask()&(1u<<variety)))continue;
 				distances[variety][at]=0;
 				sources[variety][at]=at;
 				queue.push_back(at);
@@ -56,10 +58,11 @@ struct Field
 			// Empty/default fields have no geometry to traverse. Keep their
 			// arrays initialized above, as for an initialized field without sources.
 			if(queue.empty())continue;
-			field::traverse(queue,{width,height},field::Surrounding,
+			const field::Grid grid(width,height);
+			field::traverse(queue,grid,field::Surrounding,
 				[](int){ return field::Visit::Expand; },
 				[&](int at,int x,int y) {
-					const int next=index(x,y);
+					const int next=grid.index(x,y);
 					if(!tiles[next].passable || distances[variety][next]>=0)return;
 					distances[variety][next]=distances[variety][at]+1;
 					sources[variety][next]=sources[variety][at];

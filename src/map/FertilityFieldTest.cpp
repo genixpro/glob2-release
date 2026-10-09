@@ -3,6 +3,7 @@
 
 #include "FertilityFieldTest.h"
 #include <utility>
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 
@@ -97,21 +98,30 @@ namespace
 	{
 		TinyMap()
 		{
+            // Unit binaries do not initialize Toolkit or an installed asset search path.
+            resourceRegistryValue = ResourceRegistry::loadFile((glob2test::sourceRoot() / "data/resources/registry.json").string());
+            rebuildTerrainCounts();
 			wDec = hDec = kMapDec;
 			w = h = 1 << kMapDec;
 			wMask = hMask = w - 1;
 			size = size_t(w) * h;
-			tiles.assign(size, Tile());
+			// Test-only private access bootstraps this partial map.
+			resourceCells.assign(size, {});
+			for (auto &cell : resourceCells) cell.mayGrow = 1;
+			occupancyCells.assign(size, {});
+			areaCells.assign(size, {});
+			scriptAreaCells.assign(size, 0);
+			vertexTerrain.assign(size, GRASS);
+			bindBootstrappedArrays();
+			rebuildTerrainCounts();
 		}
 		~TinyMap() { w = h = wMask = hMask = wDec = hDec = 0; size = 0; }
 
-		void makeWater(int x, int y) { tiles[coordToIndex(x, y)].terrain = 256; }
-		void makeSand(int x, int y) { tiles[coordToIndex(x, y)].terrain = 128; }
+		void makeWater(int x, int y) { paintCell(x,y,WATER); }
+		void makeSand(int x, int y) { paintCell(x,y,SAND); }
 		void putResource(int x, int y, int type)
 		{
-			Resource& r = tiles[coordToIndex(x, y)].resource;
-			r.type = type;
-			r.amount = 1;
+			replaceResource(x, y, Resource{static_cast<Uint8>(type), 0, 1, 0});
 		}
 	};
 }
@@ -200,12 +210,13 @@ void FertilityFieldTest::testSandOppositeWaterRemovesCredit()
 	bare.rebuild(32, 32, water, sand, Fertility::Path::SandCorrection);
 	CHECK_EQ(std::uint32_t(13 * 16), bare.at(16, 16));
 
-	// Sand on the far side of the centre from that water cancels it, and only there.
+	// An inhibitor at the opposite offset cancels this precise contribution.
 	sand[size_t(16) * 32 + 13] = 1;
 	Fertility::Field corrected;
 	corrected.rebuild(32, 32, water, sand, Fertility::Path::SandCorrection);
-	CHECK_EQ(std::uint32_t(0), corrected.at(16, 16));
-	CHECK_EQ(bare.at(17, 16), corrected.at(17, 16));
+	CHECK_EQ(directKernel(water,sand,32,32,16,16), corrected.at(16,16));
+	CHECK_EQ(std::uint32_t(0),corrected.at(16,16));
+	CHECK_EQ(directKernel(water,sand,32,32,17,16), corrected.at(17,16));
 }
 
 void FertilityFieldTest::testNonPowerOfTwoDimensionsWrap()
@@ -224,22 +235,25 @@ void FertilityFieldTest::testForMapZeroesNonGrass()
 	map.makeSand(6, 6);
 	map.putResource(10, 10, WHEAT);
 	const Fertility::Field field = Fertility::forMap(map);
-	CHECK_EQ(std::uint32_t(0), field.at(4, 4));
+	// Fish make open water food habitat; sand never is.
+	CHECK(field.at(4, 4) > 0u);
 	CHECK_EQ(std::uint32_t(0), field.at(6, 6));
 	CHECK(field.at(5, 4) > 0u);
 }
 
 void FertilityFieldTest::testForMapZeroesGrassNoDepositReaches()
 {
-	// An island of grass ringed by water, with the only deposit outside the ring.
+	// An island of grass ringed by sand, with the only deposit outside the ring.
 	TinyMap map;
 	for (int d = -2; d <= 2; ++d)
 	{
-		map.makeWater(14 + d, 14 - 2);
-		map.makeWater(14 + d, 14 + 2);
-		map.makeWater(14 - 2, 14 + d);
-		map.makeWater(14 + 2, 14 + d);
+		map.makeSand(14 + d, 14 - 2);
+		map.makeSand(14 + d, 14 + 2);
+		map.makeSand(14 - 2, 14 + d);
+		map.makeSand(14 + 2, 14 + d);
 	}
+	// Water outside the ring keeps the deposit's own field fertile.
+	map.makeWater(27, 25);
 	map.putResource(25, 25, WHEAT);
 	const Fertility::Field field = Fertility::forMap(map);
 	CHECK_EQ(std::uint32_t(0), field.at(14, 14));
@@ -276,4 +290,250 @@ void FertilityFieldTest::testWithinPercentBand()
 	// Inclusive at both ends, and a reversed band is read as written.
 	CHECK(Fertility::withinPercentBand(Fertility::kScale, 100, 100));
 	CHECK(Fertility::withinPercentBand(Fertility::kScale / 2, 60, 40));
+}
+
+TEST_SUITE("FertilityField")
+{
+TEST_CASE("weighted ecology handles signed donors, inhibition and local growth")
+{
+    Fertility::Field field;
+    std::vector<std::int16_t> donors(12,256);
+    std::vector<std::uint16_t> inhibition(12,128),local(12,512);
+    field.rebuildWeighted(4,3,donors,inhibition);
+    for(auto value:field.values()) CHECK(value==32768);
+    field.multiplyLocal(local);
+    for(auto value:field.values()) CHECK(value==65536);
+    std::fill(donors.begin(),donors.end(),-256);
+    field.rebuildWeighted(4,3,donors,inhibition);
+    for(auto value:field.values()) CHECK(value==0);
+    std::fill(donors.begin(),donors.end(),1024);
+    std::fill(inhibition.begin(),inhibition.end(),0);
+    field.rebuildWeighted(4,3,donors,inhibition);
+    for(auto value:field.values()) CHECK(value==65536);
+    std::fill(inhibition.begin(),inhibition.end(),512);
+    field.rebuildWeighted(4,3,donors,inhibition);
+    for(auto value:field.values()) CHECK(value==0);
+}
+
+TEST_CASE("cached ecology changes after canonical terrain mutation")
+{
+    TinyMap map;
+    const auto initial=map.resourceGrowthField().landField().at(8,8);
+    CHECK(initial==0);
+    // Cell (10,8) shares no vertex with (8,8), so repainting (8,8) keeps the water.
+    map.makeWater(10,8);
+    const auto watered=map.resourceGrowthField().landField().at(8,8);
+    CHECK(watered>initial);
+    map.paintCell(8,8,TRAIL);
+    CHECK(map.resourceGrowthRateAt(map.coordToIndex(8,8),WHEAT)==0);
+    map.paintCell(8,8,GRASS);
+    CHECK(map.resourceGrowthRateAt(map.coordToIndex(8,8),WHEAT)>0);
+}
+
+TEST_CASE("habitat and movement edits reuse exact ecology fields")
+{
+    TinyMap map;
+    map.makeWater(9,8);
+    // Two cells away, so this cell's corners never touch the water's.
+    const auto index=map.coordToIndex(7,8);
+    const auto& cache=map.resourceGrowthField();
+    const auto land=cache.landField().values(), aquatic=cache.aquaticField();
+    const auto wheat=map.resourceGrowthRateAt(index,WHEAT);
+    REQUIRE(wheat>0);
+    // A lone sand vertex makes the four cells around it shore, without sand's inhibition.
+    for(const auto type : {TRAIL,ICE,SAND,GRASS})
+    {
+        if (type==SAND) { map.paintCell(index,GRASS); map.setVertexTerrain(7,8,SAND); }
+        else map.paintCell(index,type);
+        // This also checks validity after each edit's terrain-generation bump.
+        REQUIRE(cache.validFor(map));
+        CHECK(map.resourceGrowthField().landField().values()==land);
+        CHECK(cache.aquaticField()==aquatic);
+        CHECK(map.resourceGrowthRateAt(index,WHEAT)==(type==GRASS ? wheat : 0));
+    }
+    map.putResource(8,8,WHEAT);
+    map.setResourceAmount(index,8);
+    map.setResourcesGrow(index % map.getW(),index / map.getW(),false);
+    CHECK(cache.validFor(map));
+    // Occupancy and the scenario override are checked by growth's caller, not
+    // dependencies of the cached terrain-only opportunity rate.
+    CHECK(map.resourceGrowthRateAt(index,WHEAT)==wheat);
+}
+
+TEST_CASE("ecology rebuilt inside a terrain batch survives its commit")
+{
+    TinyMap map;
+    const auto& cache=map.resourceGrowthField();
+    {
+        auto outer=map.editTerrain();
+        map.makeWater(9,8);
+        CHECK_FALSE(cache.validFor(map));
+        REQUIRE(map.resourceGrowthField().landField().at(8,8)>0);
+        {
+            auto inner=map.editTerrain();
+            map.makeSand(7,8);
+            CHECK_FALSE(cache.validFor(map));
+            map.resourceGrowthField();
+        }
+        CHECK(cache.validFor(map));
+    }
+    CHECK(cache.validFor(map));
+    Fertility::GrowthCache fresh;
+    fresh.rebuild(map);
+    CHECK(cache.landField().values()==fresh.landField().values());
+    CHECK(cache.aquaticField()==fresh.aquaticField());
+}
+
+TEST_CASE("future terrain ecology properties invalidate only their effective inputs")
+{
+    TinyMap map;
+    map.makeWater(9,8);
+    const auto index=map.coordToIndex(8,8);
+    auto& cache=map.growthCache;
+    const auto grass=terrainProperties(GRASS);
+    // Exercise properties not varied by today's built-in definitions. Each
+    // change can alter a field or rate even when the terrain enum stays fixed.
+    for(int input=0;input<5;++input)
+    {
+        cache.rebuild(map);
+        auto changed=grass;
+        switch(input)
+        {
+        case 0: changed.fertilitySource=true; changed.fertilityQ8=-128; break;
+        case 1: changed.inhibitionQ8=128; break;
+        case 2: changed.shoreSupportQ8=128; break;
+        case 3: changed.growthQ8=0; break;
+        case 4: changed.growthQ8=512; break;
+        }
+        cache.terrainChanged(index,grass,changed);
+        CHECK_FALSE(cache.validFor(map));
+    }
+
+    cache.rebuild(map);
+    const auto land=cache.landField().values(), aquatic=cache.aquaticField();
+    const auto wood=map.resourceGrowthRateAt(index,WOOD);
+    const auto food=map.resourceGrowthRateAt(index,WHEAT);
+    auto changed=grass;
+    changed.fertilityQ8=1024; // Disabled source: this value contributes nothing.
+    changed.allowedResources &= ~(1u<<WHEAT);
+    changed.walkable=false;
+    changed.groundHealthQ8=-8;
+    cache.terrainChanged(index,grass,changed);
+    REQUIRE(cache.validFor(map));
+    // Notification alone does not publish terrain properties: habitat comes
+    // from the map's compiled catalog, not a duplicate mask inside this cache.
+    CHECK(map.resourceGrowthRateAt(index,WHEAT)==food);
+    CHECK(map.resourceGrowthRateAt(index,WOOD)==wood);
+    CHECK(cache.landField().values()==land);
+    CHECK(cache.aquaticField()==aquatic);
+    auto enabled=changed;
+    enabled.fertilitySource=true;
+    cache.terrainChanged(index,changed,enabled);
+    CHECK_FALSE(cache.validFor(map));
+
+    map.makeSand(8,8);
+    cache.rebuild(map);
+    const auto sand=terrainProperties(SAND);
+    changed=sand;
+    changed.inhibitionQ8=1024; // Both inhibit fully after saturation.
+    cache.terrainChanged(index,sand,changed);
+    CHECK(cache.validFor(map));
+    changed.inhibitionQ8=255;
+    cache.terrainChanged(index,sand,changed);
+    CHECK_FALSE(cache.validFor(map));
+}
+
+TEST_CASE("growth throughput includes multiple opportunities before occupancy")
+{
+    CHECK(Fertility::usefulExpansionCapacity(4*Fertility::kScale,8,8,false)==4*Fertility::kScale);
+    CHECK(Fertility::usefulExpansionCapacity(4*Fertility::kScale,4,8,false)==2*Fertility::kScale);
+    CHECK(Fertility::usefulExpansionCapacity(4*Fertility::kScale,8,8,true)==4*Fertility::kScale/3);
+    CHECK(Fertility::usefulExpansionCapacity(2*Fertility::kScale,8,8,true)==2*Fertility::kScale/3);
+}
+
+TEST_CASE("weighted coupled land and shoreline kernels match independent probes")
+{
+    for(const auto dimensions:{std::pair{1,1},std::pair{1,7},std::pair{7,1},
+        std::pair{7,5},std::pair{23,17},std::pair{32,16}})
+        for(int sparse: {0,1,2})
+        {
+            const auto [w,h]=dimensions;
+            std::vector<std::int16_t> donors(w*h);
+            std::vector<std::uint16_t> inhibition(w*h),shore(w*h);
+            Lcg random(919+sparse);
+            for(int i=0;i<w*h;++i)
+            {
+                donors[i]=random.chance(sparse==1?10:70)?int(random.next()%1537)-512:0;
+                inhibition[i]=random.chance(sparse==2?10:70)?random.next()%1025:0;
+                shore[i]=inhibition[i];
+            }
+            Fertility::Field correction,splat;
+            correction.rebuildWeighted(w,h,donors,inhibition,Fertility::Path::SandCorrection);
+            splat.rebuildWeighted(w,h,donors,inhibition,Fertility::Path::WaterSplat);
+            REQUIRE(correction.values()==splat.values());
+            const auto aquatic=Fertility::shoreGrowthField(w,h,donors,shore);
+            for(int y=0;y<h;++y)for(int x=0;x<w;++x)
+            {
+                std::int64_t land=0,water=0;
+                for(int dy=-15;dy<=15;++dy)for(int dx=-15;dx<=15;++dx)
+                {
+                    const auto donor=donors[wrap(y+dy,h)*w+wrap(x+dx,w)];
+                    const int attenuation=256-std::min<int>(256,inhibition[wrap(y-dy,h)*w+wrap(x-dx,w)]);
+                    const int support=shore[wrap(y+2*dx,h)*w+wrap(x+2*dy,w)];
+                    const auto weighted=std::int64_t(donor)*weight(dx)*weight(dy);
+                    land+=weighted*attenuation;water+=weighted*support;
+                }
+                const auto clamp=[](std::int64_t value) {
+                    return std::uint32_t(std::clamp<std::int64_t>(value/(256*256),0,Fertility::kScale));
+                };
+                CHECK(correction.at(x,y)==clamp(land));
+                CHECK(aquatic[y*w+x]==clamp(water));
+            }
+        }
+}
+
+TEST_CASE("one-point wheat fertility retains exact positive growth potential")
+{
+    TinyMap map;
+    map.makeWater(15,15);
+    const auto& field=map.resourceGrowthField();
+    REQUIRE(field.landField().at(0,0)==1);
+    CHECK(map.resourceGrowthRateAt(map.coordToIndex(0,0),WHEAT)==1);
+    CHECK(map.resourceGrowthRateAt(map.coordToIndex(0,0),WOOD)==3);
+    unsigned draws=0;
+    CHECK(Fertility::growthOpportunities(map.resourceGrowthRateAt(0,WHEAT),[&]{++draws;return 0u;})==1);
+    CHECK(draws==1);
+}
+
+TEST_CASE("fractional growth rejects incomplete RNG bucket and preserves whole bonuses")
+{
+    static_assert(Fertility::kRateDrawLimit==4294901760u);
+    static_assert(std::uint64_t(Fertility::kRateDrawLimit)%Fertility::kRateScale==0);
+    unsigned draws=0;
+    const auto counted=[&]{++draws;return 0u;};
+    CHECK(Fertility::growthOpportunities(0,counted)==0);
+    CHECK(Fertility::growthOpportunities(4*Fertility::kRateScale,counted)==4);
+    CHECK(draws==0);
+    const std::array<std::uint32_t,3> sequence={UINT32_MAX,Fertility::kRateDrawLimit,0};
+    CHECK(Fertility::growthOpportunities(1,[&]{return sequence.at(draws++);})==1);
+    CHECK(draws==3);
+    CHECK(Fertility::growthOpportunities(1,[]{return 1u;})==0);
+    CHECK(Fertility::growthOpportunities(Fertility::kRateScale+1,[]{return Fertility::kRateScale;})==2);
+}
+
+TEST_CASE("rational growth rates preserve exact mass across complete random buckets")
+{
+    for(const std::uint32_t rate:{0u,1u,2u,Fertility::kScale,Fertility::kRateScale-1,
+        Fertility::kRateScale+1,4*Fertility::kRateScale-1,4*Fertility::kRateScale})
+    {
+        std::uint64_t firstBucket=0,lastBucket=0;
+        for(std::uint32_t residue=0;residue<Fertility::kRateScale;++residue)
+        {
+            firstBucket+=Fertility::growthOpportunities(rate,[=]{return residue;});
+            lastBucket+=Fertility::growthOpportunities(rate,[=]{return Fertility::kRateDrawLimit-Fertility::kRateScale+residue;});
+        }
+        CHECK_EQ(firstBucket,rate);
+        CHECK_EQ(lastBucket,rate);
+    }
+}
 }

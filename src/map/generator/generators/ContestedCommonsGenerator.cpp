@@ -41,7 +41,7 @@ using namespace MapGeneration;
 // - Stone never runs out: one big quarry on the commons is a permanent strategic site.
 // - Resources block movement: the commons' fields are small patches bordered by open zones, so the
 //   island stays walkable and no single forest walls off part of it.
-// - Grass may not touch water: controlSand rings every coast after painting.
+// - Grass may not touch water: layBeaches rings every coast after painting.
 //
 // Fairness: every home island is the same size and every colony is kept the same distance from the
 // commons by the joint spread in disperseSeeds, but island shapes, zone layouts and bridge angles
@@ -168,7 +168,7 @@ static void sizeIslands(Game &game, GenerationContext &context,
 	// worst-case reach, and a small flat buffer on top of all that jaggedness math.
 	const int teamReach = (int)std::ceil(L.homeRadius * (1.0 + teamJaggedness * 1.4));
 	// The moat is a share of the home radius (35% by default) but never under 4 tiles, so after the
-	// beaches controlSand adds on both shores a clear band of open water remains.
+	// beaches layBeaches adds on both shores a clear band of open water remains.
 	L.moatWidth = std::max(4, L.homeRadius * options.moatWidth / 100);
 	const int roomAvailable = std::max(0, centerGap - teamReach - L.moatWidth - 3);
 	const int roomLimitedRadius =
@@ -241,7 +241,7 @@ static void paintTerrain(Game &game, GenerationContext &context,
 	// Sea is 40 plus noise of -20 to +19, at most 59: always under the water line (70). Claimed
 	// land rises by 60 to 80..119: land everywhere, sand where the noise dips it under 85 and grass
 	// above, so island edges get patches of wider beach, and elsewhere the one-tile sand ring
-	// controlSand adds. The 60 rise is what guarantees an island's shape: no claimed tile can ever
+	// layBeaches adds. The 60 rise is what guarantees an island's shape: no claimed tile can ever
 	// be water, and no unclaimed one can ever be land.
 	std::vector<int> heights(W * H, 40);
 	adjustHeightmapFromPerlinNoise(game.map, context, heights, 20);
@@ -256,11 +256,11 @@ static void paintTerrain(Game &game, GenerationContext &context,
 		{
 			int h = heights[y * W + x];
 			if (h < 70)
-				game.map.setUMatPos(x, y, WATER, 1);
+				game.map.paintVertexSquare(x, y, WATER, 1);
 			else if (h < 85)
-				game.map.setUMatPos(x, y, SAND, 1);
+				game.map.paintVertexSquare(x, y, SAND, 1);
 			else
-				game.map.setUMatPos(x, y, GRASS, 1);
+				game.map.paintVertexSquare(x, y, GRASS, 1);
 		}
 	}
 
@@ -280,7 +280,7 @@ static void paintTerrain(Game &game, GenerationContext &context,
 			double r = sqrt((double)Torus{W, H}.dist2(x, y, L.commonsCenter.x, L.commonsCenter.y));
 			if (r >= L.commonsRadius - 1 && r < L.commonsRadius + L.moatWidth)
 			{
-				game.map.setUMatPos(x, y, WATER, 1);
+				game.map.paintVertexSquare(x, y, WATER, 1);
 				// A quarter of the ring gets algae. The algae amount thins or thickens that with
 				// draws from a stream of its own, so the layout's draws stay the same.
 				bool seeded = context.bounded("layout", 4) == 0;
@@ -290,11 +290,11 @@ static void paintTerrain(Game &game, GenerationContext &context,
 					seeded =
 						seeded || int(context.bounded("commons-algae", 300)) < options.algae - 100;
 				if (seeded)
-					game.map.setResource(x, y, ALGA, 1);
+					game.map.setResourceByIndex(x, y, ALGA, 1);
 			}
 		}
 	}
-	game.map.controlSand();
+	game.map.layBeaches();
 }
 
 // Split the commons into zones and give each a role: wood, wheat, the quarry, fruit, or open.
@@ -445,7 +445,7 @@ static void stockCommons(Game &game, GenerationContext &context,
 					chooseRandomPoints(game.map, context, fruitPts,
 									   std::max(2, (int)pts.size() / 8));
 					for (unsigned int i = 0; i < fruitPts.size(); ++i)
-						game.map.setResource(fruitPts[i].x, fruitPts[i].y,
+						game.map.setResourceByIndex(fruitPts[i].x, fruitPts[i].y,
 											 CHERRY + context.bounded("layout", 3), 1);
 				}
 				// else: left open.
@@ -495,7 +495,7 @@ static bool settleHomes(Game &game, GenerationContext &context,
 			if (!pts.empty())
 			{
 				MapGeneratorPoint quarry = pts[context.bounded("layout", pts.size())];
-				game.map.setResource(quarry.x, quarry.y, STONE, 3);
+				game.map.setResourceByIndex(quarry.x, quarry.y, STONE, 3);
 			}
 			homePoints.insert(homePoints.end(), pts.begin(), pts.end());
 			pts.clear();
@@ -523,7 +523,7 @@ static bool settleHomes(Game &game, GenerationContext &context,
 			chooseRandomPoints(game.map, context, woodPts, 4);
 			fillInResource(game.map, context, woodPts, WOOD, 2);
 			MapGeneratorPoint quarry = homePoints[context.bounded("layout", homePoints.size())];
-			game.map.setResource(quarry.x, quarry.y, STONE, 3);
+			game.map.setResourceByIndex(quarry.x, quarry.y, STONE, 3);
 		}
 		if (homePoints.empty())
 			return false;
@@ -541,7 +541,7 @@ static bool generate(Game &game, GenerationContext &context)
 {
 	context.stage = "layout";
 	const ContestedCommonsOptions options(context.request);
-	game.map.makeHomogenMap(WATER);
+	game.map.fillTerrain(WATER);
 	for (int i = 0; i < context.request.nbTeams; ++i)
 		game.addTeam();
 	Layout L(game.map);

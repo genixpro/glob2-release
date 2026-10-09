@@ -1,3 +1,4 @@
+import sharp from 'sharp';
 // Fixtures for room, match and relay tests: a fake engine agent, signed-in
 // sockets, relay calls and ticket verification against the JWKS.
 import { createPublicKey, randomBytes } from 'node:crypto';
@@ -11,7 +12,9 @@ import {
   checkDocument,
   simVersionKey,
   type EngineJobKind,
+  type MapSetCredits,
   type GeneratorDescriptor,
+  type ResourceExperimentDefinitions,
   type SimVersion,
 } from '@glob2/protocol';
 import { verifyJwt } from '@glob2/protocol/node';
@@ -87,6 +90,9 @@ export class FakeEngine {
   private running = false;
   /** Generation fails while set. */
   failGeneration = false;
+  setCredits: MapSetCredits = [];
+  resourceExperiments: ResourceExperimentDefinitions = [];
+  requiredResourceExperiments: string[] = [];
   readonly ran: { kind: EngineJobKind; jobId: string }[] = [];
 
   constructor(db: Kysely<Database>, blobs: BlobStore) {
@@ -145,7 +151,13 @@ export class FakeEngine {
         result: {
           mapHash: stored.sha256,
           size: stored.size,
-          map: { width: 128, height: 128, teamCount: teams },
+          map: {
+            width: 128,
+            height: 128,
+            teamCount: teams,
+            resourceExperiments: this.resourceExperiments,
+            requiredResourceExperiments: this.requiredResourceExperiments,
+          },
           chosenSeed: generator.seed,
         },
       };
@@ -158,7 +170,14 @@ export class FakeEngine {
       if (!text.startsWith('GLOB2MAP:')) {
         return { ok: false, error: { code: 'bad_request', message: 'cannot load the map' } };
       }
-      const png = await putContent(this.blobs, Buffer.from(`PNG:${mapHash}`));
+      const png = await putContent(
+        this.blobs,
+        await sharp({
+          create: { width: maxSizePx, height: maxSizePx, channels: 3, background: '#214355' },
+        })
+          .png()
+          .toBuffer(),
+      );
       return {
         ok: true,
         result: {
@@ -181,7 +200,7 @@ export class FakeEngine {
         result: {
           valid: true,
           mapHash: blobHash,
-          map: { width: 64, height: 64, teamCount: Number(map[1]) },
+          map: { width: 64, height: 64, teamCount: Number(map[1]), setCredits: this.setCredits },
           versionMinor: SIM.versionMinor,
           title: 'Uploaded map',
         },

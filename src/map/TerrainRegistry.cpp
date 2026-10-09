@@ -1,0 +1,516 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "TerrainRegistry.h"
+#include "FileFormatVersions.h"
+#include "online/Sha256.h"
+#include <nlohmann/json.hpp>
+#include <algorithm>
+#include <limits>
+#include <map>
+#include <set>
+#include <unordered_map>
+#include <stdexcept>
+#include <type_traits>
+
+namespace
+{
+using Json = nlohmann::json;
+void fields(const Json &j, std::initializer_list<const char *> allowed)
+{
+	if (!j.is_object())
+		throw std::invalid_argument("Terrain definition must be an object");
+	for (const auto &item : j.items())
+		if (std::find(allowed.begin(), allowed.end(), item.key()) == allowed.end())
+			throw std::invalid_argument("Unknown terrain field: " + item.key());
+}
+std::string text(const Json &j, const char *key,
+				 std::size_t limit = TerrainRegistry::MaximumTextBytes)
+{
+	const auto &v = j.at(key);
+	if (!v.is_string())
+		throw std::invalid_argument(std::string(key) + " must be text");
+	auto s = v.get<std::string>();
+	if (s.empty() || s.size() > limit || s.find('\0') != std::string::npos)
+		throw std::invalid_argument(std::string("Invalid terrain ") + key);
+	return s;
+}
+TerrainType preset(const std::string &name)
+{
+	// Every paintable built-in is a preset; legacy corner shores are not.
+	for (unsigned i = 0; i < TERRAIN_COUNT; ++i)
+		if (terrainPaintable(TerrainType(i)) && name == TerrainPresentations[i].name)
+			return TerrainType(i);
+	throw std::invalid_argument("Unknown built-in terrain preset: " + name);
+}
+void validKey(const std::string &key)
+{
+	const auto colon = key.find(':');
+	if (colon == std::string::npos || !colon || colon + 1 == key.size() ||
+		key.starts_with("glob2:"))
+		throw std::invalid_argument("Terrain keys require a non-reserved namespace:name");
+	for (unsigned char c : key)
+		if (!((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == ':' || c == '_' ||
+			  c == '-' || c == '.'))
+			throw std::invalid_argument(
+				"Terrain keys use lowercase ASCII letters, digits, colon, dot, dash or underscore");
+	if (key.find(':', colon + 1) != std::string::npos)
+		throw std::invalid_argument("Invalid terrain namespace");
+}
+template <class T> void property(const Json &j, const char *key, T &value, bool required = false)
+{
+	auto it = j.find(key);
+	if (it == j.end())
+	{
+		if (required)
+			throw std::invalid_argument(std::string("Missing terrain field: ") + key);
+		return;
+	}
+	if constexpr (std::is_same_v<T, bool>)
+	{
+		if (!it->is_boolean())
+			throw std::invalid_argument(std::string(key) + " must be boolean");
+		value = it->get<bool>();
+	}
+	else
+	{
+		if (!it->is_number_integer() ||
+			(it->is_number_unsigned() &&
+			 it->get<std::uint64_t>() > std::uint64_t(std::numeric_limits<T>::max())))
+			throw std::invalid_argument(std::string(key) + " must be an in-range integer");
+		const auto n = it->get<std::int64_t>();
+		if (n < std::numeric_limits<T>::min() || n > std::numeric_limits<T>::max())
+			throw std::invalid_argument(std::string(key) + " is out of range");
+		value = static_cast<T>(n);
+	}
+}
+// One field list drives validation, persistence and property deduplication.
+// Keep serialization field-wise: struct padding is neither portable nor stable.
+// clang-format off
+#define TERRAIN_FIELDS(X) \
+	X(walkable) \
+	X(swimmable) \
+	X(flyable) \
+	X(resourcesGrow) \
+	X(fertilitySource) \
+	X(nonGrowingResources) \
+	X(buildable) \
+	X(projectileBlocks) \
+	X(shoreline) \
+	X(groundSpeedQ8) \
+	X(airSpeedQ8) \
+	X(groundHealthQ8) \
+	X(airHealthQ8) \
+	X(growthQ8) \
+	X(fertilityQ8) \
+	X(inhibitionQ8) \
+	X(shoreSupportQ8) \
+	X(allowedResources)
+// clang-format on
+TerrainProperties readProperties(const Json &j, TerrainProperties p, bool complete = false)
+{
+#define NAME(f) #f,
+	fields(j, {TERRAIN_FIELDS(NAME) "farmMaterial", "farmCrop"});
+#undef NAME
+#define READ(f) property(j, #f, p.f, complete);
+	TERRAIN_FIELDS(READ)
+#undef READ
+	if (j.contains("farmMaterial") && j.contains("farmCrop"))
+		throw std::invalid_argument("Conflicting terrain farm material aliases");
+	if (j.contains("farmMaterial"))
+	{
+		const auto& value = j.at("farmMaterial");
+		if (value.is_null()) p.farmMaterial = 255;
+		else if (value.is_string())
+		{
+			const auto material = parseMaterialKey(value.get<std::string>());
+			if (!material) throw std::invalid_argument("Unknown terrain farm material");
+			p.farmMaterial = materialIndex(*material);
+		}
+		else throw std::invalid_argument("farmMaterial must be a material key or null");
+	}
+	else if (j.contains("farmCrop"))
+	{
+		property(j, "farmCrop", p.farmMaterial);
+		if (p.farmMaterial != 255 && p.farmMaterial >= 8)
+			throw std::invalid_argument("Legacy farmCrop must be 0 through 7 or 255");
+	}
+	else if (complete) throw std::invalid_argument("Missing terrain farmMaterial");
+	if (!validTerrainProperties(p))
+		throw std::invalid_argument("Invalid terrain property combination or range");
+	return p;
+}
+Json writeProperties(const TerrainProperties &p)
+{
+	Json j = Json::object();
+#define WRITE(f) j[#f] = p.f;
+	TERRAIN_FIELDS(WRITE)
+#undef WRITE
+	j["farmMaterial"] = p.farmMaterial == 255 ? Json(nullptr) : Json(materialKey(static_cast<MaterialId>(p.farmMaterial)));
+	return j;
+}
+auto propertyKey(const TerrainProperties &p)
+{
+#define VALUE(f) int(p.f),
+	return std::to_array<int>({TERRAIN_FIELDS(VALUE) int(p.farmMaterial)});
+#undef VALUE
+}
+#undef TERRAIN_FIELDS
+
+Json parse(std::string_view source)
+{
+	if (source.size() > TerrainRegistry::MaximumDefinitionBytes)
+		throw std::invalid_argument("Terrain definitions exceed 32 MiB");
+	// Reject duplicate JSON object members instead of accepting last-wins input.
+	std::vector<std::set<std::string>> keys;
+	auto callback = [&](int depth, Json::parse_event_t event, Json &value)
+	{
+		// Both schema variants are shallow. Bound malformed nesting before a
+		// large attacker-controlled JSON tree is constructed.
+		if (depth > 16)
+			throw std::invalid_argument("Terrain definitions are nested too deeply");
+		if (event == Json::parse_event_t::object_start)
+			keys.emplace_back();
+		if (event == Json::parse_event_t::key &&
+			!keys.back().insert(value.get<std::string>()).second)
+			throw std::invalid_argument("Duplicate terrain JSON field");
+		if (event == Json::parse_event_t::object_end)
+			keys.pop_back();
+		return true;
+	};
+	auto j = Json::parse(source, callback);
+	fields(j, {"schemaVersion", "terrains"});
+	if (j.at("schemaVersion") != 1 || !j.at("schemaVersion").is_number_integer() ||
+		!j.at("terrains").is_array() ||
+		j.at("terrains").size() > TerrainRegistry::Capacity - TERRAIN_COUNT)
+		throw std::invalid_argument("Unsupported terrain schema or definition count");
+	return j;
+}
+std::optional<std::vector<std::string>> readResourceKeys(const Json& definition, bool legacySnapshot = false)
+{
+	if (definition.contains("allowedResourceKeys"))
+	{
+		const auto& value = definition.at("allowedResourceKeys");
+		if (value.is_null()) return std::nullopt;
+		if (!value.is_array() || value.size() > 16384)
+			throw std::invalid_argument("Invalid allowedResourceKeys array");
+		std::vector<std::string> result;
+		for (const auto& entry : value)
+		{
+			if (!entry.is_string()) throw std::invalid_argument("Resource keys must be text");
+			auto key = entry.get<std::string>();
+			if (key.empty() || key.size() > 128 || key.find('\0') != std::string::npos)
+				throw std::invalid_argument("Invalid allowed resource key");
+			result.push_back(std::move(key));
+		}
+		std::sort(result.begin(), result.end());
+		if (std::adjacent_find(result.begin(), result.end()) != result.end())
+			throw std::invalid_argument("Duplicate allowed resource key");
+		return result;
+	}
+	if (legacySnapshot || definition.at("properties").contains("allowedResources"))
+	{
+		// This is an old-format identity adapter, never a simulation predicate.
+		static constexpr const char* keys[] = {"trees", "wheat", "papyrus", "rocks", "algae", "cherry-tree", "orange-tree", "prune-tree"};
+		const unsigned mask = definition.at("properties").at("allowedResources").get<unsigned>();
+		std::vector<std::string> result;
+		for (unsigned i = 0; i < std::size(keys); ++i) if (mask & (1u << i)) result.emplace_back(keys[i]);
+		std::sort(result.begin(), result.end());
+		return result;
+	}
+	return std::nullopt;
+}
+} // namespace
+
+TerrainRegistry::TerrainRegistry()
+	: properties_(TERRAIN_PROPERTIES.begin(), TERRAIN_PROPERTIES.end()),
+	  presentations_(TerrainPresentations.begin(), TerrainPresentations.end())
+{
+	for (unsigned i = 0; i < TERRAIN_COUNT; ++i)
+	{
+		keys_.emplace_back(TerrainPresentations[i].name);
+		names_.emplace_back(TerrainPresentations[i].label);
+		appearances_.push_back(TerrainType(i));
+		resourceKeys_.push_back(std::nullopt);
+	}
+}
+std::shared_ptr<const TerrainRegistry> TerrainRegistry::builtins()
+{
+	static const auto result = []
+	{
+		auto p = std::shared_ptr<TerrainRegistry>(new TerrainRegistry);
+		p->compile();
+		return p;
+	}();
+	return result;
+}
+std::shared_ptr<const TerrainRegistry> TerrainRegistry::importJson(std::string_view source) const
+{
+	auto j = parse(source);
+	auto result = std::shared_ptr<TerrainRegistry>(new TerrainRegistry(*this));
+	std::set<std::string> imported;
+	auto &definitions = j.at("terrains");
+	for (const auto &item : definitions)
+	{
+		fields(item, {"key", "name", "base", "properties", "appearance", "allowedResourceKeys"});
+		auto key = text(item, "key");
+		validKey(key);
+		if (!imported.insert(key).second)
+			throw std::invalid_argument("Duplicate terrain key: " + key);
+	}
+	std::sort(definitions.begin(), definitions.end(),
+			  [](const auto &a, const auto &b)
+			  {
+				  return a.at("key").template get<std::string>() <
+						 b.at("key").template get<std::string>();
+			  });
+	std::unordered_map<std::string, std::size_t> ids;
+	ids.reserve(result->size() + definitions.size());
+	for (std::size_t i = 0; i < result->size(); ++i)
+		ids.emplace(result->keys_[i], i);
+	for (const auto &item : definitions)
+	{
+		const auto key = text(item, "key"), name = text(item, "name");
+		const auto base = preset(text(item, "base")), appearance = preset(text(item, "appearance"));
+		auto p = readProperties(item.at("properties"), TERRAIN_PROPERTIES[base]);
+		auto allowedResources = readResourceKeys(item);
+		const auto id = ids.try_emplace(key, result->size()).first->second;
+		if (id == result->size())
+		{
+			if (id >= Capacity)
+				throw std::invalid_argument("Too many terrain types");
+			result->keys_.push_back(key);
+			result->names_.push_back(name);
+			result->properties_.push_back(p);
+			result->appearances_.push_back(appearance);
+			result->presentations_.push_back(TerrainPresentations[appearance]);
+			result->resourceKeys_.push_back(std::move(allowedResources));
+		}
+		else
+		{
+			result->names_[id] = name;
+			result->properties_[id] = p;
+			result->appearances_[id] = appearance;
+			result->presentations_[id] = TerrainPresentations[appearance];
+			result->resourceKeys_[id] = std::move(allowedResources);
+		}
+		result->presentations_[id].editorSelectable = true;
+	}
+	// Release the authoring DOM before compiling/canonical hashing large registries.
+	j.clear();
+	result->compile();
+	return result;
+}
+std::string TerrainRegistry::serialize() const
+{
+	// Stream one definition at a time. Building a second full JSON DOM during
+	// import/load would make peak memory proportional to two expanded registries.
+	// The envelope and sorted per-definition keys preserve canonical JSON bytes.
+	std::string result = R"({"schemaVersion":1,"terrains":[)";
+	for (unsigned i = TERRAIN_COUNT; i < size(); ++i)
+	{
+		const auto &colors = presentations_[i];
+		Json visual = Json::object();
+		auto color = [](TerrainColor c) { return Json::array({c.r, c.g, c.b}); };
+		visual["minimap"] = color(colors.minimap);
+		visual["overview"] = color(colors.overview);
+		visual["image"] = color(colors.image);
+		visual["preview"] = color(colors.preview);
+		if (i != TERRAIN_COUNT)
+			result += ',';
+		Json definition = {
+			{"id", i},
+			{"key", keys_[i]},
+			{"name", names_[i]},
+			{"properties", writeProperties(properties_[i])},
+			{"appearance", TerrainPresentations[appearances_[i]].name},
+			{"presentation",
+			 visual}};
+		definition["allowedResourceKeys"] = resourceKeys_[i] ? Json(*resourceKeys_[i]) : Json(nullptr);
+		result += definition.dump();
+	}
+	result += "]}";
+	return result;
+}
+unsigned TerrainRegistry::savedBuiltinCount(int versionMinor)
+{
+	return versionMinor < FILE_FORMAT_VERSION_TERRAIN_CATALOGUE ? TERRAIN_COUNT_BEFORE_CATALOGUE
+		 : versionMinor < FILE_FORMAT_VERSION_VERTEX_TERRAIN	   ? TERRAIN_COUNT_BEFORE_VERTEX
+																   : unsigned(TERRAIN_COUNT);
+}
+std::optional<unsigned> TerrainRegistry::currentTerrainId(unsigned savedBuiltins, unsigned saved)
+{
+	if (savedBuiltins == TERRAIN_COUNT)
+		return saved;
+	// Older files: the classic five keep their IDs; 5 and 6 were the shores.
+	if (saved <= TRAIL)
+		return saved;
+	if (saved < TERRAIN_COUNT_BEFORE_CATALOGUE)
+		return std::nullopt;
+	// Catalogue built-ins (formats 141 to 145) sit behind the retired shores.
+	if (saved < savedBuiltins)
+		return saved - (TERRAIN_COUNT_BEFORE_CATALOGUE - BOULDERS);
+	return saved - savedBuiltins + TERRAIN_COUNT;
+}
+std::shared_ptr<const TerrainRegistry> TerrainRegistry::deserialize(std::string_view source,
+																			  unsigned savedBuiltinCount)
+{
+	if (savedBuiltinCount != TERRAIN_COUNT_BEFORE_CATALOGUE && savedBuiltinCount != TERRAIN_COUNT_BEFORE_VERTEX &&
+		savedBuiltinCount != TERRAIN_COUNT)
+		throw std::invalid_argument("Unsupported saved terrain built-in count");
+	auto j = parse(source);
+	if (j.at("terrains").empty())
+		return builtins();
+	auto result = std::shared_ptr<TerrainRegistry>(new TerrainRegistry);
+	std::set<std::string> keys;
+	for (const auto &item : j.at("terrains"))
+	{
+		fields(item, {"id", "key", "name", "properties", "appearance", "presentation", "allowedResourceKeys"});
+		// Saved IDs are sequential from the writer's built-in count; canonical IDs
+		// follow the current built-ins so older files keep loading after the
+		// catalogue grew.
+		const auto savedId = savedBuiltinCount + (result->size() - TERRAIN_COUNT);
+		if (!item.at("id").is_number_integer() || item.at("id") != savedId)
+			throw std::invalid_argument("Invalid saved terrain ID");
+		const auto key = text(item, "key");
+		validKey(key);
+		if (!keys.insert(key).second)
+			throw std::invalid_argument("Duplicate saved terrain key");
+		const auto appearance = preset(text(item, "appearance"));
+		result->keys_.push_back(key);
+		result->names_.push_back(text(item, "name"));
+		result->properties_.push_back(readProperties(item.at("properties"), {}, true));
+		result->resourceKeys_.push_back(readResourceKeys(item, true));
+		result->appearances_.push_back(appearance);
+		auto presentation = TerrainPresentations[appearance];
+		presentation.editorSelectable = true;
+		const auto &visual = item.at("presentation");
+		// Files before format 146 also saved the shipped sprite frames of the
+		// appearance; they no longer mean anything and are ignored.
+		fields(visual,
+			   {"firstFrame", "variants", "editorFrame", "animatedBackdrop", "edgeFirstFrame",
+				"layerPriority", "animationFrames", "animationTicks", "backdropFirstFrame",
+				"backdropFrames", "backdropTicks", "minimap", "overview", "image", "preview"});
+		auto color = [&](const char *key)
+		{
+			const auto &c = visual.at(key);
+			if (!c.is_array() || c.size() != 3)
+				throw std::invalid_argument("Invalid saved terrain color");
+			TerrainColor out{};
+			unsigned n = 0;
+			for (auto *channel : {&out.r, &out.g, &out.b})
+			{
+				Json v = {{"channel", c[n++]}};
+				property(v, "channel", *channel);
+			}
+			return out;
+		};
+		presentation.minimap = color("minimap");
+		presentation.overview = color("overview");
+		presentation.image = color("image");
+		presentation.preview = color("preview");
+		result->presentations_.push_back(presentation);
+	}
+	j.clear();
+	result->compile();
+	return result;
+}
+
+void TerrainRegistry::Movement::prepare()
+{
+	if (profiles.empty() || profiles.size() > 256)
+		throw std::logic_error("Invalid terrain movement profiles");
+	auto make = [&]<std::size_t N>()
+	{
+		std::array<gradient_kernel::EntrySteps, N> costs;
+		costs.fill(profiles.front());
+		std::copy(profiles.begin(), profiles.end(), costs.begin());
+		prepared = gradient_kernel::PreparedTerrainCosts<N>(costs);
+	};
+	if (profiles.size() <= 8)
+		make.template operator()<8>();
+	else
+		make.template operator()<256>();
+}
+
+void TerrainRegistry::compile()
+{
+	// Field-wise keys exclude struct padding and preserve deterministic IDs.
+	std::map<decltype(propertyKey(TerrainProperties{})), std::uint16_t> properties;
+	propertyProfiles_.clear();
+	propertyIndices_.clear();
+	propertyProfiles_.reserve(size());
+	propertyIndices_.reserve(size());
+	for (const auto &p : properties_)
+	{
+		auto [it, inserted] = properties.emplace(propertyKey(p), propertyProfiles_.size());
+		if (inserted)
+			propertyProfiles_.push_back(p);
+		propertyIndices_.push_back(it->second);
+	}
+
+	airCosts_.resize(size());
+	airRouteCosts_.resize(size());
+	groundTravelCosts_.resize(size());
+	minimumAirCost_ = GRADIENT_STEP;
+	for (unsigned i = 0; i < size(); ++i)
+	{
+		if (i >= TERRAIN_COUNT)
+		{
+			presentations_[i].name = keys_[i].c_str();
+			presentations_[i].label = names_[i].c_str();
+		}
+		const auto &p = properties_[i];
+		groundTravelCosts_[i] = gradient_kernel::scaledTerrainStep(GRADIENT_STEP, p.groundSpeedQ8);
+		airCosts_[i] = gradient_kernel::scaledTerrainStep(GRADIENT_STEP, p.airSpeedQ8);
+		airRouteCosts_[i] = gradient_kernel::hazardRouteCost(airCosts_[i], p.airHealthQ8);
+		if (p.flyable)
+			minimumAirCost_ = std::min(minimumAirCost_, airCosts_[i]);
+	}
+	for (unsigned sw = 0; sw < movement_.size(); ++sw)
+	{
+		auto &m = movement_[sw];
+		m = {};
+		m.entries.reserve(size());
+		m.profileIds.reserve(size());
+		std::array<bool, 256> used{};
+		for (const auto &p : properties_)
+		{
+			auto cost = gradient_kernel::terrainEntrySteps(p, sw);
+			if (cost.cardinal == 0 || cost.diagonal >= 256)
+				throw std::invalid_argument("Terrain edge exceeds supported gradient queue");
+			m.entries.push_back(cost);
+			unsigned profile = 0;
+			while (profile < m.profiles.size() && (m.profiles[profile].cardinal != cost.cardinal ||
+												   m.profiles[profile].diagonal != cost.diagonal))
+				++profile;
+			if (profile == m.profiles.size())
+				m.profiles.push_back(cost);
+			m.profileIds.push_back(static_cast<std::uint8_t>(profile));
+			for (auto step : {cost.cardinal, cost.diagonal})
+				if (!used[step])
+				{
+					used[step] = true;
+					m.steps.push_back(step);
+				}
+			if (p.walkable || (sw && p.swimmable))
+				m.minimum = std::min(m.minimum, cost.cardinal);
+		}
+		m.prepare();
+	}
+	checksum_ = 0;
+	digest_.clear();
+	if (size() > TERRAIN_COUNT)
+	{
+		auto hash = Online::Sha256::of(serialize());
+		digest_ = Online::toHex(hash);
+		for (unsigned i = 0; i < hash.size(); ++i)
+			checksum_ ^= std::uint32_t(hash[i]) << ((i % 4) * 8);
+	}
+}
+
+std::optional<TerrainType> TerrainRegistry::find(std::string_view key) const
+{
+	for (unsigned i = 0; i < size(); ++i)
+		if (keys_[i] == key)
+			return TerrainType(i);
+	return std::nullopt;
+}

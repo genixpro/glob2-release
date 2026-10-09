@@ -8,6 +8,7 @@
 #include <SoftwareFramePresenter.h>
 #include <UiScale.h>
 #include <Toolkit.h>
+#include <AssetLoader.h>
 #include <FileManager.h>
 #include <SupportFunctions.h>
 #include <InterfacePresentation.h>
@@ -29,6 +30,21 @@
 
 namespace GAGCore
 {
+int GraphicContext::maximumTextureSize() const
+{
+	if (portableRenderer)
+		return portableRenderer->maximumTextureSize();
+#ifdef HAVE_OPENGL
+	if (optionFlags & USEGPU)
+	{
+		GLint limit = 0;
+		glGetIntegerv(GL_MAX_TEXTURE_SIZE, &limit);
+		return limit;
+	}
+#endif
+	return 0;
+}
+
 	// Storage for the static globals declared in graphic_context_private.h.
 	GraphicContext *_gc = NULL;
 	SDL_PixelFormatDetails _glFormat = *SDL_GetPixelFormatDetails(SDL_PIXELFORMAT_ARGB8888);
@@ -245,7 +261,7 @@ namespace GAGCore
 		}
 
 
-        if (!SDL_InitSubSystem(SDL_INIT_AUDIO))
+        if (!(flags & NOAUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO))
             SDL_Log("Audio unavailable: %s", SDL_GetError());
 		if (!TTF_Init()) {
 			SDL_Log("Font initialization failed: %s", SDL_GetError());
@@ -577,6 +593,9 @@ namespace GAGCore
         return true;
     }
 
+	namespace { std::uint64_t renderResets = 0; }
+	std::uint64_t GraphicContext::renderResetGeneration() { return renderResets; }
+
 	void GraphicContext::translateMouseEvent(SDL_Event *event)
 	{
 		if (auto sample = scrollGesture(*event))
@@ -615,6 +634,7 @@ namespace GAGCore
             case SDL_EVENT_RENDER_DEVICE_RESET:
             case SDL_EVENT_RENDER_TARGETS_RESET:
                 if (_gc->renderer) _gc->renderer->reset();
+                ++renderResets;
                 break;
 			case SDL_EVENT_MOUSE_MOTION:
                 // SDL3 keeps all renderer events in window coordinates. Convert
@@ -714,6 +734,7 @@ namespace GAGCore
 
 	bool GraphicContext::setRes(int w, int h, Uint32 flags)
 	{
+        resetRenderPacing();
 		// check dimension
 		if (minW && (w < minW))
 		{
@@ -853,6 +874,7 @@ namespace GAGCore
 			return false;
 		}
 		{
+			eventThread = SDL_GetCurrentThreadID();
 			_gc = this;
 			// Use the effective flags: software-only builds clear USEGPU above.
 			if (optionFlags & USEGPU)
@@ -894,7 +916,7 @@ namespace GAGCore
 			// setup title and icon
 			if (!appIcon.empty())
 			{
-				SDL_Surface *iconSurface = IMG_Load(appIcon.c_str());
+				SDL_Surface *iconSurface = Toolkit::assets().loadImageSurface(appIcon);
 				SDL_SetWindowIcon(window, iconSurface);
 				SDL_DestroySurface(iconSurface);
 			}
@@ -940,7 +962,6 @@ namespace GAGCore
                 optionFlags &= ~FULLSCREEN;
             }
 			installMacScrollMonitor(window);
-			eventThread = SDL_GetCurrentThreadID();
 			if (nativeDesktop && !refreshNativeWindow()) return false;
 			if (!renderer || nativeSoftware) {
 				SDL_AddEventWatch(watchWindow, this);

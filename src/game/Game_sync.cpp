@@ -49,7 +49,7 @@ void Game::buildProjectSyncStep(Sint32 localTeam)
 		int teamNumber=bpi->teamNumber;
 		assert(teamNumber <= teamsCount());
 		Sint32 typeNum=(bpi->typeNum);
-		BuildingType *bt=globalContainer->buildingsTypes.get(typeNum);
+		BuildingType *bt=buildingsTypes.get(typeNum);
 		int w=bt->width;
 		int h=bt->height;
 		if (!map.isHardSpaceForBuilding(posX, posY, w, h))
@@ -212,9 +212,9 @@ void Game::prestigeSyncStep()
 
 
 
-void Game::syncStep(Sint32 localTeam)
+void Game::syncStep(Sint32 localTeam, PreparationCompletion completion)
 {
-	const auto random = bindRandom();
+	map.preparePendingWorld();
 	applyClientRequests();
 	if (!anyPlayerWaited)
 	{
@@ -229,10 +229,11 @@ void Game::syncStep(Sint32 localTeam)
 		if (!map.gradientPipelineEnabled()) map.configureGradientPipeline(2, 8);
 		map.advanceGradientPipeline();
 
+		areaEffects.beginTick(*this);
 		for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
 			teams[i]->syncStep();
 
-		map.syncStep(stepCounter);
+		map.syncStep(stepCounter, false);
 		if (globalContainer->replaying && globalContainer->replayReader)
 			globalContainer->replayReader->applyTelemetry(*this);
 		if ((stepCounter & 31) == 0)
@@ -242,11 +243,9 @@ void Game::syncStep(Sint32 localTeam)
 			if (globalContainer->replayWriter)
 				globalContainer->replayWriter->captureTelemetry();
 		}
-		for(int p=0;p<gameHeader.getNumberOfPlayers();++p)
-			if(players[p] && players[p]->ai && players[p]->ai->implementationID==AI::JAVASCRIPT)
-				static_cast<AIJavaScript*>(players[p]->ai->aiImplementation)->observe();
-
-		syncRand();
+		// Normally polled controllers already observed this logical tick in their
+		// ordered worker stream. Only replica/replay seats need this boundary.
+		observeUnpolledAI();
 
 		if ((stepCounter&FOW_SWITCH_TICK_MASK)==FOW_SWITCH_TICK_PHASE)
 		{
@@ -282,6 +281,11 @@ void Game::syncStep(Sint32 localTeam)
 		ticksGameSum[stepCounter&(TICK_PROFILE_BUF_LEN-1)]+=static_cast<Sint64>(endTick) - static_cast<Sint64>(startTick);
 		publishTickEvents();
 		stepCounter++;
+		// All world mutations, including script/fog/project tail work, are done.
+		// Selection stays ordered; only private preparation can join AI decisions.
+		map.stagePeriodicGradientPreparation();
+        map.stageResourceGrowth();
+		if (completion == PreparationCompletion::Complete) map.preparePendingWorld();
 	}
 }
 

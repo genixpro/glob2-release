@@ -1,3 +1,4 @@
+import { applySetJobResult } from '../sets.ts';
 // Verified results → ratings and history. The verify-match verdict arrives
 // through the engine-job result task (applyEngineJobResult);
 // handleEngineJobResult records it (outcomes, team statistics and timelines,
@@ -6,7 +7,12 @@
 // under a row lock), so a re-delivered verdict or a sweep never applies a
 // rating change twice.
 import { sql, type Kysely, type Transaction } from 'kysely';
-import { applyEngineJobResult, type Logger } from '@glob2/core';
+import {
+  applyAiValidation,
+  applyGeneratorValidation,
+  applyEngineJobResult,
+  type Logger,
+} from '@glob2/core';
 import { notify, type Database } from '@glob2/db';
 import { applyMapJobResult } from '../play/maps.ts';
 import type { VerifyVerdict } from '@glob2/protocol';
@@ -73,6 +79,9 @@ export async function handleEngineJobResult(
       // Generated maps (rooms, on-demand starts and the warm pool) and
       // uploads; a no-op for verify-match jobs.
       await applyMapJobResult(trx, jobId);
+      await applyAiValidation(trx, jobId);
+      await applyGeneratorValidation(trx, jobId);
+      await applySetJobResult(trx, jobId);
     }
     return applied;
   });
@@ -288,6 +297,7 @@ export async function applyMatchRatings(
         'rating_status',
         'setup',
         'sim_version',
+        'rules_identity',
         'final_tick',
       ])
       .where('id', '=', matchId)
@@ -346,7 +356,10 @@ export async function applyMatchRatings(
         entities.set(p.seat, { entityId: await ensureAccountEntity(trx, p.account_id) });
       } else {
         const ai = p.ai_id as RatedAi;
-        entities.set(p.seat, { entityId: await ensureAiEntity(trx, ai, match.sim_version), ai });
+        entities.set(p.seat, {
+          entityId: await ensureAiEntity(trx, ai, match.rules_identity ?? match.sim_version),
+          ai,
+        });
       }
     }
     const entityIds = [...entities.values()].map((e) => e.entityId);

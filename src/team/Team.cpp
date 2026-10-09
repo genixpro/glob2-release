@@ -55,6 +55,8 @@ void Team::init(void)
 
 	for (int i=0; i<Building::MAX_COUNT; i++)
 		myBuildings[i]=NULL;
+	liveUnits.clear();
+	liveBuildings.clear();
 
 	startPosX=startPosY=0;
 	startPosSet=START_POS_UNSET;
@@ -66,8 +68,8 @@ void Team::init(void)
 	prestige=0;
 	unitConversionLost = 0;
 	unitConversionGained = 0;
-	for(int i=0; i<MAX_NB_RESOURCES; ++i)
-		teamResources[i]=0;
+	for(int i=0; i<MaterialSlotCount; ++i)
+		teamMaterials[i]=0;
 
 	for(int i=0; i<GESize; ++i)
 		eventCooldownTimers[i]=0;
@@ -78,15 +80,29 @@ void Team::init(void)
 
 
 
+void Team::rebuildLiveLists()
+{
+	liveUnits.rebuild(myUnits, Unit::MAX_COUNT);
+	liveBuildings.rebuild(myBuildings, Building::MAX_COUNT);
+}
+
 bool Team::integrity(void)
 {
 	checkInvariant(noMoreBuildingSitesCountdown<=noMoreBuildingSitesCountdownMax);
+	// The live lists must name exactly the occupied slots, in slot order. This
+	// runs every tick, so it rides along the existing slot sweeps.
+	std::size_t liveBuilding = 0;
 	for (int id=0; id<Building::MAX_COUNT; id++)
 	{
 		Building *b=myBuildings[id];
 		if (b)
+		{
+			checkInvariant(liveBuilding < liveBuildings.size() && liveBuildings.slots()[liveBuilding] == id && liveBuildings.entries()[liveBuilding] == b);
+			++liveBuilding;
 			checkInvariant(b->integrity());
+		}
 	}
+	checkInvariant(liveBuilding == liveBuildings.size());
 	for (std::list<Building *>::iterator it=virtualBuildings.begin(); it!=virtualBuildings.end(); ++it)
 	{
 		checkInvariant(*it);
@@ -98,16 +114,22 @@ bool Team::integrity(void)
 	{
 		checkInvariant(*it);
 		checkInvariant((*it)->type);
-		checkInvariant((*it)->type->isVirtual);
+		checkInvariant((*it)->type->zonable[WORKER]);
 		checkInvariant(myBuildings[Building::GIDtoID((*it)->gid)]);
 	}
 
+	std::size_t liveUnit = 0;
 	for (int i=0; i<Unit::MAX_COUNT; i++)
 	{
 		Unit *u=myUnits[i];
 		if (u)
+		{
+			checkInvariant(liveUnit < liveUnits.size() && liveUnits.slots()[liveUnit] == i && liveUnits.entries()[liveUnit] == u);
+			++liveUnit;
 			checkInvariant(u->integrity());
+		}
 	}
+	checkInvariant(liveUnit == liveUnits.size());
 	return true;
 }
 

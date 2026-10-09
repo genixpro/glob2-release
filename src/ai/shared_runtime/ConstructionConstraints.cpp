@@ -231,10 +231,11 @@ int CenterOfBuilding::calculate_constraint(Runtime& runtime, int x, int y)
 
 bool CenterOfBuilding::passes_constraint(Runtime& runtime, int x, int y)
 {
-	Building* b=runtime.player->game->teams[Building::GIDtoTeam(gbid)]->myBuildings[Building::GIDtoID(gbid)];
+	const AIEngine::BuildingView* b=runtime.observation().buildingSlots(Building::GIDtoTeam(gbid))[Building::GIDtoID(gbid)];
 	if(b)
 	{
-		if((b->posX+b->type->width/2)==x && (b->posY+b->type->height/2)==y)
+		if(runtime.observation().normalizeX(b->posX+AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).width/2)==x &&
+		   runtime.observation().normalizeY(b->posY+AIEngine::ObservationQueries::buildingType(runtime.observation(),*b).height/2)==y)
 		{
 			return true;
 		}
@@ -285,7 +286,7 @@ int SinglePosition::calculate_constraint(Runtime& runtime, int x, int y)
 
 bool SinglePosition::passes_constraint(Runtime& runtime, int x, int y)
 {
-	if(posx==x && posy==y)
+	if(runtime.observation().normalizeX(posx)==x && runtime.observation().normalizeY(posy)==y)
 		return true;
 	return false;
 }

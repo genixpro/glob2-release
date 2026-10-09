@@ -3,10 +3,12 @@
 
 #include "AITelemetryFields.h"
 #include "AICastor.h"
+#include "ai/observation/WorldQueries.h"
 #include "Game.h"
 #include "Order.h"
 #include "Player.h"
 #include "Unit.h"
+#include <algorithm>
 
 #define AI_FILE_MIN_VERSION 1
 #define AI_FILE_VERSION 2
@@ -16,8 +18,8 @@ using std::shared_ptr;
 bool AICastor::enoughFreeWorkers()
 {
 	telemetry.count(AITrace::AI2::AICastor_enoughFreeWorkers_calls);
-	int totalWorkers=team->stats.getTotalUnits(WORKER);
-	int workersBalance=team->stats.getWorkersBalance();
+	int totalWorkers=observedTeam->statistics.numberUnitPerType[WORKER];
+	int workersBalance=observedTeam->workerBalance;
 	int partFree=(totalWorkers/strategy.isFreePart);
 	int minBalance;
 	if (buildsAmount<=0)
@@ -45,12 +47,12 @@ void AICastor::computeCanSwim()
 	//printf("computeCanSwim()...\n");
 	// If our population has more healthy-working-units able to swim than healthy-working-units
 	// unable to swim then we choose to be able to go through water:
-	Unit **myUnits=team->myUnits;
+	const auto myUnits=observation->unitSlots(observedTeam->number);
 	int sumCanSwim=0;
 	int sumCantSwim=0;
 	for (int i=0; i<Unit::MAX_COUNT; i++)
 	{
-		Unit *u=myUnits[i];
+		const AIEngine::UnitView *u=myUnits[i];
 		if (u && u->typeNum==WORKER && u->medical==0)
 		{
 			if (u->performance[SWIM]>0)
@@ -67,8 +69,8 @@ void AICastor::computeCanSwim()
 void AICastor::computeNeedSwim()
 {
 	telemetry.count(AITrace::AI2::AICastor_computeNeedSwim_calls);
-	int w=map->w;
-	int h=map->h;
+	int w=observation->width;
+	int h=observation->height;
 	size_t size=w*h;
 	
 	canSwim=false;
@@ -97,24 +99,41 @@ void AICastor::computeNeedSwim()
 void AICastor::computeBuildingSum()
 {
 	telemetry.count(AITrace::AI2::AICastor_computeBuildingSum_calls);
-	for (int bi=0; bi<IntBuildingType::NB_BUILDING; bi++)
+	for (int bi=0; bi<AICastor::DemandCount; bi++)
 		for (int si=0; si<2; si++)
 			for (int li=0; li<NB_UNIT_LEVELS; li++)
 				buildingLevels[bi][si][li]=0;
 	
-	Building **myBuildings=team->myBuildings;
+	const auto& capabilities=*queries;
+	const auto myBuildings=observation->buildingSlots(observedTeam->number);
 	for (int i=0; i<Building::MAX_COUNT; i++)
 	{
-		Building *b=myBuildings[i];
+		const AIEngine::BuildingView *b=myBuildings[i];
 		if (b)
 		{
-			if (b->buildingState==Building::WAITING_FOR_CONSTRUCTION && b->constructionResultState==Building::UPGRADE)
-				buildingLevels[b->type->shortTypeNum][1][b->type->level+1]++;
-			else
-				buildingLevels[b->type->shortTypeNum][b->type->isBuildingSite][b->type->level]++;
+   const bool upgrading = b->buildingState==Building::WAITING_FOR_CONSTRUCTION && b->constructionResultState==Building::UPGRADE;
+   int completed = queries->kind(*b).resolvedType.isBuildingSite ? queries->kind(*b).resolvedType.nextLevel : b->typeNum;
+   if (upgrading && queries->kind(*b).resolvedType.nextLevel >= 0) {
+    const auto* next = (&queries->kind(queries->kind(*b).resolvedType.nextLevel).resolvedType);
+    completed = next->isBuildingSite ? next->nextLevel : queries->kind(*b).resolvedType.nextLevel;
+   }
+   if (completed < 0) continue;
+   const int stage=std::clamp(capabilities.lineagePosition(completed)-1,0,NB_UNIT_LEVELS-1);
+   const auto mask=capabilities.rawIntentMask(completed);
+   for (int demand=0; demand<DemandCount; ++demand)
+    if (mask & (std::uint64_t{1} << static_cast<unsigned>(demandIntents[demand])))
+     buildingLevels[demand][upgrading || queries->kind(*b).resolvedType.isBuildingSite][stage]++;
+
 		}
 	}
-	for (int bi=0; bi<IntBuildingType::NB_BUILDING; bi++)
+ for(const auto& intent:pendingCreates) {
+  const auto& kind=queries->kind(intent.type);
+  const int completed=kind.site?kind.next:intent.type;
+  const int stage=std::clamp(queries->lineagePosition(completed)-1,0,NB_UNIT_LEVELS-1);
+  const auto mask=queries->rawIntentMask(completed);
+  for(int demand=0;demand<DemandCount;++demand) if(mask&(Uint64(1)<<unsigned(demandIntents[demand]))) buildingLevels[demand][kind.site][stage]++;
+ }
+	for (int bi=0; bi<AICastor::DemandCount; bi++)
 		for (int si=0; si<2; si++)
 		{
 			int sum=0;
@@ -123,13 +142,13 @@ void AICastor::computeBuildingSum()
 			buildingSum[bi][si]=sum;
 		}
 
-	for (int bi=0; bi<IntBuildingType::NB_BUILDING; bi++)
+	for (int bi=0; bi<AICastor::DemandCount; bi++)
 		for (int si=0; si<2; si++)
 			for (int li=0; li<NB_UNIT_LEVELS; li++)
 				if (buildingLevels[bi][si][li]>0)
 					if ((timer&AI_CASTOR_VERBOSE_LOG_INTERVAL_MASK)==0)
 						if (verbose)
-							printf("buildingLevels[%d][%d][%d]=%d\n", bi, si, li, buildingLevels[bi][si][li]);
+							bufferedDiagnostics.push_back({"", "", "buildingLevels[" + std::to_string(bi) + "][" + std::to_string(si) + "][" + std::to_string(li) + "]=" + std::to_string(buildingLevels[bi][si][li]) + "\n"});
 }
 
 void AICastor::computeWarLevel()
@@ -147,7 +166,7 @@ void AICastor::computeWarLevel()
 	int sum=0;
 	for (int si=0; si<2; si++)
 		for (int li=strategy.warLevelTrigger; li<NB_UNIT_LEVELS; li++)
-			sum+=buildingLevels[IntBuildingType::ATTACK_BUILDING][si][li];
+			sum+=buildingLevels[AICastor::TrainAttack][si][li];
 	if (sum>AI_CASTOR_WARLEVEL_BUILDINGS_HIGH)
 		warLevelTriggerLevel=AI_CASTOR_WAR_LEVEL_HIGH;
 	else if (sum>0)
@@ -167,17 +186,17 @@ void AICastor::computeWarLevel()
 		return;
 
 	int warPowerSum=0;
-	Unit **myUnits=team->myUnits;
+	const auto myUnits=observation->unitSlots(observedTeam->number);
 	// Custom-game "glass cannon" rule: scale the same way
 	// Unit::getRealAttackStrength() does, so this self-assessment of army
 	// strength doesn't ignore a rule that's actively changing how hard these
 	// units actually hit. (experienceLevel is deliberately left out, matching
 	// getRealAttackStrength() -- this is scoped to the new rule, not a
 	// broader change to how this heuristic already approximates strength.)
-	const int glassCannonScale = team->game->gameHeader.getGlassCannonScale();
+	const int glassCannonScale = observation->configuration->getGlassCannonScale();
 	for (int i=0; i<Unit::MAX_COUNT; i++)
 	{
-		Unit *u=myUnits[i];
+		const AIEngine::UnitView *u=myUnits[i];
 		if (u && u->medical==Unit::MED_FREE && u->typeNum==WARRIOR)
 			warPowerSum+=u->performance[ATTACK_SPEED]*u->performance[ATTACK_STRENGTH]*glassCannonScale;
 	}

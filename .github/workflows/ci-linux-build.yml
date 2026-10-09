@@ -172,8 +172,14 @@ jobs:
           mkdir -p artifacts/ci-native
           python3 .github/scripts/ci_build_provenance.py write --compiler '${{ inputs.compiler }}'
           python3 .github/scripts/linux_runtime_packages.py build/linux/client/release --output artifacts/ci-native/runtime-packages.txt
-          find build/linux/client/release build/sdl3-ci/prefix/lib -path '*/configure' -prune -o \( -type f -o -type l \) \( -perm /111 -o -name '*.so*' \) -print0 |
-            tar --null -czf artifacts/ci-native/linux-test-programs.tar.gz -T -
+          # Consumers run without rebuilding; ship the generated WebP tree
+          # together with the executables that name it in their build config.
+          test -d build/linux/client/release/runtime-assets/data
+          {
+            find build/linux/client/release build/sdl3-ci/prefix/lib -path '*/configure' -prune -o \( -type f -o -type l \) \( -perm /111 -o -name '*.so*' \) -print0
+            find build/linux/client/release/runtime-assets -type f -print0
+            printf '%s\0' build/linux/client/release/runtime-assets.json
+          } | tar --null -czf artifacts/ci-native/linux-test-programs.tar.gz -T -
       - uses: actions/upload-artifact@v4
         id: upload_linux_test_programs
         if: steps.package_linux_test_programs.outcome == 'success'
@@ -511,7 +517,22 @@ jobs:
         id: test_tournament_protocol_ai_configuration_and_main_cli
         continue-on-error: true
         run: |
+          sudo apt-get update -qq
+          # Ubuntu 22.04 needs LLVM's signed repository for the pinned major.
+          . /etc/os-release
+          if [ "$VERSION_CODENAME" = jammy ]; then
+            curl --fail --silent --show-error --retry 3 https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /usr/share/keyrings/llvm.asc >/dev/null
+            echo "deb [signed-by=/usr/share/keyrings/llvm.asc] https://apt.llvm.org/jammy/ llvm-toolchain-jammy-18 main" | sudo tee /etc/apt/sources.list.d/llvm18.list >/dev/null
+            sudo apt-get update -qq
+          fi
+          sudo apt-get install -y --no-install-recommends libclang-18-dev python3-venv nodejs npm
+          python3 -m venv artifacts/map-generator-tools-venv
+          artifacts/map-generator-tools-venv/bin/python -m pip install clang==18.1.8
+          npm install --prefix artifacts/map-generator-typescript --no-save --ignore-scripts typescript@7.0.2
           python3 test/ci_run_commands.py \
+            --check 'toolkit authoring declarations' 'artifacts/map-generator-typescript/node_modules/.bin/tsc --strict --noEmit test/map_generator_toolkit_contract.ts' \
+            --check 'generator package tooling' 'python3 test/test_generator_package_tool.py' \
+            --check 'toolkit instrumentation' 'artifacts/map-generator-tools-venv/bin/python test/test_toolkit_instrumentation.py' \
             --check tournaments 'python3 test/test_tournaments.py' \
             --check 'tournament pipeline' 'python3 test/test_tournament_pipeline.py' \
             --check 'distributed map telemetry' 'python3 test/test_distributed_map_telemetry.py' \
@@ -577,7 +598,7 @@ jobs:
         if: ${{ steps.shard_plan.outputs.retain_browser_native_simulation_trace == format('{0}', matrix.shard) }}
         id: retain_browser_native_simulation_trace
         continue-on-error: true
-        run: python3 test/run-browser-determinism.py build/linux/client/release/src/glob2 artifacts/browser-determinism/native
+        run: python3 test/run-browser-determinism.py build/linux/client/release/src/glob2 artifacts/browser-determinism/native --engine-binary build/linux/client/release/test/glob2-engine-tests
       - uses: actions/upload-artifact@v4
         if: ${{ steps.shard_plan.outputs.retain_browser_native_simulation_trace == format('{0}', matrix.shard) }}
         id: upload_artifact_1

@@ -1,6 +1,3 @@
-#ifndef __EMSCRIPTEN__
-#include <SDL3_net/SDL_net.h>
-#endif
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2007 Stephane Magnenat & Luc-Olivier de Charrière
 
@@ -16,6 +13,11 @@
 #include "GameGUIKeyActions.h"
 #include "Glob2Style.h"
 #include "GlobalContainer.h"
+#include "render/ResourceSprites.h"
+#include "TerrainPresentation.h"
+#include "ResourceRegistry.h"
+#include "render/terrain/TerrainCatalogIO.h"
+#include "render/terrain/TerrainCompositor.h"
 #include "ui/ThemeCatalog.h"
 #include "IntBuildingType.h"
 #include "KeyboardManager.h"
@@ -37,7 +39,7 @@
  * The GlobalContainer basically holds all preferences, data,
  * configuration information, etc.
  */
-GlobalContainer::GlobalContainer(const char *profileName)
+GlobalContainer::GlobalContainer(const char *profileName, const std::string& buildingCatalog)
 {
 	// Init toolkit
 	Toolkit::init(profileName);
@@ -59,13 +61,23 @@ GlobalContainer::GlobalContainer(const char *profileName)
 	// Start browser profiles quietly and without clouds. Saved preferences win.
 	settings.mute = 1;
 #endif
+	// Catalog experiments must be known before preferences parse enabled keys.
+	if (buildingCatalog.empty()) buildingsTypes.init();
+	else buildingsTypes.loadManifest(buildingCatalog);
+	std::vector<CatalogExperimentDefinition> buildingExperiments;
+	for (const auto& definition : buildingsTypes.experiments())
+		buildingExperiments.push_back({definition.key, definition.label, definition.help});
+	for (const auto& definition : ResourceRegistry::availableDefaults()->experiments())
+		buildingExperiments.push_back(definition);
+	registerCatalogExperiments(buildingExperiments);
+
 	// load user preference
 	settings.load();
 	Glob2UI::applyThemes(settings.menuTheme, settings.gameTheme);
 
 	applyScrollTuning(settings, reducedMotion);
 	runNoX = false;
-	
+
 	runTestGames=false;
 	runTestGamesCount=0;
 	testGamesAIPool.clear();
@@ -116,6 +128,10 @@ GlobalContainer::~GlobalContainer(void)
 	mix.reset();
 	voiceRecorder.reset();
 	title.reset();
+    ResourceSprites::clear();
+	customTerrainCompositor.reset();
+    compositorAssets.reset();
+	terrainCompositor_.reset();
 
 	// SDL_net owns resolver threads and conditions. Join them before the
 	// graphics backend calls SDL_Quit and destroys SDL thread resources.
@@ -141,8 +157,8 @@ GlobalContainer::~GlobalContainer(void)
 
 void GlobalContainer::updateLoadProgressScreen(int value)
 {
-	// The terrain tiles come with the game sprites, which the browser installs
-	// after the main menu. Its canvas is hidden until then anyway.
+	// Terrain may still be preparing; the title remains visible while
+	// frame polling finishes the required game families.
 	if (terrain)
 	{
 		unsigned randomSeed = 1;
@@ -173,11 +189,13 @@ void GlobalContainer::loadClient(void)
 	// Native builds have every data package; the browser installs game sprites
 	// before startup and menu music afterward (scons/web_assets.py).
 	const bool gameData = GAGCore::ApplicationHost::assetPackageReady("game");
+    IntBuildingType::init();
 	if (!runNoX)
 	{
 		// create graphic context
 		GraphicContext::setRequestedUiScale(settings.uiScale / 100.0f);
 		gfx = Toolkit::initGraphic(settings.screenWidth, settings.screenHeight, settings.screenFlags, "Globulation 2", "glob 2");
+        gfx->setTargetRenderFps(settings.targetRenderFps);
 #if !defined(GLOB2_MOBILE) && !defined(__EMSCRIPTEN__)
 		gfx->setDisplayPreferenceCallback([this](int w, int h, bool fullscreen)
 		{
@@ -194,36 +212,33 @@ void GlobalContainer::loadClient(void)
 		gfx->setCompactWindowAllowed(true);
         gfx->refreshPresentation();
 		gfx->setMinRes(640, 480);
-		
+
 		// load data required for drawing progress screen
-		title = std::make_unique<DrawableSurface>("data/gfx/loading-wordmark.png");
+		title = std::make_unique<DrawableSurface>("data/gfx/loading-wordmark.webp");
 		if (gameData)
 			terrain = Toolkit::getSprite("data/gfx/terrain");
 		updateLoadProgressScreen(0);
+
+        if (gameData) requestGameGraphics();
+        Toolkit::pollAssets(4);
 
 		// create mixer
 		mix = std::make_unique<SoundMixer>(settings.musicVolume, settings.voiceVolume, settings.mute);
 		// Track slots must match the MusicTrack enum order. Engine::run may
 		// later overwrite the InGame* slots with a randomly chosen music dir.
-		loadMenuMusic();
-		mix->loadTrack("data/zik/original/a1.opus",      MusicTrack::InGameDefault);
-		mix->loadTrack("data/zik/original/a2.opus",      MusicTrack::BuildingEvent);
-		mix->loadTrack("data/zik/original/a3.opus",      MusicTrack::WarEvent);
+        mix->loadTracks({{"data/zik/original/a1.opus", MusicTrack::InGameDefault},
+            {"data/zik/original/a2.opus", MusicTrack::BuildingEvent}, {"data/zik/original/a3.opus", MusicTrack::WarEvent}});
+        loadMenuMusic();
 		mix->setNextTrack(MusicTrack::Intro);
 		mix->setNextTrack(MusicTrack::Menu);
-		
+
 		// create voice recorder
 		voiceRecorder = std::make_unique<VoiceRecorder>();
-		
+
 		updateLoadProgressScreen(15);
 	}
-	
-	// initialize building types: resolve prev/next-level links for the static
-	// table baked into game/entities/buildings*.cpp (sprites come with the
-	// game graphics below).
-	buildingsTypes.init();
-	IntBuildingType::init();
-	
+
+
 	if (!runNoX)
 	{
 		updateLoadProgressScreen(35);
@@ -247,7 +262,7 @@ void GlobalContainer::loadClient(void)
 	if (!runNoX)
 	{
 		updateLoadProgressScreen(40);
-		
+
 		// load fonts
 		std::string fontfile = "data/fonts/";
 		fontfile+=+PRIMARY_FONT;
@@ -267,13 +282,20 @@ void GlobalContainer::loadClient(void)
 		littleFont->setStyle(Font::Style(Font::STYLE_NORMAL, GAGGUI::Style::style->textColor));
 
 		updateLoadProgressScreen(50);
-		if (gameData)
-			loadGameGraphics(true);
-		
+        if (gameData && !deferAssetLoading) {
+            while (!ensureGameGraphics()) {
+                updateLoadProgressScreen(50 + Toolkit::assetProgress() / 2);
+                SDL_PumpEvents();
+#ifndef __EMSCRIPTEN__
+                SDL_Delay(1);
+#endif
+            }
+        }
+
 		// use custom style
 		Style::style = new Glob2Style;
 
-		updateLoadProgressScreen(100);
+		updateLoadProgressScreen(gameGraphics ? 100 : 50 + Toolkit::assetProgress() / 2);
 	}
 }
 
@@ -287,15 +309,15 @@ void GlobalContainer::loadGameGraphics(bool showProgress)
 	// load terrain data
 	if (!terrain)
 		terrain = sprite("data/gfx/terrain");
-	terrainWater = sprite("data/gfx/water");
+	terrainCompositor(); // Validate all registered material sources before drawing.
 	terrainCloud = sprite("data/gfx/cloud");
-	
+
 	// black for unexplored terrain
 	terrainBlack = sprite("data/gfx/black");
 
 	// load shader for invisible terrain
 	terrainShader = sprite("data/gfx/shade");
-	
+
 	if (showProgress)
 		updateLoadProgressScreen(60);
 	// load resources
@@ -331,14 +353,47 @@ void GlobalContainer::loadGameGraphics(bool showProgress)
 	gameGraphics = true;
 }
 
+void GlobalContainer::requestGameGraphics()
+{
+    if (gameGraphicsRequested) return;
+    for (const char *name : {"terrain", "cloud", "black", "shade", "ressource", "ressourcemini",
+        "mapicon", "area-clearing", "area-forbidden", "area-guard", "area-farm", "bullet", "explosion", "death",
+        "unit", "unitmini", "gamegui", "brush", "magiceffect", "particle", "guitheme"})
+        Toolkit::requestSprite(std::string("data/gfx/") + name, std::string(name) == "ressource");
+	for (const auto &material : TerrainVisual::loadCatalog().materials)
+	{
+		Toolkit::requestSprite(material.sprite);
+		if (!material.decor.sprite.empty())
+			Toolkit::requestSprite(material.decor.sprite);
+	}
+	for (size_t i = 0; i < buildingsTypes.size(); ++i) {
+        const auto *type = buildingsTypes.get(i);
+        if (type->type == "null") continue;
+        Toolkit::requestSprite(type->gameSprite);
+        if (type->miniSpriteImage >= 0) Toolkit::requestSprite(type->miniSprite);
+    }
+    gameGraphicsRequested = true;
+}
+bool GlobalContainer::finishAssetLoading()
+{
+    return ensureGameGraphics();
+}
+void GlobalContainer::drawAssetLoading()
+{
+    if (gfx->beginRenderFrame())
+        updateLoadProgressScreen(50 + Toolkit::assetProgress() / 2);
+}
+
 bool GlobalContainer::ensureGameGraphics(void)
 {
 	if (runNoX || gameGraphics)
 		return true;
 	if (!GAGCore::ApplicationHost::assetPackageReady("game"))
 		return false;
-	loadGameGraphics(false);
-	return true;
+    requestGameGraphics();
+    if (!Toolkit::pollAssets(4)) return false;
+    loadGameGraphics(false);
+    return true;
 }
 
 GAGCore::CooperativeTask GlobalContainer::gameGraphicsTask(void)
@@ -354,8 +409,7 @@ bool GlobalContainer::loadMenuMusic(void)
 		return true;
 	if (!mix || !GAGCore::ApplicationHost::assetPackageReady("menu-music"))
 		return false;
-	mix->loadTrack("data/zik/intro.opus",            MusicTrack::Intro);
-	mix->loadTrack("data/zik/menu.opus",             MusicTrack::Menu);
+    mix->loadTracks({{"data/zik/intro.opus", MusicTrack::Intro}, {"data/zik/menu.opus", MusicTrack::Menu}});
 	menuMusic = true;
 	return true;
 }
@@ -382,7 +436,7 @@ void GlobalContainer::load(void)
 		assert(false);
 		exit(-1);
 	}
-	
+
 	// A profile without a language (or with one this build no longer ships) follows
 	// the operating system's or browser's preferred languages.
 	StringTable *strings = Toolkit::getStringTable();
@@ -392,8 +446,6 @@ void GlobalContainer::load(void)
 	strings->setLang(strings->getLangCode(settings.language));
 	// load default unit types
 	Race::loadDefault();
-	// Resource types are now a compile-time const table (see
-	// src/resource/Resources.cpp); nothing to load here.
 
 	loadClient();
 }
@@ -410,4 +462,23 @@ void GlobalContainer::loadOffscreenGraphics()
 	if (!gfx) gfx = Toolkit::initGraphic(640, 480, 0, "Glob2 export", "glob2");
 	if (!standardFont || !littleFont) loadGameFonts();
 	if (!gameGraphics) loadGameGraphics(false);
+}
+
+TerrainVisual::Compositor &GlobalContainer::terrainCompositor()
+{
+	if (!terrainCompositor_)
+		terrainCompositor_ =
+			std::make_unique<TerrainVisual::Compositor>(TerrainVisual::loadCatalog());
+	return *terrainCompositor_;
+}
+
+TerrainVisual::Compositor &GlobalContainer::terrainCompositor(std::shared_ptr<const MapAssetBundle> assets)
+{
+    if (!assets || assets->isEmpty()) return terrainCompositor();
+    if (compositorAssets != assets) {
+        auto replacement = std::make_unique<TerrainVisual::Compositor>(TerrainVisual::loadCatalog(assets), assets);
+        customTerrainCompositor = std::move(replacement);
+        compositorAssets = std::move(assets);
+    }
+    return *customTerrainCompositor;
 }

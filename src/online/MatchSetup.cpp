@@ -1,3 +1,4 @@
+#include "FileFormatVersions.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 glob2 contributors
 
@@ -16,11 +17,13 @@
 
 #include "AINames.h"
 #include "BasePlayer.h"
+#include "BuildingType.h"
 #include "Engine.h"
 #include "EngineTiming.h"
 #include "ExperimentalFeatures.h"
 #include "GameHeader.h"
 #include "MapHeader.h"
+#include "ResourceRegistry.h"
 #include "Sha256.h"
 #include "WinningConditions.h"
 
@@ -39,7 +42,8 @@ bool MatchRules::operator==(const MatchRules& o) const
 	       hungerDisabled == o.hungerDisabled && unitUpgradesDisabled == o.unitUpgradesDisabled &&
 	       glassCannonLevel == o.glassCannonLevel && unitsFearless == o.unitsFearless &&
 	       permadeathDisabled == o.permadeathDisabled && peacefulMode == o.peacefulMode &&
-	       buildingHpLevel == o.buildingHpLevel;
+	       buildingHpLevel == o.buildingHpLevel && aiOrderDelay == o.aiOrderDelay &&
+	       buildingGradientDelay == o.buildingGradientDelay;
 }
 
 bool GeneratorDescriptor::operator==(const GeneratorDescriptor& o) const
@@ -50,7 +54,9 @@ bool GeneratorDescriptor::operator==(const GeneratorDescriptor& o) const
 
 bool MapSource::operator==(const MapSource& o) const
 {
-	return kind == o.kind && hash == o.hash && mapId == o.mapId && format == o.format && generator == o.generator;
+	return kind == o.kind && hash == o.hash && mapId == o.mapId && format == o.format &&
+		   generator == o.generator && scriptGenerator == o.scriptGenerator &&
+		   chosenSeed == o.chosenSeed;
 }
 
 namespace
@@ -202,6 +208,35 @@ MapSource parseMap(const json& value, const std::string& path)
 		else
 			schemaError(path + "/format", "must be map or save");
 	}
+	else if (kind == "scripted")
+	{
+		strictObject(value, path, {"kind", "generator", "hash"}, {"chosenSeed"});
+		const auto &g = value["generator"];
+		const std::string gp = path + "/generator";
+		strictObject(g, gp,
+					 {"libraryId", "versionId", "packageHash", "fileHash", "generatorId",
+					  "revision", "params", "seed", "candidates", "startingUnitLevel"});
+		uuid(g["libraryId"], gp + "/libraryId");
+		uuid(g["versionId"], gp + "/versionId");
+		hashString(g["packageHash"], gp + "/packageHash");
+		hashString(g["fileHash"], gp + "/fileHash");
+		const auto id = string(g["generatorId"], gp + "/generatorId");
+		if (id.size() > 128 || !matches(id, "^[a-z0-9_.-]+:[a-z0-9_.:-]+$"))
+			schemaError(gp + "/generatorId", "must be a namespaced generator id");
+		auto native = g;
+		for (const char *key : {"libraryId", "versionId", "packageHash", "fileHash"})
+			native.erase(key);
+		native["generatorId"] = "script";
+		const auto descriptor = parseGenerator(native, gp);
+		if (descriptor.candidates > 5 || descriptor.startingUnitLevel != 0 ||
+			descriptor.params.size() > 72)
+			schemaError(gp, "unsupported scripted generation settings");
+		map.kind = MapSource::Kind::Scripted;
+		map.scriptGenerator = g.dump();
+		if (value.contains("chosenSeed"))
+			map.chosenSeed =
+				std::uint32_t(integer(value["chosenSeed"], path + "/chosenSeed", 0, UINT32_MAX));
+	}
 	else if (kind == "generated")
 	{
 		strictObject(value, path, {"kind", "generator", "hash"});
@@ -220,7 +255,7 @@ MatchRules parseRules(const json& value, const std::string& path)
 	             {"prestigeVictory", "suddenDeathMinutes", "mapDiscovered", "allyTeamsFixed", "resourceGrowthDisabled",
 	              "resourceScarcityLevel", "instantConstruction", "stockpileStartLevel", "hungerDisabled",
 	              "unitUpgradesDisabled", "glassCannonLevel", "unitsFearless", "permadeathDisabled", "peacefulMode",
-	              "buildingHpLevel"});
+	              "buildingHpLevel"}, {"aiOrderDelay", "buildingGradientDelay"});
 	MatchRules r;
 	auto b = [&](const char* key) { return boolean(value[key], path + "/" + key); };
 	auto i = [&](const char* key, int max) { return static_cast<int>(integer(value[key], path + "/" + key, 0, max)); };
@@ -230,6 +265,10 @@ MatchRules parseRules(const json& value, const std::string& path)
 	r.allyTeamsFixed = b("allyTeamsFixed");
 	r.resourceGrowthDisabled = b("resourceGrowthDisabled");
 	r.resourceScarcityLevel = i("resourceScarcityLevel", 3);
+	r.aiOrderDelay = value.contains("aiOrderDelay") ? i("aiOrderDelay", 8) : 0;
+	r.buildingGradientDelay = value.contains("buildingGradientDelay")
+	                              ? static_cast<int>(integer(value["buildingGradientDelay"], path + "/buildingGradientDelay", 1, 8))
+	                              : int(GameHeader::DEFAULT_BUILDING_GRADIENT_DELAY);
 	r.instantConstruction = b("instantConstruction");
 	r.stockpileStartLevel = i("stockpileStartLevel", 3);
 	r.hungerDisabled = b("hungerDisabled");
@@ -306,11 +345,36 @@ const std::vector<std::string>& MatchSetup::aiIds()
 MatchSetup MatchSetup::fromJsonSchemaOnly(const json& value)
 {
 	strictObject(value, "", {"schemaVersion", "simVersion", "seed", "map", "teams", "seats", "rules", "experiments"},
-	             {"pauseLimit"});
+	             {"pauseLimit", "buildingCatalog", "resourceExperiments"});
 	if (!value["schemaVersion"].is_number_integer() || value["schemaVersion"].get<std::int64_t>() != SCHEMA_VERSION)
 		schemaError("/schemaVersion", "must be " + std::to_string(SCHEMA_VERSION));
 	MatchSetup setup;
 	setup.simVersion = SimVersion::fromJson(value["simVersion"], "/simVersion");
+	if (value.contains("resourceExperiments"))
+	{
+		const auto& definitions = value["resourceExperiments"];
+		if (!definitions.is_array() || definitions.size() > 64) schemaError("/resourceExperiments", "must be a bounded array");
+		for (unsigned i = 0; i < definitions.size(); ++i)
+		{
+			const auto path = "/resourceExperiments/" + std::to_string(i);
+			const auto& definition = definitions[i];
+			strictObject(definition, path, {"key", "label", "help"});
+			CatalogExperimentDefinition entry{string(definition["key"], path + "/key"),
+				string(definition["label"], path + "/label"), string(definition["help"], path + "/help")};
+			if (entry.key.size() > 128 || entry.label.empty() || entry.label.size() > 512 || entry.help.empty() || entry.help.size() > 4096)
+				schemaError(path, "resource experiment metadata exceeds limits");
+			setup.resourceExperiments.push_back(std::move(entry));
+		}
+	}
+	if (value.contains("buildingCatalog"))
+	{
+		const auto &catalog = value["buildingCatalog"];
+		strictObject(catalog, "/buildingCatalog", {"snapshot", "hash"});
+		setup.buildingCatalogSnapshot = string(catalog["snapshot"], "/buildingCatalog/snapshot");
+		if (setup.buildingCatalogSnapshot.empty() || setup.buildingCatalogSnapshot.size() > 8 * 1024 * 1024)
+			schemaError("/buildingCatalog/snapshot", "must contain between 1 and 8388608 UTF-8 bytes");
+		setup.buildingCatalogHash = hashString(catalog["hash"], "/buildingCatalog/hash");
+	}
 	setup.seed = static_cast<std::uint32_t>(integer(value["seed"], "/seed", 0, UINT32_MAX));
 	setup.map = parseMap(value["map"], "/map");
 
@@ -343,7 +407,7 @@ MatchSetup MatchSetup::fromJsonSchemaOnly(const json& value)
 	{
 		const std::string path = "/experiments/" + std::to_string(i);
 		const std::string key = string(experiments[i], path);
-		if (key.size() > 64 || !matches(key, "^[a-z0-9]+(-[a-z0-9]+)*$"))
+		if (key.size() > 128 || !matches(key, "^[a-z0-9]+(-[a-z0-9]+)*$"))
 			schemaError(path, "must be an experiment key");
 		if (!seen.insert(key).second)
 			schemaError(path, "is listed twice");
@@ -406,6 +470,12 @@ void MatchSetup::validateSemantics() const
 		if (!closedTeams.insert(seat.team).second)
 			semanticError(path + "/team", "team " + std::to_string(seat.team) + " is closed twice");
 	}
+	if (map.kind == MapSource::Kind::Scripted && map.scriptGenerator)
+	{
+		const auto g = json::parse(*map.scriptGenerator);
+		if (!g["params"].contains("teams") || g["params"]["teams"] != teams.size())
+			semanticError("/map/generator/params/teams", "must equal setup team count");
+	}
 	if (map.kind == MapSource::Kind::Generated && map.generator)
 	{
 		auto it = map.generator->params.find("teams");
@@ -414,8 +484,30 @@ void MatchSetup::validateSemantics() const
 			                                                 ") must equal the number of setup teams (" +
 			                                                 std::to_string(teams.size()) + ")");
 	}
+	std::vector<std::string> catalogKeys;
+	if (!buildingCatalogSnapshot.empty())
+	{
+		BuildingsTypes catalog;
+		try { catalog.loadSnapshotJson(buildingCatalogSnapshot); }
+		catch (const std::exception& error) { semanticError("/buildingCatalog/snapshot", error.what()); }
+		if (catalog.snapshotJson() != buildingCatalogSnapshot)
+			semanticError("/buildingCatalog/snapshot", "must use the canonical catalog encoding");
+		if (catalog.fingerprint() != buildingCatalogHash)
+			semanticError("/buildingCatalog/hash", "does not match the embedded catalog");
+		for (const auto& experiment : catalog.experiments()) catalogKeys.push_back(experiment.key);
+	}
+	else if (!buildingCatalogHash.empty())
+		semanticError("/buildingCatalog", "a catalog hash requires its snapshot");
+	try { validateCatalogExperiments(resourceExperiments); }
+	catch (const std::exception& error) { semanticError("/resourceExperiments", error.what()); }
+	for (const auto& definition : resourceExperiments) catalogKeys.push_back(definition.key);
+	std::set<std::string> combinedKeys(catalogKeys.begin(), catalogKeys.end());
+	for (const auto& definition : experimentDefinitions()) combinedKeys.insert(definition.key);
+	if (combinedKeys.size() > ExperimentSet::MAX_STORED)
+		semanticError("/resourceExperiments", "combined catalogs declare too many experiments");
 	for (std::size_t i = 0; i < experiments.size(); ++i)
-		if (!parseExperimentKey(experiments[i]))
+		if (!parseExperimentKey(experiments[i]) &&
+			std::find(catalogKeys.begin(), catalogKeys.end(), experiments[i]) == catalogKeys.end())
 			semanticError("/experiments/" + std::to_string(i), "unknown experiment \"" + experiments[i] + "\"");
 }
 
@@ -443,6 +535,8 @@ MatchSetup MatchSetup::parse(const std::string& text)
 json MatchSetup::toJson() const
 {
 	json out = json::object();
+	if (!buildingCatalogSnapshot.empty())
+		out["buildingCatalog"] = {{"snapshot", buildingCatalogSnapshot}, {"hash", buildingCatalogHash}};
 	// nlohmann::json orders object keys alphabetically; dump() therefore has one
 	// canonical form for a given setup, whatever order the input used.
 	out["schemaVersion"] = SCHEMA_VERSION;
@@ -459,6 +553,12 @@ json MatchSetup::toJson() const
 	case MapSource::Kind::Upload:
 		m["kind"] = "upload";
 		m["format"] = map.format == MapSource::Format::Save ? "save" : "map";
+		break;
+	case MapSource::Kind::Scripted:
+		m["kind"] = "scripted";
+		m["generator"] = json::parse(*map.scriptGenerator);
+		if (map.chosenSeed)
+			m["chosenSeed"] = *map.chosenSeed;
 		break;
 	case MapSource::Kind::Generated:
 	{
@@ -503,6 +603,8 @@ json MatchSetup::toJson() const
 	                {"allyTeamsFixed", r.allyTeamsFixed},
 	                {"resourceGrowthDisabled", r.resourceGrowthDisabled},
 	                {"resourceScarcityLevel", r.resourceScarcityLevel},
+	                {"aiOrderDelay", r.aiOrderDelay},
+	                {"buildingGradientDelay", r.buildingGradientDelay},
 	                {"instantConstruction", r.instantConstruction},
 	                {"stockpileStartLevel", r.stockpileStartLevel},
 	                {"hungerDisabled", r.hungerDisabled},
@@ -513,6 +615,12 @@ json MatchSetup::toJson() const
 	                {"peacefulMode", r.peacefulMode},
 	                {"buildingHpLevel", r.buildingHpLevel}};
 	out["experiments"] = experiments;
+	if (!resourceExperiments.empty())
+	{
+		out["resourceExperiments"] = json::array();
+		for (const auto& definition : resourceExperiments)
+			out["resourceExperiments"].push_back({{"key", definition.key}, {"label", definition.label}, {"help", definition.help}});
+	}
 	if (pauseLimit)
 		out["pauseLimit"] = {{"pauses", pauseLimit->pauses}, {"seconds", pauseLimit->seconds}};
 	return out;
@@ -581,6 +689,8 @@ GameHeader MatchSetup::toGameHeader(const MapHeader& mapHeader) const
 	WinningCondition::setSuddenDeathWinCondition(header.getWinningConditions(), endStepTick);
 	header.setResourceGrowthDisabled(rules.resourceGrowthDisabled);
 	header.setResourceScarcityLevel(static_cast<Uint8>(rules.resourceScarcityLevel));
+	header.setAIOrderDelay(rules.aiOrderDelay);
+	header.setBuildingGradientDelay(rules.buildingGradientDelay);
 	header.setInstantConstructionEnabled(rules.instantConstruction);
 	header.setStockpileStartLevel(static_cast<Uint8>(rules.stockpileStartLevel));
 	header.setHungerDisabled(rules.hungerDisabled);
@@ -590,14 +700,18 @@ GameHeader MatchSetup::toGameHeader(const MapHeader& mapHeader) const
 	header.setPermadeathDisabled(rules.permadeathDisabled);
 	header.setPeacefulModeEnabled(rules.peacefulMode);
 	header.setBuildingHpLevel(static_cast<Uint8>(rules.buildingHpLevel));
-	ExperimentSet experimentSet;
-	for (const auto& key : experiments)
-	{
-		const auto id = parseExperimentKey(key);
-		if (!id)
-			semanticError("/experiments", "unknown experiment \"" + key + "\"");
-		experimentSet.set(*id);
-	}
+	if (!buildingCatalogSnapshot.empty()) header.setBuildingCatalogSnapshot(buildingCatalogSnapshot);
+	const auto& mapExperiments = mapHeader.getVersionMinor() < FILE_FORMAT_VERSION_RUNTIME_RESOURCES
+		? ResourceRegistry::legacy()->experiments() : mapHeader.resourceExperimentDefinitions;
+	if (!resourceExperiments.empty() && resourceExperiments != mapExperiments)
+		semanticError("/resourceExperiments", "does not match the map's embedded resource catalog");
+	header.setResourceExperiments(mapExperiments);
+	ExperimentSet experimentSet = ExperimentSet::fromKeys(experiments, nullptr, header.catalogExperimentKeys());
+	for (const auto& definition : experimentDefinitions())
+		if (mapHeader.requiredTerrainExperiments.has(definition.id) && !experimentSet.has(definition.id))
+			semanticError("/experiments", "missing map-required terrain experiment " + std::string(definition.key));
+	for (const auto& key : mapHeader.requiredResourceExperiments.keys())
+		if (!experimentSet.has(key)) semanticError("/experiments", "missing map-required resource experiment " + key);
 	header.setExperiments(experimentSet);
 	return header;
 }
@@ -607,6 +721,15 @@ MatchSetup MatchSetup::fromGameHeader(GameHeader header, const MapHeader& mapHea
 {
 	MatchSetup setup;
 	setup.simVersion = simVersion;
+	setup.buildingCatalogSnapshot = header.getBuildingCatalogSnapshot();
+	setup.resourceExperiments = mapHeader.getVersionMinor() < FILE_FORMAT_VERSION_RUNTIME_RESOURCES ? header.resourceExperiments() : mapHeader.resourceExperimentDefinitions;
+	header.setResourceExperiments(setup.resourceExperiments);
+	if (!setup.buildingCatalogSnapshot.empty())
+	{
+		BuildingsTypes catalog;
+		catalog.loadSnapshotJson(setup.buildingCatalogSnapshot);
+		setup.buildingCatalogHash = catalog.fingerprint();
+	}
 	setup.seed = header.getRandomSeed();
 	setup.map = source;
 	for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
@@ -663,6 +786,8 @@ MatchSetup MatchSetup::fromGameHeader(GameHeader header, const MapHeader& mapHea
 	r.allyTeamsFixed = header.areAllyTeamsFixed();
 	r.resourceGrowthDisabled = header.isResourceGrowthDisabled();
 	r.resourceScarcityLevel = header.getResourceScarcityLevel();
+	r.aiOrderDelay = header.getAIOrderDelay();
+	r.buildingGradientDelay = static_cast<int>(header.getBuildingGradientDelay());
 	r.instantConstruction = header.isInstantConstructionEnabled();
 	r.stockpileStartLevel = header.getStockpileStartLevel();
 	r.hungerDisabled = header.isHungerDisabled();
@@ -672,6 +797,9 @@ MatchSetup MatchSetup::fromGameHeader(GameHeader header, const MapHeader& mapHea
 	r.permadeathDisabled = header.isPermadeathDisabled();
 	r.peacefulMode = header.isPeacefulModeEnabled();
 	r.buildingHpLevel = header.getBuildingHpLevel();
+	for (const auto& definition : experimentDefinitions())
+		if (mapHeader.requiredTerrainExperiments.has(definition.id)) header.getExperiments().set(definition.id);
+	for (const auto& key : mapHeader.requiredResourceExperiments.keys()) header.getExperiments().set(key, true, header.catalogExperimentKeys());
 	setup.experiments = header.getExperiments().keys();
 	setup.validateSemantics();
 	return setup;

@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
 #include "GameDiagnostics.h"
+#include "DatasetWriter.h"
+#include "Order.h"
+#include "ai/model/BuildingProjection.h"
+#include "MetricCatalog.h"
 #include "render/scene/SceneExtract.h"
 #include "AIMaximaPlacement.h"
 #include "AIMaxima.h"
@@ -10,6 +14,8 @@
 #include <SDL3_image/SDL_image.h>
 #include <fstream>
 #include <limits>
+#include <BinaryStream.h>
+#include <StreamBackend.h>
 
 TEST_SUITE("GameDiagnostics")
 {
@@ -43,6 +49,118 @@ TEST_CASE("controller capture follows simulation cadence and preserves unsigned 
 	sink.captured=false; sink.tick=9; sink.capture(world); CHECK_FALSE(sink.captured);
 	sink.tick=10; sink.capture(world); CHECK(sink.captured);
 }
+TEST_CASE("private diagnostic reservation survives owner ticks and serialization [artifacts]")
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.loadDefaultRace=true});
+    GameHeader header;header.setNumberOfPlayers(1);
+    header.getBasePlayer(0)=BasePlayer(0,"diagnostics",0,BasePlayer::playerTypeFromImplementationID(AI::MAXIMA));
+    fixture.game.setGameHeader(header);
+    GameDiagnostics::Session session(fixture.game,(glob2test::artifactDir()/"private-captures").string(),10,false);
+    auto* maxima=dynamic_cast<AIMaxima::Maxima*>(fixture.game.players[0]->ai->aiImplementation);
+    REQUIRE(maxima);
+    const auto stable=maxima->fieldDiagnostics;
+    session.beginTick(fixture.game);
+    auto clone=session.reserveCapture(0,0);
+    REQUIRE(clone);CHECK(clone!=stable);CHECK_FALSE(stable->enabled);
+    CHECK_FALSE(session.reserveCapture(0,0));
+    fixture.game.stepCounter=8;session.beginTick(fixture.game);
+    CHECK(clone->tick==0);CHECK(clone->enabled);
+    AIMaximaPlacement::WorldState state;state.reset(fixture.game.map.getW(),fixture.game.map.getH());state.tick=23;
+    state.tiles[0].foodOpportunity=std::numeric_limits<std::uint32_t>::max();
+    clone->capture(state);REQUIRE(clone->captured);CHECK_FALSE(stable->captured);
+    clone->fields[0].values[0]=std::numeric_limits<std::int64_t>::min();
+    clone->fields[1].values[0]=std::numeric_limits<std::int64_t>::max();
+    auto* backend=new GAGCore::MemoryStreamBackend;
+    GAGCore::BinaryOutputStream out(backend);clone->save(&out);out.flush();
+    const auto bytes=backend->takeContents();
+    GAGCore::BinaryInputStream in(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));in.seekFromStart(0);
+    GameDiagnostics::FieldSink restored;REQUIRE(restored.load(&in));
+    CHECK(restored.tick==0);CHECK(restored.nextTick==10);CHECK(restored.plannerTick==23);
+    CHECK(restored.fields[0].values[0]==std::numeric_limits<std::int64_t>::min());
+    CHECK(restored.fields[1].values[0]==std::numeric_limits<std::int64_t>::max());
+    CHECK(restored.fields[2].values[0]==4294967295LL);
+    {
+        const size_t fieldBytes=size_t(fixture.game.map.getW())*fixture.game.map.getH()*5*sizeof(std::int64_t);
+        GameDiagnostics::Session resumed(fixture.game,(glob2test::artifactDir()/"adopt-private").string(),10,false,2*fieldBytes);
+        REQUIRE(resumed.adoptCapture(restored));
+        CHECK(resumed.adoptCapture(restored)); // idempotent setup registration
+        auto another=restored;another.tick=1;
+        CHECK_FALSE(resumed.adoptCapture(another));
+        resumed.cancelCaptures(0);
+        CHECK(resumed.adoptCapture(another));
+        resumed.cancelCaptures(0);
+    }
+    maxima->fieldDiagnostics=stable;
+    session.publishCapture(restored);CHECK(stable->captured);CHECK(stable->tick==0);
+    restored.fields[0].values[0]=5;CHECK(stable->fields[0].values[0]!=5);
+    session.completeTick(fixture.game.captureReadBoundary({},true,session.observationRequirements(fixture.game.stepCounter)));REQUIRE(session.pending());session.drain();
+    fixture.game.stepCounter=9;session.beginTick(fixture.game);CHECK_FALSE(session.reserveCapture(0,9));
+    fixture.game.stepCounter=10;session.beginTick(fixture.game);CHECK(session.reserveCapture(0,10)!=nullptr);
+    CHECK(maxima->fieldDiagnostics==stable);
+    // Declared counts cannot bypass the bounded field layout on reload.
+    restored.fields[0].width=1;
+    auto* invalidBackend=new GAGCore::MemoryStreamBackend;
+    GAGCore::BinaryOutputStream bad(invalidBackend);restored.save(&bad);bad.flush();
+    const auto invalid=invalidBackend->takeContents();
+    GAGCore::BinaryInputStream malformed(new GAGCore::MemoryStreamBackend(invalid.data(),invalid.size()));malformed.seekFromStart(0);
+    CHECK_FALSE(restored.load(&malformed));
+}
+TEST_CASE("pending diagnostic output does not block world advancement or alias later worker output [artifacts]")
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.loadDefaultRace=true});
+    GameHeader header;header.setNumberOfPlayers(1);
+    header.getBasePlayer(0)=BasePlayer(0,"diagnostics",0,BasePlayer::playerTypeFromImplementationID(AI::MAXIMA));
+    fixture.game.setGameHeader(header);
+    const auto directory=glob2test::artifactDir()/"pending-publication";
+    GameDiagnostics::Session session(fixture.game,directory.string(),1,false);
+    AIMaximaPlacement::WorldState state;state.reset(fixture.game.map.getW(),fixture.game.map.getH());
+    session.beginTick(fixture.game);
+    const auto first=session.reserveCapture(0,0);REQUIRE(first);
+    state.tiles[0].foodOpportunity=7;first->capture(state);
+    fixture.game.stepCounter=1;session.beginTick(fixture.game);
+    const auto second=session.reserveCapture(0,1);REQUIRE(second);
+    state.tiles[0].foodOpportunity=19;second->capture(state);
+    session.publishCapture(*first);
+    session.completeTick(fixture.game.captureReadBoundary({},true,0));REQUIRE(session.pending());
+    session.publishCapture(*second);
+    fixture.game.syncStep(0);
+    CHECK(fixture.game.stepCounter==2);
+    session.beginTick(fixture.game);CHECK_FALSE(session.reserveCapture(0,2));
+    session.drain();CHECK_FALSE(session.pending());
+    session.completeTick(fixture.game.captureReadBoundary({},true,0));REQUIRE(session.pending());
+    session.drain();session.finish();
+    for (const auto [tick,expected]:{std::pair{0,7},std::pair{1,19}}) {
+        std::ifstream input(directory/(tick ? "tick-0000001.player0.team0" : "tick-0000000.player0.team0")/"foodOpportunity.field");
+        int w=0,h=0,value=0;input>>w>>h>>value;
+        CHECK(w==fixture.game.map.getW());CHECK(h==fixture.game.map.getH());CHECK(value==expected);
+    }
+}
+TEST_CASE("diagnostic budget counts private captures across the delay horizon [artifacts]")
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.wDec=5,.hDec=5,.loadDefaultRace=true});
+    GameHeader header;header.setNumberOfPlayers(1);
+    header.getBasePlayer(0)=BasePlayer(0,"diagnostics",0,BasePlayer::playerTypeFromImplementationID(AI::MAXIMA));
+    fixture.game.setGameHeader(header);
+    const size_t bytes=32*32*5*sizeof(std::int64_t);
+    GameDiagnostics::Session session(fixture.game,(glob2test::artifactDir()/"bounded-private").string(),1,false,2*bytes);
+    session.beginTick(fixture.game);
+    auto first=session.reserveCapture(0,0);REQUIRE(first);
+    // An interval shorter than the eight-tick scheduling horizon cannot admit
+    // another full field allocation while the first private output is held.
+    fixture.game.stepCounter=1;session.beginTick(fixture.game);
+    CHECK_FALSE(session.reserveCapture(0,1));
+    session.completeTick(fixture.game.captureReadBoundary({},true,session.observationRequirements(fixture.game.stepCounter)));REQUIRE(session.pending());session.drain();
+    session.publishCapture(*first);first.reset(); // an uncaptured invocation releases its reservation
+    fixture.game.stepCounter=2;session.beginTick(fixture.game);
+    auto second=session.reserveCapture(0,2);REQUIRE(second);
+    second.reset(); // cancellation joins the stream before discarding its output
+    session.cancelCaptures(0);
+    fixture.game.stepCounter=3;session.beginTick(fixture.game);
+    CHECK(session.reserveCapture(0,3)!=nullptr);
+}
 TEST_CASE("controllers sharing a team publish distinct complete captures and recover after failures [artifacts]")
 {
 	glob2test::HeadlessGlobals globals;
@@ -63,7 +181,7 @@ TEST_CASE("controllers sharing a team publish distinct complete captures and rec
 			auto* maxima=dynamic_cast<AIMaxima::Maxima*>(world.game.players[p]->ai->aiImplementation);
 			REQUIRE(maxima);REQUIRE(maxima->fieldDiagnostics);maxima->fieldDiagnostics->capture(state);
 		}
-		session.completeTick(world.game);REQUIRE(session.pending());session.drain();CHECK_FALSE(session.pending());
+		session.completeTick(world.game.captureReadBoundary({},true,session.observationRequirements(world.game.stepCounter)));REQUIRE(session.pending());session.drain();CHECK_FALSE(session.pending());
 	};
 	capture();CHECK(std::filesystem::is_regular_file(path/"diagnostics"));
 	std::filesystem::remove(path/"diagnostics");world.game.stepCounter=10;capture();session.finish();
@@ -74,7 +192,7 @@ TEST_CASE("controllers sharing a team publish distinct complete captures and rec
 	// A smaller injected budget exercises the same production admission path.
 	GameDiagnostics::Session limited(world.game,(path/"limited").string(),10,false,1024);
 	world.game.stepCounter=20;
-	limited.beginTick(world.game);limited.completeTick(world.game);REQUIRE(limited.pending());limited.drain();limited.finish();
+	limited.beginTick(world.game);limited.completeTick(world.game.captureReadBoundary({},true,limited.observationRequirements(world.game.stepCounter)));REQUIRE(limited.pending());limited.drain();limited.finish();
 	std::ifstream final(path/"limited/summary.json");final>>status;CHECK(status["skipped"]==2);
 }
 TEST_CASE("capped scene export survives repeated graphics lifetimes and write failures [artifacts]")
@@ -84,9 +202,9 @@ TEST_CASE("capped scene export survives repeated graphics lifetimes and write fa
 		glob2test::HeadlessGlobals globals;
 		glob2test::HeadlessGame world({.wDec=5,.hDec=4,.teams=2,.discovered=true,.loadDefaultRace=true});
 		REQUIRE(world.addBuilding("inn",4,4)); REQUIRE(world.addUnit(WORKER,12,8));
-		world.game.map.setResource(18,10,WHEAT,1);
-		Scene scene; SceneRequest request; request.includePanels=false;
-		extractScene(world.game,request,scene);
+		world.game.map.setResourceByIndex(18,10,WHEAT,1);
+		PresentationFrame scene; SceneRequest request; request.includePanels=false;
+		SceneExtractor().prepare((world.game).captureReadBoundary({},true,SceneExtractor::requirements(request)), request, scene);
 		const auto checksum=world.game.checkSum();
 		const auto path=(glob2test::artifactDir()/("render-"+std::to_string(lifetime)+".png")).string();
 		MapRender::toPng(scene,path,128);
@@ -108,7 +226,7 @@ TEST_CASE("portrait exports cover the whole map after dimension rounding [artifa
 {
 	glob2test::HeadlessGlobals globals;
 	glob2test::HeadlessGame world({.wDec=4,.hDec=6,.teams=1,.discovered=true,.loadDefaultRace=true});
-	Scene scene;SceneRequest request;request.includePanels=false;extractScene(world.game,request,scene);
+	PresentationFrame scene;SceneRequest request;request.includePanels=false;SceneExtractor().prepare((world.game).captureReadBoundary({},true,SceneExtractor::requirements(request)), request, scene);
 	const auto path=(glob2test::artifactDir()/"portrait.png").string();
 	MapRender::toPng(scene,path,9);
 	SDL_Surface* image=IMG_Load(path.c_str());REQUIRE(image);
@@ -140,4 +258,167 @@ TEST_CASE("offscreen pass restores transformed drawing after exceptions [display
 		SDL_DestroySurface(target);
 	}
 }
+}
+
+namespace
+{
+struct DatasetFixtureReader
+{
+    std::string bytes;
+    size_t cursor=0;
+    Uint32 number(unsigned width)
+    {
+        REQUIRE(cursor+width<=bytes.size());
+        Uint32 value=0;
+        for(unsigned i=0;i<width;++i)value|=Uint32(static_cast<unsigned char>(bytes[cursor++]))<<(8*i);
+        return value;
+    }
+    std::string text(size_t count)
+    {
+        REQUIRE(cursor+count<=bytes.size());
+        const auto result=bytes.substr(cursor,count);cursor+=count;return result;
+    }
+};
+}
+
+TEST_SUITE("DatasetWriter")
+{
+TEST_CASE("GDS2 embeds the catalog, projects unique model counts and preserves wide concrete spatial IDs [artifacts]")
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.teams=2,.header=true});
+    auto snapshot=nlohmann::json::parse(world.game.buildingsTypes.snapshotJson());
+    auto prototype=snapshot["variants"][world.game.buildingsTypes.getFinishedTypeNum("stonewall")];
+    prototype["previous"]="";prototype["next"]="";
+    prototype["semantics"]["repairable"]=false;
+    prototype["semantics"]["placeable"]=true;
+    prototype["semantics"]["instantPlacement"]=true;
+    while(snapshot["variants"].size()<=300)
+    {
+        const auto id=snapshot["variants"].size();auto variant=prototype;
+        variant["id"]=id;variant["key"]="dataset.variant."+std::to_string(id);
+        variant["properties"]["type"]="dataset-"+std::to_string(id);
+        snapshot["variants"].push_back(variant);
+    }
+    world.game.buildingsTypes.loadSnapshotJson(snapshot.dump());world.game.configureBuildingCatalog();
+    auto* own=world.game.addBuilding(4,4,300,0,0,0);REQUIRE(own);
+    world.game.map.setBuilding(4,4,1,1,own->gid);
+    auto* hidden=world.game.addBuilding(8,8,299,1,0,0);REQUIRE(hidden);
+    world.game.map.setBuilding(8,8,1,1,hidden->gid);
+    auto* stat=world.team->stats.getLatestStat();
+    stat->buildingCountByVariant.assign(world.game.buildingsTypes.size(),0);
+    stat->buildingCountByVariant[300]=1;
+    stat->numberBuildingPerType[0]=99; // legacy metadata must not leak into model counts
+    const auto path=(glob2test::artifactDir()/"catalog.dataset").string();
+    DatasetWriter writer;REQUIRE(writer.open(path));
+    OrderModifyBuilding order(own->gid,0);order.sender=0;
+    writer.writeRecord(42,order,world.game);writer.close();
+    std::ifstream in(path,std::ios::binary);
+    DatasetFixtureReader file{std::string(std::istreambuf_iterator<char>(in),{})};
+    CHECK(file.text(4)=="GDS2");CHECK(file.number(4)==1);
+    const auto metadata=nlohmann::json::parse(file.text(file.number(4)));
+    CHECK(metadata["buildingCatalog"]["hash"]==world.game.buildingsTypes.fingerprint());
+    CHECK(metadata["buildingCatalog"]["snapshot"]==nlohmann::json::parse(world.game.buildingsTypes.snapshotJson()));
+    CHECK(metadata["modelChannels"].size()==301);
+    CHECK(file.number(4)==42);CHECK(file.number(1)==0);CHECK(file.number(1)==order.getOrderType());
+    DatasetFixtureReader state{file.text(file.number(4))};
+    CHECK(state.number(4)==1);state.number(4);state.number(4);
+    for(int i=0;i<MaterialSlotCount+NB_UNIT_TYPE;++i)state.number(4);
+    for(int i=0;i<ModelBuildingProjection::Count;++i)
+        CHECK(state.number(4)==(i==ModelBuildingProjection::PassiveGround ? 1u : 0u));
+    const auto width=state.number(4),height=state.number(4);
+    CHECK(width==32);CHECK(height==32);
+    for(unsigned y=0;y<height;++y)for(unsigned x=0;x<width;++x)
+    {
+        for(int i=0;i<4;++i)state.number(1);
+        const auto mine=state.number(2),enemy=state.number(2);state.number(1);
+        CHECK(mine==(x==4 && y==4 ? 301u : 0u));
+        CHECK(enemy==0); // undiscovered enemy remains private
+    }
+    CHECK(state.cursor==state.bytes.size());
+    CHECK(file.number(4)==unsigned(order.getDataLength()));
+    CHECK(file.text(order.getDataLength())==std::string(reinterpret_cast<const char*>(order.getData()),order.getDataLength()));
+    CHECK(file.cursor==file.bytes.size());
+}
+
+TEST_CASE("reader migration distinguishes the retained GDS1 cell layout")
+{
+    // A complete one-record old file: the metadata-less header and two
+    // one-byte family values must retain their original meaning.
+    const auto u32=[](std::string& out,Uint32 n) {for(int i=0;i<4;++i)out+=char(n>>(8*i));};
+    std::string state;u32(state,1);
+    for(int i=0;i<2+MaterialSlotCount+NB_UNIT_TYPE+13;++i)u32(state,0);
+    u32(state,1);u32(state,1);
+    const unsigned char cell[]={2,5,1,0,13,6,2};
+    state.append(reinterpret_cast<const char*>(cell),sizeof(cell));
+    std::string bytes="GDS1";u32(bytes,1);u32(bytes,42);
+    bytes+=char(0);bytes+=char(ORDER_MODIFY_BUILDING);u32(bytes,state.size());
+    bytes+=state;u32(bytes,0);
+    DatasetFixtureReader old{bytes};
+    CHECK(old.text(4)=="GDS1");CHECK(old.number(4)==1);
+    CHECK(old.number(4)==42);CHECK(old.number(1)==0);CHECK(old.number(1)==ORDER_MODIFY_BUILDING);
+    DatasetFixtureReader observation{old.text(old.number(4))};
+    CHECK(observation.number(4)==1);
+    for(int i=0;i<2+MaterialSlotCount+NB_UNIT_TYPE+13;++i)observation.number(4);
+    CHECK(observation.number(4)==1);CHECK(observation.number(4)==1);
+    for(int i=0;i<4;++i)observation.number(1);
+    CHECK(observation.number(1)==13);CHECK(observation.number(1)==6);CHECK(observation.number(1)==2);
+    CHECK(observation.cursor==observation.bytes.size());
+    CHECK(old.number(4)==0);CHECK(old.cursor==old.bytes.size());
+}
+
+TEST_CASE("per-game metric bands retain labels and count every finished ground variant exactly once")
+{
+    BuildingsTypes catalog;catalog.initLegacy();
+    auto* type=catalog.get(catalog.getFinishedTypeNum("inn"));
+    type->presentation.displayName="Combined services";type->shortTypeNum=500;
+    const int inn=catalog.getFinishedTypeNum("inn");
+    auto metrics=Stats::catalogForBuildings(catalog);
+    const auto& buildings=metrics[Stats::findMetric("buildings")];
+    GameplayMeasurements sample;sample.variants.resize(catalog.size());sample.variants[inn].count=4;
+    double total=0;bool label=false;
+    for(const auto& band:buildings.bands) {total+=band.value(sample);label|=band.labelKey.find("Combined services")!=std::string::npos;}
+    CHECK(total==4);CHECK(label);
+    const auto captured=buildings.bands;
+    catalog.initLegacy(); // labels/closures own their values, no descriptor lifetime dependency
+    for(size_t i=0;i<captured.size();++i)CHECK(buildings.bands[i].labelKey==captured[i].labelKey);
+    size_t completed=0;for(size_t i=0;i<catalog.size();++i)
+        completed+=!catalog.get(i)->isBuildingSite && catalog.get(i)->semantics.occupiesGround;
+    CHECK(buildings.bands.size()==completed);
+}
+}
+
+TEST_CASE("Delayed diagnostic offers cover planner ticks without duplicate captures" * doctest::test_suite("GameDiagnostics"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.wDec=5,.hDec=5,.loadDefaultRace=true});
+    GameHeader header; header.setNumberOfPlayers(1);
+    header.getBasePlayer(0)=BasePlayer(0,"diagnostics",0,BasePlayer::playerTypeFromImplementationID(AI::MAXIMA));
+    fixture.game.setGameHeader(header);
+    GameDiagnostics::Session session(fixture.game,(glob2test::artifactDir()/"delayed-offers").string(),500,false);
+    std::vector<std::shared_ptr<GameDiagnostics::FieldSink>> offers;
+    for (unsigned tick=0;tick<8;++tick) {
+        fixture.game.stepCounter=tick;
+        session.beginTick(fixture.game);
+        offers.push_back(session.reserveCapture(0,tick));
+        REQUIRE(offers.back());
+    }
+    AIMaximaPlacement::WorldState state;
+    state.reset(32,32);
+    offers[3]->capture(state);
+    offers[4]->capture(state);
+    REQUIRE(offers[3]->captured);
+    REQUIRE(offers[4]->captured);
+    for (unsigned tick=0;tick<8;++tick) session.publishCapture(*offers[tick]);
+    auto* maxima=dynamic_cast<AIMaxima::Maxima*>(fixture.game.players[0]->ai->aiImplementation);
+    REQUIRE(maxima);
+    CHECK(maxima->fieldDiagnostics->tick==3);
+    CHECK(maxima->fieldDiagnostics->nextTick==503);
+    session.completeTick(fixture.game.captureReadBoundary({}, true, session.observationRequirements(fixture.game.stepCounter)));
+    REQUIRE(session.pending());
+    session.drain();
+    fixture.game.stepCounter=502; session.beginTick(fixture.game);
+    CHECK_FALSE(session.reserveCapture(0,502));
+    fixture.game.stepCounter=503; session.beginTick(fixture.game);
+    CHECK(session.reserveCapture(0,503)!=nullptr);
 }

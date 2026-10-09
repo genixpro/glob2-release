@@ -60,7 +60,7 @@ static constexpr int AI_NICOWAR_EXPLORER_ATTACK_INTERVAL_TICKS = 1000;
 static constexpr int AI_NICOWAR_EXPLORER_ATTACK_OFFSET         = 570;
 
 // ---------------------------------------------------------------------------
-// Resource tracker depth: AddResourceTracker(N, WHEAT, id) records the last
+// Resource tracker depth: AddMaterialTracker(N, WHEAT, id) records the last
 // N resource samples per tracked building. Used at every tracker-creation
 // site (initialization, every newly-ordered inn/swarm, and the per-level
 // inn assignment math which multiplies a wheat-trigger threshold by this
@@ -277,13 +277,6 @@ static constexpr int AI_NICOWAR_EXPLORER_GROUP_COHESION_TILES = 6;
 
 // Radius assigned (via ChangeFlagSize) to each explorer-attack flag.
 static constexpr int AI_NICOWAR_EXPLORER_ATTACK_FLAG_SIZE = 6;
-
-// Min explorer level required to participate in an explorer-attack flag.
-// [POSSIBLE BUG / preserved] Skill levels run 0..3; setting min level to 4
-// either locks the flag entirely or is silently capped at MAX_LEVEL=3 by the
-// engine. See bugs_surfaced_during_magic_number_audit.md M8 -- the literal
-// is preserved verbatim, only named.
-static constexpr int AI_NICOWAR_EXPLORER_ATTACK_MIN_LEVEL = 4;
 
 // ---------------------------------------------------------------------------
 // Farming (Farming.cpp::update_farming, ::update_fruit_flags).

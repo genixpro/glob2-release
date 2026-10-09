@@ -24,7 +24,7 @@ test(`WebAssembly produces a complete per-tick simulation trace (${variant}/${th
           FS.writeFile('/tmp/initial.game.gz', Uint8Array.from(atob('${fixture.toString('base64')}'), c => c.charCodeAt(0)));
         }],
         async onRuntimeInitialized() {
-          const code = await Module.start(['--nox', '/tmp/initial.game.gz', '1500', '1', '--ai-threads', '${threads}']);
+          const code = await Module.start(['--nox', '/tmp/initial.game.gz', '1500', '1', '--compute-threads', '${threads}']);
           if (code !== 0) throw new Error('Engine exited: ' + code);
           // Avoid millions of individually serialized Playwright values.
           // Chunk the conversion so large traces do not overflow the call stack.
@@ -60,40 +60,41 @@ test(`WebAssembly produces a complete per-tick simulation trace (${variant}/${th
 // The committed turn-protocol match record, verified by the WebAssembly engine
 // exactly as the native lanes verify it (test/run-browser-determinism.py). The
 // comparison job requires every platform's per-tick trace to be identical.
-test('WebAssembly verifies the committed match record', async ({page}, info) => {
+for (const variant of ['serial','threaded']) {
+test(`WebAssembly verifies the committed match record (${variant})`, async ({page}, info) => {
   test.setTimeout(300000);
   const root = path.resolve(__dirname, '../..');
   const record = fs.readFileSync(path.join(root, 'test/fixtures/multiplayer/FourSquares1.g2mr'));
   const map = fs.readFileSync(path.join(root, 'maps/FourSquares1.map.gz'));
-  await page.route('**/verify-match.html', route => route.fulfill({
-    contentType: 'text/html',
-    body: `<!doctype html><canvas id="canvas"></canvas><script>
+  await openRuntimeHost(page, `<!doctype html><canvas id="canvas"></canvas><script>
       window.engineLog = [];
       var Module = {
         noInitialRun: true,
         canvas: document.getElementById('canvas'),
+        locateFile:name=>name.endsWith('.data')?'/'+name:'/${variant==='threaded'?'threaded/':''}'+name,
         print: message => engineLog.push(String(message)),
         printErr: message => engineLog.push(String(message)),
         preRun: [function() {
           FS.writeFile('/tmp/match.g2mr', Uint8Array.from(atob('${record.toString('base64')}'), c => c.charCodeAt(0)));
           FS.writeFile('/tmp/FourSquares1.map.gz', Uint8Array.from(atob('${map.toString('base64')}'), c => c.charCodeAt(0)));
         }],
-        onRuntimeInitialized() {
-          window.verifyExit = Module.callMain(['--verify-match', '/tmp/match.g2mr', '--map', '/tmp/FourSquares1.map.gz', '--out', '/tmp/verify']);
+        async onRuntimeInitialized() {
+          window.verifyThreaded = typeof SharedArrayBuffer !== 'undefined' && HEAP8.buffer instanceof SharedArrayBuffer;
+          window.verifyExit = await Module.start(['--verify-match', '/tmp/match.g2mr', '--map', '/tmp/FourSquares1.map.gz', '--out', '/tmp/verify']);
           window.verifyTrace = FS.readFile('/tmp/verify/checksums.txt', {encoding: 'utf8'});
           window.verifyVerdict = FS.readFile('/tmp/verify/verdict.json', {encoding: 'utf8'});
         }
       };
-    </script><script src="/index.js"></script>`,
-  }));
-  await page.goto('/verify-match.html');
+    </script><script src="/${variant==='threaded'?'threaded/':''}index.js"></script>`);
   await page.waitForFunction(() => typeof window.verifyTrace === 'string', null, {timeout: 280000});
+  expect(await page.evaluate(() => window.verifyExit)).toBe(0);
+  expect(await page.evaluate(() => window.verifyThreaded)).toBe(variant==='threaded');
   const trace = await page.evaluate(() => window.verifyTrace);
   const verdict = JSON.parse(await page.evaluate(() => window.verifyVerdict));
   expect(trace.split('\n').length).toBeGreaterThan(600);
   expect(verdict.verdict).toBe('verified');
   expect(trace).toBe(fs.readFileSync(path.join(root, 'test/fixtures/multiplayer/FourSquares1.verify-trace.txt'), 'utf8').replace(/\r\n/g, '\n'));
-  const output = path.join(root, 'artifacts/browser-determinism/wasm');
+  const output = path.join(root, 'artifacts/browser-determinism/wasm', variant==='serial'?'':'verify-threaded');
   fs.mkdirSync(output, {recursive: true});
   fs.writeFileSync(path.join(output, 'verify-match.checksums.txt'), trace);
   fs.writeFileSync(path.join(output, 'verify-match.verdict.json'), JSON.stringify(verdict) + '\n');
@@ -101,6 +102,8 @@ test('WebAssembly verifies the committed match record', async ({page}, info) => 
   fs.mkdirSync(info.outputDir, {recursive: true});
   fs.writeFileSync(info.outputPath('verify-match.checksums.txt'), trace);
 });
+
+}
 
 // The same production-runtime cases and realistic engine observations used by
 // desktop and mobile harnesses. Golden comparisons occur inside C++, not in a
@@ -201,4 +204,228 @@ test(`WebAssembly executes the shared scripting corpus (${variant})`, async ({pa
   expect(Object.keys(result.files).some(name=>name.endsWith('realistic-economy-3.value'))).toBeTruthy();
 });
 
+}
+
+// Markets V2 uses the native cases and frozen simulation traces on both Wasm builds.
+for (const variant of ['serial', 'threaded']) {
+  test(`WebAssembly preserves Markets V2 off/on traces (${variant})`, async ({page}, info) => {
+    test.setTimeout(300000);
+    const root = path.resolve(__dirname, '../..');
+    const output = path.join(root, 'artifacts/browser-determinism/markets-v2', variant, info.project.name);
+    fs.rmSync(output, {recursive:true, force:true});
+    fs.mkdirSync(output, {recursive:true});
+    const progress = [];
+    page.on('console', message => { progress.push(message.text());
+      fs.appendFileSync(path.join(output, 'progress.log'), message.text() + '\n'); });
+    await openRuntimeHost(page, `<!doctype html><canvas id="canvas"></canvas><script>
+      window.marketExit=null;
+      var Module={noInitialRun:true,canvas:document.getElementById('canvas'),
+        locateFile:name=>name.endsWith('.data')?'/'+name:'/${variant==='threaded'?'threaded/':''}'+name,
+        print:m=>console.log(String(m)),printErr:m=>console.error(String(m)),
+        preRun:[()=>{FS.mkdirTree('/evidence/profile');
+          ENV.GLOB2_TEST_SOURCE_ROOT='/';ENV.GLOB2_USER_DATA_DIR='/evidence/profile';
+          ENV.GLOB2_TEST_ARTIFACTS_ROOT='/evidence/cases';}],
+        async onRuntimeInitialized(){
+          try {window.marketExit=(await Module.start(['--test-suite=MarketsV2',
+            '--test-case-exclude=*display*,*benchmark*','--reporters=junit','--out=/evidence/tests.xml']))??0;}
+          catch(error){window.marketError=String(error);}
+          const files={};
+          function collect(directory){for(const name of FS.readdir(directory)){
+            if(name==='.'||name==='..'||name==='profile')continue;
+            const file=directory+'/'+name;
+            if(FS.isDir(FS.stat(file).mode)){collect(file);continue;}
+            // Native evidence retains full saves; export complete traces and executed-build proof here.
+            if(!name.endsWith('.xml')&&!name.endsWith('.json')&&name!=='checksums.txt')continue;
+            files[file.substring('/evidence/'.length)]=FS.readFile(file,{encoding:'utf8'});
+          }}
+          collect('/evidence');window.marketFiles=files;window.marketDone=true;
+        }};
+    </script><script src="/${variant==='threaded'?'threaded/':''}script-tests.js"></script>`);
+    let waitError;
+    try {await page.waitForFunction(()=>window.marketDone===true, null, {timeout:280000});}
+    catch(error){waitError=error;}
+    fs.writeFileSync(path.join(output, 'run.log'), progress.join('\n'));
+    if(waitError)throw waitError;
+    const result=await page.evaluate(()=>({exit:window.marketExit,error:window.marketError,files:window.marketFiles}));
+    for(const [relative, contents] of Object.entries(result.files)){
+      const destination=path.join(output,relative);
+      fs.mkdirSync(path.dirname(destination),{recursive:true});fs.writeFileSync(destination,contents);
+    }
+    const source=JSON.parse(require('node:child_process').execFileSync('python3',
+      [path.join(root,'test/build_provenance.py')],{cwd:root,encoding:'utf8'}));
+    const producer=JSON.parse(result.files['cases/build-provenance.json']);
+    for(const key of ['revision','dirty','sourceTreeSha256'])expect(producer[key]).toEqual(source[key]);
+    fs.writeFileSync(path.join(output,'manifest.json'),JSON.stringify({source,producer,
+      variant,browser:info.project.name,browserVersion:page.context().browser().version(),
+      exit:result.exit,error:result.error,files:Object.keys(result.files)},null,2)+'\n');
+    expect(result.error).toBeUndefined();expect(result.exit).toBe(0);
+    expect(result.files['tests.xml']).toMatch(/failures="0"/);
+    expect(result.files['tests.xml']).toMatch(/errors="0"/);
+    expect(result.files['tests.xml']).toContain('disabled fruit deliveries have a stable per-tick trace and save continuation');
+    expect(result.files['tests.xml']).toContain('enabled supply networks repeat deterministically');
+    const traces=Object.entries(result.files).filter(([file])=>file.endsWith('/checksums.txt'));
+    expect(traces.length).toBe(2);
+    for(const [,trace] of traces)expect(trace.trim().split('\n').length).toBe(3000);
+    fs.writeFileSync(info.outputPath('markets-v2-tests.xml'),result.files['tests.xml']);
+  });
+}
+
+for (const variant of ['serial', 'threaded']) {
+  test(`WebAssembly preserves custom building compositions (${variant})`, async ({page}, info) => {
+    test.setTimeout(300000);
+    const output=path.resolve(__dirname,'../../artifacts/browser-determinism/buildings',variant,info.project.name);
+    fs.mkdirSync(output,{recursive:true});
+    const progress=[];
+    page.on('console',message=>progress.push(message.text()));
+    await openRuntimeHost(page, `<!doctype html><canvas id="canvas"></canvas><script>
+      var Module={noInitialRun:true,canvas:document.getElementById('canvas'),
+        locateFile:name=>name.endsWith('.data')?'/'+name:'/${variant==='threaded'?'threaded/':''}'+name,
+        print:m=>console.log(String(m)),printErr:m=>console.error(String(m)),
+        preRun:[()=>{FS.mkdirTree('/evidence/profile');ENV.GLOB2_TEST_SOURCE_ROOT='/';
+          ENV.GLOB2_USER_DATA_DIR='/evidence/profile';ENV.GLOB2_TEST_ARTIFACTS_ROOT='/evidence/cases';}],
+        async onRuntimeInitialized(){
+          try {window.result={exit:(await Module.start([
+            '--test-suite=BuildingCatalog,BuildingCatalogFixtures,BuildingServices,BuildingProductionCombat,AICustomCatalog',
+            '--test-case-exclude=*display*,*benchmark*','--reporters=junit','--out=/evidence/tests.xml']))??0};}
+          catch(error){window.result={error:String(error)};}
+          window.result.xml=FS.readFile('/evidence/tests.xml',{encoding:'utf8'});
+          window.result.producer=FS.readFile('/evidence/cases/build-provenance.json',{encoding:'utf8'});
+          window.done=true;
+        }};
+      </script><script src="/${variant==='threaded'?'threaded/':''}script-tests.js"></script>`);
+    try {await page.waitForFunction(()=>window.done===true,null,{timeout:280000});}
+    finally {fs.writeFileSync(path.join(output,'run.log'),progress.join('\n'));}
+    const result=await page.evaluate(()=>window.result);
+    fs.writeFileSync(path.join(output,'tests.xml'),result.xml);
+    fs.writeFileSync(path.join(output,'build-provenance.json'),result.producer);
+    const source=JSON.parse(require('node:child_process').execFileSync('python3',
+      [path.resolve(__dirname,'../../test/build_provenance.py')],{cwd:path.resolve(__dirname,'../..'),encoding:'utf8'}));
+    const producer=JSON.parse(result.producer);
+    for(const key of ['revision','dirty','sourceTreeSha256']) expect(producer[key]).toEqual(source[key]);
+    fs.writeFileSync(path.join(output,'manifest.json'),JSON.stringify({variant,
+      browser:info.project.name,browserVersion:page.context().browser().version(),exit:result.exit,error:result.error},null,2)+'\n');
+    expect(result.error).toBeUndefined(); expect(result.exit).toBe(0);
+    expect(result.xml).toMatch(/failures="0"/); expect(result.xml).toMatch(/errors="0"/);
+    expect(result.xml).toContain('retained seeded compositions preserve full simulation continuation');
+  });
+}
+
+// Pure registry contracts and frozen custom-resource simulations use the same
+// native source and committed per-tick/RNG trace in both Wasm runtimes. Catalog
+// poisoning cases require separate native processes and are deliberately absent.
+for (const variant of ['serial', 'threaded']) {
+  for (const selection of [
+    {name:'registry', suite:'ResourceRegistry', cases:'*'},
+    {name:'composition', suite:'RuntimeResources', cases:'frozen seeded resource compositions*'},
+  ]) {
+    test(`WebAssembly preserves runtime resource ${selection.name} contracts (${variant})`, async ({page}, info) => {
+      test.setTimeout(300000);
+      const root=path.resolve(__dirname,'../..');
+      const output=path.join(root,'artifacts/browser-determinism/resources',variant,info.project.name,selection.name);
+      fs.mkdirSync(output,{recursive:true});
+      const progress=[];
+      page.on('console',message=>progress.push(message.text()));
+      await openRuntimeHost(page, `<!doctype html><canvas id="canvas"></canvas><script>
+        var Module={noInitialRun:true,canvas:document.getElementById('canvas'),
+          locateFile:name=>name.endsWith('.data')?'/'+name:'/${variant==='threaded'?'threaded/':''}'+name,
+          print:m=>console.log(String(m)),printErr:m=>console.error(String(m)),
+          preRun:[()=>{FS.mkdirTree('/evidence/profile');ENV.GLOB2_TEST_SOURCE_ROOT='/';
+            ENV.GLOB2_USER_DATA_DIR='/evidence/profile';ENV.GLOB2_TEST_ARTIFACTS_ROOT='/evidence/cases';}],
+          async onRuntimeInitialized(){
+            const result={files:{},threaded:typeof SharedArrayBuffer !== 'undefined' && HEAP8.buffer instanceof SharedArrayBuffer};
+            try {result.exit=(await Module.start(['--test-suite=${selection.suite}',
+              '--test-case=${selection.cases}','--reporters=junit','--out=/evidence/tests.xml']))??0;}
+            catch(error){result.error=String(error);}
+            function collect(directory){for(const name of FS.readdir(directory)){
+              if(name==='.'||name==='..'||name==='profile')continue;
+              const file=directory+'/'+name;
+              if(FS.isDir(FS.stat(file).mode)){collect(file);continue;}
+              if(name.endsWith('.xml')||name.endsWith('.json')||name.endsWith('.trace'))
+                result.files[file.substring('/evidence/'.length)]=FS.readFile(file,{encoding:'utf8'});
+            }}
+            collect('/evidence');window.resourceResult=result;
+          }};
+      </script><script src="/${variant==='threaded'?'threaded/':''}script-tests.js"></script>`);
+      try {await page.waitForFunction(()=>window.resourceResult!==undefined,null,{timeout:280000});}
+      finally {fs.writeFileSync(path.join(output,'run.log'),progress.join('\n'));}
+      const result=await page.evaluate(()=>window.resourceResult);
+      for(const [relative,contents] of Object.entries(result.files)){
+        const destination=path.join(output,relative);
+        fs.mkdirSync(path.dirname(destination),{recursive:true});fs.writeFileSync(destination,contents);
+      }
+      const source=JSON.parse(require('node:child_process').execFileSync('python3',
+        [path.join(root,'test/build_provenance.py')],{cwd:root,encoding:'utf8'}));
+      const producer=JSON.parse(result.files['cases/build-provenance.json']);
+      for(const key of ['revision','dirty','sourceTreeSha256'])expect(producer[key]).toEqual(source[key]);
+      fs.writeFileSync(path.join(output,'manifest.json'),JSON.stringify({source,producer,variant,
+        selection,browser:info.project.name,browserVersion:page.context().browser().version(),
+        exit:result.exit,error:result.error,files:Object.keys(result.files)},null,2)+'\n');
+      expect(result.error).toBeUndefined();expect(result.exit).toBe(0);
+      expect(result.threaded).toBe(variant==='threaded');
+      expect(result.files['tests.xml']).toMatch(/failures="0"/);
+      expect(result.files['tests.xml']).toMatch(/errors="0"/);
+      if(selection.name==='composition'){
+        const traces=Object.entries(result.files).filter(([name])=>name.endsWith('/seeded-compositions.trace'));
+        expect(traces).toHaveLength(1);
+        const committed=fs.readFileSync(path.join(root,'test/fixtures/resources/seeded-compositions.trace'),'utf8');
+        expect(traces[0][1].replace(/\r\n/g,'\n')).toEqual(committed.replace(/\r\n/g,'\n'));
+        expect(traces[0][1].trim().split('\n')).toHaveLength(150);
+      } else expect(result.files['tests.xml']).toContain('stock catalog separates map identities');
+    });
+  }
+}
+
+for (const variant of ['serial', 'threaded']) {
+  test(`WebAssembly preserves shared generator worlds and save continuation (${variant})`, async ({page}, info) => {
+    test.setTimeout(300000);
+    const root=path.resolve(__dirname,'../..');
+    const output=path.join(root,'artifacts/browser-determinism/shared-generators',variant,info.project.name);
+    fs.rmSync(output,{recursive:true,force:true});
+    fs.mkdirSync(output,{recursive:true});
+    const progress=[];page.on('console',m=>progress.push(m.text()));
+    await openRuntimeHost(page, `<!doctype html><canvas id="canvas"></canvas><script>
+      var Module={noInitialRun:true,canvas:document.getElementById('canvas'),
+        locateFile:name=>name.endsWith('.data')?'/'+name:'/${variant==='threaded'?'threaded/':''}'+name,
+        print:m=>console.log(String(m)),printErr:m=>console.error(String(m)),
+        preRun:[()=>{FS.mkdirTree('/evidence/profile');ENV.GLOB2_TEST_SOURCE_ROOT='/';
+          ENV.GLOB2_USER_DATA_DIR='/evidence/profile';ENV.GLOB2_TEST_ARTIFACTS_ROOT='/evidence/cases';}],
+        async onRuntimeInitialized(){
+          try {window.result={exit:(await Module.start(['--test-suite=ScriptGenerator',
+            '--test-case=*Shared generated worlds*','--reporters=junit','--out=/evidence/tests.xml']))??0};}
+          catch(error){window.result={error:String(error)};}
+          const files={};function collect(dir){for(const name of FS.readdir(dir)){
+            if(name==='.'||name==='..'||name==='profile')continue;const file=dir+'/'+name;
+            if(FS.isDir(FS.stat(file).mode))collect(file);
+            else if(name.endsWith('.trace')||name.endsWith('.xml')||name==='build-provenance.json')files[file.slice('/evidence/'.length)]=FS.readFile(file,{encoding:'utf8'});
+          }}collect('/evidence');window.result.files=files;window.done=true;
+        }};
+    </script><script src="/${variant==='threaded'?'threaded/':''}script-tests.js"></script>`);
+    try {await page.waitForFunction(()=>window.done===true,null,{timeout:280000});}
+    finally {fs.writeFileSync(path.join(output,'run.log'),progress.join('\n'));}
+    const result=await page.evaluate(()=>window.result);
+    for(const [relative,contents] of Object.entries(result.files)){
+      const target=path.join(output,relative);fs.mkdirSync(path.dirname(target),{recursive:true});fs.writeFileSync(target,contents);
+    }
+    expect(result.error).toBeUndefined();expect(result.exit).toBe(0);
+    expect(result.files['tests.xml']).toMatch(/failures="0"/);
+    const traces=Object.entries(result.files).filter(([name])=>name.endsWith('shared-generators.trace'));
+    expect(traces).toHaveLength(1);
+    const native=path.join(root,'artifacts/generator-library/native-shared-generators.trace');
+    const expected=fs.readFileSync(path.join(root,'test/fixtures/generators/shared-generator-trace.sha256'),'utf8').trim();
+    expect(crypto.createHash('sha256').update(traces[0][1]).digest('hex')).toBe(expected);
+    if(fs.existsSync(native))expect(traces[0][1]).toBe(fs.readFileSync(native,'utf8'));
+    const source=JSON.parse(require('node:child_process').execFileSync('python3',
+      [path.join(root,'test/build_provenance.py')],{cwd:root,encoding:'utf8'}));
+    const build=JSON.parse(result.files['cases/build-provenance.json']);
+    const issues=['revision','dirty','sourceTreeSha256'].filter(key=>build[key]!==source[key]);
+    const packageRoot=path.join(root,'build/emscripten/client/release');
+    const binaryRoot=variant==='threaded'?path.join(packageRoot,'threaded'):packageRoot;
+    const hash=file=>crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+    fs.writeFileSync(path.join(output,'manifest.json'),JSON.stringify({...source,build,provenanceIssues:issues,
+      variant,browser:info.project.name,browserVersion:page.context().browser().version(),
+      binaries:Object.fromEntries(['script-tests.js','script-tests.wasm','script-tests.data']
+        .map(file=>[file,hash(path.join(file.endsWith('.data')?packageRoot:binaryRoot,file))])),
+      traceHash:crypto.createHash('sha256').update(traces[0][1]).digest('hex')},null,2)+'\n');
+    expect(issues).toEqual([]);
+  });
 }

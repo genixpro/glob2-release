@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "GenerationWork.h"
 // The area-grid toolkit the point-dispersion generators (Concrete islands, Isles, Contested
 // commons) and the older resource passes are built on: a grid of integer area numbers, points
 // as MapGeneratorPoint, and in-out vector arguments. New generators should design on the tile
@@ -15,7 +16,7 @@ class ListComparator
   public:
 	ListComparator(std::vector<int> &list) : list(list) {}
 
-	bool operator()(int lhs, int rhs) { return list[lhs] < list[rhs]; }
+	bool operator()(int lhs, int rhs) { return list.at(lhs) < list.at(rhs); }
 
 	std::vector<int> &list;
 };
@@ -45,7 +46,7 @@ int splitUpPoints(Map &map, GenerationContext &context, std::vector<int> &grid, 
 				  PointSearch search = PointSearch::Local, int maxPasses = 200);
 void splitUpArea(Map &map, GenerationContext &context, std::vector<int> &grid, int areaN,
 				 std::vector<MapGeneratorPoint> &points, std::vector<int> &weights,
-				 std::vector<int> &areaNumbers, bool grassOnly = false);
+				 std::vector<int> &areaNumbers, bool buildableOnly = false);
 void getAllPoints(Map &map, std::vector<int> &grid, int areaN,
 				  std::vector<MapGeneratorPoint> &points);
 void getAllOtherPoints(Map &map, std::vector<int> &grid, int areaN,

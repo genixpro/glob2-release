@@ -3,6 +3,8 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #pragma once
+#include "sim/EntityRef.h"
+#include <optional>
 
 #include <assert.h>
 
@@ -74,6 +76,14 @@ public:
 	
 	int sender; // sender player number, setby NetGame in getOrder() only
 	Uint32 gameCheckSum;
+	// Local engine transport metadata. Replay/network payloads still encode
+	// actual orders only; independently generated AI streams tag their outputs.
+	// Local admission guard, stripped by the existing wire/replay serializers.
+	Uint64 clientWorld = 0;
+	std::optional<BuildingRef> clientTarget;
+	Uint32 aiGeneration = 0;
+	Uint64 aiPollSequence = 0;
+	std::optional<BuildingRef> aiSelectedTarget;
 };
 
 
@@ -262,7 +272,7 @@ class OrderModifyExchange:public OrderModify
 {
 public:
 	OrderModifyExchange() = default;
-	OrderModifyExchange(Uint16 gid, Uint32 receiveResourceMask, Uint32 sendResourceMask);
+	OrderModifyExchange(Uint16 gid, Uint32 receiveMaterialMask, Uint32 sendMaterialMask);
 	virtual ~OrderModifyExchange(void) {}
 
 	//! See OrderModifyBuilding::deserialize.
@@ -274,8 +284,8 @@ public:
 	Uint8 getOrderType(void) { return ORDER_MODIFY_EXCHANGE; }
 
 	Uint16 gid;
-	Uint32 receiveResourceMask;
-	Uint32 sendResourceMask;
+	Uint32 receiveMaterialMask;
+	Uint32 sendMaterialMask;
 
 protected:
 	Uint8 data[10];
@@ -331,7 +341,7 @@ class OrderModifyClearingFlag:public OrderModify
 {
 public:
 	OrderModifyClearingFlag() = default;
-	OrderModifyClearingFlag(Uint16 gid, bool clearingResources[BASIC_COUNT]);
+	OrderModifyClearingFlag(Uint16 gid, bool clearingMaterials[MaterialCount]);
 	virtual ~OrderModifyClearingFlag(void);
 
 	//! See OrderModifyBuilding::deserialize.
@@ -339,11 +349,11 @@ public:
 
 	Uint8 *getData(void);
 	bool setData(const Uint8 *data, int dataLength, Uint32 versionMinor);
-	int getDataLength(void) { return 2+BASIC_COUNT; }
+	int getDataLength(void) { return 2+MaterialCount; }
 	Uint8 getOrderType(void) { return ORDER_MODIFY_CLEARING_FLAG; }
 
 	Uint16 gid;
-	bool clearingResources[BASIC_COUNT];
+	bool clearingMaterials[MaterialCount];
 
 protected:
 	Uint8 *data = nullptr;
@@ -353,7 +363,7 @@ class OrderModifyMinLevelToFlag:public OrderModify
 {
 public:
 	OrderModifyMinLevelToFlag() = default;
-	OrderModifyMinLevelToFlag(Uint16 gid, Uint16 minLevelToFlag);
+	OrderModifyMinLevelToFlag(Uint16 gid, Uint16 minLevelToFlag, Uint8 targetRole = 0);
 	virtual ~OrderModifyMinLevelToFlag(void);
 
 	//! See OrderModifyBuilding::deserialize.
@@ -361,14 +371,16 @@ public:
 
 	Uint8 *getData(void);
 	bool setData(const Uint8 *data, int dataLength, Uint32 versionMinor);
-	int getDataLength(void) { return 4; }
+	int getDataLength(void) { return 5; }
 	Uint8 getOrderType(void) { return ORDER_MODIFY_MIN_LEVEL_TO_FLAG; }
 
 	Uint16 gid;
 	Uint16 minLevelToFlag;
+	Uint8 targetRole = 0; // 0: warrior threshold, 1: explorer bombing, 2: worker qualification
+	bool legacyCombinedRole = false; // only imported pre-catalog orders
 
 protected:
-	Uint8 data[4];
+	Uint8 data[5];
 };
 
 class OrderMoveFlag:public OrderModify

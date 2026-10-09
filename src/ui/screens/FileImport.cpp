@@ -4,6 +4,8 @@
 #include "OrderMessages.h"
 #include "Order.h"
 #include "ReplayReader.h"
+#include "ReplayTelemetry.h"
+#include "FileFormatVersions.h"
 #include "Utilities.h"
 #include "Version.h"
 #include <BinaryStream.h>
@@ -42,11 +44,6 @@ bool validName(const std::string &name, const std::string &extension)
 		return false;
 	return true;
 }
-struct RestoreRng
-{
-	std::string previous = getSyncRandState();
-	~RestoreRng() { setSyncRandState(previous); }
-};
 } // namespace
 FileImport::FileImport(ApplicationHost::SelectedFile file, std::string extension, Persist persist,
 					   CooperativeSlice slice)
@@ -90,7 +87,6 @@ CooperativeTask FileImport::validate()
 	if (!std::equal(mapStart, mapStart + 4, "MapB"))
 		co_return false;
 	input.seekFromStart(0);
-	RestoreRng rng;
 	GameGUI gui(false);
 	if (!(co_await gui.loadTask(&input)))
 		co_return false;
@@ -119,19 +115,13 @@ CooperativeTask FileImport::validate()
 				break;
 			co_await CooperativeTask::checkpoint();
 		}
-		// ReplayWriter::write() appends a complete terminator to the live
-		// recording. Older recordings may already contain one, so accept any
-		// additional complete terminators while still rejecting trailing or
-		// truncated command data.
-		while (input.getPosition() < decoded.size())
+		// Current recordings end with the same bounded telemetry stream that
+		// playback reads after the order terminator. Validate it before accepting
+		// the import, including empty telemetry and truncated/corrupt footers.
+		if (minor >= FILE_FORMAT_VERSION_CUSTOM_AI)
 		{
-			if (input.readUint32("steps") != 0)
-				co_return false;
-			NetSendOrder message;
-			message.setDecodeVersionMinor(minor);
-			message.decodeData(&input);
-			if (message.getOrder()->getOrderType() != ORDER_NULL)
-				co_return false;
+			ReplayTelemetry::Stream telemetry;
+			telemetry.read(&input);
 		}
 	}
 	// The complete supported format must be consumed, including the replay

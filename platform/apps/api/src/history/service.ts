@@ -39,6 +39,7 @@ import {
   type WinRate,
 } from '@glob2/protocol';
 import {
+  currentCatalogRulesVersions,
   PROVISIONAL_SIGMA,
   STORED_MATCH_SETUP,
   STORED_VERIFY_VERDICT,
@@ -47,6 +48,7 @@ import {
   tryReadStored,
 } from '@glob2/play';
 import { hasRole } from '../auth/admin.ts';
+import { cursorTimeSql } from '../http/cursorTime.ts';
 import { apiError } from '../errors.ts';
 import { participantNetwork, reportTickRate } from './network.ts';
 import { ratingNoteText } from './ratingNotes.ts';
@@ -181,7 +183,8 @@ export class HistoryService {
     this.db = options.db;
     this.origin = options.origin;
     this.queueNames = options.queueNames;
-    this.currentSimVersions = options.currentSimVersions;
+    this.currentSimVersions = async () =>
+      currentCatalogRulesVersions(this.db, await options.currentSimVersions());
   }
 
   // ------------------------------------------------------- leaderboards
@@ -533,7 +536,10 @@ export class HistoryService {
   // ------------------------------------------------------------ matches
 
   private matchesQuery() {
-    return this.db.selectFrom('matches as m').selectAll('m');
+    return this.db
+      .selectFrom('matches as m')
+      .selectAll('m')
+      .select(cursorTimeSql(MATCH_TIME).as('cursorAt'));
   }
 
   private async page(
@@ -548,7 +554,7 @@ export class HistoryService {
       .orderBy(MATCH_TIME, 'desc')
       .orderBy('m.id', 'desc')
       .limit(limit + 1)
-      .execute()) as MatchRow[];
+      .execute()) as (MatchRow & { cursorAt: string })[];
     const page = rows.slice(0, limit);
     const last = page.at(-1);
     return {
@@ -556,7 +562,7 @@ export class HistoryService {
       ...(rows.length > limit && last
         ? {
             nextCursor: encodeCursor({
-              at: last.ended_at ?? last.started_at ?? last.created_at,
+              at: last.cursorAt,
               id: last.id,
             }),
           }

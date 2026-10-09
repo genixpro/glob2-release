@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <set>
+#include <webp/decode.h>
 #include <nlohmann/json.hpp>
 namespace Online {
 namespace {
@@ -13,11 +14,12 @@ constexpr std::size_t textureLimit=1024*1024,materialLimit=256*1024;
 const std::string directory="online/skins/";
 bool validImage(const std::string &bytes,const std::string &hash,std::size_t limit)
 {
-    // Only canonical-size (512x512) PNGs reach SDL_image. The decoder still
-    // validates CRCs and complete chunk structure; this bounds its allocation first.
-    const unsigned char header[]={137,80,78,71,13,10,26,10,0,0,0,13,73,72,68,82,0,0,2,0,0,0,2,0};
-    return bytes.size()>=33&&bytes.size()<=limit&&
-        std::memcmp(bytes.data(),header,sizeof(header))==0&&Sha256::hex(bytes)==hash;
+    // Bound allocation and authenticate the exact wire bytes before scheduling
+    // full preparation on the shared loader. Animated WebP is not a skin atlas.
+    WebPBitstreamFeatures info{};
+    return bytes.size() <= limit &&
+        WebPGetFeatures(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size(), &info) == VP8_STATUS_OK &&
+        info.width == 512 && info.height == 512 && !info.has_animation && Sha256::hex(bytes) == hash;
 }
 }
 struct SkinDownloads::Impl {
@@ -35,6 +37,7 @@ struct SkinDownloads::Impl {
     std::unique_ptr<HttpFetch::Fetch> keyRequest;
     std::vector<Entry> entries;
     std::vector<Ready> ready;
+    bool software=false;
     bool failed=false;
     bool refreshEnabled=true;
     std::int64_t nextRefresh=0;
@@ -54,6 +57,7 @@ struct SkinDownloads::Impl {
         // downloads cannot reinstall a team removed by a newer response.
         if(keyRequest || !std::all_of(entries.begin(),entries.end(),[](const auto &e){return e.finished;}))return;
         if(refreshDownloads) {
+            refreshDownloads->setSoftware(software);
             refreshDownloads->poll(now);
             for(auto &entry:refreshDownloads->takeReady())ready.push_back(std::move(entry));
             if(refreshDownloads->done())refreshDownloads.reset();
@@ -102,11 +106,11 @@ struct SkinDownloads::Impl {
     {
         auto names=storage.list("online/skins");
         std::vector<std::string> files;
-        for(const auto &name:names)if(name.size()==68&&name.substr(64)==".png"&&Sha256::isHexDigest(name.substr(0,64)))files.push_back(name);
+        for(const auto &name:names)if(name.size()==69&&name.substr(64)==".webp"&&Sha256::isHexDigest(name.substr(0,64)))files.push_back(name);
         std::sort(files.begin(),files.end());
         std::set<std::string> retained;
         for(const auto &entry:entries)if(entry.authorization)
-            if(const auto *skin=entry.authorization->skin()){retained.insert(skin->textureHash+".png");retained.insert(skin->materialHash+".png");}
+            if(const auto *skin=entry.authorization->skin()){retained.insert(skin->textureHash+".webp");retained.insert(skin->materialHash+".webp");}
         std::size_t count=files.size();
         for(const auto &file:files)if(count>64&&!retained.count(file)){storage.remove(directory+file);--count;}
     }
@@ -136,6 +140,9 @@ SkinDownloads::SkinDownloads(OnlineStorage &storage,std::string origin,std::stri
     } catch(const std::exception &){impl->failed=true;}
 }
 SkinDownloads::~SkinDownloads()=default;
+void SkinDownloads::setSoftware(bool value){impl->software=value;}
+OnlineStorage &SkinDownloads::storage(){return impl->storage;}
+SkinDownloads::FetchStarter SkinDownloads::fetchStarter()const{return impl->fetch;}
 const std::string &SkinDownloads::origin()const{return impl->origin;}
 const std::string &SkinDownloads::matchId()const{return impl->match;}
 void SkinDownloads::poll(std::int64_t now)
@@ -161,12 +168,13 @@ void SkinDownloads::poll(std::int64_t now)
         if(entry.authorization->state()==SkinAuthorization::State::Pending)continue;
         const auto *skin=entry.authorization->skin();
         if(!skin || now>=skin->expiresAt){cancel(entry);continue;}
+        if(p.software) { p.ready.push_back({*skin,{},{}});entry.finished=true;continue; }
         const std::array<std::string,2> hashes{skin->textureHash,skin->materialHash};
         const std::array<std::size_t,2> limits{textureLimit,materialLimit};
         const std::array<const char*,2> kinds{"/texture","/material"};
         for(std::size_t asset=0;asset<2&&!entry.finished;++asset){
             if(entry.verified[asset])continue;
-            const std::string path=directory+hashes[asset]+".png";
+            const std::string path=directory+hashes[asset]+".webp";
             auto &download=entry.downloads[asset];
             if(download){
                 const auto state=download->state();
@@ -184,14 +192,14 @@ void SkinDownloads::poll(std::int64_t now)
                     p.storage.remove(path);
                 }
                 if(active>=4)continue;
-                HttpFetch::Request request;request.url=p.origin+"/api/v1/skins/versions/"+skin->versionId+kinds[asset];
+                HttpFetch::Request request;request.url=p.origin+"/api/v1/skins/versions/"+skin->versionId+kinds[asset]+"?sha256="+hashes[asset];
                 request.responseLimit=limits[asset];request.timeout=std::chrono::seconds(15);
                 download=p.fetch(std::move(request));
                 if(download)++active;else{cancel(entry);break;}
             }
         }
         if(!entry.finished&&entry.verified[0]&&entry.verified[1]){
-            p.ready.push_back({*skin,p.storage.location(directory+hashes[0]+".png"),p.storage.location(directory+hashes[1]+".png")});
+            p.ready.push_back({*skin,p.storage.location(directory+hashes[0]+".webp"),p.storage.location(directory+hashes[1]+".webp")});
             entry.finished=true;
             if(entry.wrote){p.trim();p.storage.persist();}
         }

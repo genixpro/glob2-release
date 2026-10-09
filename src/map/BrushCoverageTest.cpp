@@ -8,6 +8,7 @@
 
 #include "Brush.h"
 #include "BrushCoverage.h"
+#include <set>
 
 TEST_SUITE("BrushCoverage")
 {
@@ -58,5 +59,16 @@ TEST_SUITE("BrushCoverage")
 		CHECK(BrushCoverage::cellAt(31.9, 32) == BrushCoverage::Cell(0, 1));
 		CHECK(BrushCoverage::cellAt(-0.5, 0) == BrushCoverage::Cell(-1, 0));
 		CHECK(BrushCoverage::cellAt(16, 16, 16) == BrushCoverage::Cell(1, 1));
+	}
+
+	TEST_CASE("a stamp is one centre of a stroke aligned to its origin")
+	{
+		for (unsigned figure = 0; figure < BrushTool::BRUSH_COUNT; ++figure)
+		{
+			CHECK(BrushCoverage::stamp(figure, {6, 6}, {6, 6}) == BrushCoverage::cells(figure, {{6, 6}}));
+			auto both = BrushCoverage::stamp(figure, {4, 4}, {4, 4});
+			both.merge(BrushCoverage::stamp(figure, {9, 5}, {4, 4}));
+			CHECK(both == BrushCoverage::cells(figure, {{4, 4}, {9, 5}}));
+		}
 	}
 }
