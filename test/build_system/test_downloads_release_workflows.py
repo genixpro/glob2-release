@@ -3,6 +3,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 import sys
 import tempfile
@@ -36,6 +37,114 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn('source-commit.txt)" = "$EXPECTED_COMMIT"',upload)
         self.assertIn('git rev-parse HEAD > artifacts/mac-app-store/source-commit.txt',build)
         self.assertIn('environment: mac-app-store',upload)
+
+    def test_mac_store_selects_commands_from_compiled_source_and_fails_closed(self):
+        workflow=(ROOT/'.github/workflows/mac-app-store.yml').read_text()
+        selector=workflow.split('          if test -f src/app/cli/CommandLine.h; then\n',1)[1].split('          # Installed tools',1)[0]
+        selector='if test -f src/app/cli/CommandLine.h; then\n'+selector
+        script='set -euo pipefail\n'+selector+'printf "%s\\n" "${catalog_args[*]}" "${generate_args[*]}"\n'
+        for version,expected in ((None,('--list-map-generators','--generate-map maze')),
+                                 (2,('map generators','map generate maze')),
+                                 (3,None)):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                if version is not None:
+                    header=Path(directory)/'src/app/cli/CommandLine.h'
+                    header.parent.mkdir(parents=True)
+                    header.write_text(f'inline constexpr int Version = {version};\n')
+                result=subprocess.run(['bash','-c',script],cwd=directory,text=True,capture_output=True)
+                if expected is None:
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertEqual(result.stdout,'')
+                else:
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(result.stdout.splitlines(),list(expected))
+
+    def test_gog_builds_and_stages_the_resolved_public_source(self):
+        text=(ROOT/'.github/workflows/gog-staging.yml').read_text()
+        for platform,next_job in (('windows','windows-smoke'),('linux','macos'),('macos','upload-staging')):
+            block=text.split('\n  '+platform+':',1)[1].split('\n  '+next_job+':',1)[0]
+            with self.subTest(platform=platform):
+                self.assertIn('repository: Globulation2/glob2',block)
+                self.assertIn('ref: ${{ needs.preflight.outputs.source_commit }}',block)
+                self.assertIn('working-directory: source',block)
+                self.assertIn('test "$(git rev-parse HEAD)" = "$EXPECTED_COMMIT"',block)
+                self.assertIn('../driver/tools/gog_release.py stage-'+platform+' --source-root "$PWD"',block)
+                self.assertIn('path: source/artifacts/gog/'+platform+'.tar.gz',block)
+        smoke=text.split('\n  windows-smoke:',1)[1].split('\n  linux:',1)[0]
+        self.assertIn('needs: [preflight, windows]',smoke)
+        self.assertIn('ref: ${{ needs.preflight.outputs.source_commit }}',smoke)
+        self.assertIn("default { throw 'Unsupported source CLI version' }",smoke)
+        self.assertIn("'1' { $repeatArgs = @('--nox', $save, '10', '1') }",smoke)
+        self.assertIn("'2' { $repeatArgs = @('game', 'repeat', $save, '--ticks', '10', '--runs', '1') }",smoke)
+        self.assertIn('& .\\glob2.exe @repeatArgs',smoke)
+        self.assertIn('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',smoke)
+
+    def test_gog_posix_repeat_selector_preserves_both_command_contracts(self):
+        text=(ROOT/'.github/workflows/gog-staging.yml').read_text()
+        for platform in ('linux','macos'):
+            block=text.split('\n  '+platform+':',1)[1]
+            selector='case "$CLI_VERSION" in'+block.split('case "$CLI_VERSION" in',1)[1].split('esac',1)[0]+'esac'
+            for version,expected in (('1',['--nox','SAVE','10','1']),
+                                     ('2',['game','repeat','SAVE','--ticks','10','--runs','1']),
+                                     ('3',None)):
+                with self.subTest(platform=platform,version=version), tempfile.TemporaryDirectory() as directory:
+                    script='set -euo pipefail\n'+selector+'\nprintf "%s\\n" "${repeat_args[@]}"'
+                    result=subprocess.run(['bash','-c',script],cwd=directory,
+                                          env={**os.environ,'CLI_VERSION':version},capture_output=True,text=True)
+                    if expected is None:
+                        self.assertNotEqual(result.returncode,0)
+                    else:
+                        expected=[str(Path(directory).resolve()/'games/cross-replay.game.gz') if arg=='SAVE' else arg for arg in expected]
+                        self.assertEqual(result.returncode,0,result.stderr)
+                        self.assertEqual(result.stdout.splitlines(),expected)
+
+    def test_epic_smoke_uses_tag_cli_and_rejects_unknown_versions(self):
+        text=(ROOT/'.github/workflows/epic-windows-release.yml').read_text()
+        selector='if test -f src/app/cli/CommandLine.h; then'+text.split('if test -f src/app/cli/CommandLine.h; then',1)[1].split('fi',1)[0]+'fi'
+        for version,expected in ((None,'cli_version=1'),(2,'cli_version=2'),(3,None)):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                if version is not None:
+                    header=Path(directory)/'src/app/cli/CommandLine.h'
+                    header.parent.mkdir(parents=True)
+                    header.write_text(f'inline constexpr int Version = {version};\n')
+                output=Path(directory)/'output'
+                result=subprocess.run(['bash','-c','set -euo pipefail\n'+selector],cwd=directory,
+                                      env={**os.environ,'GITHUB_OUTPUT':str(output)},capture_output=True,text=True)
+                if expected is None:
+                    self.assertNotEqual(result.returncode,0)
+                    self.assertFalse(output.exists())
+                else:
+                    self.assertEqual(result.returncode,0,result.stderr)
+                    self.assertEqual(output.read_text().strip(),expected)
+        smoke=text.split('\n  smoke-test:',1)[1].split('\n  upload-dev:',1)[0]
+        self.assertIn('CLI_VERSION: ${{ needs.preflight.outputs.cli_version }}',smoke)
+        self.assertIn("'1' { $repeatArgs = @('--nox', $save, '10', '1') }",smoke)
+        self.assertIn("'2' { $repeatArgs = @('game', 'repeat', $save, '--ticks', '10', '--runs', '1') }",smoke)
+        self.assertIn("default { throw 'Unsupported source CLI version' }",smoke)
+        self.assertIn('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',smoke)
+
+    def test_steam_tag_identity_survives_package_smoke_and_upload(self):
+        package=(ROOT/'.github/workflows/steam-windows-package.yml').read_text()
+        upload=(ROOT/'.github/workflows/steam-windows-upload.yml').read_text()
+        self.assertEqual(package.count('description: Immutable public release tag'),1)
+        self.assertIn('workflow_call:\n    inputs:\n      tag:\n        required: true',package)
+        self.assertIn('value: ${{ jobs.package.outputs.source_sha }}',package)
+        build=package.split('\n  package:',1)[1].split('\n  smoke-test:',1)[0]
+        smoke=package.split('\n  smoke-test:',1)[1]
+        for block in (build,smoke):
+            self.assertIn('repository: Globulation2/glob2',block)
+            self.assertIn('ref: ${{ needs.preflight.outputs.source_sha }}',block)
+            self.assertIn('glob2-steam-windows-${{ needs.preflight.outputs.source_sha }}',block)
+        self.assertIn('git rev-parse HEAD > artifacts/steam/windows/source-commit.txt',build)
+        self.assertIn('sha256sum source-commit.txt >> SHA256SUMS.txt',build)
+        self.assertIn('test "$(git rev-parse HEAD)" = "${{ needs.preflight.outputs.source_sha }}"',build)
+        self.assertIn('CLI_VERSION: ${{ needs.preflight.outputs.cli_version }}',smoke)
+        self.assertIn("default { throw 'Unsupported source CLI version' }",smoke)
+        self.assertIn('if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }',smoke)
+        self.assertIn('tag: ${{ inputs.tag }}',upload)
+        self.assertIn('glob2-steam-windows-${{ needs.package.outputs.source_sha }}',upload)
+        self.assertIn("if ($source -ne '${{ needs.package.outputs.source_sha }}')",upload)
+        self.assertLess(upload.index('Depot source identity mismatch'),upload.index('Upload unpublished build'))
 
     def test_owner_dispatch_master_guard_on_every_new_entrypoint(self):
         for name in ('github-release.yml','promote-downloads.yml','android-play-internal.yml','ios-testflight.yml','ios-production.yml','release.yml'):

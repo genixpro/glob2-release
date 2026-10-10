@@ -86,7 +86,9 @@ def unclassified(path):
 def cheap_path(path):
     return (path.startswith(('docs/', 'test/build_system/test_ci', 'fdroid/', 'fastlane/'))
             or path.endswith('.md') or path in MIRROR_DEPLOY_FILES or path in {
+                'INSTALL', 'AUTHORS', 'tools/README', 'debian/README.Debian', 'debian/README.source',
                 'requirements-dev.txt', 'test/test_run_tests.py', 'test/test_ci_failure_aggregation.py',
+                'tools/check_docs.py', 'tools/docs/navigation.json', 'tools/docs/requirements.txt', 'test/test_check_docs.py',
                 'tools/package_steam_windows.py', 'test/test_steam_windows_package.py',
                 'mobile/android_release.py', '.github/workflows/steam-windows-package.yml',
                 '.github/workflows/mac-app-store.yml'})
@@ -145,6 +147,8 @@ def select(paths, labels=(), known=False):
             add(path, 'map_generators', 'compatibility')
         elif path.endswith(('.h', '.hpp', '.hh')):
             add(path, *FLAGS)
+        elif path.startswith('src/app/cli/') or path in {'src/app/Glob2.cpp', 'src/app/GlobalContainerArgs.cpp', 'tools/cli_reference.py', 'test/test_cli_smoke.py'}:
+            add(path, 'native', 'browser', 'windows', 'android', 'macos', 'compatibility', 'cross_platform', 'platform', 'deployment')
         elif is_test_source(path):
             name = Path(path).name
             if name.startswith('Hive'):
