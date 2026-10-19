@@ -31,9 +31,13 @@ class Pipeline
  Uint64 peakRetainedQueryVectorBytes = 0;
  std::weak_ptr<GameDiagnostics::Session> diagnosticsSession;
 public:
- std::vector<std::pair<unsigned,std::shared_ptr<Order>>> prepare(Game& game,
+ //! Configure or attach execution without observing, submitting or delivering work.
+ void initialize(Game& game);
+ void admit(Game& game,
   std::span<const unsigned> eligible, bool paused, const std::shared_ptr<GameDiagnostics::Session>& diagnostics,
   const SimulationSnapshot::Handle& captured);
+ std::vector<std::pair<unsigned,std::shared_ptr<Order>>> deliverDue(Game&,
+  std::span<const unsigned> requested, bool paused);
  std::shared_ptr<Order> validate(Game& game, std::shared_ptr<Order> order, unsigned player);
  void settle(Game& game, const std::shared_ptr<Order>& order, bool accepted);
  void cancel(unsigned player);
@@ -41,7 +45,6 @@ public:
  void save(GAGCore::OutputStream* stream);
  bool load(Game& game, GAGCore::InputStream* stream);
  const auto& schedulingMetrics() const { return scheduler.metrics; }
- Uint64 computationNs() const { return scheduler.activeNs(); }
  bool wasPolled(unsigned player, Uint32 tick) const;
  std::pair<Uint64,unsigned> queryVectorMemory() const {
   Uint64 bytes=0; unsigned available=0;

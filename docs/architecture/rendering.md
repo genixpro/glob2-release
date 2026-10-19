@@ -125,8 +125,12 @@ borrowed from standard snapshot components. There is no second entity extraction
 or map-array capture. `Game::drawMap` requires an explicitly supplied frame;
 `Game::drawSceneMap` accepts it directly.
 
-- The engine admits presentation only when its bounded producer has capacity,
-  declares requirements with AI and gradients, and publishes one shared capture.
+- Interactive engines capture the standard simulation preset and all graphical
+  payloads at each completed observation: session, effects, statistics, history,
+  telemetry, entity diagnostics and annotations. These inputs are frozen even
+  while presentation preparation is busy. Camera movement and opening a panel
+  derive another view from that observation; they never add live data to it. AI,
+  map jobs and presentation borrow the same captured data through standard views.
   `SceneExtractor::prepare` accepts an immutable handle and request, never live
   simulation objects. Preparation runs on the shared compute executor. A complete
   frame is published through `SceneBuffer`; drawing keeps the previous complete
@@ -151,11 +155,16 @@ or map-array capture. `Game::drawMap` requires an explicitly supplied frame;
   connections and overlays are derived in resumable preparation chunks. Cached
   display data is keyed by world identity, relevant revisions and view settings.
 - Unit animation and building shooting fields live in the normal pointer-free state
-  records. Selected panels borrow those records and immutable catalogs; presentation
+  records. `UnitState` groups position, targets and movement modes at the front,
+  followed by health, hunger and cached abilities. Live units and captures use
+  the same naturally aligned record; save and checksum encoders visit named
+  fields explicitly, independently of its in-memory declaration order.
+  Selected panels borrow those records and immutable catalogs; presentation
   calculations and formatting belong in frame storage. Catalog definitions are frozen
   once per revision, so a later owner reconfiguration cannot change a retained frame.
-  AI telemetry, debug gradients, failure histories, and statistics histories are requested
-  separately from ordinary frames. Statistics histories share immutable samples
+  AI telemetry, debug gradients, failure histories and statistics histories use
+  optional snapshot components retained at the boundary. A frame selects the
+  components its view needs. Statistics histories share immutable samples
   between observations until the next history revision; the compact HUD sample
   ring remains independent. Alliance controls read session player identities and
   team masks; objective and hint dialogs retain immutable narrative payloads that
@@ -165,11 +174,11 @@ or map-array capture. `Game::drawMap` requires an explicitly supplied frame;
 - The editor and standalone tools explicitly obtain an owner-boundary snapshot before
   preparing a frame. Offline map images and diagnostic PNGs use the same drawing
   passes and graphics-thread asset ownership. Diagnostic preparation consumes the
-  published union rather than recapturing from the live game. A bounded diagnostic
+  published boundary rather than recapturing from the live game. A bounded diagnostic
   batch owns its fields and snapshot independently; PNG preparation and export do
   not park the simulation. Occupied publication slots stop further diagnostic
   admission, with skipped or superseded output reported explicitly.
-- The animated menu colony includes admitted presentation requirements in its AI
+- The animated menu colony captures the presentation preset with its simulation
   boundary and uses the same bounded preparation producer. Drawing and resizing
   never capture another world; headless menu simulations admit no presentation.
 - `test/build_system/test_scene_boundary.py` checks the rendering dependency boundary;
@@ -224,9 +233,12 @@ creating the simulation thread fails, run the same session serially (`Engine::st
 also remains the headless default and the equivalence reference.
 
 - The simulation thread paces itself with the speed presets and runs ticks
-  (`Engine::simulationStep`: orders, network, `Game::syncStep`). Before pacing,
-  the engine publishes the completed world's shared read boundary with the union
-  of AI, gradient and admitted presentation requirements. Presentation preparation
+  (`Engine::simulationStep`: orders, network, `Game::advanceLiveSimulation`). Before pacing,
+  the engine publishes the completed world's standard simulation snapshot,
+  freezing optional graphical inputs even when preparation is busy. Paused
+  camera, selection and panel changes project from that retained observation
+  without copying entities or consulting a newer live world. Headless observation
+  options remain minimal. Presentation preparation
   borrows that publication and runs on the compute executor. A worker publishes
   the completed `PresentationFrame` into a `SceneBuffer` (lock-free triple buffer);
   only one preparation is in flight, and a newer complete frame can supersede an
@@ -619,7 +631,10 @@ unit motion, team, options and sampling scale until all regions are complete.
 Each turn can submit up to four regions, yielding after a soft four-millisecond
 CPU budget or admission pressure. Region pixel and source limits remain bounded.
 Final overlays start with a fresh source budget after a turn that submits several
-regions; completed region cursors survive this yield.
+regions; completed region cursors survive this yield. A completed atlas remains
+owned by the pending presentation until its world submission is accepted.
+Deferred world work reuses that atlas without recomposing overlays or advancing
+preview opacity again.
 Region culling preserves the complete target coordinate system, and disjoint
 physical scissors prevent repeated blending at fractional zoom. Skin preview
 ownership is borrowed only within a draw call and restored before yielding.
@@ -734,3 +749,14 @@ and retired its presentation surface. A completed asynchronous screenshot can
 still need these services while the context is being destroyed.
 
 `RendererSelection` defines stable backend-family identifiers, aliases, capabilities and startup precedence. The application coordinator applies this policy through the live-switch transaction described above. Auto defaults remain unchanged, and renderer selection stays outside simulation state.
+
+### CPU presentation batches
+
+The graphics owner can synchronously dispatch bounded CPU terrain composition
+and software raster tiles through `PresentationWork` on the existing compute
+executor. This is independent of resumable scene preparation and does not add
+an asynchronous frame queue or camera cancellation pipeline. Simulation joins
+never pump graphics work. Draw ordering, cache installation, SDL/backend access,
+frame capture and presentation remain on the graphics owner. See
+[bounded CPU presentation work](software-rendering.md#bounded-cpu-presentation-work)
+for scheduling, ownership, admission, serial defaults and development controls.

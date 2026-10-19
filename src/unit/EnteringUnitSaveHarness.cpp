@@ -57,17 +57,15 @@ TEST_SUITE("EnteringUnitSave")
 	                const int bx = position[0] - (dx < 0 ? type->width - 1 : 0);
 	                const int by = position[1] - (dy < 0 ? type->height - 1 : 0);
 	                auto* inn = new Building(bx, by, 0, innType, team, &globals->buildingsTypes, 0, 0);
-	                team->myBuildings[0] = inn;
-	                team->rebuildLiveLists();
+	                team->attachBuilding(0, inn);
 	                game.map.setBuilding(bx, by, type->width, type->height, inn->gid);
 	                auto* unit = new Unit(position[0], position[1], 0, EXPLORER, team, 0);
-	                team->myUnits[0] = unit;
-	                team->rebuildLiveLists();
+	                team->attachUnit(0, unit);
 	                unit->attachedBuilding = inn;
 	                unit->activity = Unit::ACT_UPGRADING;
 	                unit->destinationPurpose = FEED;
 	                const auto& meal=inn->type->semantics.feeding.cost;
-	                for (int resource=0;resource<MaterialSlotCount;++resource) inn->materials[resource]=meal[resource];
+	                for (int resource=0;resource<MaterialSlotCount;++resource) inn->setMaterial(resource, meal[resource]);
 	                inn->reserveService(unit);
 	                inn->unitsInside.push_back(unit);
 	                unit->displacement = Unit::DIS_ENTERING_BUILDING;
@@ -125,7 +123,7 @@ TEST_SUITE("EnteringUnitSave")
 		unit->attachedBuilding=inn;
 		unit->activity=Unit::ACT_RANDOM;
 		unit->destinationPurpose=-1;
-		unit->serviceResourcesReserved=false;
+		unit->setServiceResourcesReserved(false);
 		unit->displacement=Unit::DIS_ENTERING_BUILDING;
 		unit->movement=Unit::MOV_ENTERING_BUILDING;
 		unit->action=FLY;
@@ -164,7 +162,7 @@ TEST_SUITE("EnteringUnitSave")
 	        REQUIRE(unit->hasCapability(UnitRuntimeTraits::LegacyPerformancePolicies));
 	        REQUIRE(unit->activity==Unit::ACT_RANDOM);
 	        REQUIRE(unit->destinationPurpose==-1);
-	        REQUIRE_FALSE(unit->serviceResourcesReserved);
+	        REQUIRE_FALSE(unit->serviceResourcesReserved());
 	        const auto originalUnit=static_cast<const UnitState&>(*unit);
 	        auto* currentBytes=new GAGCore::MemoryStreamBackend;
 	        GAGCore::BinaryOutputStream currentWriter(currentBytes);
@@ -195,7 +193,7 @@ TEST_SUITE("EnteringUnitSave")
 	        };
 	        CHECK(state(loaded)==state(continued));
 	        for(int tick=0;tick<64;++tick) {
-	            loaded.syncStep(0); continued.syncStep(0);
+	            loaded.step(0); continued.step(0);
 	            CHECK(state(loaded)==state(continued));
 	        }
 	        // This synthetic fixture has zero FLY/WALK/SWIM caches despite its

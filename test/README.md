@@ -39,6 +39,10 @@ python3 test/run_tests.py --binary engine --in-process     # fast local loop, no
 python3 test/run_tests.py --update-fixtures --filter 'WinningConditions/*'
 ```
 
+The `Maxima.Farming` fertility-cache case checks correctness in every build and
+enforces its CPU-time budget only in optimized builds without coverage
+instrumentation. Fast development builds report that timing for diagnosis.
+
 `ColonySkinPreview` checks shared image preparation with independent appearance
 authorization, refresh, expiry and cancellation across preview owners.
 
@@ -220,3 +224,15 @@ python3 tools/cli_reference.py --binary /path/to/glob2 --check
 ```
 
 See the [CLI guide](../docs/tools/cli.md) for command and migration contracts.
+
+CPU rendering changes use `ComputeExecutor`, `SurfaceRaster`, `SoftwareRenderer`,
+`TerrainMaterials`, `TerrainPresentation` and `RenderDevice` alongside window,
+backend-switch and recording integration suites. Executor tests control callback
+claims, cancellation and release order, check that graphics barriers do not pump
+simulation or scene work, and retain tickets across lifecycle changes. Regional
+raster checks compare complete regions and disjoint tiles exactly; software
+recorder cases also check pending source destruction, shared backing views,
+capacity flushes, fallback ordering and failure/discard recovery. Run rendering
+integration with both `GLOB2_RENDER_EXECUTION=serial` and `parallel`; the default
+`immediate` retains direct serial drawing without batching. Preserve independent base-revision captures
+because shared-kernel comparisons alone cannot prove unchanged pixel arithmetic.

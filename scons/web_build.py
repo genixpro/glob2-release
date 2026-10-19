@@ -66,7 +66,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
                       LINK=command_path(compiler), AR=command_path(emscripten / 'emar'), RANLIB=command_path(emscripten / 'emranlib'))
     env['OPUS_PREFIX'] = str(opus_prefix)
     env['PROGSUFFIX'] = '.js'
-    env.Append(LINKFLAGS=['--js-library', 'browser/canvas-size.js', '--js-library', 'browser/webgpu-device.js'])
+    env.Append(LINKFLAGS=['--js-library', 'browser/canvas-size.js', '--js-library', 'browser/webgpu-device.js', '--js-library', 'browser/gradient-compute.js'])
     if threaded:
         env.Append(CCFLAGS=['-pthread'], LINKFLAGS=['-pthread', '-sOFFSCREENCANVAS_SUPPORT=1',
             '-sDEFAULT_PTHREAD_STACK_SIZE=8388608',
@@ -169,7 +169,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
     files += ['libgag/src/' + s for s in GAG_SOURCES if s not in ('ApplicationHost.cpp', 'RecordingEncoder.cpp', 'RecordingSession.cpp')]
     files += ['libusl/src/' + s for s in USL_SOURCES]
     files += ['browser/HiveBrowserHost.cpp', 'browser/VoiceRecorder.cpp', 'browser/ApplicationHost.cpp', 'browser/RecordingPlatform.cpp', 'browser/NetTransport.cpp', 'browser/Launcher.cpp', 'browser/HttpFetch.cpp']
-    files += ['browser/Audio.cpp']
+    files += ['browser/Audio.cpp', 'browser/GradientCompute.cpp']
     if any(target in COMMAND_LINE_TARGETS for target in ('android-tests', 'ios-tests', 'web-tests')):
         from test_provenance import register_test_provenance
         provenance_header = register_test_provenance(env, output)
@@ -214,8 +214,11 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
                                '--preload-file', 'examples/javascript@/examples/javascript',
                                '--preload-file', 'games@/games', '-sEXIT_RUNTIME=0'])
         test_objects = []
-        for entry in registry.SUPPORT + registry.ENGINE_SUPPORT + registry.scripting_entries() + ['#src/common/EntityRandomTest.cpp', '#src/unit/EntityRandomLifecycleTest.cpp', ('#src/scripting/sgsl/LegacyScriptCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])), '#src/common/ComputeExecutorHarness.cpp', '#src/map/gradient/GradientPipelineHarness.cpp',
-                '#src/game/SharedWorkerLifecycleTest.cpp', '#src/map/gradient/BuildingGradientInvalidationHarness.cpp',
+        for entry in registry.SUPPORT + registry.ENGINE_SUPPORT + registry.scripting_entries() + ['#src/common/EntityRandomTest.cpp', '#src/unit/EntityRandomLifecycleTest.cpp', ('#src/scripting/sgsl/LegacyScriptCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])), '#src/common/ComputeExecutorHarness.cpp', '#src/field/WebGPUGradientTest.cpp', '#src/app/ApplicationResourcePlanTest.cpp', '#src/replay/ReplayTelemetryTest.cpp', '#src/map/gradient/GradientPipelineHarness.cpp',
+                '#src/game/SharedWorkerLifecycleTest.cpp',
+                ('#src/map/gradient/BuildingGradientInvalidationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+                '#src/map/gradient/InitialBuildingGradientHarness.cpp',
+                ('#src/map/gradient/DelayedGradientPublicationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
                 ('#src/engine/sim/snapshot/WorldSnapshotTest.cpp', dict(cxxflags=['-fno-access-control'])),
                 '#src/render/scene/SceneExtractTest.cpp', '#src/render/scene/SceneBufferTest.cpp',
                 '#src/render/overlay/OverlayFillTest.cpp',
@@ -229,6 +232,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
                 ('#src/unit/UnitCustomizationTest.cpp', dict(cxxflags=['-fno-access-control'])),
                 '#src/building/types/BuildingCatalogTest.cpp', '#src/building/BuildingCatalogFixtureHarness.cpp',
                 '#src/building/BuildingServicesTest.cpp', '#src/building/BuildingProductionCombatTest.cpp',
+                ('#src/building/MaterialDemandTest.cpp', dict(cxxflags=['-fno-access-control'])),
                 '#src/ai/shared_runtime/RuntimeContinuationTest.cpp',
                 ('#src/ai/AICustomCatalogTest.cpp', dict(cxxflags=['-fno-access-control'])),
                 ('#src/unit/MarketsV2Test.cpp', dict(cxxflags=['-fno-access-control']))]:
@@ -247,7 +251,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
         production = unique([by_source[name] for name in files if name != 'src/app/Glob2.cpp'])
         production += script_objects
         harness = tests.Program(str(output / 'script-tests.js'), production + test_objects)
-        tests.Depends(harness, ['browser/storage.js', 'browser/file-selection.js',
+        tests.Depends(harness, ['browser/gradient-compute.js', 'browser/storage.js', 'browser/file-selection.js',
                                'browser/audio.js', 'browser/runtime.js', 'browser/webgl-shaders.js', 'browser/canvas-size.js'])
         env.Depends(harness, assets)
         tests.Depends(harness, [str(p) for directory in ('data', 'maps', 'campaigns', 'scripts', 'test/fixtures', 'examples/javascript', 'games')
@@ -257,7 +261,7 @@ def _build_variant(directory, identity, arguments, threaded=False, packaged=None
             tests.Depends(harness, 'browser/threaded-egl.js')
         env.Alias('web-tests', harness)
 
-    env.Depends(program, ['browser/storage.js', 'browser/file-selection.js', 'browser/audio.js', 'browser/recording.js', 'browser/runtime.js', 'browser/webgl-shaders.js',
+    env.Depends(program, ['browser/gradient-compute.js', 'browser/storage.js', 'browser/file-selection.js', 'browser/audio.js', 'browser/recording.js', 'browser/runtime.js', 'browser/webgl-shaders.js',
                           'browser/asset-loader.js', 'browser/canvas-size.js', 'browser/toolchain.json', assets])
     if legacy_gl:
         env.Depends(program, 'browser/legacy-gl-runtime.js')

@@ -24,7 +24,7 @@ Building* place(glob2test::HeadlessGame& world, const char* key, int x, int y)
     if (building->type->semantics.occupiesGround)
         world.game.map.setBuilding(x, y, building->type->width, building->type->height, building->gid);
     world.team->addToStaticAbilitiesLists(building);
-    for (int resource=0; resource<MaterialCount; ++resource) building->materials[resource]=64;
+    for (int resource=0; resource<MaterialCount; ++resource) building->setMaterial(resource, 64);
     return building;
 }
 std::vector<Uint32> components(Game& game, bool legacy152Representation=false)
@@ -45,16 +45,15 @@ void invariants(Game& game)
 {
     REQUIRE(game.integrity());
     for (int team=0; team<game.mapHeader.getNumberOfTeams(); ++team)
-        for (int id=0; id<Building::MAX_COUNT; ++id)
+        for (auto* building : game.teams[team]->liveBuildings.entries())
         {
-            auto* building=game.teams[team]->myBuildings[id];
             if (!building) continue;
             CHECK(building->unitsInside.size() <= std::size_t(building->maxUnitInside));
             for (int resource=0; resource<MaterialCount; ++resource)
             {
-                CHECK(building->materials[resource] >= 0);
+                CHECK(building->material(resource) >= 0);
                 CHECK(building->reservedMaterials[resource] >= 0);
-                CHECK(building->reservedMaterials[resource] <= building->materials[resource]);
+                CHECK(building->reservedMaterials[resource] <= building->material(resource));
             }
         }
 }
@@ -122,7 +121,7 @@ TEST_CASE("retained seeded compositions preserve full simulation continuation [g
         for (int tick=0; tick<257; ++tick)
         {
             CAPTURE(tick);
-            restored.game.syncStep(0); invariants(restored.game);
+            restored.game.step(0); invariants(restored.game);
             CHECK(components(restored.game) == states[tick]);
             CHECK(restored.game.syncRandom == random[tick]);
         }
@@ -177,20 +176,20 @@ TEST_CASE("retained split recipes conserve every charged resource through cancel
             {
                 int spent=0;
                 for (int unit=0; unit<NB_UNIT_TYPE; ++unit)
-                    spent += world.team->stats.measurements.births[unit] *
+                    spent += world.team->stats.measurements().births[unit] *
                         forge->type->semantics.production.recipes[unit].cost[resource];
-                CHECK(forge->materials[resource] + spent == 64);
+                CHECK(forge->material(resource) + spent == 64);
                 CHECK(forge->availableMaterial(resource) >= 0);
             }
             if (tick % 53 == 0)
             {
                 forge->cancelProduction();
                 for (int resource=0; resource<MaterialCount; ++resource)
-                    CHECK(forge->availableMaterial(resource) == forge->materials[resource]);
+                    CHECK(forge->availableMaterial(resource) == forge->material(resource));
             }
         }
         for (int unit=0; unit<NB_UNIT_TYPE; ++unit)
-            CHECK(world.team->stats.measurements.births[unit] > 0);
+            CHECK(world.team->stats.measurements().births[unit] > 0);
     }
 }
 }

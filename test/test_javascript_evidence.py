@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from build_provenance import build_issues, source_identity
 from check_javascript_evidence import provenance_issues, inventory
-from check_javascript import save_header, header_checksum_delta, continuation_matches
+from check_javascript import save_header, header_checksum_delta, continuation_matches, adjust_header_checksum
 
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location('android_device_tests', ROOT / 'mobile/android_device_tests.py')
@@ -170,18 +170,34 @@ class AndroidRetrievalTests(unittest.TestCase):
 
 
 class SaveHeaderTests(unittest.TestCase):
-    def test_header_delta_uses_executed_152_or_153_protocol(self):
+    def test_fixture_header_adjustment_preserves_framing_and_every_other_record_byte(self):
+        metadata = struct.pack('<4sIIII', b'GCS1', 2, 2, 2, 0)
+        records = [struct.pack('<II', tick, 0x12345678 + tick) +
+                   struct.pack('<III', 0x87654321, 0, 0) * 2 for tick in range(2)]
+        trace = metadata + b''.join(records)
+        adjusted = adjust_header_checksum(trace, (0, 125, 2, 2), (0, 159, 2, 2))
+        self.assertEqual(adjusted[:20], metadata)
+        for offset in (20, 52):
+            self.assertEqual(adjusted[offset:offset + 4], trace[offset:offset + 4])
+            self.assertEqual(adjusted[offset + 8:offset + 32], trace[offset + 8:offset + 32])
+            self.assertEqual(struct.unpack_from('<I', adjusted, offset + 4)[0],
+                             struct.unpack_from('<I', trace, offset + 4)[0] ^ 0x1c400000)
+
+    def test_header_delta_uses_executed_protocol(self):
         before, after = (0, 125, 2, 2), (0, 153, 2, 2)
         self.assertEqual(header_checksum_delta(before, after, 152), 0x72000000)
         self.assertEqual(header_checksum_delta(before, after, 153), 0x39000000)
+        self.assertEqual(header_checksum_delta(before, after, 155), 0x1c800000)
+        self.assertEqual(header_checksum_delta(before, after), 0x1c800000)
         self.assertEqual(header_checksum_delta(after, after, 153), 0)
+        self.assertEqual(header_checksum_delta(before, after, 168), 0x1c800000)
         with self.assertRaises(AssertionError):
             header_checksum_delta(before, after, 154)
 
     def test_current_continuation_retains_every_entity_and_aggregate_bit(self):
         expected = {tick: struct.pack('<III', tick, 0x12345678, 0x87654321)
                     for tick in range(128, 256)}
-        actual = {tick: struct.pack('<III', tick, 0x12345678 ^ 0x39000000, 0x87654321)
+        actual = {tick: struct.pack('<III', tick, 0x12345678 ^ 0x1c800000, 0x87654321)
                   for tick in expected}
         with patch('check_javascript.save_header', side_effect=lambda path:
                    (0, 125 if path == 'initial' else 153, 2, 2)):
@@ -192,9 +208,23 @@ class SaveHeaderTests(unittest.TestCase):
                 changed[128] = bytes(record)
                 self.assertFalse(continuation_matches(expected, changed, 'initial', 'saved', 128))
 
+    def test_deep168_continuation_keeps_aggregate_and_entity_coverage(self):
+        expected = {tick: struct.pack('<III', tick, 0x12345678, 0x87654321)
+                    for tick in range(128, 256)}
+        actual = {tick: struct.pack('<III', tick, 0x12345678 ^ 0x06e00000, 0x87654321)
+                  for tick in expected}
+        with patch('check_javascript.save_header', side_effect=lambda path:
+                   (0, 159 if path == 'initial' else 168, 2, 2)):
+            self.assertTrue(continuation_matches(expected, actual, 'initial', 'saved', 128, 168))
+            for offset in (0, 4, 8):
+                changed = dict(actual)
+                record = bytearray(changed[128]); record[offset] ^= 1
+                changed[128] = bytes(record)
+                self.assertFalse(continuation_matches(expected, changed, 'initial', 'saved', 128, 168))
+
     @staticmethod
     def fixture(version, resource_declarations=None, required=(), ai_delay=0, building_gradient_delay=4,
-                terrain_required=('ice-terrain',)):
+                terrain_required=('ice-terrain',), statistics_delay=0):
         def text(value):
             encoded = value.encode('utf8')
             return struct.pack('>I', len(encoded)) + encoded
@@ -214,6 +244,8 @@ class SaveHeaderTests(unittest.TestCase):
         result += bytes(5)
         if version >= 143:
             result += bytes([ai_delay])
+        if version >= 155:
+            result += bytes([statistics_delay])
         if version >= 148:
             result += bytes([building_gradient_delay])
         result += struct.pack('>I', 3)  # Three players in GameHeader.
@@ -226,7 +258,7 @@ class SaveHeaderTests(unittest.TestCase):
             return save_header(path)
 
     def test_legacy_and_resource_headers_have_correct_player_offsets(self):
-        for version in (125, 137, 138, 139, 140, 142, 143, 146, 147, 148, 152, 153):
+        for version in (125, 137, 138, 139, 140, 142, 143, 146, 147, 148, 152, 153, 154, 155, 159, 167, 168, 169, 171, 172, 173):
             self.assertEqual(self.parse(self.fixture(version)), (0, version, 2, 3))
         declarations = [('custom-crops', 'Custom crops', 'Enable experimental multi-material crops.')]
         self.assertEqual(self.parse(self.fixture(140, declarations, ['custom-crops'])), (0, 140, 2, 3))
@@ -238,6 +270,12 @@ class SaveHeaderTests(unittest.TestCase):
     def test_building_gradient_delay_does_not_shift_player_count(self):
         for delay in (1, 4, 8):
             self.assertEqual(self.parse(self.fixture(148, building_gradient_delay=delay)), (0, 148, 2, 3))
+
+    def test_statistics_delay_does_not_shift_player_count(self):
+        for delay in (0, 1, 8):
+            self.assertEqual(self.parse(self.fixture(167, statistics_delay=delay)), (0, 167, 2, 3))
+        with self.assertRaises(AssertionError):
+            self.parse(self.fixture(167, statistics_delay=9))
 
     def test_resource_header_metadata_bounds_are_checked(self):
         for declarations, required in [([('x' * 129, 'Label', 'Help')], []),
@@ -256,7 +294,7 @@ class SaveHeaderTests(unittest.TestCase):
                          (0, 153, 2, 3))
 
     def test_current_header_rejects_every_truncated_prefix(self):
-        raw = gzip.decompress(self.fixture(153, [('custom-crops', 'Crops', 'Help')], ['custom-crops']))
+        raw = gzip.decompress(self.fixture(168, [('custom-crops', 'Crops', 'Help')], ['custom-crops']))
         for end in range(len(raw)):
             with self.subTest(end=end), self.assertRaises(AssertionError):
                 self.parse(gzip.compress(raw[:end]))
@@ -276,7 +314,10 @@ class SaveHeaderTests(unittest.TestCase):
                 with self.subTest(offset=offset, value=value), self.assertRaises(AssertionError):
                     self.parse(gzip.compress(malformed))
         with self.assertRaises(AssertionError):
-            self.parse(self.fixture(154))
+            self.parse(self.fixture(168, statistics_delay=9))
+        for version in (170, 174):
+            with self.subTest(version=version), self.assertRaises(AssertionError):
+                self.parse(self.fixture(version))
 
 
 if __name__ == '__main__':

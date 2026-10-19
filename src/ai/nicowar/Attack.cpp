@@ -6,6 +6,7 @@
 #include "AITelemetryFields.h"
 #include "AINicowar.h"
 #include <string>
+#include <utility>
 #include "Utilities.h"
 #include "Game.h"
 #include "Unit.h"
@@ -33,7 +34,7 @@ int NewNicowar::choose_building_to_attack(Runtime& runtime)
 
 	for(enemy_building_iterator ebi(runtime, target, -1, -1, indeterminate); ebi!=enemy_building_iterator(); ++ebi)
 	{
-		const AIEngine::BuildingView* b=runtime.observation().buildingSlots(target)[Building::GIDtoID(*ebi)];
+		const AIEngine::BuildingView* b=runtime.observation().buildingAtSlot(Building::GIDfrom(Building::GIDtoID(*ebi), target));
 		if(gradient.get_height(b->posX, b->posY) != AI_NICOWAR_GRADIENT_UNREACHABLE)
 			buildings_to_attack.push_back(*ebi);
 	}
@@ -158,7 +159,7 @@ void NewNicowar::choose_enemy_target(Runtime& runtime)
 				   cheating and has been fixed. */
 				for(; ebi != enemy_building_iterator(); ++ebi)
 				{
-					const AIEngine::BuildingView* b=runtime.observation().buildingSlots(*i)[Building::GIDtoID(*ebi)];
+					const AIEngine::BuildingView* b=runtime.observation().buildingAtSlot(Building::GIDfrom(Building::GIDtoID(*ebi), *i));
 					if(gradient.get_height(b->posX, b->posY) != AI_NICOWAR_GRADIENT_UNREACHABLE)
 					{
 						available_reachable_targets.push_back(*i);
@@ -195,7 +196,7 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 
 	for(enemy_building_iterator ebi(runtime, target, -1, -1, indeterminate); ebi!=enemy_building_iterator(); ++ebi)
 	{
-		const AIEngine::BuildingView* b=runtime.observation().buildingSlots(target)[Building::GIDtoID(*ebi)];
+		const AIEngine::BuildingView* b=runtime.observation().buildingAtSlot(Building::GIDfrom(Building::GIDtoID(*ebi), target));
 		int bx = dimensionRemainder(b->posX + mi.get_width(), mi.get_width());
 		int by = dimensionRemainder(b->posY + mi.get_height(), mi.get_height());
 		if(gradient.get_height(bx, by) == AI_NICOWAR_GRADIENT_UNREACHABLE)
@@ -210,8 +211,8 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 
 
 	int building=buildings_to_attack[num];
-	const int bx=dimensionRemainder(runtime.observation().buildingSlots(target)[Building::GIDtoID(building)]->posX, mi.get_width());
-	const int by=dimensionRemainder(runtime.observation().buildingSlots(target)[Building::GIDtoID(building)]->posY, mi.get_height());
+	const int bx=dimensionRemainder(runtime.observation().buildingAtSlot(Building::GIDfrom(Building::GIDtoID(building), target))->posX, mi.get_width());
+	const int by=dimensionRemainder(runtime.observation().buildingAtSlot(Building::GIDfrom(Building::GIDtoID(building), target))->posY, mi.get_height());
 
 	AISharedRuntime::Gradients::GradientInfo gi_pathfind;
     gi_pathfind.terrainTravel=field::TerrainTravel::Swim;
@@ -220,8 +221,8 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 	Gradient& gradient_pathfind=runtime.get_gradient_manager().get_gradient(gi_pathfind);
 
 	///Next, find the closest point manhattan distance wise, to the building that is accessible
-	int closest_x=0;
-	int closest_y=0;
+	int closest_x=-1;
+	int closest_y=-1;
 	int closest_distance=AI_NICOWAR_DIG_OUT_INIT_DIST;
 	for(int x=0; x<mi.get_width(); ++x)
 	{
@@ -230,7 +231,7 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 			if(gradient.get_height(x, y) >= 0)
 			{
 				int dist=gradient_pathfind.get_height(x, y);
-				if(dist < closest_distance)
+				if(dist >= 0 && dist < closest_distance)
 				{
 					closest_x=x;
 					closest_y=y;
@@ -239,6 +240,10 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 			}
 		}
 	}
+
+	if(closest_x < 0 || closest_y < 0)
+		return telemetry.returnedBool(AITrace::AI5::NewNicowar_dig_out_enemy_result,
+			AITrace::AI5::NewNicowar_dig_out_enemy_true, false);
 
 	///Next, follow a path around stone between the closest point and the buildings position, 
 	///placing Clearing flags as you go
@@ -251,8 +256,16 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 	int w=mi.get_width();
 	int h=mi.get_height();
 
+	// Validate the whole route before enqueueing orders. A missing descent or
+	// a cycle must not produce unbounded orders or leave a partial dig active.
+	std::vector<bool> visited(std::size_t(w)*h);
+	std::vector<std::pair<int,int>> clearing_positions;
 	while(xpos != bx || ypos!=by)
 	{
+		const auto index=std::size_t(ypos)*w+xpos;
+		if(visited[index])
+			break;
+		visited[index]=true;
 		int nxpos = xpos;
 		int nypos = ypos;
 		int rx=powerOfTwoRemainder(xpos+1+w, w);
@@ -316,30 +329,37 @@ bool NewNicowar::dig_out_enemy(Runtime& runtime)
 		}
 
 
+		if(nxpos==xpos && nypos==ypos)
+			break;
 		flag_dist_count+=1;
-
-
 		if(flag_dist_count>AI_NICOWAR_DIG_FLAG_INTERVAL)
 		{
 			flag_dist_count=0;
-			//The main order for the clearing flag
-			BuildingOrder* bo_flag = new BuildingOrder(runtime, BuildingDemand::ClearResources, AI_NICOWAR_DIG_CLEARING_WORKERS);
-			//Place it on the current point
-			bo_flag->add_constraint(new Construction::SinglePosition(xpos, ypos));
-			//Add the building order to the list of orders
-			unsigned int id_flag=runtime.add_building_order(bo_flag);
-
-			ManagementOrder* mo_destroyed=new RetireAttraction(id_flag,1u<<WORKER);
-			mo_destroyed->add_condition(new EnemyBuildingDestroyed(runtime, building));
-			runtime.add_management_order(mo_destroyed);
-
-
-			ManagementOrder* mo_completion=new ChangeFlagSize(AI_NICOWAR_DIG_FLAG_SIZE, id_flag);
-			runtime.add_management_order(mo_completion);
+			clearing_positions.emplace_back(xpos,ypos);
 		}
 		xpos = nxpos;
 		ypos = nypos;
+	}
+	if(xpos!=bx || ypos!=by || clearing_positions.empty())
+		return telemetry.returnedBool(AITrace::AI5::NewNicowar_dig_out_enemy_result,
+			AITrace::AI5::NewNicowar_dig_out_enemy_true, false);
 
+	for(const auto& [flag_x,flag_y]:clearing_positions)
+	{
+		//The main order for the clearing flag
+		BuildingOrder* bo_flag = new BuildingOrder(runtime, BuildingDemand::ClearResources, AI_NICOWAR_DIG_CLEARING_WORKERS);
+		//Place it on the current point
+		bo_flag->add_constraint(new Construction::SinglePosition(flag_x, flag_y));
+		//Add the building order to the list of orders
+		unsigned int id_flag=runtime.add_building_order(bo_flag);
+
+		ManagementOrder* mo_destroyed=new RetireAttraction(id_flag,1u<<WORKER);
+		mo_destroyed->add_condition(new EnemyBuildingDestroyed(runtime, building));
+		runtime.add_management_order(mo_destroyed);
+
+
+		ManagementOrder* mo_completion=new ChangeFlagSize(AI_NICOWAR_DIG_FLAG_SIZE, id_flag);
+		runtime.add_management_order(mo_completion);
 	}
 
 	ManagementOrder* mo_destroyed=new SendMessage("finished digging out");

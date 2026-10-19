@@ -12,7 +12,7 @@ subnormal Math results. These are compatibility fixtures, not benchmarks.
 Changing them requires explaining the intended profile or simulation change.
 
 Run `python3 test/check_javascript.py /absolute/path/to/glob2 --output artifacts/js-check`
-with a fresh output directory. It compares against the current unit-era trace, compares
+with a fresh output directory. It compares against the current deep live-world trace, compares
 replays and saves at one and four compute workers, and checks resumed state and
 ticks from several saved checkpoints, including scenario-callback boundaries. The saved payload comparison excludes only
 the existing MapHeader SHA1, which depends on save history; scripts, RNG state,
@@ -116,7 +116,7 @@ ecology can change subsequent simulation behavior. Both checkers still load the
 original version-125 saves, then compare complete current traces, one/four-worker
 execution and saved continuations; the native suite also checks replay playback.
 The native fixture runner's `--update-fixtures` option rewrites only the
-unit-era traces described below. Historical traces, initial saves and numeric/data goldens remain intact.
+deep live-world traces described below. Historical traces, initial saves and numeric/data goldens remain intact.
 MapHeader version normalization and the final-save SHA1 exclusion described above
 remain unchanged.
 
@@ -131,12 +131,40 @@ replay and save output, and every existing saved continuation boundary. It does
 not exclude RNG, registry or cache state from those comparisons.
 
 `profile1-256-units.checksums.gz` and
-`realistic-profile1-256-units.checksums.gz` are the format-153 unit-era current
+`realistic-profile1-256-units.checksums.gz` are the historical format-153 unit-era
 complete-trace references. They include resolved unit-catalog identity, assigned
-job purpose and extended cargo state. Native and Python fixture runners select
-these files; updating fixtures preserves all resource-era references and the
-original saves. Complete checks, worker parity, saved continuation boundaries
+job purpose and extended cargo state. These traces remain retained with the original saves. Complete checks, worker parity, saved continuation boundaries
 and the existing narrow MapHeader version/SHA1 adjustments remain unchanged.
 The header-prefix parser bounds every count and byte range through the player
 count. Format 153 adds unit definitions later in GameHeader; it adds no
 MapHeader metadata or player-count offset.
+The parser accepts headers through format 167 and includes the statistics-delay
+byte introduced in format 155. The current aggregate version adjustment includes
+both the unit-catalog and statistics checksum rotations; historical protocol
+checks retain their own rotation counts.
+The native frozen traces normalize the MapHeader format number to 125 after
+loading. Before exact comparison, the CLI checker adjusts only that version's
+aggregate contribution to the actual input header; entity bytes stay unchanged.
+
+Normal targeting uses the persisted L=3/R=2/K=1 pipeline from format 159,
+SIM_REVISION 49. Current runners select `profile1-initial159.game.gz` and
+`realistic-profile1-initial159.game.gz`. The corresponding
+`*-256-cached159.checksums.gz` traces are retained historical references. These
+initial states preserve the released setup, scripts and catalogs; old saved
+matches are deliberately rejected.
+
+The historical cached159 traces also include format-160 private-stock and cached-unit-
+performance caps (SIM_REVISION 56). The filename identifies the format-159 input
+save; those traces retain the checksum layout preceding format 168.
+
+Format 168 uses asynchronous routine snapshot checksums and opt-in deep live-world
+sidecars. Current runners compare `profile1-256-deep168.checksums.gz` and
+`realistic-profile1-256-deep168.checksums.gz`; the native `--update-fixtures` option
+rewrites only those current traces. Their aggregate retains existing full map,
+script, RNG and pending-work coverage, and header flag bit 0 identifies this deep
+mode. Replays separately validate the source-tagged snapshot schema. The native
+corpus normalizes only MapHeader's checksum minor to 125; the Python checker
+adjusts that version contribution with the current two-final-rotation formula,
+including for resumed format-168 saves. Historical traces and input saves remain
+unchanged. One/four-worker byte equivalence and save/replay continuation remain
+required.

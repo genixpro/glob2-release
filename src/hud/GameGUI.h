@@ -131,8 +131,8 @@ public:
 	//! has the bytes in memory (a freshly generated custom game) skips the file entirely.
 	GAGCore::CooperativeTask loadFromStreamTask(MapHeader mapHeader, GameHeader gameHeader, bool setGameHeader, bool ignoreGUIData, bool saveAI, GAGCore::InputStream *stream);
 	//!
-	bool load(GAGCore::InputStream *stream, bool ignoreGUIData=false);
-    GAGCore::CooperativeTask loadTask(GAGCore::InputStream *stream, bool ignoreGUIData=false);
+	bool load(GAGCore::InputStream *stream, bool ignoreGUIData=false,SaveLoadProfile profile=SaveLoadProfile::Published,MapLoadInitialization initialization=MapLoadInitialization::Normal);
+    GAGCore::CooperativeTask loadTask(GAGCore::InputStream *stream, bool ignoreGUIData=false,SaveLoadProfile profile=SaveLoadProfile::Published,MapLoadInitialization initialization=MapLoadInitialization::Normal);
 	void save(GAGCore::OutputStream *stream, const std::string name, DeferredGameSHA1* deferredSHA1 = nullptr);
 
 	void processEvent(SDL_Event *event);
@@ -284,7 +284,7 @@ public:
 	SceneRequest sceneRequest(bool includeTiming = true);
     void stampPresentationRequest(SceneRequest& request) const { request.tickTime=lastTickTime;request.tickInterval=tickInterval; }
 	/// Standalone owner-side observation through the shared read boundary.
-	void prepareLocalPresentation(PresentationFrame& scene) { const auto request=sceneRequest(); sceneExtractor.prepare(game.captureReadBoundary({},true,SceneExtractor::requirements(request)),request,scene); }
+	void prepareLocalPresentation(PresentationFrame& scene) { const auto request=sceneRequest(); sceneExtractor.prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)),request,scene); }
     // Explicit observation for standalone clients and owner-side tools.
     void prepareLocalPresentation()
     {
@@ -346,7 +346,7 @@ public:
 	int mapMouseX(int x)const {return camera.localX(x);}
 	int mapMouseY(int y)const {return camera.localY(y);}
 	/// Number of consecutive GUI steps the local view has been blocked waiting
-	/// on an away/late player (i.e. game.anyPlayerWaited has stayed true). Reset
+	/// on an away/late player (the latest client waiting mask stays nonzero). Reset
 	/// to 0 as soon as the wait clears. Used only to debounce the on-screen
 	/// "[waiting for X]" notice in GameGUIDraw — it is not part of simulation or
 	/// network state and is never checksummed, networked, or saved.

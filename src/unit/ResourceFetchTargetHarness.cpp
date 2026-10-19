@@ -3,6 +3,7 @@
 // a walking unit actually follows, not a one-time snapshot from task
 // assignment.
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include "GlobalContainer.h"
 #include "FileManager.h"
 #include <SDL3/SDL.h>
@@ -66,18 +67,18 @@ static void staleTargetIsRefreshedAfterGradientRebuild(int expectedClass, int sw
 	require(game.map.incResourceByIndex(farX, farY, source, 0), "seed the far wheat tile");
 
 	TestUnit* unit = new TestUnit(unitX, unitY, 0, WORKER, team, 0);
-	team->myUnits[0] = unit;
-	team->rebuildLiveLists();
+	team->attachUnit(0, unit);
 	game.map.setGroundUnit(unitX, unitY, unit->gid);
 	unit->destinationPurpose = WHEAT;
 	unit->activity = Unit::ACT_FILLING;
 	unit->displacement = Unit::DIS_GOING_TO_RESOURCE;
-	unit->validTarget = true;
-	unit->performance[WALK] = swimOnly?0:10;
-	unit->performance[SWIM] = swimSpeed;
+	unit->setValidTarget(true);
+	unit->setPerformance(WALK,swimOnly?0:10);
+	unit->setPerformance(SWIM,swimSpeed);
 	const int swimClass = unit->swimClass();
 	require(swimClass == expectedClass, "exercise the requested swim class");
 
+	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass); });
 	// Task assignment: ascend the resource gradient once, same call as
 	// Unit.cpp/UnitDisplacement.cpp.
 	game.map.materialAvailableUpdateSlot(teamNumber, WHEAT, swimClass, unit->posX, unit->posY, &unit->targetX, &unit->targetY, NULL);
@@ -98,7 +99,14 @@ static void staleTargetIsRefreshedAfterGradientRebuild(int expectedClass, int sw
 
 	// Simulate the periodic rebuild every cached gradient gets from
 	// Map::syncStep once per its round-robin turn.
+	const auto* previous=game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass);
 	game.map.updateMaterialGradient(teamNumber, WHEAT, swimClass);
+	// Stale guidance remains visible until the fixed publication boundary.
+	require(game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass)==previous,"refresh keeps the published generation");
+	glob2test::awaitGradient(game, [&] {
+		const auto* field=game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass);
+		return field && field[game.map.coordToIndex(nearX,nearY)]!=GRADIENT_AT_GOAL ? field : nullptr;
+	});
 	require(game.map.getGradient(teamNumber, WHEAT, swimClass, nearX, nearY) != GRADIENT_AT_GOAL,
 		"the rebuilt gradient no longer marks the depleted tile as the goal");
 
@@ -151,16 +159,16 @@ static void targetTracksTheGradientTheUnitActuallyFollows()
 	require(game.map.incResourceByIndex(nearBuildingX, nearBuildingY, WHEAT, 0), "seed the tile near the building");
 
 	TestUnit* unit = new TestUnit(unitX, unitY, 0, WORKER, team, 0);
-	team->myUnits[0] = unit;
-	team->rebuildLiveLists();
+	team->attachUnit(0, unit);
 	game.map.setGroundUnit(unitX, unitY, unit->gid);
 	unit->attachedBuilding = inn;
 	unit->destinationPurpose = WHEAT;
 	unit->activity = Unit::ACT_FILLING;
 	unit->displacement = Unit::DIS_GOING_TO_RESOURCE;
-	unit->validTarget = true;
+	unit->setValidTarget(true);
 	const int swimClass = unit->swimClass();
 
+	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass); });
 	require(game.map.getGlobalGradientDestination(game.map.getMaterialGradientSlot(teamNumber, WHEAT, swimClass), unit->posX, unit->posY, &unit->targetX, &unit->targetY),
 		"sanity: ascending the plain gradient reaches an exact goal");
 	require(unit->targetX == nearUnitX && unit->targetY == nearUnitY,
@@ -179,7 +187,14 @@ static void targetTracksTheGradientTheUnitActuallyFollows()
 	// The near-unit tile gets fully harvested by someone else. The resource
 	// gradient does not notice by itself.
 	game.map.replaceResource(nearUnitX, nearUnitY, Resource{});
+	const auto* previous=game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass);
 	game.map.updateMaterialGradient(teamNumber, WHEAT, swimClass);
+	// Stale guidance remains visible until the fixed publication boundary.
+	require(game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass)==previous,"refresh keeps the published generation");
+	glob2test::awaitGradient(game, [&] {
+		const auto* field=game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass);
+		return field && field[game.map.coordToIndex(nearUnitX,nearUnitY)]!=GRADIENT_AT_GOAL ? field : nullptr;
+	});
 
 	// Next action: only the near-building tile is left on the gradient: the
 	// target must be refreshed to it.
@@ -192,7 +207,7 @@ static void targetTracksTheGradientTheUnitActuallyFollows()
 	const int marketType=game.buildingsTypes.getTypeNum("market",0,false);
 	auto* market=game.addBuilding(24,24,marketType,0);
 	require(market!=nullptr, "fruit-only market placed");
-	market->materials[CHERRY]=1;
+	market->setMaterial(CHERRY, 1);
 	require(!team->directStockSuppliers.empty(), "fruit-only market is a direct supplier");
 	require(game.map.materialSupplyModesSlot(inn,WHEAT)==0, "fruit-only supplier cannot alter wheat routing");
 	require(game.map.getMaterialGradientSlot(teamNumber,WHEAT,swimClass,true,inn)==natural,

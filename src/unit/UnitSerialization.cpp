@@ -42,7 +42,7 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	configuredVisionRadius=Uint8(race->getRuntime(typeNum).visionRadius);
 	jobPurpose=UnitJobPurpose::None;
 	regenerationRemainder=0;
-	widePrimaryCargo=false;
+	stateFlags=0;
 
 	// identity
 	gid = stream->readUint16("gid");
@@ -68,13 +68,18 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	posX = stream->readSint32("posX");
 	posY = stream->readSint32("posY");
 	delta = stream->readSint32("delta");
-	dx = stream->readSint32("dx");
-	dy = stream->readSint32("dy");
-	direction = stream->readSint32("direction");
+	const Sint32 savedDx = stream->readSint32("dx"), savedDy = stream->readSint32("dy");
+	if (savedDx < -1 || savedDx > 1 || savedDy < -1 || savedDy > 1)
+		throw std::runtime_error("Invalid unit action state");
+	dx = Sint8(savedDx); dy = Sint8(savedDy);
+	const Sint32 savedDirection = stream->readSint32("direction");
+	if (savedDirection < 0 || savedDirection > UNIT_DIRECTION_NONE) throw std::runtime_error("Invalid unit action state");
+	direction = Uint8(savedDirection);
 	insideTimeout = stream->readSint32("insideTimeout");
 	speed = stream->readSint32("speed");
-	terrainHealthRemainder = versionMinor >= FILE_FORMAT_VERSION_TERRAIN_PROPERTIES ? stream->readSint32("terrainHealthRemainder") : 0;
-	if (terrainHealthRemainder <= -256 || terrainHealthRemainder >= 256) throw std::runtime_error("Invalid terrain exposure remainder");
+	const Sint32 savedTerrainRemainder = versionMinor >= FILE_FORMAT_VERSION_TERRAIN_PROPERTIES ? stream->readSint32("terrainHealthRemainder") : 0;
+	if (savedTerrainRemainder <= -256 || savedTerrainRemainder >= 256) throw std::runtime_error("Invalid terrain exposure remainder");
+	terrainHealthRemainder = Sint16(savedTerrainRemainder);
 
 	areaServiceRemainders.fill(0);
 	areaLastPulseTick=Uint32(-1);
@@ -88,7 +93,7 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 		}
 	}
 	// states
-	needToRecheckMedical = (bool)stream->readUint32("needToRecheckMedical");
+	setNeedToRecheckMedical((bool)stream->readUint32("needToRecheckMedical"));
 	auto readState = [&](const char* name, Uint32 maximum) {
 		const Uint32 value = stream->readUint32(name);
 		if (value > maximum) throw std::runtime_error("Invalid unit action state");
@@ -97,17 +102,17 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	medical = static_cast<Medical>(readState("medical", MED_DAMAGED));
 	activity = static_cast<Activity>(readState("activity", ACT_UPGRADING));
 	displacement = static_cast<Displacement>(readState("displacement", DIS_EXITING_BUILDING));
-	serviceResourcesReserved = versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
+	setServiceResourcesReserved(versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
 		? readState("serviceResourcesReserved", 1) != 0
-		: activity == ACT_UPGRADING && displacement != DIS_EXITING_BUILDING;
+		: activity == ACT_UPGRADING && displacement != DIS_EXITING_BUILDING);
 	movement = static_cast<Movement>(readState("movement", MOV_ATTACKING_TARGET));
-	action = static_cast<Abilities>(readState("action", NB_ABILITY - 1));
+	action = static_cast<Uint8>(readState("action", NB_ABILITY - 1));
 	if ((displacement % 2) != 0 || movement == 10 ||
-		direction < 0 || direction > UNIT_DIRECTION_NONE || dx < -1 || dx > 1 || dy < -1 || dy > 1)
+		dx < -1 || dx > 1 || dy < -1 || dy > 1)
 		throw std::runtime_error("Invalid unit action state");
 	targetX = (Sint32)stream->readSint32("targetX");
 	targetY = (Sint32)stream->readSint32("targetY");
-	validTarget = (bool)stream->readSint32("validTarget");
+	setValidTarget((bool)stream->readSint32("validTarget"));
 	magicActionTimeout = stream->readSint32("magicActionTimeout");
 
 	// under attack timer
@@ -134,13 +139,15 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	for (int i=0; i<NB_ABILITY; i++)
 	{
 		stream->readEnterSection(i);
-		performance[i] = stream->readSint32("performance");
-		level[i] = stream->readSint32("level");
-		if (versionMinor>=FILE_FORMAT_VERSION_UNIT_CATALOG && (performance[i]<0 || performance[i]>1000000
-            || (i==HP && performance[i]==0 && !hasCapability(UnitRuntimeTraits::LegacyPerformancePolicies))))
+		const Sint32 savedPerformance = stream->readSint32("performance");
+		const Sint32 savedLevel = stream->readSint32("level");
+		if (versionMinor>=FILE_FORMAT_VERSION_UNIT_CATALOG && (savedPerformance<0 || savedPerformance>1000000
+            || (i==HP && savedPerformance==0 && !hasCapability(UnitRuntimeTraits::LegacyPerformancePolicies))))
 			throw std::runtime_error("Invalid cached unit ability");
-		if (level[i] < 0 || level[i] >= NB_UNIT_LEVELS) throw std::runtime_error("Invalid unit level");
-		canLearn[i] = (bool)stream->readUint32("canLearn");
+        setPerformance(i,savedPerformance);
+		if (savedLevel < 0 || savedLevel >= NB_UNIT_LEVELS) throw std::runtime_error("Invalid unit level");
+		level[i] = Uint8(savedLevel);
+		setCanLearn(i, stream->readUint32("canLearn") != 0);
 		stream->readLeaveSection();
 	}
 	stream->readLeaveSection();
@@ -148,20 +155,21 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 	// hold the two apart (the editor used to offer a box for each), so even
 	// such a worker out to the higher of the two.
 	if (versionMinor < FILE_FORMAT_VERSION_ONE_WORKER_LEVEL
-		&& canLearn[BUILD] && level[HARVEST] != level[BUILD])
+		&& canLearn(BUILD) && level[HARVEST] != level[BUILD])
 		setWorkerLevel(std::max(level[HARVEST], level[BUILD]));
 
-	constructionLevel = versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
+	const Sint32 savedConstructionLevel = versionMinor >= FILE_FORMAT_VERSION_BUILDING_CATALOG
 		? stream->readSint32("constructionLevel") : level[BUILD];
-	if (constructionLevel < 0 || constructionLevel >= NB_UNIT_LEVELS) throw std::runtime_error("Invalid construction qualification");
+	if (savedConstructionLevel < 0 || savedConstructionLevel >= NB_UNIT_LEVELS) throw std::runtime_error("Invalid construction qualification");
+	constructionLevel = Uint8(savedConstructionLevel);
 
 	experience = stream->readSint32("experience");
 	experienceLevel = stream->readSint32("experienceLevel");
 	if (versionMinor>=FILE_FORMAT_VERSION_UNIT_CATALOG && (experience<0 || experienceLevel<0 || speed<0 || delta<0 || fruitCount>3))
 		throw std::runtime_error("Invalid cached unit clock or combat state");
 
-	destinationPurpose = stream->readSint32("destinationPurpose");
-	carriedMaterial = stream->readSint32("carriedRessource");
+	const Sint32 savedDestination = stream->readSint32("destinationPurpose");
+	const Sint32 savedMaterial = stream->readSint32("carriedRessource");
 	carriedPacket={};
 	if (versionMinor>=FILE_FORMAT_VERSION_BUILDING_CATALOG)
 	{
@@ -170,8 +178,10 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 		if (!carriedPacket.numerator || !carriedPacket.denominator || carriedPacket.denominator>1000000 || carriedPacket.numerator>carriedPacket.denominator)
 			throw std::runtime_error("Invalid carried material packet");
 	}
-	if (carriedMaterial < -1 || carriedMaterial >= int(MaterialCount) || destinationPurpose < -1 || destinationPurpose > FEED)
+	if (savedMaterial < -1 || savedMaterial >= int(MaterialCount) || savedDestination < -1 || savedDestination > FEED)
 		throw std::runtime_error("Invalid unit material or destination");
+	carriedMaterial = Sint8(savedMaterial);
+	destinationPurpose = Sint8(savedDestination);
 	if ((activity == ACT_FILLING && (destinationPurpose < 0 || destinationPurpose >= MaterialCount)) ||
 		(activity == ACT_UPGRADING && destinationPurpose < 0))
 		throw std::runtime_error("Invalid unit activity destination");
@@ -205,11 +215,11 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 			|| ((activity==ACT_RANDOM || activity==ACT_UPGRADING) && jobPurpose!=UnitJobPurpose::None))
 			throw std::runtime_error("Saved unit assignment does not match its activity");
 		regenerationRemainder=stream->readUint8("regenerationRemainder");
-		widePrimaryCargo=readState("widePrimaryCargo",1)!=0;
+		setWidePrimaryCargo(readState("widePrimaryCargo",1)!=0);
 		const unsigned count=stream->readUint32("cargoOverflowCount");
-		if (count>unsigned(std::max(0,runtimeTraits().cargoCapacity-1+(widePrimaryCargo?1:0))) || (count && carriedMaterial<0) || (widePrimaryCargo && !count))
+		if (count>unsigned(std::max(0,runtimeTraits().cargoCapacity-1+(widePrimaryCargo()?1:0))) || (count && carriedMaterial<0) || (widePrimaryCargo() && !count))
 			throw std::runtime_error("Invalid unit cargo count");
-		const Uint64 packets=Uint64(count)+(carriedMaterial>=0?1:0)-(widePrimaryCargo?1:0);
+		const Uint64 packets=Uint64(count)+(carriedMaterial>=0?1:0)-(widePrimaryCargo()?1:0);
 		if (packets>unsigned(runtimeTraits().cargoCapacity) || (carriedMaterial>=0 && runtimeTraits().cargoKinds==0))
 			throw std::runtime_error("Saved unit inventory exceeds its definition");
 		for (unsigned i=0;i<count;++i) {
@@ -221,7 +231,7 @@ void Unit::load(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 			// The first wide row is the already-counted primary packet, not an
 			// additional pickup. In the inline capacity-one path its material
 			// marker already consumes capacity before this row is restored.
-			const bool primary=widePrimaryCargo && i==0;
+			const bool primary=widePrimaryCargo() && i==0;
 			if (material<0 || material>=int(MaterialCount) || !packet.numerator || !packet.denominator || packet.numerator>packet.denominator || (!primary && !canCarryMaterial(material)) || (primary && material!=carriedMaterial))
 				throw std::runtime_error("Invalid unit cargo packet");
 			owner->game->unitCargo.overflow(gid).push_back({material,packet});
@@ -273,16 +283,16 @@ void Unit::save(GAGCore::OutputStream *stream)
 	for (int i=0;i<3;++i) stream->writeUint16(areaServiceRemainders[i],("areaServiceRemainder"+std::to_string(i)).c_str());
 
 	// states
-	stream->writeUint32((Uint32)needToRecheckMedical, "needToRecheckMedical");
+	stream->writeUint32((Uint32)needToRecheckMedical(), "needToRecheckMedical");
 	stream->writeUint32((Uint32)medical, "medical");
 	stream->writeUint32((Uint32)activity, "activity");
 	stream->writeUint32((Uint32)displacement, "displacement");
-	stream->writeUint32(serviceResourcesReserved, "serviceResourcesReserved");
+	stream->writeUint32(serviceResourcesReserved(), "serviceResourcesReserved");
 	stream->writeUint32((Uint32)movement, "movement");
 	stream->writeUint32((Uint32)action, "action");
 	stream->writeSint32(targetX, "targetX");
 	stream->writeSint32(targetY, "targetY");
-	stream->writeSint32(validTarget, "validTarget");
+	stream->writeSint32(validTarget(), "validTarget");
 	stream->writeSint32(magicActionTimeout, "magicActionTimeout");
 
 	// attack timer
@@ -306,7 +316,7 @@ void Unit::save(GAGCore::OutputStream *stream)
 		stream->writeEnterSection(i);
 		stream->writeUint32(performance[i], "performance");
 		stream->writeUint32(level[i], "level");
-		stream->writeUint32((Uint32)canLearn[i], "canLearn");
+		stream->writeUint32((Uint32)canLearn(i), "canLearn");
 		stream->writeLeaveSection();
 	}
 	stream->writeLeaveSection();
@@ -330,7 +340,7 @@ void Unit::save(GAGCore::OutputStream *stream)
 
 	stream->writeUint8(Uint8(jobPurpose),"jobPurpose");
 	stream->writeUint8(regenerationRemainder,"regenerationRemainder");
-	stream->writeUint32(widePrimaryCargo,"widePrimaryCargo");
+	stream->writeUint32(widePrimaryCargo(),"widePrimaryCargo");
 	const auto* extra=owner->game->unitCargo.find(gid);
 	stream->writeUint32(extra?extra->size():0,"cargoOverflowCount");
 	if (extra) for (unsigned i=0;i<extra->size();++i) {
@@ -392,7 +402,7 @@ bool Unit::integrity()
 	if (isDead)
 		return true;
 
-	if (!needToRecheckMedical)
+	if (!needToRecheckMedical())
 	{
 		checkInvariant(activity==ACT_UPGRADING);
 		checkInvariant(destinationPurpose==HEAL || destinationPurpose==FEED);
@@ -400,110 +410,111 @@ bool Unit::integrity()
 	return true;
 }
 
-Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
+template<bool Diagnostic>
+Uint32 Unit::checkSumImpl(std::vector<Uint32> *checkSumsVector, bool legacy152)
 {
-	Uint32 cs=(serviceResourcesReserved ? 0x73657276u : 0) ^ (Uint32(constructionLevel) << 20);
+	Uint32 cs=(serviceResourcesReserved() ? 0x73657276u : 0) ^ (Uint32(constructionLevel) << 20);
 
 	if(areaLastPulseTick!=Uint32(-1)) cs ^= areaLastPulseTick ^ 0x70756c73u;
 	cs ^= Uint32(areaServiceRemainders[0]) | (Uint32(areaServiceRemainders[1])<<8) | (Uint32(areaServiceRemainders[2])<<16);
 	cs^=typeNum;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(typeNum);// [0]
 	cs=rotl1(cs);
 
 	cs^=isDead;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(isDead);// [1]
 	cs=rotl1(cs);
 	cs^=gid;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(gid);// [2]
 	cs=rotl1(cs);
 
 	cs^=posX;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(posX);// [3]
 	cs=rotl1(cs);
 	cs^=posY;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(posY);// [4]
 	cs=rotl1(cs);
 	cs^=delta;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(delta);// [5]
 	cs=rotl1(cs);
 	cs^=dx;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(dx);// [6]
 	cs^=dy;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(dy);// [7]
 	cs^=direction;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(direction);// [8]
 	cs=rotl1(cs);
 	cs^=insideTimeout;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(insideTimeout);// [9]
 	cs=rotl1(cs);
 	cs^=speed;
 	cs ^= static_cast<Uint32>(terrainHealthRemainder) * 0x9e3779b9u;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(speed);// [10]
 	cs=rotl1(cs);
 
-	cs^=(int)needToRecheckMedical;
-	if (checkSumsVector)
-		checkSumsVector->push_back(needToRecheckMedical);// [11]
+	cs^=(int)needToRecheckMedical();
+	if constexpr (Diagnostic)
+		checkSumsVector->push_back(needToRecheckMedical());// [11]
 	cs=rotl1(cs);
 	cs^=medical;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(medical);// [12]
 	cs^=activity;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(activity);// [13]
 	cs^=displacement;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(displacement);// [14]
 	cs^=movement;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(movement);// [15]
 	cs^=action;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(action);// [16]
 	cs=rotl1(cs);
 	cs^=targetX;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(targetX);// [17]
 	cs^=targetY;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(targetY);// [18]
 	cs=rotl1(cs);
 
 	cs^=hp;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(hp);// [19]
 	cs^=trigHP;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(trigHP);// [20]
 	cs=rotl1(cs);
 
 	cs^=hungry;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(hungry);// [21]
 	cs^=trigHungry;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(trigHungry);// [22]
 	cs^=trigHungryCarrying;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(trigHungryCarrying);// [23]
 	cs=rotl1(cs);
 
 	cs^=fruitMask;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(fruitMask);// [24]
 	cs^=fruitCount;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(fruitCount);// [25]
 	cs=rotl1(cs);
 
@@ -513,48 +524,48 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 		cs=rotl1(cs);
 		cs^=level[i];
 		cs=rotl1(cs);
-		cs^=(Uint32)canLearn[i];
+		cs^=(Uint32)canLearn(i);
 		cs=rotl1(cs);
 	}
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [26]
 	cs=rotl1(cs);
 
 	cs^=(attachedBuilding!=NULL ? 1:0);
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back((attachedBuilding!=NULL ? 1:0));// [27]
 	cs=rotl1(cs);
 	cs^=(targetBuilding!=NULL ? 1:0);
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back((targetBuilding!=NULL ? 1:0));// [28]
 	cs^=(ownExchangeBuilding!=NULL ? 2:0);
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back((ownExchangeBuilding!=NULL ? 1:0));// [29]
 	cs=rotl1(cs);
 
 	cs^=destinationPurpose;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(destinationPurpose);// [31]
 	cs^=carriedMaterial;
 	cs=rotl1(cs); cs^=carriedPacket.numerator;
 	cs=rotl1(cs); cs^=carriedPacket.denominator;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(carriedMaterial);// [33]
 
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [34]
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [35]
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [36]
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [37]
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [38]
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(0);// [39]
 
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 	{
 		const auto random = entityRandom.exportState();
 		checkSumsVector->push_back(Uint32(random.value >> 32));
@@ -564,10 +575,10 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 	}
 
 	if (!legacy152) {
-		const auto append=[&](Uint32 value) { cs=rotl1(cs)^value; if (checkSumsVector) checkSumsVector->push_back(value); };
-		append(Uint8(jobPurpose)|(Uint32(regenerationRemainder)<<8)|(Uint32(widePrimaryCargo)<<16));
+		const auto append=[&](Uint32 value) { cs=rotl1(cs)^value; if constexpr (Diagnostic) checkSumsVector->push_back(value); };
+		append(Uint8(jobPurpose)|(Uint32(regenerationRemainder)<<8)|(Uint32(widePrimaryCargo())<<16));
 		append(configuredFoodCapacity); append(capabilityFlags);
-		if (hasCapability(UnitRuntimeTraits::ExtendedCargo) || widePrimaryCargo) {
+		if (hasCapability(UnitRuntimeTraits::ExtendedCargo) || widePrimaryCargo()) {
 			const auto* extra=owner->game->unitCargo.find(gid); append(extra?extra->size():0);
 			if (extra) for (const auto& entry:*extra) {
 				append(entry.material); append(entry.packet.numerator>>32); append(entry.packet.numerator);
@@ -575,6 +586,11 @@ Uint32 Unit::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 			}
 		}
 	}
-	cs ^= entityRandom.checksum();
+	cs ^= (legacy152 ? entityRandom.legacyChecksum() : entityRandom.checksum());
 	return cs;
+}
+
+Uint32 Unit::checkSum(std::vector<Uint32> *fields, bool legacy152)
+{
+    return fields ? checkSumImpl<true>(fields, legacy152) : checkSumImpl<false>(nullptr, legacy152);
 }

@@ -4,7 +4,9 @@
 #pragma once
 
 #include "Material.h"
+#include <algorithm>
 #include <bitset>
+#include <cassert>
 #include <climits>
 #include <list>
 #include <memory>
@@ -17,6 +19,8 @@
 #include "MaterialPacket.h"
 #include "UnitConsts.h"
 #include "BuildingCatalog.h"
+#include "BuildingType.h"
+#include "Team.h"
 
 namespace GAGCore
 {
@@ -28,12 +32,12 @@ namespace GAGCore
 struct WideMaterialPacket;
 struct WideMaterialDeliveryResult;
 class Unit;
-class Team;
 class Map;
 class BuildingGradientSearch;
-struct BuildingType;
+struct SharedBuildingGradient;
 class BuildingsTypes;
 class Order;
+struct BuildingMaterialDemand;
 
 /// Sentinel for `BuildingType::prevLevel` / `nextLevel` meaning
 /// "no upgrade/downgrade exists in this chain" (signed int).
@@ -49,7 +53,7 @@ static constexpr int MATERIAL_TYPE_NONE = -1;
 /// `[canSwim]` where `canSwim == 0` means the no-swim variant and
 /// `canSwim == 1` means the can-swim variant. Used both as the array
 /// dimension and as the loop bound in `for (canSwim=0; canSwim<...; …)`.
-static constexpr int SWIM_VARIANT_COUNT = 3;
+static constexpr int SWIM_VARIANT_COUNT = 4;
 
 /// Index into a `[SWIM_VARIANT_COUNT]` array selecting the variant
 /// reachable by units that have the SWIM ability. Used at sites that
@@ -59,18 +63,24 @@ static constexpr int SWIM_VARIANT_CAN_SWIM = 1;
 
 enum class BuildingRoute : unsigned char { Footprint, Clearing, Combat, Automatic };
 inline constexpr int BUILDING_ROUTE_COUNT = 3;
-inline constexpr int BUILDING_GRADIENT_COUNT = BUILDING_ROUTE_COUNT * SWIM_CLASS_COUNT;
+inline constexpr int BUILDING_GRADIENT_COUNT = BUILDING_ROUTE_COUNT * MOVEMENT_CLASS_COUNT;
 inline constexpr int BUILDING_ACCESS_COUNT = BUILDING_ROUTE_COUNT * SWIM_VARIANT_COUNT;
-static_assert(BUILDING_ACCESS_COUNT == std::extent_v<decltype(BuildingStateRecord::locked)>);
+static_assert(BUILDING_ACCESS_COUNT == BuildingStateRecord::LockCount);
 
 class Building : public BuildingUtils, public BuildingStateRecord
 {
 	friend struct TeamStatsMeasurementFixture;
 
   public:
+	// Owner-thread hooks; excluded from immutable state record copies.
+	Building* populationPrevious=nullptr;
+	Building* populationNext=nullptr;
+	const void* populationMembership=nullptr;
+
 	static const int MAX_COUNT=1024;
 	const BuildingRuntimeTraits* runtime=nullptr;
 	void bindType(Sint32 id, BuildingsTypes* catalog=nullptr);
+    int shootingCooldownRemaining() const { return shootingCooldown; }
 
 	/// `lastShootStep = LAST_SHOOT_STEP_NEVER` means this turret has
 	/// not fired yet this game; the field is `Uint32` step counter.
@@ -233,7 +243,26 @@ class Building : public BuildingUtils, public BuildingStateRecord
 	void subscribeUnitForInside(Unit* unit);
 	// Reservations protect shared stock from other services and production.
 	BuildingMaterialCost reservedMaterials{};
-	Sint32 availableMaterial(int resource) const;
+	Sint32 material(int resource) const { return sharedMaterials ? sharedMaterials[resource] : privateMaterial(resource); }
+	bool usesTeamMaterials() const { return sharedMaterials != nullptr; }
+	bool sharesMaterialPool(const Building& other) const { return this == &other || (sharedMaterials && sharedMaterials == other.sharedMaterials); }
+	Sint32 materialStockLimit() const { return sharedMaterials ? INT_MAX : PrivateBuildingStockLimit; }
+	void setMaterial(int resource, Sint64 value)
+	{
+		if (sharedMaterials)
+		{
+			assert(value >= INT_MIN && value <= INT_MAX);
+			sharedMaterials[resource] = Sint32(value);
+		}
+		else setPrivateMaterial(resource, value);
+	}
+	void changeMaterial(int resource, Sint32 change) { setMaterial(resource, Sint64(material(resource)) + change); }
+	// Keep stock and demand queries header-defined for the per-material hot loops.
+	Sint32 availableMaterial(int resource) const
+	{
+		const auto reserved = type->useTeamMaterials ? owner->reservedTeamMaterials[resource] : reservedMaterials[resource];
+		return std::max(0, material(resource) - reserved);
+	}
 	bool reserveMaterials(const BuildingMaterialCost& cost);
 	bool restoreMaterialsReservation(const BuildingMaterialCost& cost);
 	void releaseMaterials(const BuildingMaterialCost& cost);
@@ -289,24 +318,58 @@ class Building : public BuildingUtils, public BuildingStateRecord
 	MaterialPacket withdrawMaterialPacket(int resourceType);
 	int getConstructionOriginTypeNum() const { return constructionOriginTypeNum; }
 	int getConstructionCompletionTypeNum() const;
-	int constructionMaterialNeed(int resource) const;
-	int materialDeliveryNeed(int resource) const;
-	int materialDeliveryTarget(int resource) const;
+	int constructionMaterialNeed(int r) const
+	{
+		return type->isBuildingSite ? std::max(0, constructionBudget[r]-constructionReserved[r]) : 0;
+	}
+	int materialDeliveryNeed(int r) const
+	{
+		const bool construction = type->isBuildingSite && (constructionBudget[r] || type->semantics.constructionCost[r]);
+		// A slot outside the replenishment policy cannot request a delivery. Sites
+		// still use their live budget, even when the catalog does not replenish it.
+		if (!construction && (!(runtime->replenishMaterialMask & (1u<<r)) || !type->maxMaterial[r]))
+			return 0;
+		const int stock = material(r);
+		const Sint64 room = std::max<Sint64>(0, Sint64(materialStockLimit()) - stock);
+		if (construction)
+		{
+			// Construction can use unreserved stock already here. Repairs consume
+			// new deliveries directly, so existing inventory cannot satisfy them.
+			const int reserved = type->useTeamMaterials ? owner->reservedTeamMaterials[r] : reservedMaterials[r];
+			const int uncommitted = constructionResultState == REPAIR ? 0 : std::max(0, stock-reserved);
+			return Sint32(std::min<Sint64>(room, std::max(0, constructionMaterialNeed(r)-uncommitted)));
+		}
+		return Sint32(std::min<Sint64>(room, std::max(0, type->maxMaterial[r]-stock)));
+	}
+	int materialDeliveryTarget(int r) const
+	{
+		return type->isBuildingSite && (constructionBudget[r] || type->semantics.constructionCost[r]) ? constructionBudget[r] : (runtime->replenishMaterialMask & (1u<<r)) ? type->maxMaterial[r] : 0;
+	}
 	void fundConstructionFromInventory();
 	void restoreConstructionReservations();
 	void releaseConstructionReservations();
 	bool canTransferMaterialsTo(const BuildingType* destination) const;
 	void transferMaterialsPointer(bool wasShared);
 	BuildingMaterialCost constructionBudget{}, constructionReserved{};
-	std::array<Sint32,NB_UNIT_TYPE> constructionOriginRatios{};
+	std::array<Uint16,NB_UNIT_TYPE> constructionOriginRatios{};
 	// Optional additional types do not enlarge the pointer-free hot state record.
 	std::vector<Sint32> extraProductionRatios, extraProductionUsed, extraConstructionOriginRatios;
-	Sint32& productionRatio(unsigned id) { return id<NB_UNIT_TYPE ? ratio[id] : extraProductionRatios.at(id-NB_UNIT_TYPE); }
+	// Preferences are assigned from validated 0..32767 inputs, never incremented.
+	// Keep production counters wide: committed jobs can outlive preference changes.
 	Sint32 productionRatio(unsigned id) const { return id<NB_UNIT_TYPE ? ratio[id] : extraProductionRatios.at(id-NB_UNIT_TYPE); }
+	void setProductionRatio(unsigned id, Sint32 value)
+	{
+		assert(value >= 0 && value <= 32767);
+		if (id<NB_UNIT_TYPE) ratio[id]=Uint16(value); else extraProductionRatios.at(id-NB_UNIT_TYPE)=value;
+	}
 	Sint32& productionUsed(unsigned id) { return id<NB_UNIT_TYPE ? percentUsed[id] : extraProductionUsed.at(id-NB_UNIT_TYPE); }
 	Sint32 productionUsed(unsigned id) const { return id<NB_UNIT_TYPE ? percentUsed[id] : extraProductionUsed.at(id-NB_UNIT_TYPE); }
-	Sint32& originProductionRatio(unsigned id) { return id<NB_UNIT_TYPE ? constructionOriginRatios[id] : extraConstructionOriginRatios.at(id-NB_UNIT_TYPE); }
 	Sint32 originProductionRatio(unsigned id) const { return id<NB_UNIT_TYPE ? constructionOriginRatios[id] : extraConstructionOriginRatios.at(id-NB_UNIT_TYPE); }
+	void setOriginProductionRatio(unsigned id, Sint32 value)
+	{
+		assert(value >= 0 && value <= 32767);
+		if (id<NB_UNIT_TYPE) constructionOriginRatios[id]=Uint16(value); else extraConstructionOriginRatios.at(id-NB_UNIT_TYPE)=value;
+	}
 	void configureProductionState();
 	std::size_t productionTypeCount() const { return NB_UNIT_TYPE+extraProductionRatios.size(); }
 	void transitionProductionPreferences(const BuildingType* previous, const BuildingType* origin = nullptr, bool restoring = false);
@@ -356,6 +419,9 @@ class Building : public BuildingUtils, public BuildingStateRecord
 
 	bool integrity();
 	Uint32 checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152=false);
+private:
+	template<bool Diagnostic> Uint32 checkSumImpl(std::vector<Uint32> *checkSumsVector, bool legacy152);
+public:
 
 private:
 	// ─── Turret targeting (turretStep helpers) ──────────────────────
@@ -404,26 +470,6 @@ private:
 	/// the turret is off cooldown and may search for a target this tick; when
 	/// still cooling it decrements by shootRhythm and returns false.
 	bool tickShootingCooldown();
-
-	/// Scan outward ring-by-ring for the best enemy target in range. Pure query
-	/// over map/units/buildings; mutates nothing on the turret.
-	TurretTarget findBestTarget() const;
-
-	/// Evaluate the single tile (targetX,targetY) on ring `ring` and update
-	/// `best` if it holds a higher-priority/higher-scoring target. `ticksToHit`
-	/// is how long a bullet would take to reach this ring; targets that will
-	/// move away before then are skipped (and, matching the original, skipping a
-	/// ground unit also skips the air/building checks at the same tile).
-	void considerScanTile(int targetX, int targetY, int ring, int ticksToHit,
-	                      Uint32 enemies, Map* map, TurretTarget& best) const;
-
-	/// Score a warrior target (offense + weakness + proximity); higher is more
-	/// urgent. `ring` is the scan ring distance used for the proximity term.
-	int scoreWarriorTarget(const Unit* target, int ring) const;
-
-	/// Overwrite `best` with this candidate when its score beats the incumbent.
-	static void applyCandidate(TurretTarget& best, int score, int ticks,
-	                           int x, int y, TurretTargetType type);
 
 	/// Phase 5 geometry: compute the bullet spawn origin and velocity aimed at
 	/// the target tile, accounting for toroidal map wrap.
@@ -484,28 +530,6 @@ private:
 	bool considerUnitForWorkerFlag(Unit* unit, int* dist);
 	bool considerUnitForWarriorFlag(Unit* unit, int* dist, int terrainDistance=-1);
 
-	/// One worker that could be hired to carry materials to this building,
-	/// with the metrics the selection passes of
-	/// subscribeToBringMaterialsStep score on. A null `unit` means the slot
-	/// holds no candidate. `distance` is the linear gradient distance to the
-	/// building when the unit already carries the material being staffed, or
-	/// the round distance through a source when it must fetch the material.
-	struct BringMaterialsCandidate
-	{
-		Unit* unit;
-		int distance;
-	};
-
-	/// Running best-candidate state shared, in order, across the three
-	/// selection passes. Later passes run only while `choosen` is still null.
-	/// Candidates are ranked by `maxLevel` first, then by smallest `minValue`.
-	struct BringMaterialsSelection
-	{
-		int maxLevel;
-		int minValue;
-		Unit* choosen;
-	};
-
 	/// Lets src/unit/FetchHiringScoreHarness.cpp reach considerUnitForMaterial
 	/// without exposing it to game callers, as GameGUI does for its own harness.
 	friend class FetchHiringScoreHarness;
@@ -523,16 +547,8 @@ private:
 	/// the HARVEST ability or already filling this building.
 	bool considerUnitForMaterial(Unit* unit, int wantedMaterial, int* dist, int airDistance=-1);
 
-	/// Packs workers hireable to fetch `wantedMaterial` into candidates in unit
-	/// index order and returns their count. The caller supplies Unit::MAX_COUNT
-	/// slots. Rejection reasons are tallied via considerUnitForMaterial. The
-	/// tallies are reset per scan, so they describe one material, never a unit
-	/// counted once per material the building tried.
-	int gatherBringMaterialsCandidates(BringMaterialsCandidate* candidates, int wantedMaterial, const int* airDistances=nullptr);
-	// Keep large scratch arrays off fully staffed/dead/timer-only admission paths.
-	[[gnu::noinline]] bool hireMaterialUnit(const int* targets, const int* served, const int* airDistances);
-	[[gnu::noinline]] bool hireMaterialUnitWithFlyingDistances(const int* targets, const int* served);
-	[[gnu::noinline]] bool hireFlagUnits();
+	bool hireMaterialUnit(const int* targets,const int* served);
+	bool hireFlagUnits();
 
 	/// Per-material delivery targets and how many of each are already accounted
 	/// for by deliveries that landed plus units on their way. Counted in
@@ -544,21 +560,6 @@ private:
 	/// room for one more delivery and the deliveries already subscribed do not
 	/// cover the target.
 	bool wantsAnotherDelivery(int r, const int* targets, const int* served);
-
-	/// Hire a unit that already carries a material this building still wants. It
-	/// delivers without a fetch trip at all, so it is preferred whatever the
-	/// apportionment says; the apportionment only directs units we must send
-	/// out. Assigns destinationPurpose to every carrying candidate it inspects,
-	/// not only the one chosen, and scores on a hunger-discounted distance.
-	/// Both are deliberate and must be preserved.
-	void selectUnitCarryingWantedMaterial(const int* targets, const int* served, BringMaterialsSelection& sel, const int* airDistances=nullptr);
-
-	/// The fetch-out selection pass for one material. Scans all candidates and
-	/// updates `sel` with the best match, assigning destinationPurpose only to
-	/// the unit it chooses. A candidate holding something else is charged
-	/// CARRIED_MATERIAL_PENALTY_TILES of detour rather than excluded, so it is
-	/// hired when it is enough closer to be worth the loss.
-	void selectFetcher(const BringMaterialsCandidate* candidates, int count, int wantedMaterial, BringMaterialsSelection& sel);
 
 	/// Updates the materials pointer to local or team storage, depending on BuildingType.
 	void updateMaterialsPointer();
@@ -579,13 +580,16 @@ public:
 	// ─── Public data ────────────────────────────────────────────────
 
 	int verbose;
+	// Load-only reconciliation marker uses the existing pointer-alignment gap.
+	// Cleared after cross-reference restoration; never serialized.
+	bool privateStockClampedOnLoad = false;
 
 	// Pointer-free authoritative values are inherited from BuildingStateRecord.
 	BuildingType *type;
 	Team *owner;
-	/// Runtime alias selecting localMaterials or owner->teamMaterials. Snapshot
-	/// records retain the local stock and a selector for the frozen team stock.
-	Sint32* materials;
+	/// Borrowed shared pool, or null when the compact private stock is active.
+	/// Changing the binding does not overwrite inactive private inventory.
+	Sint32* sharedMaterials = nullptr;
 	/// Units actively working for and occupying the building, respectively.
 	std::list<Unit *> unitsWorking;
 	std::list<Unit *> unitsInside;
@@ -595,6 +599,10 @@ public:
 	//! Building owns these buffers; resetPathfindGradients frees them. Refresh and
 	//! stuck-unit retry policy lives in Map::buildingGradient / pathfindBuilding.
 	Uint16 *globalGradient[BUILDING_GRADIENT_COUNT];
+    // Owner creates/replaces leases. Workers touch the leased generation only.
+    std::shared_ptr<SharedBuildingGradient> sharedGradient[BUILDING_GRADIENT_COUNT];
+    std::shared_ptr<SharedBuildingGradient> leaseGradient(int slot);
+    void retireSharedGradient(int slot);
 	//! Retained propagation queues. Never serialized: saving completes
 	//! their fields first. Null for loaded or locked fields; owned with globalGradient.
 	std::unique_ptr<BuildingGradientSearch> globalGradientSearch[BUILDING_GRADIENT_COUNT];
@@ -631,9 +639,9 @@ public:
 	GradientDrop gradientDrop[BUILDING_GRADIENT_COUNT] {};
 	BuildingRoute resolveRoute(BuildingRoute route) const;
 	int routeSlot(int swimClass, BuildingRoute route) const
-	{ return int(route == BuildingRoute::Automatic ? resolveRoute(route) : route) * SWIM_CLASS_COUNT + swimClass; }
+	{ return int(route == BuildingRoute::Automatic ? resolveRoute(route) : route) * MOVEMENT_CLASS_COUNT + swimClass; }
 	int routeAccess(int swimClass, BuildingRoute route) const
-	{ return int(route == BuildingRoute::Automatic ? resolveRoute(route) : route) * SWIM_VARIANT_COUNT + (swimClass == SWIM_CLASS_COUNT-1 ? 2 : int(swimClass > 0)); }
+	{ return int(route == BuildingRoute::Automatic ? resolveRoute(route) : route) * SWIM_VARIANT_COUNT + int(swimAccessVariant(swimClass)); }
 	int workRoleTarget(int role) const; // -1 delivery, otherwise attracted unit class
 	bool subscribeWorkStep();
 
@@ -670,6 +678,14 @@ public:
 	void resetFailureTallies();
 
 private:
+	// These overloads share a temporary calculation within one building update;
+	// the original entry points always calculate fresh demand from live stock.
+	BuildingMaterialDemand materialDemand() const;
+	void computeWishedMaterials(int needs[MaterialSlotCount], const BuildingMaterialDemand& demand);
+	int desiredNumberOfWorkers(const BuildingMaterialDemand& demand) const;
+	void updateCallLists(const BuildingMaterialDemand& demand);
+	void updateCallLists(int desiredWorkers, bool resourceFull);
+
 	// ─── Private data ───────────────────────────────────────────────
 
 	// pending player orders (consumed by step())
@@ -677,8 +693,6 @@ private:
 
 	// units: scratch counters for subscription / priority diff
 	Sint32 maxUnitWorkingPrevious;
-	///The subscribeToBringMaterialsStep and subscribeForFlagingStep operate every 32 ticks
-	Sint32 subscriptionWorkingTimer;
 	///This stores the old priority, so that if the priority changes, this building will be updated in Teams
 	Sint32 oldPriority;
 

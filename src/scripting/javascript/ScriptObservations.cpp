@@ -1,5 +1,5 @@
-#include <bit>
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <type_traits>
 #include "PowerOfTwo.h"
 #include "ScriptObservations.h"
 #include <bit>
@@ -47,6 +47,25 @@ Value numbers(const Sint32 *values, int n)
 	for (int i = 0; i < n; ++i)
 		a.items.emplace_back(values[i]);
 	return a;
+}
+Value numbers(BuildingStockView values, int n)
+{
+    Value a = Value::array();
+    for (int i=0;i<n;++i) a.items.emplace_back(values[i]);
+    return a;
+}
+Value numbers(const Uint16 *values, int n)
+{
+    Value a = Value::array();
+    for (int i=0;i<n;++i)a.items.emplace_back(Sint32(values[i]));
+    return a;
+}
+Value numbers(const Uint8 *values, int n)
+{
+    Value a = Value::array();
+    for (int i = 0; i < n; ++i)
+        a.items.emplace_back(Sint32(values[i]));
+    return a;
 }
 bool visible(const AIEngine::AIWorldView &world, int team, const AIEngine::UnitView &u)
 {
@@ -119,7 +138,7 @@ Value Observations::unit(const AIEngine::UnitView &u, bool extended) const
             cargo.items.push_back(Value::object().set("material", material)
                 .set("numerator", std::to_string(numerator)).set("denominator", std::to_string(denominator)));
         };
-        if (u.carriedMaterial>=0 && !u.widePrimaryCargo) packet(u.carriedMaterial,u.carriedPacket.numerator,u.carriedPacket.denominator);
+        if (u.carriedMaterial>=0 && !u.widePrimaryCargo()) packet(u.carriedMaterial,u.carriedPacket.numerator,u.carriedPacket.denominator);
         if (const auto* extra=world().extraCargo(u)) for (const auto& entry:*extra)
             packet(entry.material,entry.packet.numerator,entry.packet.denominator);
         v.set("cargo",std::move(cargo)).set("assignedPurpose",int(u.jobPurpose));
@@ -161,8 +180,8 @@ Value Observations::building(const AIEngine::BuildingView &b) const
 			.set("minimumLevel", b.minLevelToFlag)
 			.set("requireBombing", b.explorersRequireBombing)
 			.set("workerMinimumLevel", b.minWorkerLevelToFlag)
-			.set("materials", numbers(world().buildingResources(b).data(), MaterialCount))
-			.set("resources", numbers(world().buildingResources(b).data(), MaterialSlotCount))
+			.set("materials", numbers(world().buildingResources(b), MaterialCount))
+			.set("resources", numbers(world().buildingResources(b), MaterialSlotCount))
 			.set("wishedMaterials", numbers(b.wishedMaterials, MaterialCount))
 			.set("wishedResources", numbers(b.wishedMaterials, MaterialSlotCount))
 			.set("production", numbers(b.ratio, NB_UNIT_TYPE))
@@ -172,9 +191,9 @@ Value Observations::building(const AIEngine::BuildingView &b) const
 			.set("bullets", b.bullets);
 		Value a = Value::array();
 		for (int i = 0; i < BASIC_COUNT; ++i)
-			a.items.emplace_back(b.clearingMaterials[i]);
+			a.items.emplace_back(b.clearsMaterial(i));
 		v.set("clearingResources", a);
-        for (unsigned i=BASIC_COUNT;i<MaterialCount;++i) a.items.emplace_back(b.clearingMaterials[i]);
+        for (unsigned i=BASIC_COUNT;i<MaterialCount;++i) a.items.emplace_back(b.clearsMaterial(i));
         v.set("clearingMaterials", a);
 	}
 	return v;
@@ -553,41 +572,33 @@ Value Observations::query(const std::string &name, const std::vector<Value> &arg
 		if (!limit)
 			return Value::array();
 		Value a = Value::array();
+		auto appendTeam = [&](const auto& records) {
+			using Pointer = decltype(*records.begin());
+			using Record = std::remove_cv_t<std::remove_pointer_t<Pointer>>;
+			std::vector<Pointer> visibleRecords;
+			for (const auto* record : records) {
+				if constexpr (std::is_same_v<Record, AIEngine::UnitView>) {
+					if (record->isDead || !visible(world(), team, *record)) continue;
+				} else {
+					if (record->buildingState == Building::DEAD || !visible(world(), team, *record)) continue;
+				}
+				visibleRecords.push_back(record);
+			}
+			// Public script pages retain ascending ID order. Sort only visible
+			// records locally; hidden populations change neither pages nor budgets.
+			std::sort(visibleRecords.begin(),visibleRecords.end(),[](const auto* a,const auto* b){ return a->gid<b->gid; });
+			for (const auto* record : visibleRecords) {
+				if (offset) { --offset; continue; }
+				charge(160);
+				if constexpr (std::is_same_v<Record, AIEngine::UnitView>) a.items.push_back(unit(*record));
+				else a.items.push_back(building(*record));
+				if (a.items.size() == unsigned(limit)) return true;
+			}
+			return false;
+		};
 		for (int t = 0; t < int(world().teams.size()); ++t)
 			if (filter < 0 || t == filter)
-				for (int i = 0; i < (name == "units" ? Unit::MAX_COUNT : Building::MAX_COUNT); ++i)
-				{
-					Value v;
-					if (name == "units")
-					{
-						auto *u = world().unitAtSlot(Unit::GIDfrom(i, t));
-						if (!u || u->isDead || !visible(world(), team, *u))
-							continue;
-						if (offset)
-						{
-							--offset;
-							continue;
-						}
-						charge(160);
-						v = unit(*u);
-					}
-					else
-					{
-						auto *b = world().buildingAtSlot(Building::GIDfrom(i, t));
-						if (!b || b->buildingState == Building::DEAD || !visible(world(), team, *b))
-							continue;
-						if (offset)
-						{
-							--offset;
-							continue;
-						}
-						charge(160);
-						v = building(*b);
-					}
-					a.items.push_back(std::move(v));
-					if (a.items.size() == unsigned(limit))
-						return a;
-				}
+				if (name == "units" ? appendTeam(world().unitsForTeam(t)) : appendTeam(world().buildingsForTeam(t))) return a;
 		return a;
 	}
 	if (name == "unit" || name == "unitBehavior" || name == "building")
@@ -613,7 +624,7 @@ Value Observations::query(const std::string &name, const std::vector<Value> &arg
 				if (name == "unitBehavior") {
 					charge(8, world().unitCatalog().definition(u->typeNum).key.size());
 					if (team < 0 || u->team == team) {
-						std::size_t packets = u->carriedMaterial >= 0 && !u->widePrimaryCargo ? 1 : 0;
+						std::size_t packets = u->carriedMaterial >= 0 && !u->widePrimaryCargo() ? 1 : 0;
 						if (const auto* extra = world().extraCargo(*u)) packets += extra->size();
 						charge(packets * 8, packets * 64);
 					}
@@ -874,20 +885,19 @@ void Script::Observations::visitSpatialEntities(
 			// Charge the fixed slot scan, independent of hidden entity counts.
 			if (budget)
 				budget(capacity, 0);
-			for (int i = 0; i < capacity; ++i)
-				if (units)
-				{
-					const auto *u = world().unitAtSlot(Unit::GIDfrom(i, t));
-					if (u && !u->isDead && visible(world(), team, *u))
+			if (units)
+			{
+				for (const auto* u : world().unitsForTeam(t))
+					if (!u->isDead && visible(world(), team, *u))
 						visit({t, u->typeNum, u->posX, u->posY, u->hp,
 							   u->performance[ATTACK_STRENGTH], false});
-				}
-				else
-				{
-					const auto *b = world().buildingAtSlot(Building::GIDfrom(i, t));
-					if (b && b->buildingState != Building::DEAD && visible(world(), team, *b))
+			}
+			else
+			{
+				for (const auto* b : world().buildingsForTeam(t))
+					if (b->buildingState != Building::DEAD && visible(world(), team, *b))
 						visit({t, b->shortTypeNum, b->posX, b->posY, b->hp, 0,
 							   bool(world().catalog->at(b->typeNum).isVirtual), b->typeNum});
-				}
+			}
 		}
 }

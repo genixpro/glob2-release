@@ -10,6 +10,11 @@
 #include "SnapshotGradient.h"
 #include "ResourceSeedCache.h"
 #include "TerrainSafetyCache.h"
+#include "ResourceGradientProbe.h"
+#include "ResourceGradientExploration.h"
+#include "GradientWorkStats.h"
+#include "GradientMarketTargets.h"
+#include <cstdlib>
 #include "field/GradientWorkspace.h"
 
 #include <vector>
@@ -25,15 +30,36 @@
 
 struct GradientRuntime
 {
+    std::unique_ptr<ResourceGradientProbe> qualityProbe;
+    AdaptiveGradientState adaptive;
+    std::unique_ptr<GradientWorkStats> workStats;
+    GradientMarketTargets marketTargets;
+    std::unique_ptr<ResourceGradientExploration> exploration;
 	struct Workspace
 	{
 		GradientWorkspace propagation;
 		gradient_preparation::CrowdingScratch crowding;
 	};
     TerrainSafetyCache safety;
+    // Owner-only derived summary, invalidated alongside air safety on edits,
+    // catalog replacement and loading. Never depends on query order.
+    struct DirectFlight {
+        bool resourceBlockers = false, valid = false;
+    } directFlight;
+	// A positive-speed action completes within 256 simulation ticks. Keep a
+    // new result for that first read opportunity, then permit deterministic
+    // reclamation when the original request has been abandoned.
+    static constexpr Uint32 MaterialReadHoldTicks = 256;
+
 	struct MaterialField
 	{
 		std::unique_ptr<Uint16[]> cells;
+        Uint16* published = nullptr;
+        // Consumer pool membership changes which otherwise eligible suppliers
+        // must be excluded, even when script identity/type/position are stable.
+        bool excludesShared = false;
+        bool awaitingFirstRead = false;
+        Uint32 publishedStep = 0;
 		Uint64 sourceRevision=0, recency=0;
 		Uint32 topology=0, builtStep=0, identity=0;
 		Sint32 consumer=-1, type=-1, x=0, y=0;
@@ -46,16 +72,17 @@ struct GradientRuntime
 	std::array<std::array<Uint64,MaterialCount>,Team::MAX_COUNT> stockRevision{};
 	Uint64 materialCacheClock=0, materialCacheBudget=64ull*1024*1024;
 	std::vector<Workspace> workspaces{1};
+	// Publication is idempotent during pause, inspection and restored boundaries.
+	std::optional<Uint32> worldResultsPublishedTick;
+	std::optional<Uint32> worldWorkSubmittedTick;
 	GradientPipeline pipeline;
+    struct FieldRequest { Uint16** slot; gradient_preparation::Request request; };
+    std::deque<FieldRequest> fieldRequests;
 	// Scheduled building fields share the executor with the periodic pipeline.
 	// Drain it before teams and the gradient buffer pool are destroyed.
 	BuildingGradientJobPipeline buildings;
-	// Execution placement for building jobs, following the periodic pipeline's
-	// worker setting. Local configuration, never saved.
-	bool buildingShared = true;
-	// A refresh asked for during team stepping, admitted FIFO after the tick.
-	// stale requests were superseded while queued; they stay in place so queue
-	// length (and with it the overflow fallback) survives save and load.
+	// Initialization or refresh asked for during team stepping, admitted FIFO
+	// after the tick. Superseded metadata is pruned before adding further demand.
 	struct BuildingRequest
 	{
 		int team = 0;
@@ -64,13 +91,11 @@ struct GradientRuntime
 		int slot = 0;
 		bool stale = false;
 	};
-	static constexpr std::size_t BuildingRequestLimit = 64;
+	static constexpr std::size_t BuildingRequestLimit = Team::MAX_COUNT * Building::MAX_COUNT * BUILDING_GRADIENT_COUNT;
 	std::deque<BuildingRequest> buildingRequests;
 	// Reserved this tick, prepared together at the observation boundary.
 	std::vector<BuildingGradientJobPipeline::Job*> stagedBuildings;
-	// Owner-side building walking field builds (cold fields, own-building
-	// changes and queue overflow; every build on a map without a game), split
-	// by reason.
+	// Explicit synchronous/editor field builds, split by diagnostic reason.
 	Uint64 buildingSynchronous = 0;
 	std::array<Uint64, std::size_t(Map::BuildingSyncReason::Count)> synchronousByReason{};
 	Map::BuildingSyncReason syncReason = Map::BuildingSyncReason::Other;
@@ -79,41 +104,44 @@ struct GradientRuntime
 		++buildingSynchronous;
 		++synchronousByReason[std::size_t(std::exchange(syncReason, Map::BuildingSyncReason::Other))];
 	}
-	// Worker depth for scheduled walking fields (Map::predictBuildingDepth):
-	// the generated model at one of its operating points, everything, or
-	// nothing beyond the seeds. Results never depend on it;
-	// GLOB2_BUILDING_DEPTH=full|table|lazy|<point name> selects it for timing
-	// comparisons. Local configuration, never saved.
-	enum class BuildingDepth { Table, Full, Lazy };
-	BuildingDepth buildingDepth = BuildingDepth::Table;
-	int buildingDepthPoint = BuildingGradientDepth::DEFAULT_POINT;
     ResourceGrowth::Pipeline growth;
-	// One simulation-owned reservation, consumed once during the observation phase.
+	// Owner reservations, consumed together at the immutable observation boundary.
 	// Scalar identities survive the scheduling barrier without borrowing stack lambdas.
 	struct Preparation {
 		using Kind = gradient_preparation::Kind;
 		GradientPipeline::Job *job = nullptr;
 		Kind kind = Kind::Materials;
 		int team = 0, material = 0, swim = 0;
-	} preparation;
+	};
+    std::vector<Preparation> preparations;
 	bool supplierLocationsDirty = true;
 	std::unordered_map<std::size_t, std::vector<std::uint16_t>> overlaySupplierLocations;
 	ResourceSeedCache resourceSeeds;
-	// Shared inert field for materials with no natural or supplier source.
+	// Shared immediate negative answer when global natural-source counts are zero.
 	std::vector<Uint16> absentMaterialField;
-    std::shared_ptr<gradient_kernel::GradientDeviceService> deviceService = std::make_shared<gradient_kernel::GradientDeviceService>();
-    std::shared_ptr<gradient_kernel::BackendSession> backendSession = std::make_shared<gradient_kernel::BackendSession>();
+    std::shared_ptr<gradient_kernel::GradientDeviceService> deviceService;
+    std::shared_ptr<gradient_kernel::BackendSession> backendSession;
     void shareBackendSession()
     {
         for (auto& workspace : workspaces) workspace.propagation.backendSession = backendSession;
         pipeline.setBackendSession(backendSession);
-        pipeline.setDeviceService(deviceService);
+
     }
     void resetBackendSession()
     {
-        backendSession = std::make_shared<gradient_kernel::BackendSession>();
+        if (backendSession) backendSession = std::make_shared<gradient_kernel::BackendSession>();
         shareBackendSession();
     }
-    GradientRuntime() { shareBackendSession(); }
+    GradientRuntime() {
+        pipeline.onSuperseded=[this](GradientPipeline::Job& job) {
+            if(job.adaptiveKey) {
+                const auto found=adaptive.fields.find(*job.adaptiveKey);
+                if(found!=adaptive.fields.end())found->second.inflight=false;
+            }
+        };
+        shareBackendSession();
+        if (const char* path=std::getenv("GLOB2_RESOURCE_GRADIENT_PROBE"))
+            if (*path) qualityProbe=std::make_unique<ResourceGradientProbe>(path);
+    }
 
 };

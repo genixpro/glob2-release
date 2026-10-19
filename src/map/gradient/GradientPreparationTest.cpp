@@ -3,12 +3,21 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "sim/snapshot/SnapshotStore.h"
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
+#include "LegacyPopulationOutput.h"
 #include "MapInternal.h"
 #include "gradient/GradientRuntime.h"
+#include "gradient/DirectFlightDirection.h"
+#include "gradient/GradientExecutionAudit.h"
 #include "engine/sim/snapshot/WorldSnapshot.h"
 #include <map>
+#include <BinaryStream.h>
+#include "Version.h"
 #include <type_traits>
 #include <nlohmann/json.hpp>
+#include <BinaryStream.h>
+#include <TextStream.h>
+#include <StreamBackend.h>
 
 #include <algorithm>
 #include <array>
@@ -46,8 +55,7 @@ void scalarClear(Map &m, int team, int swim, Uint16 *out)
 	const Uint32 mask = Team::teamNumberToMask(team);
 	for (size_t i = 0; i < m.size; ++i)
 	{
-		const auto c = m.getTile(size_t(i));
-		if (m.areaCells[i].forbidden & mask)
+				if (m.areaCells[i].forbidden & mask)
 			out[i] = GRADIENT_FORBIDDEN;
 		else if (m.isClearingTarget(i, mask, m.farmAreasEnabled()))
 			out[i] = GRADIENT_AT_GOAL;
@@ -70,8 +78,7 @@ void scalarGuard(Map &m, int team, int swim, Uint16 *out)
 	bool painted = false;
 	for (size_t i = 0; i < m.size; ++i)
 	{
-		const auto c = m.getTile(size_t(i));
-		if (m.areaCells[i].forbidden & mask)
+				if (m.areaCells[i].forbidden & mask)
 			out[i] = GRADIENT_FORBIDDEN;
 		else if (m.occupancyCells[i].immobileUnit != IMMOBILE_UNIT_NONE)
 			out[i] = GRADIENT_FORBIDDEN;
@@ -186,8 +193,8 @@ TEST_SUITE("GradientPreparation")
 		auto* consumer=world.addBuilding(names[3],44,8);
 		REQUIRE(unified); REQUIRE(direct); REQUIRE(shared); REQUIRE(consumer);
 		auto* foreign=world.addBuilding(names[0],56,8,0,1); REQUIRE(foreign);
-		foreign->materials[WHEAT]=10;
-		unified->materials[WHEAT]=10; direct->materials[WHEAT]=10; shared->materials[WHEAT]=10;
+		foreign->setMaterial(WHEAT, 10);
+		unified->setMaterial(WHEAT, 10); direct->setMaterial(WHEAT, 10); shared->setMaterial(WHEAT, 10);
 		auto& cache=m.gradientRuntime->resourceSeeds;
 		std::vector<Uint16> expected(m.size), actual(m.size);
 		cache.allocationFailed=true;
@@ -202,11 +209,11 @@ TEST_SUITE("GradientPreparation")
 		CHECK(actual[m.coordToIndex(44,8)]==GRADIENT_FORBIDDEN);
 		CHECK(actual[m.coordToIndex(56,8)]==GRADIENT_FORBIDDEN);
 		// Live stock changes must not wait for template invalidation.
-		direct->materials[WHEAT]=0;
+		direct->setMaterial(WHEAT, 0);
 		m.seedMaterialGradient(0,WHEAT,0,actual.data(),true,consumer,3);
 		CHECK(cache.valid);
 		CHECK(actual[m.coordToIndex(20,8)]==GRADIENT_UNREACHABLE);
-		direct->materials[WHEAT]=10;
+		direct->setMaterial(WHEAT, 10);
 		m.addForbidden(20,8,0); m.markImmobileUnit(21,8,0);
 		m.seedMaterialGradient(0,WHEAT,0,actual.data(),true,consumer,3);
 		CHECK(actual[m.coordToIndex(20,8)]==GRADIENT_FORBIDDEN);
@@ -264,7 +271,7 @@ TEST_SUITE("GradientPreparation")
 		auto &cache = m.gradientRuntime->resourceSeeds;
 		std::vector<Uint16> expected(m.size), actual(m.size);
 		auto compare = [&](int phase) {
-			for (int resource = 0; resource < MaterialCount; ++resource)
+			for (int resource = 0; resource < int(MaterialCount); ++resource)
 			{
 				const int team = phase % Team::MAX_COUNT, swim = phase % SWIM_CLASS_COUNT;
 				CAPTURE(team);
@@ -280,7 +287,7 @@ TEST_SUITE("GradientPreparation")
 		compare(0);
 		compare(1);
 		REQUIRE(cache.valid);
-		CHECK(cache.allocatedBytes() <= 16 * m.size);
+		CHECK(cache.allocatedBytes() <= 24 * m.size);
 		CHECK(cache.allocatedBytes() <= 32 * 1024 * 1024);
 		for (int phase = 0; phase < 160; ++phase)
 		{
@@ -478,7 +485,7 @@ TEST_SUITE("GradientPreparation")
 			m.clearImmobileUnit(x, y);
 			compare(hiddenResource, GRADIENT_AT_GOAL);
             // The first appearances of wood and the hidden material each add
-            // one lazy goal bitset. After these materials have been observed,
+            // lazy ground goal bitsets; air storage remains dormant until queried.
             // occupancy churn, invalidation and rebuild must allocate nothing.
             const auto warmedBytes=cache.allocatedBytes();
             const auto goalBytes=((m.size+63)/64)*sizeof(Uint64);
@@ -650,6 +657,7 @@ TEST_SUITE("GradientPreparation")
 		for (unsigned threads : {1, 2, 4})
 		{
 			m.configureCompute(threads);
+			REQUIRE(m.computeExecutor().threadCount()==(GAGCore::ThreadSupport::available ? threads : 1u));
 			for (int phase=0; phase<4; ++phase)
 			{
 				world.game.gameHeader.getExperiments().set(ExperimentId::FarmAreas, phase & 1);
@@ -658,10 +666,10 @@ TEST_SUITE("GradientPreparation")
 				world.game.configureBuildingCatalog();
 				m.fogOfWar = phase & 1 ? m.fogOfWarB.data() : m.fogOfWarA.data();
 				world.game.teams[0]->allies = phase & 1 ? 3 : 1;
-				for (int r=0; r<MaterialCount; ++r)
+				for (int r=0; r<int(MaterialCount); ++r)
 				{
-					market0->materials[r] = phase & 1 ? 0 : 10;
-					market1->materials[r] = phase & 1 ? 10 : 0;
+					market0->setMaterial(r, phase & 1 ? 0 : 10);
+					market1->setMaterial(r, phase & 1 ? 10 : 0);
 				}
 				for (int team=0; team<2; ++team)
 				for (int swim=0; swim<SWIM_CLASS_COUNT; ++swim)
@@ -670,7 +678,7 @@ TEST_SUITE("GradientPreparation")
 					CAPTURE(phase);
 					CAPTURE(team);
 					CAPTURE(swim);
-					for (int resource=0; resource<MaterialCount; ++resource)
+					for (int resource=0; resource<int(MaterialCount); ++resource)
 					for (bool markets : {false, true})
 					{
 						CAPTURE(resource);
@@ -722,7 +730,7 @@ TEST_SUITE("GradientPreparation")
 		{
 			CAPTURE(team);
 			CAPTURE(swim);
-			for (int resource=0; resource<MaterialCount; ++resource)
+			for (int resource=0; resource<int(MaterialCount); ++resource)
 			{
 				CAPTURE(resource);
 				scalarResource(m, team, resource, swim, expected.data(), false);
@@ -819,6 +827,9 @@ TEST_SUITE("GradientPreparation")
 		for (unsigned workers : {0, 1, 2})
 		{
 			CAPTURE(workers);
+			// Isolate this request's capture-to-publication delay from warm FIFO
+			// refreshes left queued by the previous parameter iteration.
+			m.resetGradientPipeline();
 			// Use an unallocated field for every worker count.
 			const int resource = workers;
 			REQUIRE(m.materialGradients[0][resource][0] == nullptr);
@@ -827,14 +838,28 @@ TEST_SUITE("GradientPreparation")
 			m.propagateGradient(expected.data(), 0);
 			m.configureGradientPipeline(workers, 8);
 			m.configureCompute(4);
-			std::vector<Uint16 *> requests(8);
+			std::vector<const Uint16 *> requests(8);
 			m.computeExecutor().run(requests.size(), [&](size_t j) {
 				requests[j] = m.getMaterialGradientSlot(0, resource, 0);
 			});
-			REQUIRE(requests[0] != nullptr);
-			for (size_t j=1; j<requests.size(); ++j)
-				REQUIRE(requests[j] == requests[0]);
-			requireSameField(m, "lazy resource", std::vector<Uint16>(requests[0], requests[0] + m.size), expected);
+            for (const auto* field:requests) REQUIRE(field==nullptr);
+            REQUIRE(m.gradientRuntime->fieldRequests.empty());
+            // Private worker reads cannot enroll owner requests. Demand enters at
+            // the completed-world boundary and remains absent through K-1 advances.
+            REQUIRE(m.getMaterialGradientSlot(0,resource,0)==nullptr);
+            REQUIRE(m.gradientRuntime->fieldRequests.size()==1);
+            m.advanceGradientPipeline();
+            m.stagePeriodicGradientPreparation();
+            m.game->snapshotStore().invalidateBoundary();
+            m.preparePendingGradient(m.game->snapshotStore().captureBoundary(*m.game));
+            for (unsigned i=1;i<8;++i) {
+                m.advanceGradientPipeline();
+                REQUIRE(m.lookupMaterialGradientSlot(0,resource,0)==nullptr);
+            }
+            m.advanceGradientPipeline();
+            const auto* published=m.lookupMaterialGradientSlot(0,resource,0);
+            REQUIRE(published!=nullptr);
+            requireSameField(m,"delayed resource",std::vector<Uint16>(published,published+m.size),expected);
 		}
 	}
 }
@@ -866,13 +891,17 @@ TEST_CASE("compound passable material goals track depletion visibility and overl
     std::vector<Uint16> direct(map.size),cached(map.size);
     gradient_preparation::MaterialSeedCache snapshotCache;
     auto compare=[&](int material) {
+        // Seed membership, including visibility and depletion, must agree
+        // across direct, cached and immutable-snapshot preparation paths.
         map.seedMaterialGradientDirect(0,material,0,direct.data(),nullptr);
         for (int repeat=0;repeat<32;++repeat) map.seedMaterialGradient(0,material,0,cached.data(),false);
         REQUIRE(map.gradientRuntime->resourceSeeds.valid);
         requireSameField(map,"compound source",cached,direct);
         gradient_preparation::Request request{gradient_preparation::Kind::Materials,0,material,0};
-        auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),request.requirements());
-        REQUIRE(snapshotCache.trySeed(snapshot,0,material,0,cached.data(),nullptr));
+        auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),SimulationSnapshot::Simulation);
+        std::uint64_t goalCount=0;
+        REQUIRE(snapshotCache.trySeed(snapshot,0,material,0,cached.data(),nullptr,&goalCount));
+        CHECK(goalCount==std::uint64_t(std::count(direct.begin(),direct.end(),GRADIENT_AT_GOAL)));
         requireSameField(map,"compound snapshot cache",cached,direct);
     };
     compare(int(MaterialId::Food));
@@ -910,6 +939,44 @@ TEST_CASE("compound passable material goals track depletion visibility and overl
 
 TEST_SUITE("RuntimeResources")
 {
+TEST_CASE("legacy pending natural publication can be saved before any movement query")
+{
+    glob2test::HeadlessGlobals globals;
+    for (bool text : {false,true}) {
+        glob2test::HeadlessGame original({.wDec=6,.hDec=6,.header=true});
+        auto& map=original.game.map;
+        map.setResourceByIndex(20,20,WHEAT,10);
+        glob2test::LegacyPopulationOutput::primeMaterialGradient(map,0,WHEAT,0);
+        const auto* field=map.getMaterialGradientSlot(0,WHEAT,0);
+        REQUIRE(field);
+        map.configureGradientPipeline(0,2);
+        auto data=std::make_unique<Uint16[]>(map.size);
+        std::copy_n(field,map.size,data.get());
+        // Legacy pending jobs retain their logical identity but have unknown
+        // capture history. Publication must not fabricate known observations.
+        map.gradientRuntime->adaptive={};
+        const GradientFieldKey key{GradientFieldFamily::Materials,0,0,WHEAT};
+        map.gradientRuntime->pipeline.restoreCompleted({
+            &map.materialGradients[0][WHEAT][0],0,1,false,std::move(data),key});
+        map.advanceGradientPipeline();
+        REQUIRE(map.gradientRuntime->adaptive.fields.size()==1);
+        CHECK_FALSE(map.gradientRuntime->adaptive.fields.at(key).serving.known);
+        auto* memory=new GAGCore::MemoryStreamBackend;
+        std::unique_ptr<GAGCore::OutputStream> out(text
+            ? static_cast<GAGCore::OutputStream*>(new GAGCore::TextOutputStream(memory))
+            : static_cast<GAGCore::OutputStream*>(new GAGCore::BinaryOutputStream(memory)));
+        original.game.save(out.get(),false,"legacy pending publication"); out->flush();
+        auto backend=std::make_unique<GAGCore::MemoryStreamBackend>(memory->getBuffer(),memory->getPosition());
+        backend->seekFromStart(0);
+        std::unique_ptr<GAGCore::InputStream> in(text
+            ? static_cast<GAGCore::InputStream*>(new GAGCore::TextInputStream(backend.get()))
+            : static_cast<GAGCore::InputStream*>(new GAGCore::BinaryInputStream(backend.release())));
+        Game restored(nullptr);
+        REQUIRE(restored.load(in.get()));
+        CHECK(map.checkSum(true)==restored.map.checkSum(true));
+    }
+}
+
 TEST_CASE("unused catalog definitions allocate no material gradients and schedule no extra work")
 {
     glob2test::HeadlessGlobals globals;
@@ -937,21 +1004,24 @@ TEST_CASE("unused catalog definitions allocate no material gradients and schedul
         for (unsigned material=0;material<MaterialCount;++material)
             for (int swim=0;swim<SWIM_CLASS_COUNT;++swim)
             {
-                REQUIRE(map->getMaterialGradientSlot(0,material,swim)!=nullptr);
-                CHECK((map->materialGradients[0][material][swim]!=nullptr)==(material==materialIndex(MaterialId::Food)));
+                const auto* field=map->getMaterialGradientSlot(0,material,swim);
+                CHECK((field==nullptr)==map->hasMaterialSourceSlot(material));
+                CHECK(map->materialGradients[0][material][swim]==nullptr);
             }
     }
     expanded.game.syncRandom=base.game.syncRandom;
     for (unsigned tick=0;tick<64;++tick)
     {
-        { auto random=base.game.bindRandom(); base.game.syncStep(0); }
-        { auto random=expanded.game.bindRandom(); expanded.game.syncStep(0); }
+        { auto random=base.game.bindRandom(); base.game.step(0); }
+        { auto random=expanded.game.bindRandom(); expanded.game.step(0); }
         CHECK(base.game.syncRandom==expanded.game.syncRandom);
         CHECK(original.gradientPipelineStatus().jobs==candidate.gradientPipelineStatus().jobs);
         CHECK(original.gradientPipelineStatus().pending==candidate.gradientPipelineStatus().pending);
     }
     original.finishGradientPipeline();
     candidate.finishGradientPipeline();
+    // Explicit cold reads above still receive their first complete generation.
+    // Unused catalog definitions add no work to that admitted demand.
     CHECK(original.gradientPipelineStatus().jobs>0);
     CHECK(original.gradientPipelineStatus().published==candidate.gradientPipelineStatus().published);
     CHECK(original.gradientRuntime->resourceSeeds.allocatedBytes()==candidate.gradientRuntime->resourceSeeds.allocatedBytes());
@@ -1064,9 +1134,13 @@ TEST_CASE("compact clearing traits preserve custom high-ID property combinations
             scalarGuard(map,0,swim,expected.data());
             map.seedGuardAreasGradient(0,swim,actual.data());
             CHECK(actual==expected);
-            map.getForbiddenGradient(0,swim);
+            const auto* previous=map.forbiddenGradient[0][swim];
             map.updateForbiddenGradient(0,swim);
-            CHECK(map.forbiddenGradient[0][swim][index]==((n&1) || swim==WATER_ONLY_CLASS ? GRADIENT_FORBIDDEN : GRADIENT_AT_GOAL));
+            const auto* forbidden=glob2test::awaitGradient(world.game,[&] {
+                const auto* field=map.getForbiddenGradient(0,swim);
+                return field!=previous ? field : nullptr;
+            });
+            CHECK(forbidden[index]==((n&1) || swim==WATER_ONLY_CLASS ? GRADIENT_FORBIDDEN : GRADIENT_AT_GOAL));
         }
     }
 }
@@ -1102,17 +1176,24 @@ TEST_CASE("published plane registry matches a sweep of live material fields" * d
 			if (!inserted) { CHECK(plane.generation >= it->second); it->second = plane.generation; }
 		}
 	};
-	for (int resource=0; resource<3; ++resource) m.setResourceByIndex(10 + resource, 10, resource, 0);
+	for (int resource : {WOOD, WHEAT, STONE}) m.setResourceByIndex(10 + resource, 10, resource, 0);
 	m.setMapDiscovered();
 	check(); CHECK(m.publishedResourceFields().empty());
-	m.getMaterialGradientSlot(0, WHEAT, 0); check();
+	CHECK(m.getMaterialGradientSlot(0,WHEAT,0)==nullptr); check();
+	CHECK(m.publishedResourceFields().empty()); // Enrollment does not publish a placeholder.
+	glob2test::awaitGradient(world.game,[&] { return m.getMaterialGradientSlot(0,WHEAT,0); }); check();
 	REQUIRE(m.publishedResourceFields().size() == 1);
 	const auto first = m.publishedResourceFields()[0].generation;
 	m.updateMaterialGradient(0, WHEAT, 0, false); check();
+	CHECK(m.publishedResourceFields()[0].generation==first);
+	glob2test::awaitGradient(world.game,[&] {
+		const auto* field=m.getMaterialGradientSlot(0,WHEAT,0);
+		return m.publishedResourceFields()[0].generation>first ? field : nullptr;
+	}); check();
 	CHECK(m.publishedResourceFields()[0].generation > first);
-	m.getMaterialGradientSlot(1, WOOD, 2); check();
-	std::vector<Uint16> observed(m.getW() * m.getH(), 5);
-	m.installObservedResourceField(1, STONE, 1, observed); check();
+	glob2test::awaitGradient(world.game,[&] { return m.getMaterialGradientSlot(1,WOOD,2); }); check();
+	auto* liveStone=glob2test::awaitGradient(world.game,[&] { return m.getMaterialGradientSlot(1,STONE,1); }); check();
+
 	CHECK(m.publishedResourceFields().size() == 3);
 	// Bulk slot changes re-register every live plane with a newer generation.
 	std::map<Uint16, Uint64> before;
@@ -1124,7 +1205,20 @@ TEST_CASE("published plane registry matches a sweep of live material fields" * d
 	REQUIRE(handle.resourceFields);
 	CHECK(handle.resourceFields->planes.size() == 3);
 	const auto* stone = handle.resourceFields->find(MapState::planeKey(1, STONE, 1, false));
-	REQUIRE(stone); CHECK(stone->values->at(7) == 5);
+	REQUIRE(stone);
+	CHECK(std::equal(stone->values->begin(), stone->values->end(), liveStone));
+	const auto frozen = *stone->values;
+	// Published fields are immutable. Replace the live generation through its
+	// normal delayed refresh and retain the captured snapshot across publication.
+	m.replaceResource(10 + STONE, 10, Resource{});
+	m.updateMaterialGradient(1, STONE, 1, false);
+	const auto* replacement = glob2test::awaitGradient(world.game, [&]() -> const Uint16* {
+		const auto* field = m.getMaterialGradientSlot(1, STONE, 1);
+		return field && !std::equal(frozen.begin(), frozen.end(), field) ? field : nullptr;
+	});
+	check();
+	CHECK(*stone->values == frozen);
+	CHECK_FALSE(std::equal(stone->values->begin(), stone->values->end(), replacement));
 	CHECK_FALSE(handle.resourceFields->find(MapState::planeKey(0, WOOD, 0, false)));
 }
 
@@ -1156,7 +1250,7 @@ TEST_CASE("snapshot seeds preserve every periodic kind after the live world chan
     for (auto kind : {Kind::Materials, Kind::Markets, Kind::Guard, Kind::Clear})
     for (int swim=0; swim<SWIM_CLASS_COUNT; ++swim) {
         Request request{kind,0,WHEAT,swim,game.teams[0]->allies,true,m.terrainQueueBuckets()};
-        auto snapshot=SimulationSnapshot::capture(game, SimulationSnapshot::captureCatalog(game), request.requirements());
+        auto snapshot=SimulationSnapshot::capture(game, SimulationSnapshot::captureCatalog(game), SimulationSnapshot::Simulation);
         std::vector<Uint16> expected(m.size), actual(m.size);
         if(kind==Kind::Materials || kind==Kind::Markets) scalarResource(m,0,WHEAT,swim,expected.data(),kind==Kind::Markets);
         else if(kind==Kind::Clear) scalarClear(m,0,swim,expected.data());
@@ -1192,19 +1286,19 @@ TEST_CASE("periodic supplier snapshots subtract reservations and retain overlay 
     game.gameHeader.getExperiments().set(ExperimentId::MarketsV2,true);
     game.configureBuildingCatalog();
     auto* supplier=world.addBuilding("inn",8,8); REQUIRE(supplier);
-    supplier->materials[WHEAT]=10;
+    supplier->setMaterial(WHEAT, 10);
     using namespace gradient_preparation;
     Request request{Kind::Markets,0,WHEAT,0};
     CrowdingScratch scratch;
     for (int reserved : {0,10}) {
         supplier->reservedMaterials[WHEAT]=reserved;
-        auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),request.requirements());
+        auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
         std::vector<Uint16> expected(m.size),actual(m.size);
         m.seedMaterialGradient(0,WHEAT,0,expected.data(),true);
-        supplier->materials[WHEAT]=0;
+        supplier->setMaterial(WHEAT, 0);
         seed(request,snapshot,actual.data(),scratch);
         requireSameField(m,"supplier snapshot",actual,expected);
-        supplier->materials[WHEAT]=10;
+        supplier->setMaterial(WHEAT, 10);
     }
 }
 
@@ -1220,7 +1314,7 @@ TEST_CASE("snapshot material templates refresh changed chunks and accept older s
     using namespace gradient_preparation;
     Request request{Kind::Materials,0,WHEAT,0};
     SimulationSnapshot::Store store;
-    auto before=store.captureBoundary(game,request.requirements());
+    auto before=store.captureBoundary(game);
     CrowdingScratch scratch;
     std::vector<Uint16> actual(map.size),expected(map.size);
     auto check=[&](const auto& snapshot) {
@@ -1245,44 +1339,15 @@ TEST_CASE("snapshot material templates refresh changed chunks and accept older s
     map.occupancyCells[3].immobileUnit=0; map.markOccupancy(3);
     map.fogOfWar[6]=0; map.markVisibility(6);
     ++game.stepCounter;
-    auto after=store.captureBoundary(game,request.requirements());
+    auto after=store.captureBoundary(game);
     check(after);
     CHECK(scratch.materials.refreshedCells-initial==256);
     check(before); // Worker scheduling need not visit snapshot ticks in order.
     check(after);
     // A reused cache must discard templates after registry/world replacement.
     glob2test::HeadlessGame replacement({.wDec=7,.hDec=7,.teams=2,.discovered=true,.clearImmobile=true,.header=true});
-    auto other=SimulationSnapshot::capture(replacement.game,SimulationSnapshot::captureCatalog(replacement.game),request.requirements());
+    auto other=SimulationSnapshot::capture(replacement.game,SimulationSnapshot::captureCatalog(replacement.game),SimulationSnapshot::Simulation);
     check(other);
-}
-
-TEST_CASE("GradientPreparation/explicit snapshot batches isolate invalid fields and retain exact output")
-{
-    using namespace gradient_kernel;
-    const auto previous=backend();struct Restore {Backend value;~Restore(){setBackend(value);}} restore{previous};
-    glob2test::HeadlessGlobals globals;
-    glob2test::HeadlessGame fixture({.wDec=6,.hDec=6,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
-    auto& game=fixture.game;auto& map=game.map;
-    map.setVertexTerrain(5,5,WATER);
-    auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),gradient_preparation::buildingRequirements());
-    std::array<std::vector<Uint16>,3> outputs,expected;
-    std::array<std::exception_ptr,3> errors{};
-    std::array<GradientWorkspace,3> scratch;
-    std::vector<gradient_preparation::PropagationField> fields;
-    setBackend(Backend::CPU);
-    for(unsigned i=0;i<3;++i){
-        outputs[i].assign(map.getW()*map.getH(),1);outputs[i][i]=65535;outputs[i][13]=0;
-        outputs[i][21]=65000;expected[i]=outputs[i];
-        map.propagateGradient(expected[i].data(),i==2?6:0);
-        gradient_preparation::Request request;request.swim=i==2?6:0;request.terrainBuckets=i==1?65:64;
-        fields.push_back({request,&snapshot,outputs[i].data(),&scratch[i],&errors[i]});
-    }
-    setBackend(Backend::OpenCL);gradient_preparation::propagateBatch(fields);
-    CHECK(outputs[0]==expected[0]);CHECK(outputs[2]==expected[2]);
-    CHECK_FALSE(errors[0]);CHECK_FALSE(errors[2]);REQUIRE(errors[1]);
-    CHECK_THROWS_AS(std::rethrow_exception(errors[1]),std::invalid_argument);
-    CHECK(outputs[1][1]==65535);CHECK(outputs[1][21]==65000); // Invalid field was never propagated.
-
 }
 
 TEST_CASE("GradientPreparation/modified terrain costs remain exact when field obstacles change")
@@ -1296,37 +1361,58 @@ TEST_CASE("GradientPreparation/modified terrain costs remain exact when field ob
     map.importTerrainDefinitions(R"({"schemaVersion":1,"terrains":[{"key":"test:gpu-cost","name":"Slow ground","base":"grass","appearance":"grass","properties":{"groundSpeedQ8":192}}]})");
     map.setGame(&world.game);
     map.paintCell(3,*map.terrainRegistry().find("test:gpu-cost"));
-    const auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),gradient_preparation::buildingRequirements());
+    const auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),SimulationSnapshot::Simulation);
     REQUIRE(snapshot.terrain->movementModifiers);
     gradient_preparation::Request request;
     GradientWorkspace scratch;
     setBackend(Backend::OpenCL);
     map.configureCompute(3); // one eligible maintenance worker plus presentation
     if constexpr(GAGCore::ThreadSupport::available) {
+        REQUIRE(map.computeExecutor().threadCount() == 3);
         const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
         while(initializationState.load()!=2 && std::chrono::steady_clock::now()<deadline) std::this_thread::yield();
         REQUIRE(initializationState.load()==2);
     }
 
-    for (unsigned entry=0;entry<3;++entry) {
+    for (unsigned entry=0;entry<2;++entry) {
         for(unsigned phase=0;phase<2;++phase) {
+            CAPTURE(entry); CAPTURE(phase);
             std::vector<Uint16> output(map.size,1);output[0]=65535;output[phase?37:13]=0;
+            const auto seeds=output;
             auto expected=output;
             setBackend(Backend::CPU);map.propagateGradient(expected.data(),0);
             setBackend(Backend::OpenCL);
-            const auto completed=openCLStatus().committedFields;
+            const auto before = openCLStatus();
+            const auto completed=before.committedFields;
+            std::size_t executionSlot = 0;
             const bool deviceReady=readyPlans.load()&(1u<<unsigned(Plan::Frozen8));
             std::function<void()> work=[&] {
+                executionSlot = ComputeExecutor::workerSlot();
                 if(entry==0) gradient_preparation::propagate(request,snapshot,output.data(),scratch);
-                else if(entry==1) {
-                    const gradient_preparation::PropagationField field{request,&snapshot,output.data(),&scratch};
-                    gradient_preparation::propagateBatch(std::span(&field,1));
-                } else map.propagateGradient(output.data(),0);
+                else map.propagateGradient(output.data(),0);
             };
             const ComputeExecutor::Group group{1,{[](void* p,std::size_t){(*static_cast<std::function<void()>*>(p))();},&work}};
             auto batch=map.computeExecutor().submit(std::span(&group,1)); map.computeExecutor().join(batch);
+            const auto after = openCLStatus();
+            CAPTURE(executionSlot); CAPTURE(deviceReady);
+            CAPTURE(before.available); CAPTURE(after.available); CAPTURE(after.error);
+            CAPTURE(before.budgetDeclines); CAPTURE(after.budgetDeclines);
+            CAPTURE(before.cpuSelections); CAPTURE(after.cpuSelections);
+            if constexpr(GAGCore::ThreadSupport::available)
+                REQUIRE(executionSlot != 0);
             CHECK(output==expected);
-            if(deviceReady) CHECK(openCLStatus().committedFields==completed+1);
+            if (deviceReady) {
+                if (after.error.empty()) {
+                    CHECK(after.committedFields == completed + 1);
+                } else {
+                    // Readiness permits a device attempt, not a successful
+                    // execution. A reported failure must retire the backend and
+                    // recover this exact field on CPU without a false GPU commit.
+                    REQUIRE_FALSE(after.available);
+                    CHECK(after.committedFields == completed);
+                    CHECK(after.cpuSelections == before.cpuSelections + 1);
+                }
+            }
         }
     }
 }
@@ -1354,7 +1440,7 @@ TEST_CASE("GradientPreparation/minimal GPU views release source graphs and recov
             map.setGame(&world.game);map.paintCell(3,*map.terrainRegistry().find("test:minimal-cost"));
         }
         map.setVertexTerrain(5,5,WATER);
-        auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),gradient_preparation::buildingRequirements());
+        auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),SimulationSnapshot::Simulation);
         // Distinct owners let expiry prove that the view did not retain the
         // Terrain or its table even though the live map has its own catalog.
         auto terrain=std::make_shared<SimulationSnapshot::Terrain>(*snapshot.terrain);
@@ -1417,11 +1503,12 @@ TEST_CASE("GradientPreparation/minimal view pressure declines without moving ori
     using namespace gradient_kernel;
     glob2test::HeadlessGlobals globals;
     glob2test::HeadlessGame world({.wDec=4,.hDec=4,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
-    auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),gradient_preparation::buildingRequirements());
+    auto snapshot=SimulationSnapshot::capture(world.game,SimulationSnapshot::captureCatalog(world.game),SimulationSnapshot::Simulation);
     auto data=std::make_unique<Uint16[]>(world.game.map.size);std::fill_n(data.get(),world.game.map.size,Uint16(77));
     const auto original=data.get();auto session=std::make_shared<BackendSession>();gradient_preparation::Request request;
     const auto current=openCLStatus().hostBytes;
-    REQUIRE(current<=OpenCLHostBudget);const auto pressure=OpenCLHostBudget-current;
+    REQUIRE(current<=OpenCLHostBudget);
+    const std::size_t pressure=OpenCLHostBudget-static_cast<std::size_t>(current);
     REQUIRE(reserveOpenCLHostBytes(pressure));
     {
         struct Release {std::size_t bytes;~Release(){releaseOpenCLHostBytes(bytes);}} release{pressure};
@@ -1436,4 +1523,931 @@ TEST_CASE("GradientPreparation/minimal view pressure declines without moving ori
     CHECK_FALSE(gradient_preparation::ownPropagation(request,snapshot,data,session,{},17));
     CHECK(gradient_preparation::minimalCostViewMetrics().representationDeclines==before.representationDeclines+1);
     CHECK(data.get()==original);CHECK(data[0]==77);
+}
+
+TEST_CASE("compiled preparation tables preserve rule and catalog interpretation" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=2,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& map=world.game.map;
+    for(std::size_t i=0;i<map.size;++i)map.paintCell(i,static_cast<TerrainType>(i%TERRAIN_COUNT));
+    const auto snapshot=world.game.captureReadBoundary().gradientView();
+    const auto& rules=*snapshot.terrain->rules;
+    REQUIRE(rules.gradientPreparation().size()==rules.size());
+    for(std::size_t id=0;id<rules.size();++id)for(unsigned swim=0;swim<8;++swim){
+        const auto& original=rules[Uint16(id)];const auto& compact=rules.gradientPreparation()[id];
+        CHECK(bool(compact.accessibility&(1u<<swim))==gradient_kernel::terrainAllowsGround(original.properties,swim));
+        CHECK((compact.costs[swim]&65535)==original.ground[swim].cardinal);
+        CHECK((compact.costs[swim]>>16)==original.ground[swim].diagonal);
+        const auto& cpu=rules.openTerrainSeeds(swimAccessVariant(swim));
+        REQUIRE(cpu.size()==rules.size());
+        CHECK(cpu[id]==(gradient_kernel::terrainAllowsGround(original.properties,swim)
+            ? GRADIENT_UNREACHABLE : GRADIENT_FORBIDDEN));
+    }
+    const auto& resources=*snapshot.catalogs->resources;
+    REQUIRE(resources.gradientPreparation().size()==resources.size());
+    for(std::size_t id=0;id<resources.size();++id){
+        const auto& original=resources.properties(static_cast<ResourceId>(id));
+        const auto compact=resources.gradientPreparation()[id];
+        CHECK((compact&AllMaterials)==original.materialMask);
+        CHECK(bool(compact&(1u<<16))==original.blocksGround);
+        CHECK(bool(compact&(1u<<17))==original.visibleToHarvest);
+        CHECK(bool(compact&(1u<<18))==original.clearable);
+        CHECK(bool(compact&(1u<<19))==original.farmable);
+    }
+}
+
+TEST_CASE("rejected corner identities preserve all compiled gradient tables" *
+		  doctest::test_suite("GradientPreparation"))
+{
+	glob2test::HeadlessGlobals globals;
+	CellRuleTable table(TerrainRegistry::builtins(), ResourceRegistry::builtins());
+	table.intern(GRASS, SAND, GRASS, SAND);
+	const auto original = table;
+	const auto invalid = static_cast<TerrainType>(TerrainRegistry::builtins()->size());
+	CHECK_THROWS_AS(table.intern(GRASS, SAND, GRASS, invalid), std::invalid_argument);
+	REQUIRE(table.size() == original.size());
+	CHECK(table.gradientPreparation().size() == original.gradientPreparation().size());
+	for (unsigned swim = 0; swim < 8; ++swim)
+	{
+		CHECK(table.openTerrainSeeds(swimAccessVariant(swim)) ==
+			  original.openTerrainSeeds(swimAccessVariant(swim)));
+		const auto &actual = table.movement(swim);
+		const auto &expected = original.movement(swim);
+		CHECK(actual.entries.size() == expected.entries.size());
+		CHECK(actual.profiles.size() == expected.profiles.size());
+		CHECK(actual.profileIds == expected.profileIds);
+		CHECK(actual.steps == expected.steps);
+		CHECK(actual.minimum == expected.minimum);
+	}
+	// A subsequent valid insertion still issues the next stable rule identity.
+	CHECK(table.intern(GRASS, GRASS, GRASS, SAND) == original.size());
+	CHECK(table.gradientPreparation().size() == table.size());
+	for (unsigned variant = 0; variant < CellRuleTable::OpenTerrainClasses.size(); ++variant)
+		CHECK(table.openTerrainSeeds(variant).size() == table.size());
+}
+
+TEST_CASE("movement profile rejection rolls back previously appended swim classes" *
+		  doctest::test_suite("GradientPreparation"))
+{
+	glob2test::HeadlessGlobals globals;
+	for (const auto count : {8u, 9u})
+	{
+		CAPTURE(count);
+		CellRuleTable table(TerrainRegistry::builtins(), ResourceRegistry::builtins());
+		// The first class gains a new cost before the last class rejects. Exercise
+		// rollback both across the 8/256 alternative transition and within 256.
+		auto &changed = const_cast<TerrainRegistry::Movement &>(table.movement(0));
+		changed.profiles.assign(count, gradient_kernel::EntrySteps{1, 1});
+		changed.prepare();
+		// Force the final class's documented profile limit. Earlier classes have
+		// already appended entries when this rejection occurs; rollback must cover
+		// their prepared metadata as well as the unpublished derived record.
+		auto &capped = const_cast<TerrainRegistry::Movement &>(table.movement(7));
+		capped.profiles.assign(256, gradient_kernel::EntrySteps{1, 1});
+		const auto original = table;
+		const auto corners = CellRuleTable::key(GRASS, SAND, GRASS, SAND);
+		CHECK_THROWS_AS(table.intern(corners), std::length_error);
+		CHECK_FALSE(table.find(corners).has_value());
+		CHECK(table.size() == original.size());
+		CHECK(table.gradientPreparation().size() == original.gradientPreparation().size());
+		for (unsigned swim = 0; swim < 8; ++swim)
+		{
+			CHECK(table.openTerrainSeeds(swimAccessVariant(swim)) ==
+				  original.openTerrainSeeds(swimAccessVariant(swim)));
+			const auto &actual = table.movement(swim);
+			const auto &expected = original.movement(swim);
+			REQUIRE(actual.entries.size() == expected.entries.size());
+			REQUIRE(actual.profiles.size() == expected.profiles.size());
+			CHECK(actual.profileIds == expected.profileIds);
+			CHECK(actual.steps == expected.steps);
+			CHECK(actual.minimum == expected.minimum);
+			REQUIRE(actual.prepared.has_value() == expected.prepared.has_value());
+			if (actual.prepared)
+				std::visit(
+					[&](const auto &profile)
+					{
+						using Profile = std::remove_cvref_t<decltype(profile)>;
+						const auto *previous = std::get_if<Profile>(&*expected.prepared);
+						REQUIRE(previous != nullptr);
+						CHECK(profile.terrainClasses == previous->terrainClasses);
+						CHECK(profile.cardinalSlots == previous->cardinalSlots);
+						CHECK(profile.diagonalSlots == previous->diagonalSlots);
+						CHECK(profile.steps == previous->steps);
+						CHECK(profile.maxAppends == previous->maxAppends);
+						CHECK(profile.classCount == previous->classCount);
+						CHECK(profile.stepCount == previous->stepCount);
+						for (std::size_t i = 0; i < profile.classes.size(); ++i) {
+							CHECK(profile.classes[i].cardinal == previous->classes[i].cardinal);
+							CHECK(profile.classes[i].diagonal == previous->classes[i].diagonal);
+						}
+					},
+					*actual.prepared);
+			for (std::size_t i = 0; i < actual.entries.size(); ++i)
+			{
+				CHECK(actual.entries[i].cardinal == expected.entries[i].cardinal);
+				CHECK(actual.entries[i].diagonal == expected.entries[i].diagonal);
+			}
+		}
+	}
+}
+
+TEST_CASE("CPU snapshot dispatch preserves trivial fields and validates before its shortcut" *
+          doctest::test_suite("GradientPreparation"))
+{
+    using namespace gradient_kernel;
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.wDec=4,.hDec=4,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
+    auto& game=fixture.game;auto& map=game.map;
+    auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+    gradient_preparation::Request request;request.swim=0;request.terrainBuckets=64;
+    GradientWorkspace scratch;
+    // Unchanged scratch proves this is the trivial shortcut, rather than a
+    // full solve that happens to return an identical field.
+    scratch.buckets[0].push(17);
+    for (const auto value : {GRADIENT_FORBIDDEN, GRADIENT_AT_GOAL}) {
+        std::vector<Uint16> output(map.size,value);
+        gradient_preparation::propagateCPU(request,snapshot,output.data(),scratch);
+        CHECK(std::all_of(output.begin(),output.end(),[&](auto cell){return cell==value;}));
+        CHECK(scratch.buckets[0].size==1);
+    }
+    std::vector<Uint16> output(map.size,GRADIENT_AT_GOAL);
+    request.terrainBuckets=65;
+    CHECK_THROWS_AS(gradient_preparation::propagateCPU(request,snapshot,output.data(),scratch),std::invalid_argument);
+    map.game=nullptr;
+    map.importTerrainDefinitions(R"({"schemaVersion":1,"terrains":[{"key":"test:cpu-audit-slow","name":"Slow water","base":"water","appearance":"water","properties":{"groundSpeedQ8":64}}]})");
+    map.setGame(&game);map.paintCell(0,*map.terrainRegistry().find("test:cpu-audit-slow"));
+    snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+    request.terrainBuckets=64;request.swim=6;
+    CHECK_THROWS_AS(gradient_preparation::propagateCPU(request,snapshot,output.data(),scratch),std::invalid_argument);
+    CHECK(std::all_of(output.begin(),output.end(),[](auto cell){return cell==GRADIENT_AT_GOAL;}));
+}
+
+TEST_CASE("air shares preparation and lazy building fields while ignoring ground blockers" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& game=world.game;auto& map=game.map;
+    auto* building=world.addBuilding("inn",8,8);REQUIRE(building);
+    auto* flyer=world.addUnit(EXPLORER,4,4);REQUIRE(flyer);
+    REQUIRE(flyer->movementClass()==AIR_MOVEMENT_CLASS);
+    CHECK(swimAccessVariant(AIR_MOVEMENT_CLASS)==3);
+    for(int ground=0;ground<SWIM_CLASS_COUNT;++ground)
+        CHECK(building->routeAccess(ground,BuildingRoute::Footprint)!=building->routeAccess(AIR_MOVEMENT_CLASS,BuildingRoute::Footprint));
+    map.setResourceByIndex(10,10,WHEAT,1);
+    map.setResourceByIndex(11,10,WOOD,1);
+    map.markImmobileUnit(10,10,0);
+    map.addForbidden(12,8,0); // Keep this paint probe clear of the void tile's blended edges.
+    map.paintCell(13,10,VOID_HOLE);
+    for(auto kind:{gradient_preparation::Kind::Materials,gradient_preparation::Kind::Clear,gradient_preparation::Kind::Guard}) {
+        using namespace gradient_preparation;
+        Request request{kind,0,WHEAT,AIR_MOVEMENT_CLASS,game.teams[0]->allies,false,map.movementQueueBuckets(AIR_MOVEMENT_CLASS)};
+        const auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+        std::vector<Uint16> owner(map.size),worker(map.size);
+        auto run=[&](auto fn){fn(0,map.size);};
+        if(kind==Kind::Materials)materialCells(map.stateView(),map.fogOfWar,0,WHEAT,AIR_MOVEMENT_CLASS,owner.data(),nullptr,run);
+        else if(kind==Kind::Clear)clearCells(map.stateView(),false,0,AIR_MOVEMENT_CLASS,owner.data(),run);
+        else guardCells(map.stateView(),game.teams[0]->allies,0,AIR_MOVEMENT_CLASS,owner.data(),run);
+        CrowdingScratch scratch;
+        seed(request,snapshot,worker.data(),scratch);
+        REQUIRE(owner==worker);
+        if(kind==Kind::Materials) {
+            CHECK(owner[map.coordToIndex(10,10)]==GRADIENT_AT_GOAL);
+            CHECK(owner[map.coordToIndex(11,10)]==GRADIENT_UNREACHABLE);
+            CHECK(owner[map.coordToIndex(8,8)]==GRADIENT_UNREACHABLE);
+            CHECK(owner[map.coordToIndex(12,8)]==GRADIENT_UNREACHABLE);
+            CHECK(owner[map.coordToIndex(13,10)]==GRADIENT_FORBIDDEN);
+            // Both template caches must preserve the air plane's independent
+            // goal membership when an immobile ground unit occupies a deposit.
+            MaterialSeedCache cache;
+            std::vector<Uint16> cached(map.size);
+            REQUIRE(cache.trySeed(snapshot,0,WHEAT,0,cached.data(),nullptr));
+            CHECK(cache.airSignatures.empty());
+            REQUIRE(cache.trySeed(snapshot,0,WHEAT,AIR_MOVEMENT_CLASS,cached.data(),nullptr));
+            CHECK_FALSE(cache.airSignatures.empty());
+            CHECK(cached==owner);
+            for(int repeat=0;repeat<20;++repeat)
+                map.gradientRuntime->resourceSeeds.trySeed(map,0,WHEAT,0,cached.data(),nullptr);
+            REQUIRE(map.gradientRuntime->resourceSeeds.trySeed(map,0,WHEAT,AIR_MOVEMENT_CLASS,cached.data(),nullptr));
+            CHECK(cached==owner);
+        }
+        map.propagateGradient(owner.data(),AIR_MOVEMENT_CLASS);
+        GradientWorkspace workspace;
+        propagate(request,snapshot,worker.data(),workspace);
+        REQUIRE(owner==worker);
+    }
+    int distance=0;
+    glob2test::awaitBuildingGradient(game,building,AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+    REQUIRE(map.buildingAvailable(building,AIR_MOVEMENT_CLASS,4,4,&distance));
+    const auto slot=building->routeSlot(AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+    const auto lease=map.leaseBuildingRoute(building,AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+    REQUIRE(lease);
+    CHECK(building->globalGradientSearch[slot]);
+    flyer->performance[FLY]*=2;
+    CHECK(flyer->movementClass()==AIR_MOVEMENT_CLASS);
+    CHECK(map.leaseBuildingRoute(building,flyer->movementClass(),BuildingRoute::Footprint)==lease);
+}
+
+TEST_CASE("air material planes and cache keys occupy an independent namespace" * doctest::test_suite("GradientPreparation"))
+{
+    std::vector<bool> seen(MapState::PlaneCount,false);
+    for(int team=0;team<Team::MAX_COUNT;++team)
+        for(int material=0;material<int(MaterialSlotCount);++material)
+            for(int movement=0;movement<MOVEMENT_CLASS_COUNT;++movement)
+                for(bool market:{false,true}) {
+                    const auto key=MapState::planeKey(team,material,movement,market);
+                    REQUIRE(key<seen.size());CHECK_FALSE(seen[key]);seen[key]=true;
+                    const auto decoded=MapState::decodePlaneKey(key);
+                    CHECK(decoded.team==team);CHECK(decoded.resource==material);
+                    CHECK(decoded.swim==movement);CHECK(decoded.market==market);
+                    if(material<int(MaterialCount))for(int ground=0;ground<SWIM_CLASS_COUNT;++ground)
+                        CHECK(MapState::materialFieldKey(-1,team,material,AIR_MOVEMENT_CLASS,market)
+                            !=MapState::materialFieldKey(-1,team,material,ground,market));
+                }
+    CHECK(std::all_of(seen.begin(),seen.end(),[](bool v){return v;}));
+}
+
+TEST_CASE("authored air blockers constrain the common point router while forbidden paint only blocks ground" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.discovered=true,.clearImmobile=true,.header=true});
+    auto& map=world.game.map;
+    using Json=nlohmann::json;
+    auto blocker=Json::parse(map.resourceRegistry().serialize())["resources"][1];
+    blocker["key"]="test:air-wall";
+    blocker["properties"]["blocksAir"]=true;
+    blocker["properties"]["blocksGround"]=false;
+    map.installResourceDefinitions(Json{{"schemaVersion",1},{"resources",Json::array({blocker})}}.dump());
+    const auto resource=*map.resourceRegistry().find("test:air-wall");
+    for(int y=0;y<32;++y) {
+        if(y!=20)map.setResourceByIndex(8,y,resourceIndex(resource),1);
+        map.setResourceByIndex(24,y,resourceIndex(resource),1);
+    }
+    int dx=0,dy=0;
+    REQUIRE(map.pathfindPointToPoint(4,4,12,4,&dx,&dy,AIR_MOVEMENT_CLASS,1,1000));
+    CHECK(dy!=0);
+    REQUIRE(map.pathfindPointToPoint(4,4,12,4,&dx,&dy,0,1,1000));
+    CHECK(dx==1);CHECK(dy==0);
+    // A blocked task goal can be approached, while steering never enters it.
+    REQUIRE(map.pathfindPointToPoint(7,4,8,4,&dx,&dy,AIR_MOVEMENT_CLASS,1,1000));
+    CHECK(dx==0);CHECK(dy==0);
+    map.addForbidden(8,20,0);
+    CHECK(map.pathfindPointToPoint(4,4,12,4,&dx,&dy,AIR_MOVEMENT_CLASS,1,1000));
+    CHECK(dy!=0);
+    for(int y=0;y<map.getH();++y) { map.addForbidden(6,y,0); map.addForbidden(24,y,0); }
+    CHECK_FALSE(map.pathfindPointToPoint(4,4,12,4,&dx,&dy,0,1,1000));
+    CHECK(dx==0);CHECK(dy==0);
+}
+
+TEST_CASE("unreleased routing draft formats are rejected before reading runtime state" * doctest::test_suite("GradientPreparation"))
+{
+    for(Sint32 version:{170,VERSION_MINOR+1}) {
+        auto* bytes=new GAGCore::MemoryStreamBackend;
+        GAGCore::BinaryOutputStream output(bytes);
+        output.writeText("draft routing","mapName");
+        output.writeSint32(VERSION_MAJOR,"versionMajor");
+        output.writeSint32(version,"versionMinor");
+        const std::string data(bytes->getBuffer(),bytes->getPosition());
+        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(data.data(),data.size()));
+        input.seekFromStart(0);
+        MapHeader header;
+        CHECK_FALSE(header.load(&input));
+    }
+}
+
+TEST_CASE("forbidden paint is ground-only for air material service guard and clearing queries" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for(bool constrained:{false,true}) {
+        CAPTURE(constrained);
+        glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.header=true});
+        auto& game=world.game;auto& map=game.map;
+        auto* inn=world.addBuilding("inn",20,12);REQUIRE(inn);
+        auto* flag=world.addBuilding("explorationflag",20,20);REQUIRE(flag);
+        flag->unitStayRange=8;
+        map.setResourceByIndex(18,12,WHEAT,1);
+        map.setResourceByIndex(18,20,WOOD,1);map.addClearArea(18,20,0);
+        map.addGuardArea(18,16,0);
+        REQUIRE_FALSE(map.hasAirRoutingConstraints());
+        for(int y=0;y<map.getH();++y) for(int x=0;x<map.getW();++x) map.addForbidden(x,y,0);
+        CHECK_FALSE(map.hasAirRoutingConstraints());
+        if(constrained) map.paintCell(60,60,VOID_HOLE);
+        CHECK(map.hasAirRoutingConstraints()==constrained);
+        CHECK(map.isFreeForMovement(9,8,AIR_MOVEMENT_CLASS,1));
+        CHECK_FALSE(map.isFreeForMovement(9,8,0,1));
+        int distance=-1,dx=0,dy=0;
+        glob2test::awaitBuildingGradient(game,inn,AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+        glob2test::awaitBuildingGradient(game,flag,AIR_MOVEMENT_CLASS,BuildingRoute::Clearing);
+        CHECK(map.buildingAvailable(inn,AIR_MOVEMENT_CLASS,8,8,&distance,BuildingRoute::Footprint));
+        CHECK(distance>0);
+        CHECK_FALSE(map.buildingAvailable(inn,0,8,8,&distance,BuildingRoute::Footprint));
+        CHECK(map.buildingAvailable(flag,AIR_MOVEMENT_CLASS,8,8,&distance,BuildingRoute::Clearing));
+        // AIR shared fields follow the same cold asynchronous contract as
+        // ground; availability/seed assertions require actual publication.
+        glob2test::awaitGradient(game,[&]{return map.getMaterialGradientSlot(0,WHEAT,AIR_MOVEMENT_CLASS,false);});
+        glob2test::awaitGradient(game,[&]{return map.getMaterialGradientSlot(0,WHEAT,0,false);});
+        CHECK(map.materialAvailable(0,MaterialId::Food,AIR_MOVEMENT_CLASS,8,8));
+        CHECK_FALSE(map.materialAvailable(0,MaterialId::Food,0,8,8));
+        CHECK(glob2test::awaitGradient(game,[&]{return map.getClearAreasGradient(0,AIR_MOVEMENT_CLASS);})[map.coordToIndex(18,20)]==GRADIENT_AT_GOAL);
+        CHECK(glob2test::awaitGradient(world.game,[&] { return map.getClearAreasGradient(0,0); })[map.coordToIndex(18,20)]==GRADIENT_FORBIDDEN);
+        CHECK(glob2test::awaitGradient(game,[&]{return map.getGuardAreasGradient(0,AIR_MOVEMENT_CLASS);})[map.coordToIndex(18,16)]==GRADIENT_AT_GOAL);
+        CHECK(glob2test::awaitGradient(world.game,[&] { return map.getGuardAreasGradient(0,0); })[map.coordToIndex(18,16)]==GRADIENT_FORBIDDEN);
+        CHECK(map.pathfindPointToPoint(8,8,12,8,&dx,&dy,AIR_MOVEMENT_CLASS,1,100));
+        CHECK(dx==1);CHECK(dy==0);
+        CHECK_FALSE(map.pathfindPointToPoint(8,8,12,8,&dx,&dy,0,1,100));
+        // Warm both owner and immutable worker templates before repainting.
+        auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+        gradient_preparation::MaterialSeedCache cache;
+        std::vector<Uint16> output(map.size);
+        REQUIRE(cache.trySeed(snapshot,0,WHEAT,AIR_MOVEMENT_CLASS,output.data(),nullptr));
+        CHECK(output[map.coordToIndex(18,12)]==GRADIENT_AT_GOAL);
+        map.removeForbidden(18,12,0);
+        snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+        REQUIRE(cache.trySeed(snapshot,0,WHEAT,AIR_MOVEMENT_CLASS,output.data(),nullptr));
+        CHECK(output[map.coordToIndex(18,12)]==GRADIENT_AT_GOAL);
+        map.addForbidden(18,12,0);
+        map.updateMaterialGradient(0,WHEAT,AIR_MOVEMENT_CLASS,false);
+        CHECK(map.materialAvailable(0,MaterialId::Food,AIR_MOVEMENT_CLASS,8,8));
+    }
+}
+
+TEST_CASE("ordinary air service choices keep geometric ranking without allocating fields" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (int purpose : {FEED, HEAL, WALK}) {
+        CAPTURE(purpose);
+        glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+        auto& map=world.game.map;
+        auto* unit=world.addUnit(purpose==WALK ? WORKER : EXPLORER,8,8);
+        REQUIRE(unit);
+        // Exercise a flying worker's training using its normal learnable skills.
+        if (purpose==WALK) unit->performance[FLY]=32;
+        const char* kind=purpose==FEED ? "inn" : purpose==HEAL ? "hospital" : "racetrack";
+        auto* near=world.addBuilding(kind,20,8);
+        auto* far=world.addBuilding(kind,18,18);
+        REQUIRE(near); REQUIRE(far);
+        for (auto* building : {near,far}) {
+            building->setMaterial(WHEAT,20);
+            building->updateCallLists();
+            REQUIRE(building->canOfferService(unit,purpose));
+        }
+        const auto select=[&] {
+            if (purpose==FEED) return world.team->findNearestFood(unit);
+            if (purpose==HEAL) return world.team->findNearestHeal(unit);
+            return world.team->findBestUpgrade(unit);
+        };
+        for (bool painted : {false,true}) {
+            if (painted) for (int y=0;y<map.getH();++y) map.addForbidden(15,y,0);
+            REQUIRE_FALSE(map.hasAirRoutingConstraints());
+            CHECK(select()==near);
+            for (auto* building : {near,far}) {
+                const auto slot=building->routeSlot(AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+                CHECK(building->globalGradient[slot]==nullptr);
+            }
+        }
+        // A real terrain edit must switch selection to the shared route policy.
+        map.paintCell(60,60,VOID_HOLE);
+        REQUIRE(map.hasAirRoutingConstraints());
+        for (auto* building : {near,far})
+            glob2test::awaitBuildingGradient(world.game,building,AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+        REQUIRE(select()!=nullptr);
+        for (auto* building : {near,far}) {
+            const auto slot=building->routeSlot(AIR_MOVEMENT_CLASS,BuildingRoute::Footprint);
+            CHECK(building->globalGradient[slot]!=nullptr);
+        }
+    }
+}
+
+TEST_CASE("pending escape guidance preserves a material assignment without consuming RNG" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
+    auto& map=world.game.map;
+    map.setResourceByIndex(12,12,WHEAT,1);
+    REQUIRE(map.materialGradients[0][WHEAT][0]==nullptr);
+    map.materialGradients[0][WHEAT][0]=new Uint16[map.size];
+    std::fill_n(map.materialGradients[0][WHEAT][0],map.size,GRADIENT_FORBIDDEN);
+    EntityRandom random;
+    random.seed(42,54);
+    const auto before=random.exportState();
+    int dx=9,dy=9;
+    bool stopWork=true;
+    CHECK(map.queryMaterialStep(random,0,WHEAT,0,4,4,&dx,&dy,&stopWork,nullptr)==StepResult::Pending);
+    CHECK_FALSE(stopWork);
+    CHECK(random.exportState()==before);
+    CHECK(dx==9);
+    CHECK(dy==9);
+    CHECK(map.lookupForbiddenGradient(0,0)==nullptr);
+    REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+    CHECK(map.queryMaterialStep(random,0,WHEAT,0,4,4,&dx,&dy,&stopWork,nullptr)==StepResult::Pending);
+    CHECK(map.gradientRuntime->fieldRequests.size()==1);
+}
+
+TEST_CASE("material LRU retains a published result until its waiting reader observes it" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (bool abandoned : {false,true}) {
+        CAPTURE(abandoned);
+        glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+        auto& map=world.game.map;
+        auto* consumer=world.addBuilding("inn",8,8);
+        REQUIRE(consumer);
+        map.configureGradientPipeline(0,3);
+        map.setMaterialRoutingCacheBudget(map.size*sizeof(Uint16));
+        const auto publish=[&] {
+            map.advanceGradientPipeline();
+            map.stagePeriodicGradientPreparation();
+            map.game->snapshotStore().invalidateBoundary();
+            map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+            for (unsigned i=0;i<3;++i) map.advanceGradientPipeline();
+        };
+        CHECK(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)==nullptr);
+        publish();
+        REQUIRE(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)!=nullptr);
+        CHECK(map.cachedMaterialGradientSlot(consumer,WOOD,0,2)==nullptr);
+        publish();
+        if (!abandoned) {
+            CHECK(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)==nullptr);
+            REQUIRE(map.cachedMaterialGradientSlot(consumer,WOOD,0,2)!=nullptr);
+            CHECK(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)==nullptr);
+            CHECK(map.gradientRuntime->fieldRequests.size()==1);
+        } else {
+            world.game.stepCounter+=GradientRuntime::MaterialReadHoldTicks-1;
+            CHECK(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)==nullptr);
+            CHECK(map.gradientRuntime->fieldRequests.empty());
+            ++world.game.stepCounter;
+            CHECK(map.cachedMaterialGradientSlot(consumer,WHEAT,0,2)==nullptr);
+            // A live building whose task changed no longer pins its old result.
+            // The replacement request can now enter, even though no reader consumed Wood.
+            REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+            CHECK(map.gradientRuntime->fieldRequests.front().request.material==WHEAT);
+
+        }
+    }
+}
+
+TEST_CASE("ground refreshes preserve warm air material seeds across edits" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.header=true});
+    auto& game=world.game;auto& map=game.map;
+    gradient_preparation::MaterialSeedCache cache;
+    std::vector<Uint16> cached(map.size),reference(map.size);
+    CHECK_FALSE(cache.trySeed({},0,WHEAT,WATER_ONLY_CLASS,cached.data(),nullptr));
+    auto snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+    REQUIRE(cache.trySeed(snapshot,0,WHEAT,0,cached.data(),nullptr));
+    CHECK(cache.airSignatures.empty());
+    REQUIRE(cache.trySeed(snapshot,0,WHEAT,AIR_MOVEMENT_CLASS,cached.data(),nullptr));
+    REQUIRE_FALSE(cache.airSignatures.empty());
+    map.setResourceByIndex(18,12,WHEAT,1);
+    map.markImmobileUnit(18,12,0);
+    map.addForbidden(18,12,0);
+    snapshot=SimulationSnapshot::capture(game,SimulationSnapshot::captureCatalog(game),SimulationSnapshot::Simulation);
+    REQUIRE(cache.trySeed(snapshot,0,WHEAT,0,cached.data(),nullptr));
+    CHECK(cached[map.coordToIndex(18,12)]==GRADIENT_FORBIDDEN);
+    REQUIRE(cache.trySeed(snapshot,0,WHEAT,AIR_MOVEMENT_CLASS,cached.data(),nullptr));
+    const auto run=[](auto fn) { fn(0,size_t(128*128)); };
+    gradient_preparation::materialCells(map.stateView(),map.fogOfWar,0,WHEAT,AIR_MOVEMENT_CLASS,reference.data(),nullptr,run);
+    CHECK(cached==reference);
+    CHECK(cached[map.coordToIndex(18,12)]==GRADIENT_AT_GOAL);
+    // Reusing the cache for another world must discard the old air template.
+    glob2test::HeadlessGame other({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.header=true});
+    auto next=SimulationSnapshot::capture(other.game,SimulationSnapshot::captureCatalog(other.game),SimulationSnapshot::Simulation);
+    REQUIRE(cache.trySeed(next,0,WHEAT,0,cached.data(),nullptr));
+    CHECK(cache.airSignatures.empty());
+    CHECK(cached[other.game.map.coordToIndex(18,12)]==GRADIENT_UNREACHABLE);
+    // An unused air plane must not consume the ground-only cache budget.
+    gradient_preparation::MaterialSeedCache limited;
+    limited.budget=300*1024;
+    REQUIRE(limited.trySeed(next,0,WHEAT,0,cached.data(),nullptr));
+    CHECK_FALSE(limited.trySeed(next,0,WHEAT,AIR_MOVEMENT_CLASS,cached.data(),nullptr));
+    CHECK(limited.airSignatures.empty());
+    CHECK(limited.trySeed(next,0,WHEAT,0,cached.data(),nullptr));
+
+}
+
+TEST_CASE("ordinary air explorer recruitment does not create a combat field" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& map=world.game.map;
+    auto* flyer=world.addUnit(EXPLORER,8,8);
+    auto* flag=world.addBuilding("explorationflag",20,8);
+    REQUIRE(flyer); REQUIRE(flag);
+    flag->unitStayRange=8;
+    const int slot=flag->routeSlot(AIR_MOVEMENT_CLASS,BuildingRoute::Combat);
+    for (bool painted : {false,true}) {
+        if (painted) for(int y=0;y<map.getH();++y) map.addForbidden(15,y,0);
+        REQUIRE_FALSE(map.hasAirRoutingConstraints());
+        int distance=-1;
+        REQUIRE(flag->considerUnitForExplorerFlag(flyer,&distance));
+        CHECK(distance==map.warpDistSquare(8,8,20,8));
+        CHECK(flag->globalGradient[slot]==nullptr);
+    }
+    map.paintCell(60,60,VOID_HOLE);
+    REQUIRE(map.hasAirRoutingConstraints());
+    glob2test::awaitBuildingGradient(world.game,flag,AIR_MOVEMENT_CLASS,BuildingRoute::Combat);
+    int distance=-1;
+    REQUIRE(flag->considerUnitForExplorerFlag(flyer,&distance));
+    CHECK(flag->globalGradient[slot]!=nullptr);
+}
+
+TEST_CASE("ordinary flying building jobs and warrior recruitment avoid route fields" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (bool warrior : {false,true}) {
+        CAPTURE(warrior);
+        glob2test::HeadlessGame world({.wDec=7,.hDec=7,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+        auto& map=world.game.map;
+        auto* unit=world.addUnit(warrior ? WARRIOR : WORKER,8,8);
+        auto* building=world.addBuilding(warrior ? "warflag" : "inn",20,8);
+        REQUIRE(unit); REQUIRE(building);
+        unit->performance[FLY]=32;
+        building->maxUnitWorking=building->desiredMaxUnitWorking=1;
+        const auto route=warrior ? BuildingRoute::Combat : BuildingRoute::Footprint;
+        const auto slot=building->routeSlot(AIR_MOVEMENT_CLASS,route);
+        const auto eligible=[&](int* distance) {
+            return warrior ? building->considerUnitForWarriorFlag(unit,distance)
+                           : building->considerUnitForBuilding(unit,distance);
+        };
+        for (bool painted : {false,true}) {
+            if (painted) for(int y=0;y<map.getH();++y) map.addForbidden(15,y,0);
+            REQUIRE_FALSE(map.hasAirRoutingConstraints());
+            int distance=-1;
+            REQUIRE(eligible(&distance));
+            CHECK(distance==map.warpDistMax(8,8,20,8));
+            CHECK(building->globalGradient[slot]==nullptr);
+        }
+        map.paintCell(60,60,VOID_HOLE);
+        REQUIRE(map.hasAirRoutingConstraints());
+        glob2test::awaitBuildingGradient(world.game,building,AIR_MOVEMENT_CLASS,route);
+        int distance=-1;
+        REQUIRE(eligible(&distance));
+        CHECK(building->globalGradient[slot]!=nullptr);
+    }
+}
+
+TEST_CASE("absent natural sources return shared negative guidance without enrolling rebuilds" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (unsigned participants:{1u,2u,4u}) {
+        CAPTURE(participants);
+        glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
+        auto& game=world.game; auto& map=game.map;
+        map.configureCompute(participants); map.configureGradientPipeline(participants-1,3);
+        map.setResourceByIndex(8,8,WHEAT,1);
+        const auto boundary=[&] {
+            ++game.stepCounter; map.advanceGradientPipeline();
+            map.stagePeriodicGradientPreparation();
+            map.game->snapshotStore().invalidateBoundary();
+            map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+        };
+        REQUIRE(map.queryMaterialDistance(0,WHEAT,0,8,8)==RouteResult::Pending);
+        for (unsigned i=0;i<16 && !map.lookupMaterialGradientSlot(0,WHEAT,0);++i) boundary();
+        REQUIRE(map.lookupMaterialGradientSlot(0,WHEAT,0)!=nullptr);
+        REQUIRE(map.queryMaterialDistance(0,WHEAT,0,8,8)==RouteResult::Reachable);
+        REQUIRE(map.lookupMaterialGradientSlot(0,WHEAT,0)[map.coordToIndex(8,8)]==GRADIENT_AT_GOAL);
+        map.replaceResource(8,8,Resource{});
+        REQUIRE_FALSE(map.hasMaterialSourceSlot(WHEAT));
+        // Global source counts are an authoritative cheap negative answer, not
+        // a cold cache miss. Depletion retains master's immediate behavior.
+        REQUIRE(map.queryMaterialDistance(0,WHEAT,0,8,8)==RouteResult::Unreachable);
+        const auto* field=map.getMaterialGradientSlot(0,WHEAT,0);
+        REQUIRE(field!=nullptr);
+        CHECK(std::all_of(field,field+map.size,[](Uint16 value){return value==GRADIENT_UNREACHABLE;}));
+        // Neither repeated queries across movement classes nor periodic rounds
+        // may turn absent materials into an endless stream of full-map work.
+        for (unsigned i=0;i<32;++i) boundary();
+        const auto jobs=map.gradientPipelineStatus().jobs;
+        for (unsigned i=0;i<32;++i) {
+            for (int swim=0;swim<SWIM_CLASS_COUNT;++swim)
+                CHECK(map.getMaterialGradientSlot(0,WHEAT,swim)==field);
+            boundary();
+        }
+        CHECK(map.gradientPipelineStatus().jobs==jobs);
+        CHECK(map.gradientRuntime->fieldRequests.empty());
+        EntityRandom random; int dx=0,dy=0; bool stopWork=false;
+        CHECK(map.queryMaterialStep(random,0,WHEAT,0,8,8,&dx,&dy,&stopWork,nullptr)==StepResult::Blocked);
+        CHECK(stopWork);
+        // Reintroducing a source resumes the ordinary delayed refresh schedule,
+        // including for a previously published generation retained at depletion.
+        map.setResourceByIndex(12,12,WHEAT,1);
+        REQUIRE(map.hasMaterialSourceSlot(WHEAT));
+        // Warm adaptive refreshes are driven by movement demand, rather than
+        // cache inspection. The demanded age cap bounds eventual replacement.
+        for (unsigned i=0;i<128+map.gradientPipelineStatus().delay
+             && map.getMaterialGradientSlot(0,WHEAT,0)[map.coordToIndex(12,12)]!=GRADIENT_AT_GOAL;++i) {
+            map.queryMaterialStep(random,0,WHEAT,0,8,8,&dx,&dy,&stopWork,nullptr);
+            boundary();
+        }
+        REQUIRE(map.getMaterialGradientSlot(0,WHEAT,0)[map.coordToIndex(12,12)]==GRADIENT_AT_GOAL);
+    }
+}
+
+TEST_CASE("stock changes during shared market work retain dirty demand through its fixed deadline" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& game=world.game; auto& map=game.map;
+    auto catalog=nlohmann::json::parse(game.buildingsTypes.snapshotJson());
+    auto& spec=catalog["variants"][game.buildingsTypes.getFinishedTypeNum("inn")];
+    spec["properties"]["maxMaterial"][WHEAT]=20;
+    spec["semantics"]["occupiesGround"]=false;
+    auto& market=spec["semantics"]["market"];
+    market["suppliesStock"]=true; market["suppliesStockExperiment"]="";
+    market["suppliesStockMaterials"]={"food"}; market["pickupPenalty"]=7;
+    game.buildingsTypes.loadSnapshotJson(catalog.dump());
+    game.gameHeader.getExperiments().set(ExperimentId::MarketsV2,true);
+    game.configureBuildingCatalog();
+    map.configureCompute(2); map.configureGradientPipeline(1,8);
+    auto* supplier=world.addBuilding("inn",8,8); REQUIRE(supplier);
+    supplier->setMaterial(WHEAT,10);
+    const auto boundary=[&] {
+        ++game.stepCounter; map.advanceGradientPipeline();
+        map.stagePeriodicGradientPreparation();
+        map.game->snapshotStore().invalidateBoundary();
+        map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+    };
+    CHECK(map.queryMaterialDistance(0,WHEAT,0,12,8,nullptr,true)==RouteResult::Pending);
+    for (unsigned i=0;i<16 && !map.lookupMaterialGradientSlot(0,WHEAT,0,true);++i) boundary();
+    REQUIRE(map.queryMaterialDistance(0,WHEAT,0,12,8,nullptr,true)==RouteResult::Reachable);
+    // An explicit refresh captures old stock; passage of time alone does not
+    // reserve a replacement. Complete its output without advancing publication.
+    map.updateMaterialGradient(0,WHEAT,0,true);
+    boundary();
+    bool pending=false;
+    map.gradientRuntime->pipeline.forEachDestination([&](auto* slot) {
+        if (slot==&map.marketMaterialGradients[0][WHEAT][0]) pending=true;
+    });
+    REQUIRE(pending);
+    map.finishGradientPipeline();
+    const auto jobs=map.gradientPipelineStatus().jobs;
+    supplier->setMaterial(WHEAT,0);
+    map.dirtyMarketGradientsSlot(0,WHEAT);
+    // A real explicit recovery request during flight must coalesce while
+    // retaining the changed-world recovery requirement.
+    map.updateMaterialGradient(0,WHEAT,0,true);
+    const GradientFieldKey key{GradientFieldFamily::Markets,0,0,WHEAT};
+    for (unsigned i=1;i<8;++i) {
+        boundary();
+        CHECK(map.gradientRuntime->adaptive.fields.at(key).reactive);
+        CHECK(map.queryMaterialDistance(0,WHEAT,0,12,8,nullptr,true)==RouteResult::Reachable);
+    }
+    boundary(); // Original captured stock still publishes exactly at its deadline.
+    CHECK(map.queryMaterialDistance(0,WHEAT,0,12,8,nullptr,true)==RouteResult::Reachable);
+    CHECK(map.gradientPipelineStatus().jobs==jobs+1); // Dirty follow-up captured after publication.
+    CHECK_FALSE(map.gradientRuntime->adaptive.fields.at(key).reactive);
+    for (unsigned i=0;i<8;++i) boundary();
+    CHECK(map.queryMaterialDistance(0,WHEAT,0,12,8,nullptr,true)==RouteResult::Unreachable);
+}
+
+TEST_CASE("blocked live guidance and removed material goals deduplicate delayed refresh demand" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (unsigned scenario=0;scenario<4;++scenario) {
+        CAPTURE(scenario);
+        glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
+        auto& map=world.game.map;
+        map.setResourceByIndex(20,20,WHEAT,1); // Keep a real source beyond the stale local goal.
+        map.configureCompute(2); map.configureGradientPipeline(1,3);
+        // These hand-installed warm fields represent a prior capture at0.
+        // Recovery deduplication is tested at the next eligible minimum8 age.
+        world.game.stepCounter=AdaptiveGradientState::MinimumInterval;
+        EntityRandom random; random.seed(42,54);
+        int dx=0,dy=0; bool stopWork=false;
+        const auto blockNeighbors=[&] {
+            for (int direction=0;direction<8;++direction)
+                map.setResourceByIndex(8+tabClose[direction][0],8+tabClose[direction][1],WHEAT,1);
+        };
+        if (scenario==0) { // a removed material goal requests a refresh without consuming RNG.
+            map.materialGradients[0][WHEAT][0]=new Uint16[map.size];
+            std::fill_n(map.materialGradients[0][WHEAT][0],map.size,GRADIENT_AT_GOAL);
+            const auto before=random.exportState();
+            GradientExecutionAudit audit;
+            for (unsigned i=0;i<16;++i)
+                CHECK(map.queryMaterialStep(random,0,WHEAT,0,8,8,&dx,&dy,&stopWork,nullptr)==StepResult::AtGoal);
+            CHECK(random.exportState()==before);
+            CHECK_FALSE(stopWork);
+            REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+            CHECK(map.gradientRuntime->fieldRequests.front().slot==&map.materialGradients[0][WHEAT][0]);
+            CHECK(audit.totals().owner==0);
+        }
+        if (scenario==1) { // a locally blocked material route requests its own field.
+            map.materialGradients[0][WHEAT][0]=new Uint16[map.size];
+            std::fill_n(map.materialGradients[0][WHEAT][0],map.size,GRADIENT_AT_GOAL-32);
+            blockNeighbors();
+            GradientExecutionAudit audit;
+            for (unsigned i=0;i<16;++i)
+                CHECK(map.queryMaterialStep(random,0,WHEAT,0,8,8,&dx,&dy,&stopWork,nullptr)==StepResult::Blocked);
+            REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+            CHECK(map.gradientRuntime->fieldRequests.front().slot==&map.materialGradients[0][WHEAT][0]);
+            CHECK(audit.totals().owner==0);
+        }
+        if (scenario==2) { // local escape blockage requests an earlier forbidden field.
+            // Escape is required only inside a forbidden area. An outside tile
+            // is a valid arrival and must not count as a stalled escape query.
+            map.addForbidden(8,8,0);
+            map.forbiddenGradient[0][0]=new Uint16[map.size];
+            std::fill_n(map.forbiddenGradient[0][0],map.size,GRADIENT_AT_GOAL);
+            blockNeighbors();
+            GradientExecutionAudit audit;
+            for (unsigned i=0;i<16;++i)
+                CHECK(map.queryForbiddenStep(nullptr,0,0,8,8,&dx,&dy)==StepResult::Blocked);
+            REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+            CHECK(map.gradientRuntime->fieldRequests.front().slot==&map.forbiddenGradient[0][0]);
+            CHECK(audit.totals().owner==0);
+        }
+        if (scenario==3) { // complete unreachable material and escape fields do not create urgent requests.
+            map.materialGradients[0][WHEAT][0]=new Uint16[map.size];
+            map.forbiddenGradient[0][0]=new Uint16[map.size];
+            std::fill_n(map.materialGradients[0][WHEAT][0],map.size,GRADIENT_UNREACHABLE);
+            std::fill_n(map.forbiddenGradient[0][0],map.size,GRADIENT_UNREACHABLE);
+            CHECK(map.queryMaterialStep(random,0,WHEAT,0,8,8,&dx,&dy,&stopWork,nullptr)==StepResult::Blocked);
+            CHECK(stopWork);
+            CHECK(map.queryForbiddenStep(nullptr,0,0,8,8,&dx,&dy)==StepResult::Blocked);
+            CHECK(map.gradientRuntime->fieldRequests.empty());
+        }
+    }
+}
+
+TEST_CASE("a locally blocked consumer field refreshes its stable supplier-cache destination" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& game=world.game; auto& map=game.map;
+    auto catalog=nlohmann::json::parse(game.buildingsTypes.snapshotJson());
+    auto& buyer=catalog["variants"][game.buildingsTypes.getFinishedTypeNum("inn")];
+    buyer["properties"]["maxMaterial"][WHEAT]=20;
+    buyer["semantics"]["market"]["fetchesDirectStock"]=true;
+    buyer["semantics"]["market"]["fetchesDirectStockMaterials"]={"food"};
+    auto& source=catalog["variants"][game.buildingsTypes.getFinishedTypeNum("hospital")];
+    source["properties"]["maxMaterial"][WHEAT]=20;
+    source["semantics"]["market"]["suppliesStock"]=false;
+    source["semantics"]["market"]["suppliesDirectStock"]=true;
+    source["semantics"]["market"]["suppliesDirectStockMaterials"]={"food"};
+    game.buildingsTypes.loadSnapshotJson(catalog.dump()); game.configureBuildingCatalog();
+    map.configureCompute(2); map.configureGradientPipeline(1,3);
+    auto* consumer=world.addBuilding("inn",4,4); auto* supplier=world.addBuilding("hospital",20,20);
+    REQUIRE(consumer); REQUIRE(supplier); supplier->setMaterial(WHEAT,10);
+    REQUIRE(map.materialSupplyModesSlot(consumer,WHEAT)==2);
+    CHECK(map.getMaterialGradientSlot(0,WHEAT,0,false,consumer)==nullptr);
+    for (unsigned i=0;i<16 && !map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer);++i) {
+        ++game.stepCounter; map.advanceGradientPipeline();
+        map.stagePeriodicGradientPreparation();
+        map.game->snapshotStore().invalidateBoundary();
+        map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+    }
+    const auto* field=map.getMaterialGradientSlot(0,WHEAT,0,false,consumer);
+    REQUIRE(field!=nullptr);
+    REQUIRE(field[map.coordToIndex(12,12)]>GRADIENT_UNREACHABLE);
+    REQUIRE(field[map.coordToIndex(12,12)]<GRADIENT_AT_GOAL);
+    REQUIRE(map.gradientRuntime->materialFields.size()==1);
+    auto& entry=map.gradientRuntime->materialFields.begin()->second;
+    for (int direction=0;direction<8;++direction)
+        map.setResourceByIndex(12+tabClose[direction][0],12+tabClose[direction][1],WHEAT,1);
+    // Isolate local blockage from the cache's independent age/topology refresh.
+    entry.topology=map.topologyGeneration; entry.builtStep=game.stepCounter;
+    REQUIRE(map.gradientRuntime->fieldRequests.empty());
+    EntityRandom random; int dx=0,dy=0; bool stopWork=false;
+    GradientExecutionAudit audit;
+    for (unsigned i=0;i<16;++i)
+        CHECK(map.queryMaterialStep(random,0,WHEAT,0,12,12,&dx,&dy,&stopWork,consumer)==StepResult::Blocked);
+    REQUIRE(map.gradientRuntime->fieldRequests.size()==1);
+    const auto& request=map.gradientRuntime->fieldRequests.front();
+    CHECK(request.slot==&entry.published);
+    CHECK(request.request.modes==entry.modes);
+    CHECK(request.request.consumer==entry.consumer);
+    CHECK(audit.totals().owner==0);
+}
+
+TEST_CASE("the version-152 checksum adapter excludes newly introduced publication state" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.header=true});
+    auto& map=world.game.map;
+    map.setResourceByIndex(12,12,WHEAT,1);
+    const auto legacy=map.checkSum(true,false,true);
+    const auto current=map.checkSum(true,false,false);
+    REQUIRE(map.getMaterialGradientSlot(0,WHEAT,0)==nullptr);
+    CHECK(map.checkSum(true,false,true)==legacy);
+    CHECK(map.checkSum(true,false,false)!=current);
+}
+
+TEST_CASE("consumer pool changes hard-supersede ground supplier fields at a stable identity" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    for (bool publishFirst : {false,true}) {
+        CAPTURE(publishFirst);
+        glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+        auto& game=world.game; auto& map=game.map;
+        auto catalog=nlohmann::json::parse(game.buildingsTypes.snapshotJson());
+        for (const auto* name : {"inn","hospital"}) {
+            auto& variant=catalog["variants"][game.buildingsTypes.getFinishedTypeNum(name)];
+            variant["properties"]["maxMaterial"][WHEAT]=20;
+            auto& market=variant["semantics"]["market"];
+            market["suppliesStock"]=false;
+            market["suppliesDirectStock"]=true;
+            market["suppliesDirectStockMaterials"]={"food"};
+            market["fetchesDirectStock"]=true;
+            market["fetchesDirectStockMaterials"]={"food"};
+        }
+        game.buildingsTypes.loadSnapshotJson(catalog.dump()); game.configureBuildingCatalog();
+        map.configureCompute(2); map.configureGradientPipeline(1,3);
+        auto* consumer=world.addBuilding("inn",4,4);
+        auto* supplier=world.addBuilding("hospital",20,20);
+        REQUIRE(consumer); REQUIRE(supplier);
+        // Exercise pool membership independently of slot/type/script identity.
+        // Both configurations have the same supply modes and private cache key.
+        consumer->sharedMaterials=nullptr;
+        supplier->sharedMaterials=world.team->teamMaterials;
+        supplier->setMaterial(WHEAT,10);
+        const auto identity=consumer->scriptIdentity;
+        const auto type=consumer->typeNum;
+        const auto boundary=[&] {
+            ++game.stepCounter; map.advanceGradientPipeline();
+            map.stagePeriodicGradientPreparation();
+            map.game->snapshotStore().invalidateBoundary();
+            map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+        };
+        REQUIRE(map.getMaterialGradientSlot(0,WHEAT,0,false,consumer)==nullptr);
+        if (publishFirst) {
+            for (unsigned i=0;i<16 && !map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer);++i) boundary();
+            const auto* field=map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer);
+            REQUIRE(field!=nullptr);
+            REQUIRE(field[map.coordToIndex(12,12)]>GRADIENT_UNREACHABLE);
+        } else {
+            boundary(); // An admitted private output holds the old pool policy.
+            map.finishGradientPipeline(); // Completion must not publish it early.
+        }
+        consumer->sharedMaterials=world.team->teamMaterials;
+        REQUIRE(consumer->scriptIdentity==identity); REQUIRE(consumer->typeNum==type);
+        CHECK(map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer)==nullptr);
+        CHECK(map.getMaterialGradientSlot(0,WHEAT,0,false,consumer)==nullptr);
+        REQUIRE(map.gradientRuntime->materialFields.size()==1);
+        CHECK(map.gradientRuntime->materialFields.begin()->second.excludesShared);
+        for (unsigned i=0;i<16 && !map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer);++i) boundary();
+        const auto* field=map.lookupMaterialGradientSlot(0,WHEAT,0,false,consumer);
+        REQUIRE(field!=nullptr);
+        CHECK(field[map.coordToIndex(12,12)]==GRADIENT_UNREACHABLE);
+        // The shared supplier remains stocked: exclusion, not depletion, removed it.
+        CHECK(supplier->material(WHEAT)==10);
+        map.finishGradientPipeline();
+
+    }
+}
+
+TEST_CASE("released ground and air draft routing layouts remain independent" * doctest::test_suite("GradientPreparation"))
+{
+    CHECK(hasSnapshotChecksumMetadata(168));
+    CHECK(hasSnapshotChecksumMetadata(169));
+    CHECK_FALSE(hasSnapshotChecksumMetadata(171));
+    CHECK(hasSnapshotChecksumMetadata(172));
+    CHECK(hasSnapshotChecksumMetadata(173));
+    CHECK(hasDelayedGradientState(169));
+    CHECK_FALSE(hasDelayedGradientState(171));
+    CHECK_FALSE(hasDelayedGradientState(172));
+    CHECK(hasDelayedGradientState(173));
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=2,.header=true});
+    auto& map=world.game.map;
+    for (int team=0;team<2;++team) for (int movement=0;movement<SWIM_CLASS_COUNT;++movement) {
+        const unsigned oldMaterial=(team*(MaterialSlotCount+2)+WHEAT)*SWIM_CLASS_COUNT+movement;
+        CHECK(map.gradientDestination(oldMaterial,SWIM_CLASS_COUNT)==&map.materialGradients[team][WHEAT][movement]);
+        CHECK(map.gradientDestination(5000+team*SWIM_CLASS_COUNT+movement,SWIM_CLASS_COUNT)==&map.forbiddenGradient[team][movement]);
+        auto* slot=&map.materialGradients[team][WHEAT][movement];
+        CHECK(map.gradientDestination(map.gradientDestination(slot))==slot);
+    }
+    auto* air=&map.materialGradients[1][WHEAT][AIR_MOVEMENT_CLASS];
+    CHECK(map.gradientDestination(map.gradientDestination(air))==air);
+}
+
+TEST_CASE("weighted AIR market oracle follows live pickup and uses AIR cost buckets" * doctest::test_suite("GradientPreparation"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame world({.wDec=5,.hDec=5,.teams=1,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    auto& game=world.game;auto& map=game.map;
+    auto catalog=nlohmann::json::parse(game.buildingsTypes.snapshotJson());
+    auto& spec=catalog["variants"][game.buildingsTypes.getFinishedTypeNum("inn")];
+    spec["properties"]["maxMaterial"][WHEAT]=20;spec["semantics"]["occupiesGround"]=false;
+    auto& market=spec["semantics"]["market"];market["suppliesStock"]=true;market["suppliesStockExperiment"]="";
+    market["suppliesStockMaterials"]={"food"};market["pickupPenalty"]=7;
+    game.buildingsTypes.loadSnapshotJson(catalog.dump());game.gameHeader.getExperiments().set(ExperimentId::MarketsV2,true);game.configureBuildingCatalog();
+    map.game=nullptr;
+    map.importTerrainDefinitions(R"({"schemaVersion":1,"terrains":[{"key":"test:air-oracle-hazard","name":"Air hazard","base":"grass","properties":{"airHealthQ8":-256},"appearance":"grass"}]})");
+    map.setGame(&game);map.paintCell(12,8,*map.terrainRegistry().find("test:air-oracle-hazard"));
+    CHECK(map.terrainQueueBuckets()==64);CHECK(map.movementQueueBuckets(AIR_MOVEMENT_CLASS)==256);
+    auto* supplier=world.addBuilding("inn",20,20);REQUIRE(supplier);supplier->setMaterial(WHEAT,10);
+    map.configureGradientPipeline(0,3);
+    const auto* live=glob2test::awaitGradient(game,[&](){return map.getMaterialGradientSlot(0,WHEAT,AIR_MOVEMENT_CLASS,true);});REQUIRE(live);
+    CHECK(*std::max_element(live,live+map.size)<GRADIENT_AT_GOAL);
+    Sint32 tx=0,ty=0;int distance=0;
+    REQUIRE(map.materialAvailableUpdateSlot(0,WHEAT,AIR_MOVEMENT_CLASS,8,8,&tx,&ty,&distance,true,nullptr));
+    Sint32 px=0,py=0;CHECK_FALSE(map.getGlobalGradientDestination(live,8,8,&px,&py));CHECK(px==tx);CHECK(py==ty);
+    const GradientFieldKey key{GradientFieldFamily::Markets,0,AIR_MOVEMENT_CLASS,WHEAT};EntityRandom random;random.seed(42,54);
+    GradientQueryContext context{key,8,8,random};context.mode=GradientQueryContext::Mode::DirectFlight;
+    const auto expected=direct_flight::select(8,8,tx,ty,map.getW(),map.getH(),[&](int x,int y){return map.isFreeForMovement(x,y,AIR_MOVEMENT_CLASS,1);});
+    const auto result=map.selectGradientQuery(context,live);CHECK(result.moved);CHECK(result.goalValid);CHECK(result.dx==expected.dx);CHECK(result.dy==expected.dy);
+    const auto path=(glob2test::artifactDir()/"weighted-air-oracle.csv").string();ResourceGradientProbe probe(path.c_str());std::vector<Uint16> fresh;
+    const auto checksum=game.checkSum();CHECK_NOTHROW(probe.rebuildFresh(map,key,fresh));CHECK(fresh==std::vector<Uint16>(live,live+map.size));CHECK(game.checkSum()==checksum);
+    CHECK_NOTHROW(probe.observe(map,context,live));CHECK(game.checkSum()==checksum);
 }

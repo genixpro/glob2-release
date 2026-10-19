@@ -2,6 +2,9 @@
 #include <Environment.h>
 #include "Headless.h"
 #include "ResourceGrowth.h"
+#include "gradient/AdaptiveGradientModel.h"
+#include "gradient/AdaptiveGradientState.h"
+#include "gradient/ResourceGradientProbe.h"
 #include <utility>
 #include "scripting/javascript/ScriptCommand.h"
 #include "scripting/javascript/ScriptRuntime.h"
@@ -10,6 +13,7 @@
 #include <array>
 #include <bit>
 #include "Engine.h"
+#include "sim/snapshot/SnapshotChecksum.h"
 #include "GameDiagnostics.h"
 #include "GlobalContainer.h"
 #include "BuildingArtwork.h"
@@ -18,10 +22,10 @@
 #include "AIJavaScript.h"
 #include "ComputeThreads.h"
 #include "field/OpenCLGradient.h"
+#include "field/GradientAccelerators.h"
 #include "AIMaximaStrategy.h"
 #include "ai/cortex/CortexTuning.h"
 #include "Game.h"
-#include "gradient/BuildingGradientStats.h"
 #include "GameRuleOverrides.h"
 #include "Player.h"
 #include "TeamStat.h"
@@ -33,6 +37,8 @@
 #include "SimVersion.h"
 #include <nlohmann/json.hpp>
 #include <BinaryStream.h>
+#include <StreamBackend.h>
+#include "GameGUI.h"
 #include <FileManager.h>
 #include <Toolkit.h>
 #include <algorithm>
@@ -114,7 +120,7 @@ void isolateEnvironment()
 		"GLOB2_NICOWAR_V3_TUNING", "GLOB2_MAXIMA_TELEMETRY", "GLOB2_DATASET_PATH",
 		"GLOB2_CHECKSUM_SIDECAR", "GLOB2_REPLAY_PATH", "GLOB2_TEAM_TIMELINE", "GLOB2_TEAM_RESULTS", "GLOB2_GRADIENT_STATS",
 		"GLOB2_DUMP_GAME", "GLOB2_STUDY_EXPLAIN", "GLOB2_USER_DIR", "GLOB2_USER_DATA_DIR",
-		"GLOB2_PERF_DISABLE", "GLOB2_PERF_BUILD_LABEL",
+		"GLOB2_PERF_DISABLE", "GLOB2_PERF_BUILD_LABEL", "GLOB2_RESOURCE_GRADIENT_PROBE",
 		"GLOB2_CORTEX_POLICY", "GLOB2_CORTEX_NET", "GLOB2_CORTEX_DECISION_NET",
 		"GLOB2_CORTEX_TRACE", "GLOB2_CORTEX_DECIDE_TRACE", "GLOB2_CORTEX_INN_TRACE",
 		"GLOB2_CHECKSUM_SIDECAR_MAX_TICKS", "CORTEX_DUMP_PERIODIC", "CORTEX_DUMP_OFFENSE",
@@ -234,12 +240,12 @@ void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::
 		Team *team=game.teams[t];
 		int units=0,workers=0,explorers=0,warriors=0,buildings=0,sites=0;
 		long long warriorHP=0,warriorAttack=0;
-		for(int i=0;i<Unit::MAX_COUNT;++i) if(const Unit *u=team->myUnits[i])
+		for (const Unit *u : team->liveUnits.entries())
 		{
 			++units;workers+=u->typeNum==WORKER;explorers+=u->typeNum==EXPLORER;
 			if(u->typeNum==WARRIOR){++warriors;warriorHP+=u->hp;warriorAttack+=u->getRealAttackStrength();}
 		}
-		for(int i=0;i<Building::MAX_COUNT;++i) if(const Building *b=team->myBuildings[i])
+		for (const Building *b : team->liveBuildings.entries())
 			if(!b->type->isVirtual){if(b->type->isBuildingSite)++sites;else ++buildings;}
 		int alliance=game.gameHeader.getAllyTeamNumber(t);
 		if(team->hasWon){winningTeams.push_back(t);winningAlliances.insert(alliance);}
@@ -275,6 +281,73 @@ void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::
 
 struct HeadlessRunner
 {
+    static int migrate(const Options& options,const fs::path& output)
+    {
+        if (one(options,"--legacy-adaptive-174","false")!="true")
+            throw std::invalid_argument("Migration requires explicit --legacy-adaptive-174");
+        auto inputPath=fs::absolute(one(options,"--input"));
+        if (one(options,"--input").empty()) throw std::invalid_argument("Migration requires --input");
+        GlobalContainer globals(one(options,"--profile","glob2-save-migration").c_str(),one(options,"--building-catalog"));
+        globalContainer=&globals;globals.runNoX=true;globals.structuredHeadless=true;
+        for (const auto& directory:many(options,"--data-dir")) globals.fileManager->addDir(directory);
+        globals.load();
+        inputPath=glob2PreferGzipReadPath(*globals.fileManager,inputPath.string());
+        Online::Sha256 inputHash;
+        {
+            std::ifstream file(inputPath,std::ios::binary);if (!file) throw std::invalid_argument("Cannot read migration input");
+            std::array<char,65536> block;
+            while (file) {file.read(block.data(),block.size());inputHash.update(block.data(),file.gcount());}
+            if (!file.eof()) throw std::runtime_error("Failed reading migration input");
+        }
+        std::unique_ptr<GAGCore::StreamBackend> backend(glob2OpenMapOrSaveInputStreamBackend(*globals.fileManager,inputPath.string()));
+        if (!backend || !backend->isValid()) throw std::invalid_argument("Cannot open migration input");
+        auto input=std::make_unique<GAGCore::BinaryInputStream>(backend.release());
+        GameGUI loaded(false);
+        if (!loaded.load(input.get(),false,SaveLoadProfile::PrivateAdaptive174,MapLoadInitialization::PreserveEncoded))
+            throw std::runtime_error("Cannot decode private adaptive174 input");
+        // FILE-backed EOF is set only after a failed read, whereas inflated
+        // memory streams report position==size immediately. Compare extents.
+        const auto consumed=input->getPosition();
+        if (consumed>std::size_t(std::numeric_limits<int>::max())) throw std::invalid_argument("Migration input is too large");
+        input->seekFromEnd(0);const auto end=input->getPosition();input->seekFromStart(int(consumed));
+        if (consumed!=end) throw std::invalid_argument("Migration input has trailing binary data");
+        const bool saved=loaded.game.mapHeader.getIsSavedGame();
+        const auto tick=loaded.game.stepCounter;
+        const auto mapName=loaded.game.mapHeader.getMapName();
+        const auto state=[](Game& game) {
+            std::vector<Uint32> world,buildings,units;
+            game.checkSum(&world,&buildings,&units,true);
+            if (!world.empty()) world.erase(world.begin()); // Saved-format identity only.
+            return std::array{world,buildings,units};
+        };
+        const auto original=state(loaded.game);
+        auto* memory=new GAGCore::MemoryStreamBackend;
+        GAGCore::BinaryOutputStream encoded(memory);
+        if (saved) loaded.save(&encoded,mapName);
+        else loaded.game.save(&encoded,true,mapName);
+        encoded.flush();const auto bytes=memory->takeContents();
+        if (state(loaded.game)!=original) throw std::runtime_error("Serialization changed decoded simulation state");
+        GameGUI verified(false);
+        auto* copy=new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size());copy->seekFromStart(0);
+        GAGCore::BinaryInputStream reload(copy);
+        if (!verified.load(&reload,false,SaveLoadProfile::Published,MapLoadInitialization::PreserveEncoded) || verified.game.stepCounter!=tick
+            || verified.game.mapHeader.getIsSavedGame()!=saved || state(verified.game)!=original)
+            throw std::runtime_error("Migrated file did not preserve decoded simulation state");
+        const auto destination=output/(saved ? "migrated.game" : "migrated.map");
+        if (fs::exists(destination)) throw std::invalid_argument("Migration destination already exists");
+        const auto temporary=destination.string()+".tmp";
+        {std::ofstream file(temporary,std::ios::binary);file.write(bytes.data(),bytes.size());file.close();
+            if (!file) throw std::runtime_error("Cannot write migrated file");}
+        fs::rename(temporary,destination);
+        nlohmann::json result={{"schema_version",1},{"status","completed"},{"profile","private-adaptive-174"},
+            {"input",inputPath.string()},{"input_sha256",Online::Sha256::toHex(inputHash.finish())},
+            {"output",destination.filename().string()},{"output_sha256",Online::Sha256::hex(bytes)},
+            {"input_format","binary"},{"source_version",174},{"save_version",VERSION_MINOR},
+            {"tick",tick},{"ticks_advanced",0},{"map_initialization_deferred",!saved},{"is_saved_game",saved},{"map_name",mapName},
+            {"normalized_state",original},{"reload_state_equal",true}};
+        Headless::writeJson((output/"result.json").string(),result.dump(2));
+        return 0;
+    }
 	static int game(const Options &options, const fs::path &output)
 	{
 		const auto setupStart = std::chrono::steady_clock::now();
@@ -294,12 +367,16 @@ struct HeadlessRunner
 			setHeadlessEnvironment("SDL_AUDIODRIVER","dummy");
 		}
 		const unsigned gradientDelay = integer(one(options, "--gradient-delay", std::to_string(Cli::DefaultGradientDelay)), 1, 16);
+		if (one(options,"--resource-gradient-probe","false")=="true")
+			setHeadlessEnvironment("GLOB2_RESOURCE_GRADIENT_PROBE",(output/"gradient-quality.csv").string().c_str());
 		GlobalContainer globals(one(options, "--profile", "glob2-tournament").c_str(), one(options, "--building-catalog"));
 		globalContainer=&globals;
         for(const auto &directory:many(options,"--data-dir"))globals.fileManager->addDir(directory);
 		globals.runNoX=true;
 		if (options.count("--gpu")) globals.gpuComputeOverride = one(options, "--gpu") == "on";
-		globals.structuredHeadless=true;
+		if(options.count("--gradient-backend"))globals.gradientBackendOverride=*gradient_kernel::parseBackend(one(options,"--gradient-backend"));
+        if(options.count("--gradient-algorithm"))globals.gradientAlgorithmOverride=*gradient_kernel::parseAlgorithm(one(options,"--gradient-algorithm"));
+        globals.structuredHeadless=true;
 		globals.automaticEndingGame=true;
 		globals.automaticGameGlobalEndConditions=true;
 		globals.automaticEndingSteps=integer(one(options, "--ticks", std::to_string(Cli::DefaultTicks)), 1, std::numeric_limits<int>::max());
@@ -314,7 +391,6 @@ struct HeadlessRunner
 			if(telemetry=="checksums") setHeadlessEnvironment("GLOB2_CHECKSUM_SIDECAR", "1");
 			else if(telemetry=="team-timeline") setHeadlessEnvironment("GLOB2_TEAM_TIMELINE", "1");
 			else if(telemetry=="maxima") setHeadlessEnvironment("GLOB2_MAXIMA_TELEMETRY", "1");
-			else if(telemetry=="gradient-stats") setHeadlessEnvironment("GLOB2_GRADIENT_STATS", "1");
 			else throw std::invalid_argument("unknown telemetry: " + telemetry);
 		}
 		globals.load();
@@ -466,9 +542,13 @@ struct HeadlessRunner
 		}
 		if (!fields.empty()) engine.diagnostics = std::make_shared<GameDiagnostics::Session>(engine.gui.game,(output/"diagnostics").string(),diagnosticInterval,diagnosticPng=="true");
 		const std::string requestedSizing = one(options, "--compute-threads", "auto");
-		const unsigned computeThreads = resolveComputeThreadCount(parseComputeThreadCount(requestedSizing));
-		globals.configureGradientBackend();
+		globals.computeThreads = parseComputeThreadCount(requestedSizing);
+		globals.configureExecutionResources();
+		const unsigned computeThreads = globals.resourcePlan.computeParticipants;
 		engine.gui.game.map.configureCompute(computeThreads);
+        const auto computeMode = ComputeTelemetry::parseMode(one(options, "--compute-telemetry", "off"));
+        if (engine.gui.game.map.computeExecutor().telemetryMode() != computeMode)
+            engine.gui.game.map.computeExecutor().configureTelemetry(computeMode);
         engine.gui.game.map.setResourceGrowthDelay(integer(
             one(options, "--resource-growth-delay", std::to_string(engine.gui.game.map.resourceGrowthDelay())), 1, 16));
 		const auto pipeline = engine.gui.game.map.gradientPipelineStatus();
@@ -480,6 +560,19 @@ struct HeadlessRunner
 			}
 			engine.gui.game.map.setGradientWorkerCount(1);
 		}
+        if (options.count("--gradient-work-stats")) {
+            const auto path=fs::absolute(one(options,"--gradient-work-stats"));
+            fs::create_directories(path.parent_path());
+            engine.gui.game.map.configureGradientWorkStats(path.string());
+        }
+        if (options.count("--resource-gradient-exploration")) {
+            if (one(options,"--resource-gradient-probe","false")!="true" || recordReplay)
+                throw std::invalid_argument("Gradient collection overrides require the probe and reject replay recording");
+            engine.gui.game.map.configureResourceGradientExploration(
+                one(options,"--resource-gradient-exploration"),
+                integer(one(options,"--resource-gradient-exploration-seed","0"),0,UINT32_MAX),
+                (output/"gradient-decisions.csv").string());
+        }
 		globals.headlessReplay=recordReplay;
 		if(recordReplay) {
 			globals.replayWriter=std::make_unique<ReplayWriter>();
@@ -492,7 +585,14 @@ struct HeadlessRunner
 			if (player && player->ai && player->ai->implementationID == AI::JAVASCRIPT)
 				static_cast<AIJavaScript *>(player->ai->aiImplementation)->enableValidationReporting();
 		}
-		const auto initialChecksum = engine.gui.game.checkSum(nullptr, nullptr, nullptr, true);
+        // Endpoint reports use the same snapshot schema as routine engine samples.
+        // Complete this reporting-only sample during setup. A serial executor
+        // otherwise retains the initial world for the entire match.
+        SimulationChecksum::Pipeline initialHash(engine.gui.game.map.computeExecutor());
+        const auto& initialWorld=engine.gui.game.observeCompletedWorld();
+        initialHash.submit(initialWorld,initialWorld.tick,engine.routineMapChecksums());
+        const auto initialSamples=initialHash.collect(initialWorld.tick,true);
+        if (initialSamples.size()!=1) throw std::runtime_error("Missing initial snapshot checksum");
 		const auto runStart = std::chrono::steady_clock::now();
 		uint64_t setupCpu=0,runCpu=0,measureStart=0;
 		unsigned measuredTicks=0;
@@ -521,12 +621,15 @@ struct HeadlessRunner
 			engine.finishSession();
 			engine.gui.game.map.finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth();
 			if(!measureStart || engine.gui.game.stepCounter<=start) throw std::runtime_error("game ended before benchmark measurement");
+			engine.gui.game.drainHiring();
 			runCpu=processCpuNs()-measureStart;
 			measuredTicks=engine.gui.game.stepCounter-start;
 		}
-		else { engine.run(); engine.gui.game.map.finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth(); }
-		if (engine.diagnostics) engine.diagnostics->finish();
-		const auto runEnd = std::chrono::steady_clock::now();
+		else { engine.run(); engine.gui.game.map.finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth(); engine.gui.game.drainHiring(); }
+        if (!engine.latestChecksum) throw std::runtime_error("Missing terminal snapshot checksum");
+        const auto initialChecksum=initialSamples.front().sample.value;
+        if (engine.diagnostics) engine.diagnostics->finish();
+        const auto runEnd = std::chrono::steady_clock::now();
 		const auto saveCpuStart=benchmark?processCpuNs():0;
 		if(final) engine.saveInitialGameStateOrExit((output/"final.game").string(),"final",engine.gui.game.mapHeader.getMapName());
 		const auto saveCpu=benchmark?processCpuNs()-saveCpuStart:0;
@@ -535,10 +638,21 @@ struct HeadlessRunner
 		Game &game=engine.gui.game;
 		const auto pipelineResult = game.map.gradientPipelineStatus();
 		const auto buildingResult = game.map.buildingGradientPipelineStatus();
-		const auto opencl = gradient_kernel::openCLStatus();
+		const auto gradient=gradient_kernel::configuration();
+        const auto accelerator=gradient_kernel::acceleratorStatus(gradient.backend);
         std::sort(tickDurations.begin(),tickDurations.end());
         const auto percentile=[&](unsigned p)->Uint64 {return tickDurations.empty()?0:tickDurations[(tickDurations.size()-1)*p/100];};
 		engine.trackTeamEliminations();
+        game.map.computeExecutor().cancelPresentationAndWait();
+        const auto computeSnapshot = game.map.computeExecutor().telemetrySnapshot(game.map.computeExecutor().telemetryMode() == ComputeTelemetryMode::Trace);
+        const auto measured = [&](auto value, bool available) { return available ? std::to_string(value) : std::string("null"); };
+        const auto joinTotal = [&](ComputeProducer producer) {
+            std::uint64_t value = 0;
+            for (const auto& reason : computeSnapshot.summary.joins[unsigned(producer)]) value += reason.total.totalNs;
+            return measured(value, computeSnapshot.available);
+        };
+        const bool summaryAvailable = computeSnapshot.available;
+        const bool workerAvailable = computeSnapshot.mode == ComputeTelemetryMode::Trace;
 		std::ostringstream result;
 		// A game the win probability model called is reported distinctly from one
 		// the rules actually decided. The two are not the same evidence: analysis
@@ -554,7 +668,8 @@ struct HeadlessRunner
 		}
 		result << "{\"schema_version\":1,\"job_type\":\"game\",\"status\":\"completed\",\"ticks\":" << game.stepCounter
 			<< ",\"initialChecksum\":" << initialChecksum
-			<< ",\"finalChecksum\":" << game.checkSum(nullptr, nullptr, nullptr, true)
+			<< ",\"finalChecksum\":" << engine.latestChecksum->value
+            << ",\"checksum_algorithm\":\"snapshot-v3\""
 			<< ",\"benchmark_setup_cpu_ns\":" << setupCpu
 			<< ",\"benchmark_run_cpu_ns\":" << runCpu
 			<< ",\"benchmark_save_cpu_ns\":" << saveCpu
@@ -575,10 +690,7 @@ struct HeadlessRunner
 			<< ",\"growth_maxProposals\":" << game.map.resourceGrowthMetrics().maxProposals
 			<< ",\"growth_maxPending\":" << game.map.resourceGrowthMetrics().maxPending
 			<< ",\"growth_maxProposalBytes\":" << game.map.resourceGrowthMetrics().maxProposalBytes
-			<< ",\"growth_computeNs\":" << game.map.resourceGrowthMetrics().computeNs
-			<< ",\"growth_queueNs\":" << game.map.resourceGrowthMetrics().queueNs
-			<< ",\"growth_waitNs\":" << game.map.resourceGrowthMetrics().waitNs
-			<< ",\"growth_publicationNs\":" << game.map.resourceGrowthMetrics().publicationNs
+			<< ",\"growth_waitNs\":" << joinTotal(ComputeProducer::ResourceGrowth)
 			<< ",\"growth_delay\":" << game.map.resourceGrowthDelay()
             << ",\"tick_p50_ns\":" << percentile(50)
             << ",\"tick_p95_ns\":" << percentile(95)
@@ -590,53 +702,68 @@ struct HeadlessRunner
 			<< ",\"gradient_published\":" << pipelineResult.published
 			<< ",\"gradient_discarded\":" << pipelineResult.discarded
 			<< ",\"gradient_max_pending\":" << pipelineResult.maxPending
-			<< ",\"gradient_wait_ns\":" << pipelineResult.waitNs
-			<< ",\"gradient_preparation_ns\":" << pipelineResult.preparationNs
-			<< ",\"gradient_active_elapsed_ns\":" << pipelineResult.activeElapsedNs
-			<< ",\"compute_active_elapsed_ns\":" << game.map.computeExecutor().activeNs()
+			<< ",\"gradient_wait_ns\":" << joinTotal(ComputeProducer::PeriodicGradient)
+			<< ",\"compute_active_elapsed_ns\":" << measured(game.map.computeExecutor().activeNs(), workerAvailable)
 			<< ",\"building_gradient_jobs\":" << buildingResult.jobs
 			<< ",\"building_gradient_published\":" << buildingResult.published
 			<< ",\"building_gradient_discarded\":" << buildingResult.discarded
 			<< ",\"building_gradient_synchronous\":" << buildingResult.synchronous
 			<< ",\"building_gradient_max_pending\":" << buildingResult.maxPending
-			<< ",\"building_gradient_wait_ns\":" << buildingResult.waitNs
+			<< ",\"building_gradient_wait_ns\":" << joinTotal(ComputeProducer::BuildingGradient)
 			<< ",\"building_gradient_pending\":" << buildingResult.pending
 			<< ",\"building_gradient_synchronous_by_reason\":{";
 		for (std::size_t reason = 0; reason < buildingResult.synchronousByReason.size(); ++reason)
 			result << (reason ? "," : "") << quote(Map::buildingSyncReasonName(Map::BuildingSyncReason(reason)))
 				<< ':' << buildingResult.synchronousByReason[reason];
 		result << '}';
-		if (auto *stats = game.map.gradientStats.get())
-		{
-			// Diagnostics only: close the live field lifetimes and export them.
-			stats->finish(game);
-			result << ",\"building_gradient\":";
-			stats->writeJson(result);
-			std::ofstream csv(output/"gradient-stats.csv");
-			stats->writeCsv(csv);
-			if (!csv) throw std::runtime_error("cannot write gradient-stats.csv");
-		}
+
+
+        // Dataset observation semantics version independently of inference.
+        result << ",\"adaptive_gradient_policy\":{\"contract\":" << quote(AdaptiveGradientModel::ContractId)
+            << ",\"collector_contract\":" << quote(ResourceGradientProbe::CollectorContract)
+            << ",\"model_trained\":" << (AdaptiveGradientModel::Trained?"true":"false")
+            << ",\"threshold_milli_direction_cost\":" << AdaptiveGradientState::Threshold
+            << ",\"prediction_horizon_ticks\":" << ResourceGradientProbe::HorizonTicks
+            << ",\"minimum_interval\":" << AdaptiveGradientState::MinimumInterval
+            << ",\"demanded_age_cap\":" << AdaptiveGradientState::MaximumAge
+            << ",\"mode\":" << quote(options.count("--resource-gradient-exploration")?"explicit-per-field-fixed-interval-research":AdaptiveGradientModel::Trained?"adaptive-model":"untrained-cold-reactive-and-history-init-only")
+            << ",\"quality_collection\":" << (one(options,"--resource-gradient-probe","false")=="true"?"true":"false") << '}';
+        if (options.count("--gradient-work-stats")) result << ",\"gradient_work_stats\":" << quote(fs::absolute(one(options,"--gradient-work-stats")).string());
+		result << ",\"compute_telemetry\":";
+        ComputeTelemetry::writeJson(result, computeSnapshot);
+        result << ",\"resource_plan\":";
+        writeApplicationResourcePlanJson(result, globals.resourcePlan);
 		result
 			<< ",\"compute_threads\":" << game.map.computeExecutor().threadCount()
 			<< ",\"compute_requested_threads\":" << quote(requestedSizing)
 			<< ",\"compute_resolved_threads\":" << computeThreads
-			<< ",\"gpu_requested\":" << globals.gpuComputeEnabled()
-			<< ",\"gpu_device\":" << quote(opencl.device)
-			<< ",\"gpu_error\":" << quote(opencl.error)
+			<< ",\"gradient_backend\":" << quote(gradient_kernel::backendName(gradient.backend))
+            << ",\"gradient_algorithm\":" << quote(gradient_kernel::algorithmName(gradient.algorithm))
+            << ",\"gradient_device\":" << quote(accelerator.device)
+            << ",\"gradient_driver\":" << quote(accelerator.driver)
+            << ",\"gradient_shader\":" << quote(accelerator.shaderIdentity)
+            << ",\"gradient_gpu_fields\":" << accelerator.fields
+            << ",\"gradient_cpu_fallbacks\":" << accelerator.fallbacks
+            << ",\"gpu_requested\":" << globals.gpuComputeEnabled()
+			<< ",\"gpu_device\":" << quote(accelerator.device)
+			<< ",\"gpu_error\":" << quote(accelerator.error)
 			<< ",\"compute_workers\":" << game.map.computeExecutor().threadCount() - 1
-			<< ",\"compute_batches\":" << game.map.computeExecutor().metrics().batches
-			<< ",\"compute_jobs\":" << game.map.computeExecutor().metrics().jobs
-			<< ",\"compute_parallel_batches\":" << game.map.computeExecutor().metrics().parallelBatches
-			<< ",\"compute_batch_ns\":" << game.map.computeExecutor().metrics().batchNs
-			<< ",\"compute_wait_ns\":" << game.map.computeExecutor().metrics().waitNs
-			<< ",\"compute_deferred_batches\":" << game.map.computeExecutor().metrics().deferredBatches
-			<< ",\"compute_deferred_jobs\":" << game.map.computeExecutor().metrics().deferredJobs
-			<< ",\"compute_owner_jobs\":" << game.map.computeExecutor().metrics().ownerJobs
-			<< ",\"compute_worker_jobs\":" << game.map.computeExecutor().metrics().workerJobs
-			<< ",\"compute_join_wait_ns\":" << game.map.computeExecutor().metrics().joinWaitNs
+			<< ",\"compute_batches\":" << measured(game.map.computeExecutor().metrics().batches, summaryAvailable)
+			<< ",\"compute_jobs\":" << measured(game.map.computeExecutor().metrics().jobs, summaryAvailable)
+			<< ",\"compute_parallel_batches\":" << measured(game.map.computeExecutor().metrics().parallelBatches, summaryAvailable)
+			<< ",\"compute_batch_ns\":" << measured(game.map.computeExecutor().metrics().batchNs, summaryAvailable)
+			<< ",\"compute_wait_ns\":" << measured(game.map.computeExecutor().metrics().waitNs, summaryAvailable)
+			<< ",\"compute_deferred_batches\":" << measured(game.map.computeExecutor().metrics().deferredBatches, summaryAvailable)
+			<< ",\"compute_deferred_jobs\":" << measured(game.map.computeExecutor().metrics().deferredJobs, summaryAvailable)
+			<< ",\"compute_owner_jobs\":" << measured(game.map.computeExecutor().metrics().ownerJobs, workerAvailable)
+			<< ",\"compute_worker_jobs\":" << measured(game.map.computeExecutor().metrics().workerJobs, workerAvailable)
+			<< ",\"compute_join_wait_ns\":" << measured(game.map.computeExecutor().metrics().joinWaitNs, summaryAvailable)
 			<< ",\"ai_pipeline\":{";
 		bool metricComma=false;
-		for(const auto& [name,value]:game.aiMetrics()) {if(metricComma)result<<',';metricComma=true;result<<quote(name)<<':'<<value;}
+		for(const auto& [name,value]:game.aiMetrics()) {if(metricComma)result<<',';metricComma=true;result<<quote(name)<<':';
+            const bool available = (name == "computation_ns" ? workerAvailable
+                : (name == "deadline_misses" || name == "deadline_wait_ns") ? summaryAvailable : true);
+            result << measured(value, available);}
         result << "},\"benchmark_tick_histogram\":[";
         for(unsigned i=0;i<tickHistogram.size();++i) {
             if(i) result<<',';
@@ -675,6 +802,12 @@ struct HeadlessRunner
 			for(const auto& setting:forkSettings) { if(comma)result<<','; comma=true; result<<quote(setting); }
 			result << ']';
 		}
+        if (options.count("--resource-gradient-exploration")) {
+            result << ",\"resource_gradient_collection\":{\"intervals\":" << quote(one(options,"--resource-gradient-exploration"))
+                << ",\"seed\":" << integer(one(options,"--resource-gradient-exploration-seed","0"),0,UINT32_MAX)
+                << ",\"save_continuation_supported\":true"
+                << ",\"continuation_policy\":" << quote("requires-identical-explicit-exploration-options") << '}';
+        }
 		result << "},";
 		Headless::playersAndTeamsJson(result, game, engine.teamEliminatedTick);
 		result << ",\"javascriptControllers\":[";
@@ -705,7 +838,7 @@ struct HeadlessRunner
 int runHeadlessCommand(const Cli::Request &request)
 {
     const auto &command = request.command;
-    if(command!="info catalog" && command!="game run" && command!="map study"
+    if(command!="info catalog" && command!="game migrate" && command!="game run" && command!="map study"
         && command!="match verify" && command!="info sim-version" && command!="online turn-client" && command!="assets compose-buildings") return -1;
 	fs::path output;
 	try
@@ -799,7 +932,7 @@ int runHeadlessCommand(const Cli::Request &request)
 			GlobalContainer globals("glob2-tournament-catalog");
 			globalContainer=&globals;for(const auto &directory:request.all("--data-dir"))globals.fileManager->addDir(directory);globals.runNoX=true;
 			std::cout << "{\"schema_version\":1,\"save_version\":" << VERSION_MINOR << ",\"protocol_version\":" << NET_PROTOCOL_VERSION
-				<< ",\"building_catalog_hash\":" << quote(globals.buildingsTypes.fingerprint()) << ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"ai_telemetry_version\":1,\"performance_telemetry_version\":1,\"commands\":[\"game\",\"generate_map\",\"verify_match\",\"sim_version\",\"compose_buildings\",\"validate_set\"],\"sim_version\":" << Online::currentSimVersion().toJson().dump() << ",\"verify_match_version\":1,\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\",\"gradient-stats\"],\"ais\":[";
+				<< ",\"building_catalog_hash\":" << quote(globals.buildingsTypes.fingerprint()) << ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"ai_telemetry_version\":1,\"performance_telemetry_version\":1,\"commands\":[\"game\",\"generate_map\",\"verify_match\",\"sim_version\",\"compose_buildings\",\"validate_set\"],\"sim_version\":" << Online::currentSimVersion().toJson().dump() << ",\"verify_match_version\":1,\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\"],\"ais\":[";
 
 			bool comma=false;
 			for(int ai:AINames::selectionOrder())
@@ -849,7 +982,8 @@ int runHeadlessCommand(const Cli::Request &request)
 		if (fs::exists(output / "result.json"))
 			throw std::invalid_argument("output directory already contains a result");
 		int code;
-		if (command == "game run")
+        if (command=="game migrate") code=HeadlessRunner::migrate(options,output);
+        else if (command == "game run")
 		{
 			if (options.count("--generator"))
 			{

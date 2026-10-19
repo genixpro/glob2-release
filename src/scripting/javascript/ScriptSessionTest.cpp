@@ -16,10 +16,8 @@ TEST_CASE("JavaScript fatal failure tears down a live engine session" *
 	options.loadStrings = true;
 	glob2test::HeadlessGlobals globals(options);
 	Engine engine;
-	auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial.game.gz");
+	auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial159.game.gz");
 	REQUIRE(engine.initCustom(initial.string()) == Engine::EE_NO_ERROR);
-	engine.beginSession(0);
-	const auto tick = engine.gui.game.stepCounter;
 	struct FailingRuntime : Script::Runtime
 	{
 		void validate(const std::string &) override {}
@@ -32,12 +30,19 @@ TEST_CASE("JavaScript fatal failure tears down a live engine session" *
 	auto *controller =
 		static_cast<AIJavaScript *>(engine.gui.game.players[0]->ai->aiImplementation);
 	controller->runtime = std::make_unique<FailingRuntime>();
-	CHECK_THROWS_AS(engine.stepSession(40, {}), Script::HostFailure);
+	// Install the failure before session setup can admit work, instead of
+	// replacing a runtime already used by a job.
+	engine.beginSession(0);
+	// The first session turn establishes readiness; the next turn delivers
+	// the decision admitted at that completed boundary.
+	CHECK_NOTHROW(engine.stepSession(40, {}));
+	const auto tick = engine.gui.game.stepCounter;
+	CHECK_THROWS_AS(engine.stepSession(80, {}), Script::HostFailure);
 	CHECK_FALSE(engine.gui.isRunning);
 	CHECK_FALSE(engine.net);
 	CHECK_FALSE(engine.session);
 	CHECK(engine.gui.game.stepCounter == tick);
-	CHECK_THROWS_AS(engine.stepSession(80, {}), std::logic_error);
+	CHECK_THROWS_AS(engine.stepSession(120, {}), std::logic_error);
 }
 
 TEST_CASE("JavaScript deterministic scenario failure ends the engine session" *
@@ -48,7 +53,7 @@ TEST_CASE("JavaScript deterministic scenario failure ends the engine session" *
 	glob2test::HeadlessGlobals globals(options);
 	globals->structuredHeadless = true;
 	Engine engine;
-	auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial.game.gz");
+	auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial159.game.gz");
 	REQUIRE(engine.initCustom(initial.string()) == Engine::EE_NO_ERROR);
 	auto &script = engine.gui.game.mapscript;
 	script.setMapScript("export function step(c,s){s.bad=true;return [{type:'unknown'}];}");
@@ -78,7 +83,7 @@ TEST_CASE("JavaScript initialization errors reach headless and UI load diagnosti
 	glob2test::GlobalsOptions options;
 	options.loadStrings = true;
 	glob2test::HeadlessGlobals globals(options);
-	const auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial.game.gz");
+	const auto initial = glob2test::inflated("test/fixtures/javascript/profile1-initial159.game.gz");
 	const auto invalid = glob2test::artifactDir() / "invalid-embedded-ai.game";
 	{
 		GameGUI original;

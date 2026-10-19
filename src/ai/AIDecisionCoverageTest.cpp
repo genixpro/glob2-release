@@ -42,7 +42,7 @@ struct World
             auto* inn=world.addBuilding("inn",10+offset,4+offset,0,team);
             for (auto* building : {swarm,inn})
             {
-                building->materials[WHEAT]=depleted ? 0 : building->type->maxMaterial[WHEAT];
+                building->setMaterial(WHEAT, depleted ? 0 : building->type->maxMaterial[WHEAT]);
                 building->update();
             }
             for (int unit=0; unit<12; ++unit)
@@ -78,7 +78,7 @@ std::string tick(Game& game)
     if (length) encoded.append(reinterpret_cast<const char*>(order->getData()),length);
     order->sender=0;
     game.executeOrder(order,0);
-    game.syncStep(0);
+    game.step(0);
     return encoded;
 }
 std::vector<Uint32> state(Game& game)
@@ -258,7 +258,7 @@ TEST_SUITE("AIDecisionCoverage")
             World fixture(AI::ECONO,true,713);
             auto& game=fixture.world.game;
             auto* swarm=fixture.startingSwarm;
-            swarm->materials[WHEAT]=wheat;
+            swarm->setMaterial(WHEAT, wheat);
             AISharedRuntime::Runtime runtime(new AISharedRuntime::Econo,game.players[0]);
             AISharedRuntime::Runtime::OwnerObservationScope observationScope(runtime);
             MersenneTwister controllerRandom(713);runtime.setRandomEngine(controllerRandom);

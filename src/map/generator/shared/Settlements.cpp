@@ -268,10 +268,9 @@ int countBuildings(const Game &game, int team, const char *typeName)
 	if (team < 0 || team >= game.teamsCount() || !game.teams[team])
 		return 0;
 	int count = 0;
-	for (int i = 0; i < Building::MAX_COUNT; ++i)
+	for (const Building *b : game.teams[team]->liveBuildings.entries())
 	{
 		::MapGeneration::generationCheckpoint();
-		if (const Building *b = game.teams[team]->myBuildings[i])
 			if (b->type && b->type->type == typeName && !b->type->isBuildingSite)
 				++count;
 	}
@@ -299,7 +298,7 @@ int placeTower(Game &game, int team, int level, double x, double y, int within,
 		// avoids an immediate delivery job, but combat consumes them normally and
 		// later replenishment still needs miners. Refresh the call lists now so
 		// the initial save does not retain the empty store's worker request.
-			building->materials[materialIndex(MaterialId::Stone)] = tower->maxMaterial[materialIndex(MaterialId::Stone)];
+			building->setMaterial(materialIndex(MaterialId::Stone), tower->maxMaterial[materialIndex(MaterialId::Stone)]);
 		building->updateCallLists();
 	}
 	game.teams[team]->addToStaticAbilitiesLists(building);
@@ -329,7 +328,7 @@ int placeStartingBuilding(Game &game, int team, const char *name, int level, dou
 	for (int resource : supplies)
 	{
 		::MapGeneration::generationCheckpoint();
-		building->materials[resource] = buildingType->maxMaterial[resource];
+		building->setMaterial(resource, buildingType->maxMaterial[resource]);
 	}
 	game.teams[team]->addToStaticAbilitiesLists(building);
 	// Register this building's feeding/work services, leaving existing task

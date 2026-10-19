@@ -4,35 +4,52 @@
 #include <algorithm>
 namespace SimulationSnapshot
 {
-Handle Store::captureBoundary(const Game& game, Requirements required)
+Handle Store::captureBoundary(const Game& game, CaptureOptions options)
 {
-	const auto requested = required;
+	auto required = captureRequirements(options);
 	if (latest && latest->worldIdentity != game.map.identity()) reset();
+	bool unchangedBoundary = false;
 	if (latest && latest->tick == game.stepCounter && latest->observationRevision == observationRevision
         && latest->configurationRevision == game.gameHeader.observationRevision()
         && latest->mapGenerations == game.map.snapshotGenerations()) {
-		if ((required & latest->requirements) == required) return latest->project(requested);
+		if ((required & latest->requirements) == required) return *latest;
+		unchangedBoundary = true;
 		required |= latest->requirements;
 	}
-	const auto start = std::chrono::steady_clock::now();
-	const auto preparedBefore = storage.preparationNs;
-	if (needs(required, Component::Catalogs) && (!catalog || catalogConfigurationRevision != game.gameHeader.observationRevision())) {
+	if (!catalog || catalogConfigurationRevision != game.gameHeader.observationRevision()) {
 		catalog = captureCatalog(game);
 		catalogConfigurationRevision = game.gameHeader.observationRevision();
 	}
 	const auto copiedBefore = storage.bytesCopied;
-	auto next = capture(game, catalog, required, latest ? &*latest : nullptr, &storage);
+	const auto entityBefore = storage.entityBytesCopied;
+	const auto sidecarBefore = storage.entitySidecarBytesCopied;
+	auto next = capture(game, catalog, required, latest ? &*latest : nullptr, &storage, unchangedBoundary);
+	metrics.coreMaterializations = storage.coreMaterializations;
+	metrics.entityBytesCopied += storage.entityBytesCopied - entityBefore;
+	metrics.entitySidecarBytesCopied += storage.entitySidecarBytesCopied - sidecarBefore;
 	next.observationRevision = observationRevision;
+	metrics.mapBytesCopied += storage.bytesCopied - copiedBefore;
+	if (detailedMetrics || game.map.computeExecutor().telemetryEnabled()) {
+		const Handle empty;
+		accountCapture(next, latest ? *latest : empty, storage.bytesCopied - copiedBefore);
+		++metrics.detailedCaptures;
+	}
+	metrics.allocations = storage.allocations;
+	++metrics.captures;
+	latest = std::move(next);
+	return *latest;
+}
+
+void Store::accountCapture(const Handle& next, const Handle& previous, Uint64 copiedMapBytes)
+{
 	// Map arrays report the chunks they actually copied; other components are
 	// accounted by size when not shared with the previous capture.
-	metrics.bytesCopied += storage.bytesCopied - copiedBefore;
+	metrics.bytesCopied += copiedMapBytes;
 	auto account = [&](const auto& current, const auto& previous, Uint64 bytes) {
 		if (!current) return;
 		if (current == previous) ++metrics.reusedComponents;
 		else metrics.bytesCopied += bytes;
 	};
-	const Handle empty;
-	const auto& previous = latest ? *latest : empty;
 	account(next.terrain, previous.terrain, 0);
 	account(next.resources, previous.resources, 0);
 	account(next.occupancy, previous.occupancy, 0);
@@ -44,13 +61,17 @@ Handle Store::captureBoundary(const Game& game, Requirements required)
 		const auto sizes=next.growth->storageSizes();
 		account(next.growth,previous.growth,(sizes[0]+sizes[1])*sizeof(Uint32)+sizes[2]*sizeof(Uint16));
 	}
-	if (next.entities) {
+	if (next.entities && next.entities == previous.entities) ++metrics.reusedComponents;
+	else if (next.entities) {
 		metrics.bytesCopied += next.entities->buildings.size() * sizeof(BuildingView) + next.entities->units.size() * sizeof(UnitView)
+			+ (next.entities->buildingRanges.size() + next.entities->unitRanges.size()) * sizeof(UnitRange)
 			+ next.entities->projects.size() * sizeof(BuildProjectView)
             + (next.entities->buildingSlotIndices.size() + next.entities->unitSlotIndices.size()) * sizeof(Uint32);
-		metrics.bytesCopied += next.entities->relationships.size() * sizeof(UnitRef);
+		metrics.bytesCopied += next.entities->relationships.size() * sizeof(UnitRef)
+			+ next.entities->funding.size() * sizeof(FundingState);
 	}
-	if (next.teams) {
+	if (next.teams && next.teams == previous.teams) ++metrics.reusedComponents;
+	else if (next.teams) {
 		metrics.bytesCopied += next.teams->values.size() * sizeof(TeamView);
 		for (const auto& team : next.teams->values) metrics.bytesCopied += team.statistics.buildingCountByVariant.size() * sizeof(int)
 			+ (team.virtualBuildings.size()+team.swarms.size()) * sizeof(BuildingRef);
@@ -60,33 +81,44 @@ Handle Store::captureBoundary(const Game& game, Requirements required)
 		if (found && found->values == field.values) ++metrics.reusedComponents;
 		else metrics.bytesCopied += field.values->size() * sizeof(Uint16);
 	}
-    if (next.session) metrics.bytesCopied+=sizeof(Session)+next.session->players.size()*sizeof(Session::Player)
+    if (next.session && next.session == previous.session) ++metrics.reusedComponents;
+    else if (next.session) metrics.bytesCopied+=sizeof(Session)+next.session->players.size()*sizeof(Session::Player)
         +next.session->legacyScriptText.size();
-    if (next.effects) {
+    if (next.effects && next.effects == previous.effects) ++metrics.reusedComponents;
+    else if (next.effects) {
         metrics.bytesCopied+=next.effects->sectors.size()*sizeof(SectorEffects);
         for (const auto& sector:next.effects->sectors) metrics.bytesCopied+=sector.bullets.size()*sizeof(BulletRecord)
             +sector.explosions.size()*sizeof(ExplosionRecord)+sector.deaths.size()*sizeof(DeathRecord);
     }
-    if (next.statistics) {
+    if (next.statisticsInputs && next.statisticsInputs == previous.statisticsInputs) ++metrics.reusedComponents;
+    else if(next.statisticsInputs) {
+        for(const auto& row:next.statisticsInputs->events)metrics.bytesCopied+=sizeof(GameplayEventCounters)+row.capacityBytes();
+        for(const auto& row:next.statisticsInputs->coverage)metrics.bytesCopied+=row.size()*sizeof(TeamStats::CoverageBuilding);
+    }
+    if (next.statistics && next.statistics == previous.statistics) ++metrics.reusedComponents;
+    else if (next.statistics) {
         for (size_t i=0;i<next.statistics->teams.size();++i) {
             const auto& team=next.statistics->teams[i];
             if (previous.statistics && i<previous.statistics->teams.size() && team==previous.statistics->teams[i]) ++metrics.reusedComponents;
             else if (team) metrics.bytesCopied+=sizeof(TeamStats)+team->displayCapacityBytes();
         }
     }
-    if (next.telemetry) {
+    if (next.telemetry && next.telemetry == previous.telemetry) ++metrics.reusedComponents;
+    else if (next.telemetry) {
         for (const auto& row:next.telemetry->rows) metrics.bytesCopied+=sizeof(row)
             +row.fields.size()*sizeof(AITelemetry::Field)+row.values.size()*sizeof(AITelemetry::Value)
             +row.named.size()*sizeof(AITelemetry::NamedValue);
     }
-    if (next.history) {
+    if (next.history && next.history == previous.history) ++metrics.reusedComponents;
+    else if (next.history) {
         for (size_t i = 0; i < next.history->teams.size(); ++i) {
             const auto& team = next.history->teams[i];
             if (previous.history && i < previous.history->teams.size() && team == previous.history->teams[i]) ++metrics.reusedComponents;
             else if (team) metrics.bytesCopied += sizeof(TeamStats) + team->displayCapacityBytes();
         }
     }
-    if (next.entityDiagnostics) for (const auto& building:next.entityDiagnostics->buildings) {
+    if (next.entityDiagnostics && next.entityDiagnostics == previous.entityDiagnostics) ++metrics.reusedComponents;
+    else if (next.entityDiagnostics) for (const auto& building:next.entityDiagnostics->buildings) {
         metrics.bytesCopied+=sizeof(building)+building.gradient.size()*sizeof(Uint16);
         for (const auto& failed:building.failingUnits) metrics.bytesCopied+=failed.size()*sizeof(Uint16);
     }
@@ -95,13 +127,6 @@ Handle Store::captureBoundary(const Game& game, Requirements required)
         for (const auto& name : next.annotations->areaNames) metrics.bytesCopied += name.size();
     }
     account(next.annotations,previous.annotations,0); // Stamped array copies counted by storage.
-	metrics.allocations = storage.allocations;
-	const auto preparation = storage.preparationNs-preparedBefore;
-	metrics.preparationNs += preparation;
-	++metrics.captures;
-	metrics.captureNs += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()-preparation;
-	latest = std::move(next);
-	return latest->project(requested);
 }
 
 MemoryMetrics Store::memoryMetrics() const

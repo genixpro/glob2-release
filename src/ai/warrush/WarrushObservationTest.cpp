@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include "AIWarrush.h"
 #include "ai/observation/WorldQueries.h"
 #include "Player.h"
@@ -8,7 +9,7 @@
 
 TEST_SUITE("WarrushObservation")
 {
- TEST_CASE("declared inputs omit published fields without changing decisions")
+ TEST_CASE("standard observation preserves decisions from the legacy narrow view")
  {
   glob2test::HeadlessGlobals globals;
   glob2test::HeadlessGame fixture{glob2test::GameOptions{.wDec=5,.hDec=5,.teams=2,.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true}};
@@ -16,11 +17,12 @@ TEST_SUITE("WarrushObservation")
   REQUIRE(fixture.addBuilding("swarm",4,4));
   game.map.setResourceByIndex(18,18,WHEAT,1);
   Sint32 x=0,y=0,distance=0;
+  glob2test::awaitGradient(game,[&] { return game.map.getMaterialGradientSlot(0,materialIndex(MaterialId::Food),0); });
   game.map.materialAvailableUpdateSlot(0,materialIndex(MaterialId::Food),0,4,4,&x,&y,&distance);
   AIWarrush full(game.players[0]),projected(game.players[0]);
   MersenneTwister fullRandom(713),projectedRandom(713);
   full.setRandomEngine(fullRandom);projected.setRandomEngine(projectedRandom);
-  const auto requirements=projected.observationRequirements();
+  const auto requirements=SimulationSnapshot::Simulation & ~SimulationSnapshot::bit(SimulationSnapshot::Component::ResourceFields);
   CHECK_FALSE(SimulationSnapshot::needs(requirements,SimulationSnapshot::Component::ResourceFields));
   CHECK(SimulationSnapshot::needs(requirements,SimulationSnapshot::Component::Growth));
   const auto world=AIEngine::AIWorldView::capture(game,AIEngine::AIWorldView::captureCatalog(game));

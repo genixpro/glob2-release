@@ -34,6 +34,7 @@
 #include "ReplayWriter.h"
 #include "ReplayReader.h"
 #include "AITelemetry.h"
+#include "TurretTargeting.h"
 
 #define BULLET_IMGID 0
 
@@ -214,9 +215,10 @@ void Game::prestigeSyncStep()
 
 
 
-void Game::syncStep(Sint32 localTeam, PreparationCompletion completion)
+void Game::advanceLiveSimulation(Sint32 localTeam)
 {
-	map.preparePendingWorld();
+	map.applyGradientBackendRequest();
+    assert(completedObservation && completedObservation->tick == stepCounter);
 	applyClientRequests();
 	if (!anyPlayerWaited)
 	{
@@ -228,34 +230,27 @@ void Game::syncStep(Sint32 localTeam, PreparationCompletion completion)
 
 		Uint64 startTick=SDL_GetTicks();
 
-		if (!map.gradientPipelineEnabled()) map.configureGradientPipeline(2, 8);
-		map.advanceGradientPipeline();
-
 		areaEffects.beginTick(*this);
 		for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
 			teams[i]->syncStep();
 
-		map.syncStep(stepCounter, false);
+		map.syncStep(stepCounter);
 		if (globalContainer->replaying && globalContainer->replayReader)
 			globalContainer->replayReader->applyTelemetry(*this);
 		if ((stepCounter & 31) == 0)
 		{
 			for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
-				AITelemetry::capture(teams[t], false, false);
+				AITelemetry::capture(teams[t], (stepCounter & 511)==0, getenv("GLOB2_TEAM_TIMELINE")!=nullptr);
 			if (globalContainer->replayWriter)
 				globalContainer->replayWriter->captureTelemetry();
 		}
-		// Normally polled controllers already observed this logical tick in their
-		// ordered worker stream. Only replica/replay seats need this boundary.
-		observeUnpolledAI();
 
 		if ((stepCounter&FOW_SWITCH_TICK_MASK)==FOW_SWITCH_TICK_PHASE)
 		{
 			map.switchFogOfWar();
 			for (int t=0; t<mapHeader.getNumberOfTeams(); t++)
-				for (int i=0; i<Building::MAX_COUNT; i++)
+				for (Building *b : teams[t]->liveBuildings.entries())
 				{
-					Building *b=teams[t]->myBuildings[i];
 					if (b)
 					{
 						assert(b->owner==teams[t]);
@@ -282,12 +277,10 @@ void Game::syncStep(Sint32 localTeam, PreparationCompletion completion)
 		Uint64 endTick=SDL_GetTicks();
 		ticksGameSum[stepCounter&(TICK_PROFILE_BUF_LEN-1)]+=static_cast<Sint64>(endTick) - static_cast<Sint64>(startTick);
 		publishTickEvents();
+		map.computeExecutor().advancingTick(stepCounter);
 		stepCounter++;
-		// All world mutations, including script/fog/project tail work, are done.
-		// Selection stays ordered; only private preparation can join AI decisions.
-		map.stagePeriodicGradientPreparation();
-        map.stageResourceGrowth();
-		if (completion == PreparationCompletion::Complete) map.preparePendingWorld();
+        orderEditedWorld = false;
+
 	}
 }
 

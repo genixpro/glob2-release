@@ -78,7 +78,7 @@ TEST_SUITE("BuildingAreaEffectsBenchmark")
 					{
 						const int x = 4 + (n % 32) * 4, y = 4 + (n / 32) * 4;
 						auto *b = world.addBuilding("stonewall", x, y, 0, n % teamCount);
-						b->materials[WHEAT] = 100000;
+						b->setMaterial(WHEAT, 100000);
 						buildings.push_back(b);
 					}
 					for (int t = 0; t < teamCount; ++t)
@@ -183,8 +183,7 @@ TEST_SUITE("BuildingAreaEffectsBenchmark")
 						((tick & 15) ? steady : pulses).push_back(ns(start));
 					}
 					int units = 0;
-					for (int n = 0; n < Unit::MAX_COUNT; ++n)
-						units += world.team->myUnits[n] != nullptr;
+					units += world.team->liveUnits.size();
 					std::vector<Uint32> states, unitStates;
 					world.game.checkSum(nullptr, &states, &unitStates, true);
 					states.insert(states.end(), unitStates.begin(), unitStates.end());

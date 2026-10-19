@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include <memory>
 #include "GlobalContainer.h"
 #include "Game.h"
@@ -49,10 +50,9 @@ struct Colony
         game.gameHeader.getWinningConditions().push_back(std::make_shared<WinningConditionDeath>());
         const int type = globalContainer->buildingsTypes.getTypeNum(buildingName, 0, false);
         inn = new Building(8, 8, 0, type, team, &globalContainer->buildingsTypes, 0, 0);
-        team->myBuildings[0] = inn;
-        team->rebuildLiveLists();
+        team->attachBuilding(0, inn);
         game.map.setBuilding(8, 8, inn->type->width, inn->type->height, inn->gid);
-        inn->materials[WHEAT] = corn;
+        inn->setMaterial(WHEAT, corn);
         inn->maxUnitInside = 1;
         inn->updateCallLists();
         game.map.setMapDiscovered();
@@ -61,13 +61,14 @@ struct Colony
     Unit* unit(int type = WORKER)
     {
         auto* u = new Unit(6, 8, 0, type, team, 0);
-        team->myUnits[0] = u;
-        team->rebuildLiveLists();
+        team->attachUnit(0, u);
         u->action = type == EXPLORER ? FLY : WALK;
         u->hungry = u->trigHungry / 2;
         u->medical = Unit::MED_HUNGRY;
         if (type == EXPLORER) game.map.setAirUnit(6, 8, u->gid);
         else game.map.setGroundUnit(6, 8, u->gid);
+        // These fixtures test occupied service capacity after route publication.
+        if (!u->performance[FLY]) glob2test::awaitBuildingGradient(game,inn,u->swimClass());
         return u;
     }
 
@@ -130,7 +131,7 @@ static std::vector<Uint32> checkFeeding(int type, int corn)
     }
     require(entered && timerReachedZero && u->hungry == Unit::HUNGRY_MAX,
             "unit completes its meal, including the zero timer boundary");
-    require(c.inn->materials[WHEAT] == corn - 1, "one meal consumes exactly one wheat");
+    require(c.inn->material(WHEAT) == corn - 1, "one meal consumes exactly one wheat");
     for (int tick = 0; tick < 300; ++tick)
         c.step(true, "fed colony remains alive through exit and medical refresh");
     require(u->attachedBuilding == nullptr && u->medical == Unit::MED_FREE,
@@ -156,6 +157,7 @@ TEST_SUITE("HungryDefeat")
         Unit* patient = world.addUnit(WORKER, 6, 8);
         patient->hp = patient->trigHP;
         patient->medical = Unit::MED_DAMAGED;
+        glob2test::awaitBuildingGradient(world.game,hospital,patient->swimClass());
         patient->delta = 255;
         REQUIRE(world.addUnit(WORKER, 20, 20, 1));
         world.step();
@@ -173,7 +175,7 @@ TEST_SUITE("HungryDefeat")
             std::vector<Uint32> trace;
             for (int tick = 0; tick < 512; ++tick)
             {
-                game.syncStep(0);
+                game.step(0);
                 REQUIRE(game.teams[0]->isAlive);
                 REQUIRE_FALSE(game.teams[0]->hasLost);
                 REQUIRE_FALSE(game.teams[1]->hasWon);
@@ -221,13 +223,13 @@ TEST_SUITE("HungryDefeat")
 	        Unit* u = c.unit();
 	        u->medical = Unit::MED_FREE;
 	        u->hungry = Unit::HUNGRY_MAX;
-	        c.inn->materials[WHEAT] = 0;
+	        c.inn->setMaterial(WHEAT, 0);
 	        c.inn->updateCallLists();
 	        c.step(true, "a healthy worker without food still sustains a colony");
 	    }
 	    {
 	        Colony c;
-	        c.inn->materials[WHEAT] = 0;
+	        c.inn->setMaterial(WHEAT, 0);
 	        c.inn->updateCallLists();
 	        c.unit();
 	        c.step(false, "hungry colony with no food still loses");

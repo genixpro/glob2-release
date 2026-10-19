@@ -16,8 +16,24 @@
 #include "Utilities.h"
 #include "GlobalContainer.h"
 
+namespace {
+// Crowding eligibility changes independently of tile movement when a warrior
+// enters/leaves a building or finishes a capability upgrade. Stack-only and
+// owner-thread; this records a conservative event, not a weighted seed change.
+struct GuardCostEligibility {
+    Unit& unit;
+    bool before;
+    static bool eligible(const Unit& unit) {
+        return !unit.isDead && unit.displacement!=Unit::DIS_INSIDE && unit.hasCapability(UnitRuntimeTraits::GuardIdle);
+    }
+    explicit GuardCostEligibility(Unit& value):unit(value),before(eligible(value)) {}
+    ~GuardCostEligibility() {if(before!=eligible(unit))unit.owner->map->gradientGuardCostsChanged(unit.owner->teamNumber);}
+};
+}
+
 void Unit::handleDisplacement(void)
 {
+    const GuardCostEligibility guardCostEligibility(*this);
 	switch (activity)
 	{
 		case ACT_RANDOM:
@@ -33,7 +49,7 @@ void Unit::handleDisplacement(void)
 			}
 			else
 				displacement=DIS_RANDOM;
-			validTarget=false;
+			setValidTarget(false);
 		}
 		break;
 
@@ -52,7 +68,7 @@ void Unit::handleDisplacement(void)
 					dx = off->dx;
 					dy = off->dy;
 					displacement=DIS_HARVESTING;
-					validTarget=false;
+					setValidTarget(false);
 				}
 				else if ((attachedBuilding->runtime->fetchesStockMask | attachedBuilding->runtime->fetchesDirectStockMask)&(1u<<destinationPurpose))
 				{
@@ -65,7 +81,7 @@ void Unit::handleDisplacement(void)
 						if (continueCargoCollection()) break;
 						setTargetBuilding(attachedBuilding);
 						displacement=DIS_GOING_TO_BUILDING;
-						validTarget=true;
+						setValidTarget(true);
 						if (verbose)
 							printf("guid=(%d) took material (%d) out of market gbid=(%d)\n", gid, destinationPurpose, market->gid);
 					}
@@ -96,13 +112,13 @@ void Unit::handleDisplacement(void)
 					// resource, so this either harvests again next step or
 					// resumes the gradient walk.
 					displacement=DIS_GOING_TO_RESOURCE;
-					validTarget=false;
+					setValidTarget(false);
 				}
 				else
 				{
 					// we got the resource.
 					receiveCarriedMaterial(destinationPurpose,{});
-					++owner->stats.measurements.harvested[destinationPurpose];
+					++owner->stats.events().harvested[destinationPurpose];
 
 					if (continueCargoCollection()) break;
 
@@ -112,14 +128,14 @@ void Unit::handleDisplacement(void)
 						dx = off->dx;
 						dy = off->dy;
 						displacement=DIS_FILLING_BUILDING;
-						validTarget=false;
+						setValidTarget(false);
 					}
 					else
 					{
 						displacement=DIS_GOING_TO_BUILDING;
 						targetX=targetBuilding->getMidX();
 						targetY=targetBuilding->getMidY();
-						validTarget=true;
+						setValidTarget(true);
 					}
 				}
 			}
@@ -131,7 +147,7 @@ void Unit::handleDisplacement(void)
 					dx = off->dx;
 					dy = off->dy;
 					displacement=DIS_FILLING_BUILDING;
-					validTarget=false;
+					setValidTarget(false);
 				}
 			}
 			else if (displacement==DIS_FILLING_BUILDING)
@@ -145,7 +161,7 @@ void Unit::handleDisplacement(void)
 					assert(targetBuilding);
 					assert(ownExchangeBuilding);
 					if (!(targetBuilding->runtime->suppliesDirectStockMask&(1u<<destinationPurpose)) || !(attachedBuilding->runtime->fetchesDirectStockMask&(1u<<destinationPurpose))
-						|| targetBuilding->buildingState != Building::ALIVE || targetBuilding->materials == attachedBuilding->materials)
+						|| targetBuilding->buildingState != Building::ALIVE || targetBuilding->sharesMaterialPool(*attachedBuilding))
 					{
 						stopAttachedForBuilding(false);
 						break;
@@ -171,7 +187,7 @@ void Unit::handleDisplacement(void)
 						displacement=DIS_GOING_TO_BUILDING;
 						targetX=targetBuilding->getMidX();
 						targetY=targetBuilding->getMidY();
-						validTarget=true;
+						setValidTarget(true);
 						exchangeReady=true;
 						if (verbose)
 							printf("guid=(%d) took a foreign fruit in our exhange building to food\n", gid);
@@ -180,7 +196,7 @@ void Unit::handleDisplacement(void)
 				else if (carriedMaterial>=0 && (hasCapability(UnitRuntimeTraits::ExtendedCargo) || targetBuilding->materialDeliveryNeed(carriedMaterial)>0))
 				{
 					if (verbose)
-						printf("guid=(%d) Giving material (%d) to building gbid=(%d) old-amount=(%d)\n", gid, destinationPurpose, targetBuilding->gid, targetBuilding->materials[carriedMaterial]);
+						printf("guid=(%d) Giving material (%d) to building gbid=(%d) old-amount=(%d)\n", gid, destinationPurpose, targetBuilding->gid, targetBuilding->material(carriedMaterial));
 					cargoDeliveryProgress=deliverCargo(*targetBuilding);
 				}
 
@@ -194,8 +210,8 @@ void Unit::handleDisplacement(void)
 						jobPurpose=UnitJobPurpose::None;
 						activity=ACT_RANDOM;
 						displacement=DIS_RANDOM;
-						validTarget=false;
-						assert(needToRecheckMedical);
+						setValidTarget(false);
+						assert(needToRecheckMedical());
 					}
 					else
 					{
@@ -217,7 +233,7 @@ void Unit::handleDisplacement(void)
 						int timeLeft = numberOfStepsLeftUntilHungry();
 						if (timeLeft > 0)
 						{
-							int bestResource=-1;
+							int bestResource=-1, pendingResource=-1;
 							int minValue=owner->map->getW()+owner->map->getW();
 
 							Map* map=owner->map;
@@ -226,8 +242,12 @@ void Unit::handleDisplacement(void)
 								const int need=needs[r];
 								if (need<=0 || (hasCapability(UnitRuntimeTraits::ExtendedCargo) && !canCarryMaterial(r))) continue;
 								int distance;
-								const bool available=performance[FLY]?findMaterialDestination(r,nullptr,nullptr,&distance,false,attachedBuilding):map->materialAvailableSlot(teamNumber,r,swimClass(),posX,posY,&distance,false,attachedBuilding);
-								if (!available || (distance<<1)>=timeLeft) continue;
+								const auto route=performance[FLY]
+									? queryMaterialDestination(r,nullptr,nullptr,&distance,false,attachedBuilding)
+									: map->queryMaterialDistance(teamNumber,r,swimClass(),posX,posY,&distance,false,attachedBuilding);
+								if (route==RouteResult::Pending) { if (pendingResource<0) pendingResource=r; continue; }
+								if (route!=RouteResult::Reachable || (distance<<1)>=timeLeft) continue;
+
 								const int value=distance/need;
 								if (value<minValue) { bestResource=r; minValue=value; }
 							}
@@ -235,6 +255,13 @@ void Unit::handleDisplacement(void)
 							if (verbose)
 								printf("guid=(%d) bestResource=%d, minValue=%d\n", gid, bestResource, minValue);
 
+							if (bestResource<0 && pendingResource>=0) {
+								destinationPurpose=pendingResource;
+								setTargetBuilding(nullptr);
+								displacement=DIS_GOING_TO_RESOURCE;
+								setValidTarget(false);
+								break;
+							}
 							if (bestResource>=0)
 							{
 								destinationPurpose=bestResource;
@@ -246,18 +273,16 @@ void Unit::handleDisplacement(void)
 										dx = off->dx;
 										dy = off->dy;
 										displacement=DIS_HARVESTING;
-										validTarget=false;
+										setValidTarget(false);
 									}
-									else if (findMaterialDestination(destinationPurpose,&targetX,&targetY,&dummyDist,attachedBuilding->fetchesFromMarkets(),attachedBuilding))
-									{
-										displacement=DIS_GOING_TO_RESOURCE;
-										validTarget=true;
-									}
-									else
-									{
-										assert(false);//You can remove this assert(), but *do* notice me!
-										stopAttachedForBuilding(false);
-									}
+                                    else {
+                                        const auto route=queryMaterialDestination(destinationPurpose,&targetX,&targetY,&dummyDist,attachedBuilding->fetchesFromMarkets(),attachedBuilding);
+                                        if (route==RouteResult::Pending) {
+                                            displacement=DIS_GOING_TO_RESOURCE; setValidTarget(false);
+                                        } else if (route==RouteResult::Reachable) {
+                                            displacement=DIS_GOING_TO_RESOURCE; setValidTarget(true);
+                                        } else stopAttachedForBuilding(false);
+                                    }
 								}
 							}
 							else
@@ -279,7 +304,7 @@ void Unit::handleDisplacement(void)
 			else
 			{
 				displacement=DIS_RANDOM;
-				validTarget=false;
+				setValidTarget(false);
 			}
 		}
 		break;
@@ -295,7 +320,7 @@ void Unit::handleDisplacement(void)
 					dx = off->dx;
 					dy = off->dy;
 					displacement=DIS_ENTERING_BUILDING;
-					validTarget=false;
+					setValidTarget(false);
 				}
 			}
 			else if (displacement==DIS_ENTERING_BUILDING)
@@ -308,7 +333,18 @@ void Unit::handleDisplacement(void)
 				else
 					owner->map->setGroundUnit(posX-dx, posY-dy, NOGUID);
 				displacement=DIS_INSIDE;
-				validTarget=false;
+				setValidTarget(false);
+
+				// Loading can cancel a visit whose stock was normalized below
+				// its cost. Finish removing the entry occupancy, then leave
+				// without starting its timer or granting any service benefit.
+				if (!serviceResourcesReserved())
+				{
+					insideTimeout=0;
+					displacement=DIS_EXITING_BUILDING;
+					setNeedToRecheckMedical(true);
+					break;
+				}
 
 				if (destinationPurpose==FEED)
 				{
@@ -367,7 +403,7 @@ void Unit::handleDisplacement(void)
 					&& destinationPurpose!=FEED && destinationPurpose!=HEAL))
 				{
 					displacement=DIS_EXITING_BUILDING;
-					validTarget=false;
+					setValidTarget(false);
 					// A restored or reconfigured visit may now offer an unsafe
 					// course. Release its original reservation before changing any
 					// levels, then exit using the existing movement clocks.
@@ -375,30 +411,30 @@ void Unit::handleDisplacement(void)
 					const auto courses=trainingVisit && !owner->game->gameHeader.isUnitUpgradesDisabled()
 						? trainingVisitCourses(*attachedBuilding,destinationPurpose) : std::optional<Uint32>{};
 					if (trainingVisit && !owner->game->gameHeader.isUnitUpgradesDisabled() && courses)
-						++owner->stats.measurements.trainingVisits[typeNum];
+						++owner->stats.events().trainingVisits[typeNum];
 
 					if (destinationPurpose==FEED)
 					{
 						hungry=foodCapacity();
 						if (owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
 						fruitCount=attachedBuilding->eatOnce(&fruitMask, this);
-						needToRecheckMedical=true;
+						setNeedToRecheckMedical(true);
 					}
 					else if (destinationPurpose==HEAL)
 					{
 						attachedBuilding->settleService(this);
-						++attachedBuilding->owner->stats.measurements.healingVisits;
-						attachedBuilding->owner->stats.measurements.hpRestored +=
+						++attachedBuilding->owner->stats.events().healingVisits;
+						attachedBuilding->owner->stats.events().hpRestored +=
 							std::max<Sint64>(0, Sint64(performance[HP]) - hp);
 						hp=performance[HP];
 						if (owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
-						needToRecheckMedical=true;
+						setNeedToRecheckMedical(true);
 					}
 					// Restored units already inside exit safely without gaining a level.
 					// New training visits are rejected by Team::findBestUpgrade.
 					else if (!owner->game->gameHeader.isUnitUpgradesDisabled())
 					{
-						if(!courses) { attachedBuilding->releaseService(this); needToRecheckMedical=true; break; }
+						if(!courses) { attachedBuilding->releaseService(this); setNeedToRecheckMedical(true); break; }
 						attachedBuilding->settleService(this);
 						Sint32 previousLevels[NB_ABILITY];
 						std::copy(level, level + NB_ABILITY, previousLevels);
@@ -417,7 +453,7 @@ void Unit::handleDisplacement(void)
 							applyTrainingUnchecked(attachedBuilding->type->semantics.training[destinationPurpose], destinationPurpose);
 
 						for (int a = 0; a < NB_ABILITY; ++a)
-							owner->stats.measurements.abilityGains[typeNum][a] +=
+							owner->stats.events().abilityGains[typeNum][a] +=
 								std::max(0, level[a] - previousLevels[a]);
 					}
 				}
@@ -433,7 +469,7 @@ void Unit::handleDisplacement(void)
 			else
 			{
 				displacement=DIS_RANDOM;
-				validTarget=false;
+				setValidTarget(false);
 			}
 		}
 		break;
@@ -444,7 +480,7 @@ void Unit::handleDisplacement(void)
 			displacement=DIS_GOING_TO_FLAG;
 			targetX=attachedBuilding->posX;
 			targetY=attachedBuilding->posY;
-			validTarget=true;
+			setValidTarget(true);
 			int distance=owner->map->warpDistSquare(targetX, targetY, posX, posY);
 			int usr=attachedBuilding->unitStayRange;
 			int usr2=usr*usr;
@@ -453,7 +489,7 @@ void Unit::handleDisplacement(void)
 
 			if (distance<=usr2)
 			{
-				validTarget=false;
+				setValidTarget(false);
 				if (jobPurpose==UnitJobPurpose::Clear)
 					displacement=DIS_CLEARING_RESOURCES;
 				else if (jobPurpose==UnitJobPurpose::Explore)
@@ -475,11 +511,11 @@ void Unit::handleDisplacement(void)
 							int x=posX+tdx;
 							int y=posY+tdy;
 							if (map->warpDistSquare(x, y, targetX, targetY)<=usr2
-								&& map->isClearableResourceForMaterials(x, y, attachedBuilding->clearingMaterials))
+								&& map->isClearableResourceForMaterials(x, y, attachedBuilding->clearingMaterialMask))
 							{
 								dx=tdx;
 								dy=tdy;
-								validTarget=false;
+								setValidTarget(false);
 								displacement=DIS_CLEARING_RESOURCES;
 								//movement=MOV_HARVESTING;
 								return;
@@ -545,7 +581,7 @@ void Unit::applyPartialInsideBenefit()
 		if (attachedBuilding->type->semantics.healing.partial == BuildingPartialService::None) return;
 		attachedBuilding->settleService(this);
 		const Sint64 restored = ((Sint64(performance[HP]) - hp) * elapsed) / total;
-		attachedBuilding->owner->stats.measurements.hpRestored += std::max<Sint64>(0, restored);
+		attachedBuilding->owner->stats.events().hpRestored += std::max<Sint64>(0, restored);
 		hp=int(Sint64(hp)+restored);
 		if (hp>=performance[HP] && owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
 	}
@@ -553,6 +589,7 @@ void Unit::applyPartialInsideBenefit()
 
 void Unit::expelFromBuilding(int x, int y, int dx, int dy)
 {
+    const GuardCostEligibility guardCostEligibility(*this);
 	applyPartialInsideBenefit();
 	standardRandomActivity();
 	insideTimeout=0;

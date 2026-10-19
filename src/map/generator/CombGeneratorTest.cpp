@@ -246,13 +246,14 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 	game.teams[0]->allies &= ~game.teams[1]->me;
 	game.teams[0]->enemies |= game.teams[1]->me;
 	tower->bullets = 0;
-	tower->materials[STONE] = 0;
+	tower->setMaterial(STONE, 0);
 	for (unsigned tick = 0; tick < 256; ++tick)
 		tower->turretStep(tick);
 	require(tower->bullets == 0, "unfed tower cannot shoot");
-	tower->materials[STONE] = 1;
+	tower->setMaterial(STONE, 1);
+	glob2test::prepareTurretTargets(*tower);
 	tower->turretStep(256);
-	require(tower->materials[STONE] == 0 &&
+	require(tower->material(STONE) == 0 &&
 				tower->bullets == tower->type->multiplierStoneToBullets - 1,
 			"test stock becomes ammunition and a cross-channel shot");
 	const auto path =
@@ -266,7 +267,7 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 	game.anyPlayerWaited = false;
 	const auto beforeStep = game.stepCounter;
 	for (int tick = 0; tick < 32; ++tick)
-		game.syncStep(0);
+		game.step(0);
 	require(game.stepCounter == beforeStep + 32, "controlled combat simulation advances");
 	require((buildingTarget ? enemyTower->hp : worker->hp) < before,
 			"cross-channel projectile damages target");
@@ -274,7 +275,7 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 	{
 		// A second probe starts empty and hires trained workers through normal
 		// building updates. Only native quarry harvests can supply further fire.
-		tower->materials[STONE] = 0;
+		tower->setMaterial(STONE, 0);
 		tower->bullets = 0;
 		tower->maxUnitWorking = 3;
 		tower->update();
@@ -289,13 +290,13 @@ void firing(const std::filesystem::path &output, bool buildingTarget)
 					++added;
 			}
 		require(added == 3, "supply workers fit near tower");
-		auto &m = game.teams[0]->stats.measurements;
+		auto &m = game.teams[0]->stats.editMeasurements();
 		const auto shots = m.shots[GameplayMeasurements::TOWER];
 		int ticks = 0;
 		for (; ticks < 12000 &&
 			   (m.delivered[STONE] == 0 || m.shots[GameplayMeasurements::TOWER] == shots);
 			 ++ticks)
-			game.syncStep(0);
+			game.step(0);
 		std::printf("SUPPLY ticks=%d harvested=%llu delivered=%llu new-shots=%llu\n", ticks,
 					(unsigned long long)m.harvested[STONE], (unsigned long long)m.delivered[STONE],
 					(unsigned long long)(m.shots[GameplayMeasurements::TOWER] - shots));

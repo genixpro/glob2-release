@@ -10,6 +10,11 @@ Its output directory is separate from ordinary stripped release builds. Other
 release packages keep their existing stripping behavior; macOS already retains
 symbols for its matching dSYM.
 
+Windows builds use MinGW's existing pthread runtime for Boost.Asio in every
+translation unit (`BOOST_ASIO_HAS_PTHREADS=1`). Keep this build-wide: header-order
+detection can otherwise mix POSIX and Win32 Asio thread layouts, corrupting
+network teardown. The pthread runtime is already required by the Windows build.
+
 ## Fast development builds
 
 `python3 tools/dev_build.py` enables caching and `dev_fast=1` in a separate output
@@ -145,3 +150,36 @@ profiles. A free-profile test cannot establish the behavior of a disabled paid
 feature. The native `ClientCapabilities` suite checks exposed categories, and
 `HiveMindIntegration` checks that a free client makes no Commander requests and
 preserves existing checkpoints.
+
+## Gradient compute assets and Apple runtime
+
+All native clients compile the optional Vulkan compute adapter; a missing or
+unsupported driver uses CPU fallback. Vulkan-Headers **1.2.162** are vendored under
+`third_party/vulkan` with their licence and source hashes; they are build inputs,
+not a linked SDK. No Vulkan loader is bundled on Linux, Windows or Android.
+
+`src/field/shaders` owns the two compute programs. Normal builds verify the
+embedded bundle and need no compiler. Regenerate after source/tool changes with:
+
+```sh
+python3 tools/shaders/gradient_compute.py --glslang /path/to/glslang --naga /path/to/naga
+```
+
+Use glslang **15.1.0** and Naga **27.0.0**. The generated header embeds SPIR-V,
+WGSL and a source identity; the manifest hashes sources and generated artifacts.
+Verification requires the complete receipt set, including the generator and
+pinned Vulkan headers; missing receipts or a changed target fail the build.
+Shader translation tools remain development dependencies.
+
+Apple packaging fetches hash-pinned MoltenVK **1.4.2** using `scons/moltenvk.json`.
+macOS bundles select the executable's architecture and include its framework and
+Apache-2.0 notice; iOS device/simulator projects embed and sign the matching slice.
+Downloads and extraction publish to the dependency cache only after validating
+the archive, selected framework binary, slice metadata and licence. Cached runtime
+receipts are rechecked before reuse; interrupted extraction cannot publish a
+partial package. Remove a damaged dependency cache to retry from the pinned archive.
+The unthinned macOS binary is about 10.3 MiB; iOS device is about 4.6 MiB, excluding
+framework metadata. These are upstream input sizes, not measured compressed
+package growth. Adding MoltenVK is a runtime dependency change requiring explicit
+maintainer approval and Apple packaging/device qualification. Runtime selection
+remains independent of rendering and never ships a shader compiler.

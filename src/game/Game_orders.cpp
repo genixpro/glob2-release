@@ -48,10 +48,10 @@ Building* Game::lookupBuilding(Uint16 gid) const
 
 bool Game::executeOrder(std::shared_ptr<Order> order, int localPlayer)
 {
-	const bool wasWaiting=anyPlayerWaited;
 	const auto finish = [&](bool accepted) {
-        if (wasWaiting!=anyPlayerWaited || (accepted && order && order->getOrderType()!=ORDER_NULL && order->getOrderType()!=ORDER_TEXT_MESSAGE))
-            snapshots().invalidateBoundary();
+        if (accepted && order && order->getOrderType()!=ORDER_NULL
+            && order->getOrderType()!=ORDER_TEXT_MESSAGE && order->getOrderType()!=ORDER_PAUSE_GAME)
+            orderEditedWorld = true;
 		settleAIOrder(order, accepted);
 		return accepted;
 	};
@@ -65,8 +65,7 @@ bool Game::executeOrder(std::shared_ptr<Order> order, int localPlayer)
 
 	// Mirror the order into the AI-trainer dataset if requested via
 	// GLOB2_DATASET_PATH. One record per executed order, tagged with
-	// the firing tick (the live stepCounter is correct here because
-	// executeOrder runs after Game::syncStep advances it).
+	// the current order boundary, before its live simulation advancement.
 	if (globalContainer->datasetWriter && globalContainer->datasetWriter->isValid())
 	{
 		globalContainer->datasetWriter->writeRecord((Uint32)stepCounter, *order, *this);
@@ -314,7 +313,8 @@ bool Game::executeModifyClearingFlag(const OrderModifyClearingFlag& omcf, int lo
 		&& b->buildingState==Building::ALIVE
 		&& b->runtime->attractsRole(0))
 	{
-		memcpy(b->clearingMaterials, omcf.clearingMaterials, sizeof(bool)*MaterialCount);
+		for (unsigned material=0; material<MaterialCount; ++material)
+			b->setClearsMaterial(material,omcf.clearingMaterials[material]);
 		return true;
 	}
 
@@ -417,9 +417,8 @@ bool Game::executeAlterForbidden(const OrderAlterForbidden& oaa, int localPlayer
 	if (!changed) return true;
 
 	for (int team=0; team<mapHeader.getNumberOfTeams(); ++team)
-		for (int id=0; id<Building::MAX_COUNT; ++id)
+		for (Building* building : teams[team]->liveBuildings.entries())
 		{
-			Building* building = teams[team]->myBuildings[id];
 			if (!building) continue;
 			const bool ownTeam = team == oaa.teamNumber;
 			const bool clearingFlag = building->runtime->attractsRole(0);
@@ -530,7 +529,7 @@ bool Game::executeModifySwarm(const OrderModifySwarm& oms, int localPlayer)
 			if (!b->runtime->produces(j) && oms.ratio[j]) return false;
 		for (int j=0; j<NB_UNIT_TYPE; j++)
 		{
-			b->ratio[j]=oms.ratio[j];
+			b->setProductionRatio(j,oms.ratio[j]);
 		}
 		b->update();
 		return true;
@@ -613,7 +612,9 @@ bool Game::executeSetAlliance(const SetAllianceOrder& sao)
 {
 	Uint32 team=sao.teamNumber;
 	if (team >= static_cast<unsigned>(mapHeader.getNumberOfTeams()) || !teams[team]) return false;
+	const auto previousAllies=teams[team]->allies;
 	teams[team]->allies=sao.alliedMask;
+	map.gradientAlliancesChanged(team,previousAllies);
 	teams[team]->enemies=sao.enemyMask;
 	teams[team]->sharedVisionExchange=sao.visionExchangeMask;
 	teams[team]->sharedVisionFood=sao.visionFoodMask;

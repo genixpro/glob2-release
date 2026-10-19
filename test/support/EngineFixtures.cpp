@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
+#include "HiringPipeline.h"
 #include "render/scene/SceneExtract.h"
 
 #include "FileManager.h"
@@ -32,7 +34,7 @@ namespace glob2test
 			}
 		// Production decisions all observe the same completed simulation tick.
 		for (const auto &order : pending) game.executeOrder(order, order->sender);
-		game.syncStep(0);
+		game.step(0);
 		return orders;
 	}
 
@@ -45,7 +47,7 @@ namespace glob2test
         if (view.selectedBuilding) request.selectedBuilding=Game::refOf(view.selectedBuilding);
         if (view.selectedUnit) request.selectedUnit=Game::refOf(view.selectedUnit);
 		game.snapshots().invalidateBoundary(); // Fixture helpers may directly edit public state.
-		SceneExtractor().prepare(game.captureReadBoundary({},true,SceneExtractor::requirements(request)),request,scene);
+		SceneExtractor().prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)),request,scene);
 		return scene;
 	}
 
@@ -68,7 +70,7 @@ namespace glob2test
     {
         REQUIRE(map.game);
         SceneRequest request;request.includePanels=false;
-        const auto world=map.game->captureReadBoundary({},true,SceneExtractor::requirements(request));
+        const auto world=map.game->captureReadBoundary(SceneExtractor::captureOptions(request));
         view.bindSnapshot(world,map.displayViewportW,map.displayViewportH,map.displayedTeam);
         view.prepareChunk(0,size_t(world.width)*world.height);
     }
@@ -172,7 +174,7 @@ namespace glob2test
 	{
 		for (int i = 0; i < ticks; ++i)
 		{
-			game.syncStep(0);  // advances stepCounter itself
+			game.step(0);  // advances stepCounter itself
 			gui.consumeClientEvents();  // as the engine does after every tick
 		}
 	}
@@ -181,4 +183,94 @@ namespace glob2test
 	{
 		return game.checkSum();
 	}
+}
+
+class HiringPipelineHarness
+{
+  public:
+    static void discardPremature(Game &game)
+    {
+        if(!game.hiringPipeline)return;
+        game.drainHiring();
+        for(unsigned team=0;team<unsigned(game.teamsCount());++team)
+            if(const auto &o=game.hiringPipeline->published[team];o &&
+               (o->tick+HiringPipeline::Delay>game.stepCounter || o->tick%HiringPipeline::Refresh!=team%HiringPipeline::Refresh))
+                game.hiringPipeline->published[team].reset();
+    }
+	static void publish(Game &game)
+	{
+		game.drainHiring();
+		game.snapshotStore().invalidateBoundary();
+		const auto setup = game.captureReadBoundary();
+		// Immediate-ranking fixtures establish the same published inputs that real
+		// matches obtain over their normal ticks; no unit actions run during setup.
+		for (const auto& record : setup.entities->buildings)
+		{
+			if (!HiringPlanner::needsCandidates(record)) continue;
+			auto* building = game.resolveBuilding(record.identity);
+			if (!building) continue;
+			for (int swim=0; swim<MOVEMENT_CLASS_COUNT; ++swim)
+				if (setup.entities->availableMovementClasses[record.team] & (1u<<swim))
+				{
+					for (int material=0; material<MaterialCount; ++material)
+						if (building->materialDeliveryNeed(material)>0)
+							glob2test::awaitGradient(game,[&] { return game.map.getMaterialGradientSlot(record.team,material,swim,false,building); });
+				}
+			const auto& type = setup.catalogs->buildings->at(record.typeNum).resolvedType;
+			const bool footprint = std::any_of(std::begin(type.maxMaterial),std::begin(type.maxMaterial)+MaterialCount,[](int value){return value>0;}) ||
+				std::any_of(std::begin(record.wishedMaterials),std::begin(record.wishedMaterials)+MaterialCount,[](int value){return value>0;});
+			for (int swim=0; swim<SWIM_CLASS_COUNT; ++swim)
+				if (setup.entities->availableMovementClasses[record.team] & (1u<<swim))
+				{
+					for (auto route : {BuildingRoute::Footprint,BuildingRoute::Clearing,BuildingRoute::Combat})
+					{
+						if ((route==BuildingRoute::Footprint && !footprint) ||
+							(route==BuildingRoute::Clearing && !type.attractsRole(0)) ||
+							(route==BuildingRoute::Combat && !type.attractsRole(1) && !type.attractsRole(2))) continue;
+						glob2test::awaitGradient(game,[&] {
+							game.map.requestBuildingField(building,swim,route);
+							return game.map.lookupBuildingField(building,swim,route);
+						});
+					}
+				}
+		}
+		game.snapshotStore().invalidateBoundary();
+		auto input = HiringPipeline::bindRoutes(game, game.captureReadBoundary());
+		if (!game.hiringPipeline)
+			game.hiringPipeline = std::make_unique<HiringPipeline>(game.map.computeExecutor());
+		for (unsigned team = 0; team < unsigned(game.teamsCount()); ++team)
+		{
+			HiringPlanner::Planner cache;
+			auto output = std::make_shared<HiringPlanner::Output>(cache.rank(input, team, 128));
+			game.hiringPipeline->published[team] = std::move(output);
+		}
+	}
+};
+namespace glob2test
+{
+void discardPrematureHiringSuggestions(Game &game)
+{
+    HiringPipelineHarness::discardPremature(game);
+}
+void publishCurrentHiringSuggestions(Game &game)
+{
+	HiringPipelineHarness::publish(game);
+}
+} // namespace glob2test
+#include "TurretTargeting.h"
+namespace glob2test {
+void prepareTurretTargets(Building& turret)
+{
+    auto& game=*turret.owner->game;
+    if (std::find(turret.owner->turrets.begin(),turret.owner->turrets.end(),&turret)==turret.owner->turrets.end())
+        turret.owner->addToStaticAbilitiesLists(&turret);
+    game.snapshots().invalidateBoundary();
+    for (unsigned phase=0;phase<4;++phase) {
+        const auto observed=game.captureReadBoundary();
+        game.turretTargeting()->admit(game,observed,false);
+        ++game.stepCounter;
+        game.turretTargeting()->publish(game);
+        if (!game.turretTargeting()->entries(turret).empty()) return;
+    }
+}
 }

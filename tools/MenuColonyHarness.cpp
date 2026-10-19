@@ -109,6 +109,24 @@ void checkMenuPainting()
 		StaticBackdrop() { FrontendTheme::current->colony = std::make_unique<MenuColony>(); }
 		~StaticBackdrop() { FrontendTheme::current->colony = std::move(live); }
 	} staticBackdrop;
+	const auto menuTheme = Glob2UI::menuTheme().id;
+	const auto gameTheme = Glob2UI::gameTheme().id;
+	for (const auto &theme : Glob2UI::ThemeCatalog::shared().themes())
+	{
+		if (theme.backdrop.kind != GAGGUI::ui::Backdrop::Kind::Colony)
+			continue;
+		Glob2UI::applyThemes(theme.id, gameTheme);
+		DrawableSurface fallback(4, 4);
+		FrontendTheme::current->background(&fallback, false);
+		auto *surface = fallback.getSDLSurface();
+		Uint8 r, g, b, a;
+		SDL_GetRGBA(*static_cast<Uint32 *>(surface->pixels), SDL_GetPixelFormatDetails(surface->format),
+					SDL_GetSurfacePalette(surface), &r, &g, &b, &a);
+		require(r == theme.palette.backdrop.r && g == theme.palette.backdrop.g &&
+				b == theme.palette.backdrop.b && a == 255,
+				"missing colony uses its theme's exact fallback without the artwork veil");
+	}
+	Glob2UI::applyThemes(menuTheme, gameTheme);
 	struct Menu : Glob2UI::Screen
 	{
 		Glob2UI::Element build(const Glob2UI::Presentation &) override { return Glob2UI::label("menu"); }
@@ -204,7 +222,7 @@ void generate(const char *path)
 		auto order = game.players[0]->ai->getOrder(false);
 		order->sender = 0;
 		game.executeOrder(order, 0);
-		game.syncStep(0);
+		game.step(0);
 		if (i % 3000 == 0)
 		{
 			int buildings = 0, units = 0;
@@ -677,7 +695,7 @@ int main(int argc, char **argv)
 				auto order = gui.game.players[0]->ai->getOrder(false);
 				order->sender = 0;
 				gui.game.executeOrder(order, 0);
-				gui.game.syncStep(0);
+				gui.game.step(0);
 			}
 			const auto result =
 				std::make_pair(gui.game.checkSum(nullptr, nullptr, nullptr), getSyncRandState());
@@ -745,7 +763,8 @@ int main(int argc, char **argv)
 			Preview<MainMenuScreen> probe;
 			probe.render();
 			const auto order = probe.GAGGUI::ui::UIScreen::host().focusOrder();
-			require(order.size() == std::size(actions),
+			require(order.size() == std::size(actions) + 1 &&
+					std::find(order.begin(), order.end(), "menu/discord") != order.end(),
 					"main menu exposes every navigation action to the keyboard");
 			for (size_t i = 0; i < order.size(); ++i)
 			{
@@ -754,7 +773,20 @@ int main(int argc, char **argv)
 				for (size_t t = 0; t <= i; ++t)
 					main.key(SDLK_TAB);
 				main.key(SDLK_RETURN);
-				require(main.result() == std::atoi(order[i].c_str() + 5), "main keyboard route");
+				if (order[i] == "menu/discord")
+				{
+					main.render();
+					const auto communityOrder = main.GAGGUI::ui::UIScreen::host().focusOrder();
+					require(main.isExecutionRunning() &&
+						std::find(communityOrder.begin(), communityOrder.end(), "discord/back") != communityOrder.end(),
+						"community keyboard route opens its panel");
+					main.key(SDLK_ESCAPE);
+					main.render();
+					require(main.isExecutionRunning() && main.GAGGUI::ui::UIScreen::host().focusOrder() == order,
+						"community Back returns to main menu navigation");
+				}
+				else
+					require(main.result() == std::atoi(order[i].c_str() + 5), "main keyboard route");
 			}
 			Preview<SettingsScreen> settings;
 			settings.selectCategory(SettingsScreen::Category::Recording);

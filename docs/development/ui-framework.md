@@ -143,6 +143,24 @@ vetoed. `endExecute(code)` and the
 `ScreenStack` completion callback remain the navigation contract; push child
 screens onto the stack rather than running them inline.
 
+### Buffered input completion
+
+Hosts can inject an additional event batch through `ScreenStack::AdditionalInput`.
+The stack prepares it after ordinary input and viewport changes, runs one screen
+update, and reports the prefix that the consumer actually processed. The completion
+can arrive on a later GUI tick. Enqueuing an event is not a dispatch acknowledgement.
+
+Screens that buffer events must override `defersExecutionInput()` and
+`hasPendingExecutionInput()`, and implement `beginAdditionalInput()` and
+`endAdditionalInput()` to retain the batch's `InputDispatchReceipt`. Resolve its
+`consumed` count only when the event loop consumes that range. Check cancellation
+before processing, erase only the cancelled range, and resolve it with zero;
+suspension, viewport changes and teardown must also resolve outstanding receipts.
+`EventQueue::erase()` preserves text storage for the remaining human events.
+`GameSessionScreen` and `MapEditorScreen` provide the reference implementations.
+The [MCP UI server](mcp-ui-server.md#extension-boundary) uses this boundary for
+ordered input, release cleanup and capture after actual dispatch.
+
 ### Presentation
 
 `Presentation` is resolved once per frame from the graphic context and passed
@@ -325,7 +343,10 @@ compiled `light` and `dark` themes (`ThemeCatalog::builtinLight()` and
   theme starts from `light`. Colours are `#rrggbb` or `#rrggbbaa`.
 - `backdrop.kind` is `colony` (the live colony), `image` (`backdrop.image`,
   cropped to cover), `terrain` (the original tiled grass) or `solid`
-  (`palette.backdrop` only). `veil` washes over it. `wordmark` replaces the main
+  (`palette.backdrop` only). Missing colony or image artwork uses that theme's
+  `palette.backdrop` unchanged: light paper for Light, sand for Dune, and dark
+  colours for Dark and Ocean. `veil` washes over available artwork only.
+  `wordmark` replaces the main
   menu wordmark with an image shown as drawn. Backdrop and wordmark overrides
   must name `.webp` artwork under `data/`; lookup retains user-directory priority.
   Without an override the shipped wordmark is

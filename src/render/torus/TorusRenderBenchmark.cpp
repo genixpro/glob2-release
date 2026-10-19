@@ -1,5 +1,6 @@
 #include "CommandLine.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <PresentationWork.h>
 // Loaded-game benchmark. Run with an isolated profile; no desktop input is generated.
 #include "GlobalContainer.h"
 #include "TorusPicking.h"
@@ -10,6 +11,7 @@
 #undef private
 #include "GameGUI.h"
 #include "Engine.h"
+#include "ComputeThreads.h"
 #include "Team.h"
 #include "Unit.h"
 #include "Player.h"
@@ -54,8 +56,7 @@ class TorusRenderBenchmark
     {
         gui.game.snapshots().invalidateBoundary(); // Synthetic fixtures edit public records.
         const auto request = gui.sceneRequest();
-        SceneExtractor().prepare(gui.game.captureReadBoundary({}, true,
-            SceneExtractor::requirements(request)), request, gui.view.render.ownScene);
+        SceneExtractor().prepare(gui.game.captureReadBoundary(SceneExtractor::captureOptions(request)), request, gui.view.render.ownScene);
         gui.view.scene = &gui.view.render.ownScene;
     }
 
@@ -63,8 +64,7 @@ class TorusRenderBenchmark
     {
         int total = 0;
         for (int team = 0; team < game.mapHeader.getNumberOfTeams(); ++team)
-            for (int slot = 0; slot < Unit::MAX_COUNT; ++slot)
-                if (game.teams[team]->myUnits[slot]) ++total;
+            total += game.teams[team]->liveUnits.size();
         return total;
     }
 
@@ -110,11 +110,13 @@ class TorusRenderBenchmark
         std::vector<unsigned> actors;
         for(int player=0;player<game.gameHeader.getNumberOfPlayers();++player)
             if(game.players[player]->ai)actors.push_back(unsigned(player));
-        for(const auto& [actor,scheduled]:game.prepareAIOrders(actors,false)) {
+        const auto& world=game.observeCompletedWorld();
+        game.admitAIOrders(actors,false,{},world);
+        for(const auto& [actor,scheduled]:game.deliverAIOrders(actors,false)) {
             scheduled->sender=actor;
             gui.executeOrder(game.validateAIOrder(scheduled,actor));
         }
-        game.syncStep(gui.localTeamNo);
+        game.advanceLiveSimulation(gui.localTeamNo);
     }
 
     static void warmupCheckpoint(GameGUI &gui)
@@ -236,6 +238,7 @@ static int run(int argc, char **argv)
         throw std::runtime_error("The immediate-versus-batched comparison requires legacy GL");
     {
         GameGUI gui;
+        GAGCore::PresentationWorkScope cpuWork(gui.game.map.computeExecutor());
         const char *path = std::getenv("GLOB2_BENCH_MAP");
         const char *savedGame = std::getenv("GLOB2_BENCH_GAME");
         if (savedGame)
@@ -264,6 +267,7 @@ static int run(int argc, char **argv)
             gameHeader.setNumberOfPlayers(mapHeader.getNumberOfTeams());
             assert(gui.loadFromHeaders(mapHeader, gameHeader, true, true));
         }
+        gui.game.map.configureCompute(resolveComputeThreadCount(globalContainer->computeThreads));
         gui.localPlayer = gui.localTeamNo = 0;
         gui.adjustLocalTeam();
         gui.adjustInitialViewport();

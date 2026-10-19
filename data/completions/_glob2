@@ -30,6 +30,7 @@ _glob2() {
       'dev|dump-wheat') command_path='dev dump-wheat';;
       'dev|dump-tiled') command_path='dev dump-tiled';;
       'dev|hive-worker') command_path='dev hive-worker';;
+      'game|migrate') command_path='game migrate';;
       'game|run') command_path='game run';;
       'game|repeat') command_path='game repeat';;
       'info|version') command_path='info version';;
@@ -59,7 +60,7 @@ _glob2() {
     'ai') compadd check;;
     'assets') compadd compose-buildings render-skin skin-info;;
     'dev') compadd random-games stress-maps textshots dump-resources dump-wheat dump-tiled hive-worker;;
-    'game') compadd run repeat;;
+    'game') compadd migrate run repeat;;
     'info') compadd version sim-version catalog paths;;
     'map') compadd generate study generators preview render import-image export-image inspect-package validate-set;;
     'match') compadd verify;;
@@ -74,7 +75,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -89,7 +90,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--help[help]' \
       '*:file:_files';;
     'replay') _arguments -s \
@@ -101,7 +105,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -116,7 +120,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--help[help]' \
       '*:file:_files';;
     'map generate') _arguments -s \
@@ -215,6 +222,16 @@ _glob2() {
       '--variation[variation]:value:' \
       '--help[help]' \
       '*:file:_files';;
+    'game migrate') _arguments -s \
+      '--output-dir[output-dir]:value:_files -/' \
+      '--profile[profile]:value:' \
+      '--building-catalog[building-catalog]:value:_files' \
+      '*--data-dir[data-dir]:value:_files -/' \
+      '*--generator-package[generator-package]:value:_files' \
+      '--input[input]:value:_files' \
+      '--legacy-adaptive-174[legacy-adaptive-174]' \
+      '--help[help]' \
+      '*:file:_files';;
     'game run') _arguments -s \
       '--output-dir[output-dir]:value:_files -/' \
       '--profile[profile]:value:' \
@@ -222,7 +239,10 @@ _glob2() {
       '*--data-dir[data-dir]:value:_files -/' \
       '*--generator-package[generator-package]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--map-file[map-file]:value:_files' \
       '--load-game[load-game]:value:_files' \
       '--generator[generator]:value:' \
@@ -245,9 +265,13 @@ _glob2() {
       '--resource-growth-delay[resource-growth-delay]:value:' \
       '--ai-order-delay[ai-order-delay]:value:' \
       '*--save[save]:value:' \
-      '*--telemetry[telemetry]:value:(checksums team-timeline maxima gradient-stats)' \
+      '*--telemetry[telemetry]:value:(checksums team-timeline maxima)' \
       '--write-replay[write-replay]' \
       '--benchmark-warmup[benchmark-warmup]:value:' \
+      '--gradient-work-stats[gradient-work-stats]:value:_files' \
+      '--resource-gradient-probe[resource-gradient-probe]' \
+      '--resource-gradient-exploration[resource-gradient-exploration]:value:' \
+      '--resource-gradient-exploration-seed[resource-gradient-exploration-seed]:value:' \
       '--diagnostic-fields[diagnostic-fields]:value:(maxima)' \
       '--diagnostic-interval[diagnostic-interval]:value:' \
       '--diagnostic-png[diagnostic-png]' \
@@ -265,7 +289,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -279,6 +303,8 @@ _glob2() {
       '--display[display]' \
       '--compute-threads[compute-threads]:value:' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--ticks[ticks]:value:' \
       '--runs[runs]:value:' \
       '--building-catalog[building-catalog]:value:_files' \
@@ -300,7 +326,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -315,7 +341,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--instance[instance]:value:' \
       '--help[help]' \
       '*:file:_files';;
@@ -328,7 +357,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -343,7 +372,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--instance[instance]:value:' \
       '--hash[hash]:value:' \
       '--title[title]:value:' \
@@ -358,7 +390,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -373,7 +405,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--instance[instance]:value:' \
       '--hash[hash]:value:' \
       '--title[title]:value:' \
@@ -430,7 +465,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -443,6 +478,8 @@ _glob2() {
       '--record-chapter-ticks[record-chapter-ticks]:value:' \
       '--compute-threads[compute-threads]:value:' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--display[display]' \
       '--runs[runs]:value:' \
       '--ticks[ticks]:value:' \
@@ -467,7 +504,7 @@ _glob2() {
       '--no-custom-cursor[no-custom-cursor]' \
       '--mute[mute]' \
       '--no-mute[no-mute]' \
-      '--renderer[renderer]:value:(gpu software)' \
+      '--renderer[renderer]:value:(auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl)' \
       '--graphics-detail[graphics-detail]:value:(full reduced)' \
       '--window-size[window-size]:value:' \
       '--username[username]:value:' \
@@ -482,7 +519,10 @@ _glob2() {
       '*--generator-package[generator-package]:value:_files' \
       '--building-catalog[building-catalog]:value:_files' \
       '--compute-threads[compute-threads]:value:' \
+      '--compute-telemetry[compute-telemetry]:value:(off waits trace)' \
       '--gpu[gpu]:value:(on off)' \
+      '--gradient-backend[gradient-backend]:value:(cpu scalar sse2 neon opencl vulkan webgpu)' \
+      '--gradient-algorithm[gradient-algorithm]:value:(buckets frozen8 jacobi)' \
       '--output-dir[output-dir]:value:_files -/' \
       '--help[help]' \
       '*:file:_files';;

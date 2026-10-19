@@ -10,6 +10,8 @@
 #include <span>
 
 #include "Map.h"
+#include "Building.h"
+#include "Unit.h"
 #include "UnitCatalog.h"
 #include "UnitCargo.h"
 #include "sim/snapshot/SnapshotStore.h"
@@ -39,6 +41,10 @@ namespace GAGCore
 }
 using namespace GAGCore;
 namespace SimulationSnapshot { class Store; }
+namespace TurretTargeting { class Pipeline; }
+class TeamStatsPipeline;
+class HiringPipeline;
+namespace HiringPlanner { struct BuildingLists; }
 class GameGUI;
 class SceneMap;
 struct PresentationFrame;
@@ -176,6 +182,7 @@ public:
 	}
 	//! Legacy test diagnostics only; production consumers are forbidden.
 	SyncRandScope bindRandom() { return SyncRandScope(syncRandom); }
+friend class HiringPipelineHarness;
 private:
 	std::unique_ptr<const AIPlanning::BuildingCapabilityIndex> buildingCapabilityIndex;
 	std::vector<Uint8> unitAvailability;
@@ -197,8 +204,8 @@ public:
 	virtual ~Game();
 
 	///Loads data from a stream
-	bool load(GAGCore::InputStream *stream);
-    GAGCore::CooperativeTask loadTask(GAGCore::InputStream *stream);
+	bool load(GAGCore::InputStream *stream,SaveLoadProfile profile=SaveLoadProfile::Published,MapLoadInitialization initialization=MapLoadInitialization::Normal);
+    GAGCore::CooperativeTask loadTask(GAGCore::InputStream *stream,SaveLoadProfile profile=SaveLoadProfile::Published,MapLoadInitialization initialization=MapLoadInitialization::Normal);
 
 	//! Check some available integrity constraints
 	bool integrity(void);
@@ -241,27 +248,60 @@ public:
 	/// Executes an Order with respect to the localPlayer of the GUI. All Orders get processed here.
 	// Returns whether the existing executor admitted the command, including queued construction.
 	bool executeOrder(std::shared_ptr<Order> order, int localPlayer);
-	std::vector<std::pair<unsigned, std::shared_ptr<Order>>> prepareAIOrders(
-		std::span<const unsigned> eligiblePlayers, bool paused, const std::shared_ptr<GameDiagnostics::Session>& diagnostics = {},
-		const SimulationSnapshot::Handle* captured = nullptr);
-	//! Declare every reader before publishing this immutable observation boundary.
-	SimulationSnapshot::Handle captureReadBoundary(std::span<const unsigned> eligiblePlayers, bool paused,
-		SimulationSnapshot::Requirements additional = 0) const;
+	//! Owner sequence: publish due state, capture, admit world work.
+	//! The first call fixes this observation's optional payload; later calls may
+	//! request only components already captured. Copy the handle to retain it.
+	const SimulationSnapshot::Handle& observeCompletedWorld(SimulationSnapshot::CaptureOptions options = {});
+	//! Borrowed until owner invalidation, the next observation or session reset; copy to retain.
+	const SimulationSnapshot::Handle& observation() const;
+	//! Exceptional owner edit at a fixed simulation tick; old handles remain frozen.
+	void invalidateObservation();
+	//! Finish an order batch; invalidate actual edits if advancement will not follow.
+	void finishOrderPhase(bool advancing);
+	//! Standalone inspection only: captures without admitting simulation work.
+	SimulationSnapshot::Handle captureReadBoundary(SimulationSnapshot::CaptureOptions options = {}) const;
+	void admitAIOrders(std::span<const unsigned> eligiblePlayers, bool paused,
+		const std::shared_ptr<GameDiagnostics::Session>& diagnostics, const SimulationSnapshot::Handle& world);
+	std::vector<std::pair<unsigned, std::shared_ptr<Order>>> deliverAIOrders(
+		std::span<const unsigned> eligiblePlayers, bool paused);
 	std::shared_ptr<Order> validateAIOrder(std::shared_ptr<Order> order, unsigned player);
 	void settleAIOrder(const std::shared_ptr<Order>& order, bool accepted);
 	void cancelAI(unsigned player);
 	void drainAI();
+    void drainHiring();
+    bool preparingBuildingGradient(const Building&, int slot) const;
+    void saveHiring(GAGCore::OutputStream*);
+    void loadHiring(GAGCore::InputStream*, int versionMinor);
+    Uint32 hiringChecksum() const;
+    std::vector<std::pair<std::string,Uint64>> hiringMetrics() const;
+    const HiringPlanner::BuildingLists* hiringCandidates(const Building&) const;
+    void drainTeamStats();
+    void saveTeamStats(GAGCore::OutputStream*);
+    void loadTeamStats(GAGCore::InputStream*, int versionMinor);
+    Uint32 teamStatsChecksum(bool heavy = false) const;
+    std::vector<std::pair<std::string, Uint64>> teamStatsMetrics() const;
 	//! Simulation-owner service shared by AI, gradients and presentation.
 	SimulationSnapshot::Store& snapshots() const { return worldSnapshots; }
 	void clearAI();
 	void saveAI(GAGCore::OutputStream* stream);
 	bool loadAI(GAGCore::InputStream* stream);
-	void observeUnpolledAI();
+	void observeUnpolledAI(const SimulationSnapshot::Handle&);
+	// Normal-game target lists use the selected three-entry, two-tick cadence.
+	void forgetTurret(BuildingRef);
+	void configureTurretTargeting(unsigned delay=1,unsigned refresh=2,unsigned capacity=3,unsigned margin=1);
+	TurretTargeting::Pipeline* turretTargeting() const { ensureTurretTargeting(); return turretTargetingPipeline.get(); }
 	SimulationSnapshot::Store& snapshotStore() { return worldSnapshots; }
 	std::vector<std::pair<std::string, Uint64>> aiMetrics() const;
 private:
 	mutable SimulationSnapshot::Store worldSnapshots;
+	std::optional<SimulationSnapshot::Handle> completedObservation;
+	std::optional<Uint32> submittedObservation;
+	bool orderEditedWorld = false;
+	mutable std::unique_ptr<TurretTargeting::Pipeline> turretTargetingPipeline;
+    void ensureTurretTargeting() const;
 	std::unique_ptr<AIEngine::Pipeline> aiPipeline;
+    std::unique_ptr<TeamStatsPipeline> statsPipeline;
+    std::unique_ptr<HiringPipeline> hiringPipeline;
 public:
 
 	/// Makes a step for building projects that are waiting for the areas to clear of units.
@@ -283,12 +323,11 @@ public:
 	/// Updates total prestige stats
 	void prestigeSyncStep();
 
-	/// Advances the Game by one tick, in reference to localTeam being the localTeam. This does all
-	/// internal processing.
-	// Complete is safe for direct stepping followed by arbitrary orders/saves.
-	// Engine alone defers into its next read-only batch, before applying orders.
-	enum class PreparationCompletion { Complete, Deferred };
-	void syncStep(Sint32 localTeam, PreparationCompletion completion = PreparationCompletion::Complete);
+	//! Observe and advance for direct callers, including replica visibility history.
+	//! Callers owning AI/order scheduling must admit and deliver commands explicitly.
+	void step(Sint32 localTeam);
+	//! Advance live state after observing and applying due orders; never captures.
+	void advanceLiveSimulation(Sint32 localTeam);
 
 	void dirtyWarFlagGradient();
 
@@ -317,15 +356,35 @@ public:
 	Building *addBuilding(int x, int y, int typeNum, int teamNumber, Sint32 unitWorking = 1, Sint32 unitWorkingFuture = 1);
 	//! This remove anything at case(x, y), and return a rect which include every removed things.
 	bool removeUnitAndBuildingAndFlags(int x, int y, unsigned flags=DEL_UNIT|DEL_BUILDING|DEL_FLAG);
-	bool removeUnitAndBuildingAndFlags(int x, int y, int size, unsigned flags=DEL_UNIT|DEL_BUILDING|DEL_FLAG);
+	// Area calls must name their flags, so a three-argument enum cannot bind as a brush size.
+	bool removeUnitAndBuildingAndFlags(int x, int y, int size, unsigned flags);
 	//! Over the w*h tiles from (x, y), remove the buildings off grass and the ground units on water that cannot swim.
 	void removeUnallowedUnitsAndBuildings(int x, int y, int w, int h);
 	///A convenience function, returns a pointer to the unit with the guid, or NULL otherwise
 	Unit* getUnit(int guid);
 	///Client handles (see sim/EntityRef.h). resolve* returns null when the
 	///entity is gone or its slot now holds a different entity.
-	static BuildingRef refOf(const Building *b);
-	static UnitRef refOf(const Unit *u);
+	// Keep these factories visible to snapshot loops in builds without LTO.
+	static BuildingRef refOf(const Building *b)
+	{
+		BuildingRef ref;
+		if (b)
+		{
+			ref.gid = b->gid;
+			ref.generation = b->scriptIdentity;
+		}
+		return ref;
+	}
+	static UnitRef refOf(const Unit *u)
+	{
+		UnitRef ref;
+		if (u)
+		{
+			ref.gid = u->gid;
+			ref.generation = u->scriptIdentity;
+		}
+		return ref;
+	}
 	Building *resolveBuilding(BuildingRef ref) const;
 	Unit *resolveUnit(UnitRef ref) const;
 
@@ -421,7 +480,6 @@ private:
 
 public:
 	bool anyPlayerWaited;
-	Uint32 maskAwayPlayer;
 
 public:
 
@@ -470,6 +528,7 @@ private:
 	static void drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SnapshotUnit& unit, Uint32 drawOptions, const PresentationFrame& scene, float unitMotion = 0);
 	static bool isOnScreen(int left, int top, int right, int bot, int viewportX, int viewportY, int x, int y, const SceneMap& map);
 public:
+	// Explicit live-world diagnostic/verification API. Routine engine checks use snapshot jobs.
 	Uint32 checkSum(std::vector<Uint32> *checkSumsVector=NULL, std::vector<Uint32> *checkSumsVectorForBuildings=NULL, std::vector<Uint32> *checkSumsVectorForUnits=NULL, bool heavy=false, bool legacy152=false);
 
 	/// Sets the alliances from the GameHeader alliance teams

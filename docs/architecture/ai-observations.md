@@ -5,13 +5,15 @@ How immutable observations, compute ownership and delayed AI orders interact. Re
 ## AI observations and delayed orders
 
 All shipped AI controllers decide from an immutable engine snapshot through
-`AIEngine::AIWorldView`. The simulation owner captures a union of required
-components through `Game::captureReadBoundary()`. The engine declares AI, gradient,
-admitted presentation and diagnostic requirements before publishing their union.
-`Game::snapshots()` owns the shared Store; the AI pipeline receives a projection
-of that published handle and does not initiate capture. Explicit
-`Store::invalidateBoundary()` revisions allow an owner to publish same-tick edits
-without advancing game time; existing leases stay immutable. Engine snapshot records live under
+`AIEngine::AIWorldView`. The simulation owner captures the standard simulation
+preset through `Game::observeCompletedWorld()`, with `CaptureOptions` for ordinary
+presentation and explicit cold UI/diagnostic payloads. AI controllers and map jobs
+do not declare capture masks. `Game::snapshots()` owns the shared Store; the AI
+pipeline constructs one `simulationView()` adapter shared by all polled controllers
+at that boundary and does not initiate another capture. The first request fixes
+the observation's optional payloads; later requests must fit that retained payload.
+`Game::invalidateObservation()` marks an actual paused edit for a new same-tick
+revision at the next observation; existing leases stay immutable. Engine snapshot records live under
 `src/engine/sim/snapshot/`; the AI adapter and shared queries live under
 `src/ai/observation/`. Records contain values and stable entity identities;
 rendering pointers and live `Game`, `Map`, `Team`, `Unit` or `Building` objects
@@ -37,10 +39,10 @@ copies to avoid many strided row copies. Both paths copy the same authoritative
 records without per-cell translation. Copy-byte metrics include the multi-material
 stock sidecar, which is copied whole when resources are refreshed. Writes that
 bypass the marked setters are caught by `GLOB2_SNAPSHOT_VERIFY=1`, which
-byte-compares every capture with the live game. Published material gradient planes
+compares captured map bytes and logical entity values with the live game. Published material gradient planes
 sit in a dense registry keyed like the snapshot's plane table
-(`src/map/ResourcePlaneKey.h`); teams keep sorted live entity lists
-(`src/team/LiveSlotList.h`) so extraction visits occupied slots only. The old
+(`src/map/ResourcePlaneKey.h`); teams keep authoritative intrusive entity lists in append order
+(`src/team/IntrusiveEntityList.h`) so extraction visits existing entities only. The old
 `Tile` value is assembled only for compatibility consumers such as editor undo.
 Growth flags retain their original byte values; growth predicates test nonzero.
 
@@ -52,8 +54,14 @@ select private stock or the captured team's stock through an immutable resource
 pool selector; team stock is not duplicated into every building. Supplier records
 also capture a material-availability mask after reservations, used by periodic
 market gradients without consulting live stock. Ordered
-relationship IDs remain explicit capture work. Upgrade and repair feasibility
-queries read the frozen map arrays when requested; capture does not scan every
+relationship IDs remain explicit capture work. Entity records
+reuse their constructed vector ranges and are filled directly, avoiding
+temporary entity copies and per-record vector growth. Statistics input components
+use the same bounded buffer pools and retain vector capacities across captures.
+`TeamRecords.h` selects a team's contiguous entity range without another index
+table. Statistics use those ranges instead of filtering the whole world per team;
+cross-team spatial diagnostics still read all relevant records.
+Upgrade and repair feasibility queries read the frozen map arrays when requested; capture does not scan every
 building footprint to precompute unused decisions.
 Controllers read those canonical records directly. The engine captures one shared
 slot-to-record index so legacy slot scans preserve holes and ordering without
@@ -72,8 +80,8 @@ including farm eligibility, which remains an explicit derived query when only
 that value is needed. Keep capture and derived-query costs separate in profiles.
 
 `AIWorldView` validates dimensions and leased map-array sizes when it binds an
-observation. Its scalar readers borrow the retained arrays directly: callers must
-request the corresponding component and supply an index from that view's geometry.
+observation. Its scalar readers borrow the retained arrays directly from the
+complete simulation view; callers supply an index from that view's geometry.
 Dimensions are immutable and wrapping masks/shifts are cached. Keep checked handle
 queries at diagnostic boundaries; do not add component or bounds checks to each
 inner-loop read. Use full tiles only when the consumer needs the combined fields,
@@ -85,7 +93,9 @@ pointer; the pool reuses a buffer once that pointer is the only one left, after 
 acquire fence that orders the consumer's final reads before the owner's next write,
 including inputs retired by delayed gradient jobs. Reads need no locking, and a
 buffer outlives the capture Store while any consumer holds it. Memory metrics are
-computed on telemetry query, never on the capture path. Component pools permit
+computed on telemetry query, never on the capture path. Detailed byte/reuse
+accounting is enabled by compute telemetry or explicitly by a snapshot harness;
+the exact map-copy counter remains available without it. Component pools permit
 22 buffers, retaining the existing safety ceiling until the combined consumer
 horizon is measured. Buffers allocate only on demand. Retired frame slots release
 their world leases immediately while preserving reusable derived arrays; the
@@ -96,21 +106,32 @@ presentation does not lease resource-gradient fields.
 All parallel simulation work shares the map's `ComputeExecutor`
 (`src/common/ComputeExecutor.h`): blocking `run()` batches for map computation and
 deferred batches for AI decisions, periodic gradients, scheduled building
-gradients and resource growth. Each deferred batch carries the tick it is due. Workers run deferred
-jobs earliest due first, in submission order within a lane. The owner never runs
+gradients, resource growth and team statistics. Each deferred batch carries its
+due tick. Selection tracks batches with unclaimed jobs in a bit index, avoiding
+completed retained tickets and empty slots. Sparse queues use that index; dense
+queues use a linear scan. Both preserve due/submission ordering and lane prerequisites.
+Deferred submissions wake one worker for one runnable job and broadcast when
+multiple independent jobs can run. An ordered lane contributes only its runnable
+head; submissions blocked behind a predecessor need no notification. Returning
+workers immediately claim further work, including lane successors and resumed
+continuations. External completions wake one worker when they make a lane head or
+continuation runnable. Blocking fork/join, presentation and lifecycle transitions
+retain their broadcasts. Presentation owners wait on a separate condition variable
+so they cannot consume a notification intended for a worker.
+Workers run deferred jobs earliest due first, in submission order within a lane. The owner never runs
 deferred work while a worker exists: at a join it only waits, even when the only
 worker also runs presentation, which that worker interleaves with simulation jobs
 (so a join may wait out one presentation chunk). Only an executor with no workers
 runs deferred jobs on the owner, at the join, because nothing else can. This keeps
 owner time split cleanly into owner work and owner wait (`compute_owner_jobs` is
-zero whenever workers exist). A cheap AI batch at delay 0 computes
-inline when it submits, outside the executor, and still publishes at the deadline.
+zero whenever workers exist). AI work uses that same deferred path for every
+configured delay, including zero; zero now means next-boundary delivery.
 AI controller lanes preserve decision order;
 gradient and growth jobs need no lane.
 `AIEngine::Pipeline` submits one batch per tick with one job per controller on
 that controller's lane, and joins it at the deadline. The
 match-wide `GameHeader::aiOrderDelay` is an integer from 0 through 8, defaulting
-to 8 for new games. An order observed at logical tick `t` is delivered at `t + delay`. Thread
+to 8 for new games. An order observed at logical tick `t` is delivered at `t + max(1, delay)`. Thread
 count and completion time never choose that deadline or which decision a
 controller makes; the owner publishes in stable request order. Human orders and
 scenario map scripts retain their existing scheduling.
@@ -144,9 +165,9 @@ requests, including at zero delay; strategy thresholds and selection cadence sta
 unchanged.
 
 JavaScript memory updates run in the same ordered stream as decisions, once per
-logical observation tick. Unpolled replica and replay controllers retain the old
-post-step visibility-history boundary through an explicit owner barrier and a
-fresh frozen observation. Never mutate their remembered terrain concurrently with
+logical observation tick. Unpolled replica and replay controllers update their
+visibility history from that same completed observation through an explicit owner
+barrier. Never mutate their remembered terrain concurrently with
 a decision. Worker diagnostics are buffered values; file output, field publication
 and shared telemetry updates belong to the owner at the delivery boundary.
 Diagnostic field reservations count outstanding captures and publication-copy
@@ -158,12 +179,124 @@ share one restored allocation after their initialization identity and contents m
 Save barriers finish outstanding computation without delivering future orders
 early. Format 143 retains the match delay, completed pending command bytes and
 deadlines, request sequences, execution feedback, controller RNG and private
-continuation state. Older supported saves load with delay 0 and an empty engine
-order queue; the save compatibility floor remains 58. Lifecycle changes cancel
+continuation state. Saves before format 143 load with delay 0 and an empty engine
+order queue. Maps and saved games remain readable from version 58. Lifecycle changes cancel
 requests by controller generation. Verify delay 0 and 8, rejection and identity
 reuse, serial/threaded execution, and save/load with outstanding work. A snapshot
 migration alone does not establish identical AI trajectories or performance;
-compare per-tick checksums and measure capture, retention and worker costs. Delay 0
-retains each controller's strategy and cadence, apart from the explicit pending
+compare per-tick checksums and measure capture, retention and worker costs. From
+format 167, delay 0 delivers newly admitted decisions one boundary later. Controller
+strategy and polling cadence remain unchanged, apart from the explicit pending
 intent, rejection and identity fixes listed in the
 [replay guide](../development/headless-replays.md).
+
+## Delayed team statistics
+
+Team statistics join due results before the shared read-boundary capture, then
+submit one ordered batch of team samples from that same immutable world. The
+standard simulation view includes cumulative statistics inputs; statistics do not
+contribute capture masks. `statisticsView()` leases only calculation inputs and
+retains map buffers on spatial-diagnostic ticks. `captureReadBoundary()` remains an
+explicit standalone inspection entry point and never admits normal simulation
+work. Runtime UI views use the retained observation. The common owner
+coordinator publishes due statistics before its single capture; publication never
+reconstructs an observation already handed to consumers.
+The owner retains consecutive raw smoothing samples and histories. At aggregation
+boundaries only, it freezes the latest 31 published samples; the worker includes
+its current raw sample and finalizes the aggregate before publication. This is
+exact for delays zero and one. Larger delays omit the latest K-1 pending samples
+and substitute older published rows. Maxima can lose a recent peak or retain an
+older peak; overlapping windows do not guarantee similar decisions. Approximate
+aggregates never feed back into the raw ring.
+Routine checksums cover
+pending source ticks, deadlines and sampling progression, plus published
+simulation-driving statistics and smoothing;
+they never inspect worker completion. Full verification joins pending jobs and
+hashes their complete computed samples without publishing early.
+This follows the existing light/full checksum split for resource growth.
+Full checks also cover the published diagnostic measurements and live collector;
+these reporting ledgers do not drive simulation decisions.
+Canonical scalar hashing uses `GAGCore::ChecksumStream`, which produces the same
+hash bytes as `BinaryOutputStream` without a backend allocation or endian scratch
+writes. The statistics field visitors also omit ignored field-name construction.
+`teamStatsDelay` is a saved 0–8 tick rule (new games default to eight). Delay zero
+uses a one-tick effective delay for new work. Older pending samples retain their
+computed outputs and original publication deadlines, including historical zero-delay
+outputs; subsequent samples follow the new observation rule.
+See [gameplay statistics](../ai/gameplay-statistics.md#sampling-and-saves).
+
+Statistics and snapshot capture use shared executor diagnostics and external
+profilers. Separate subsystem timing controls and per-team timing buffers are
+retired. Statistics jobs retain the completion synchronization needed to release
+their snapshot.
+Cumulative events alone cross the statistics read boundary; instantaneous and
+labour measurements are initialized by the calculation. The live calculation
+remains an independent equivalence reference and supports older-save rebuilding.
+Workers complete measurement frames by accumulating labour and carrying forward
+spatial diagnostics on one dedicated statistics executor lane. One job computes
+the cheap team rows in team order, avoiding separate lane/group scheduling costs;
+batches complete in source order without worker waits. Calculation or submission
+failure is sticky: subsequent owner barriers and saves rethrow it rather than
+continuing from a partial frame.
+AI and statistics use separate lane ranges because their deadlines can differ.
+Publication swaps the completed measurement frame into the published reader
+accessor, installs raw ring rows and finalized aggregates, and appends periodic
+histories. Replaced frame storage travels back with the reusable batch; a retained
+frame is never overwritten. The legacy live calculation is a cold reference path.
+
+## Compact entity records
+
+The single `UnitState` record retains pointer-free, standard-layout, trivially
+copyable storage. Medical, activity, displacement and movement enums use explicit
+byte backing and retain their historical numeric values and gaps. The action
+selector, direction and one-cell displacement components are bytes; global ability
+IDs retain their existing enum. Wide pathfinding outputs are stored even on failure.
+Training levels and construction qualification are bytes, destination and carried
+material IDs are signed bytes, animation clocks are bytes, and the terrain health
+remainder is signed 16-bit storage. Terrain exposure accumulates in an `int`
+before signed division and remainder. Seventeen learning flags use an unsigned
+mask shared with service reservation, primary-cargo ownership, medical recheck
+and target-validity flags. Value getters and explicit setters preserve neighboring
+bits; natural field ordering groups byte storage without packed structs.
+Editor level controls bind the byte fields explicitly and retain wide arithmetic.
+
+Cached unit performance uses unsigned 16-bit storage with an explicit 0–65535
+cap. Catalog and per-team race tables remain wide; HP rule division occurs in wide
+arithmetic before a newly computed cache value is capped. Actual HP, hunger,
+speed, movement surplus, experience and unrestricted timers remain wide. Loaded
+cache values outside the cap are deliberately normalized, so this part of the
+change alters historical or authored extreme-value continuation; it is not a
+lossless narrowing. See [persistence](persistence.md#entity-storage-and-serialized-values)
+for validation and save normalization.
+
+Building lifecycle enums and recruitment levels use byte storage. Inside capacity
+uses unsigned 16-bit storage through 65535. Catalog-bounded identifiers, stay range,
+and builtin production preferences use 16-bit storage; production counters remain
+wide because valid ratio changes can carry them beyond that range. Named unsigned
+masks store clearing preferences and footprint locks; wire encodings still write
+individual logical flags.
+Private building stock contains fifteen bytes and saturates at 255. Shared team
+stock remains wide. Live accessors select the active pool, while immutable stock
+views return logical values without widening the captured private array. Bindings
+retain inactive private stock; private-to-team upgrades transfer it once. Demand,
+staffing, failure counters, exchange masks and unrestricted timers remain wide.
+A private commitment needing more than 255 of any material cannot be funded under
+this cap; catalog costs are not silently reduced. See [persistence](persistence.md#entity-storage-and-serialized-values)
+for the deliberate normalization of historical stock and reservation migration.
+Snapshot views inherit the authoritative records for bulk capture; only those
+base records have a standard-layout guarantee, and views only promise trivial
+copyability. Natural alignment is retained without packed structs.
+
+`Storage::bytesCopied` counts actual map-array copies. Separate cumulative
+`entityBytesCopied` and `entitySidecarBytesCopied` counters count authoritative
+entity records and logical sidecar payload read during capture. Entity sidecars
+include builtin construction-origin preferences, extra production state, cargo
+rows (including their identity keys), and relationship IDs. These counters exclude
+view metadata, slot-index preparation, retained capacity, allocator overhead and
+vector growth copies. `Store::Metrics` exposes their deltas alongside the existing
+aggregate `bytesCopied` estimate, whose meaning is unchanged. Pool memory metrics
+continue to describe retained capacity and leases separately. Verification compares
+entity completeness, team/population ordering, identities, lookup tables and logical
+scalar fields, including presentation state. It also checks ordered working/inside
+relationships, cargo, production and building-project sidecars, without comparing
+entity padding bytes.

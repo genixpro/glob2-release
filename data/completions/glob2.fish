@@ -55,6 +55,8 @@ function __glob2_path
         set path 'dev dump-tiled'
       case 'dev|hive-worker'
         set path 'dev hive-worker'
+      case 'game|migrate'
+        set path 'game migrate'
       case 'game|run'
         set path 'game run'
       case 'game|repeat'
@@ -111,7 +113,7 @@ complete -c glob2 -n "__glob2_at ''" -f -a 'play replay map game match online ai
 complete -c glob2 -n "__glob2_at 'ai'" -f -a 'check'
 complete -c glob2 -n "__glob2_at 'assets'" -f -a 'compose-buildings render-skin skin-info'
 complete -c glob2 -n "__glob2_at 'dev'" -f -a 'random-games stress-maps textshots dump-resources dump-wheat dump-tiled hive-worker'
-complete -c glob2 -n "__glob2_at 'game'" -f -a 'run repeat'
+complete -c glob2 -n "__glob2_at 'game'" -f -a 'migrate run repeat'
 complete -c glob2 -n "__glob2_at 'info'" -f -a 'version sim-version catalog paths'
 complete -c glob2 -n "__glob2_at 'map'" -f -a 'generate study generators preview render import-image export-image inspect-package validate-set'
 complete -c glob2 -n "__glob2_at 'match'" -f -a 'verify'
@@ -125,7 +127,7 @@ complete -c glob2 -n "__glob2_at 'play'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'play'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'play'" -l mute
 complete -c glob2 -n "__glob2_at 'play'" -l no-mute
-complete -c glob2 -n "__glob2_at 'play'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'play'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'play'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'play'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'play'" -l username -r
@@ -140,7 +142,10 @@ complete -c glob2 -n "__glob2_at 'play'" -l data-dir -r -f -a '(__fish_complete_
 complete -c glob2 -n "__glob2_at 'play'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'play'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'play'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'play'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'play'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'play'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'play'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'play'" -l help
 complete -c glob2 -n "__glob2_at 'replay'" -l fullscreen
 complete -c glob2 -n "__glob2_at 'replay'" -l no-fullscreen
@@ -150,7 +155,7 @@ complete -c glob2 -n "__glob2_at 'replay'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'replay'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'replay'" -l mute
 complete -c glob2 -n "__glob2_at 'replay'" -l no-mute
-complete -c glob2 -n "__glob2_at 'replay'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'replay'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'replay'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'replay'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'replay'" -l username -r
@@ -165,7 +170,10 @@ complete -c glob2 -n "__glob2_at 'replay'" -l data-dir -r -f -a '(__fish_complet
 complete -c glob2 -n "__glob2_at 'replay'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'replay'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'replay'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'replay'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'replay'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'replay'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'replay'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'replay'" -l help
 complete -c glob2 -n "__glob2_at 'map generate'" -l seed -r
 complete -c glob2 -n "__glob2_at 'map generate'" -l set -r
@@ -245,13 +253,24 @@ complete -c glob2 -n "__glob2_at 'map validate-set'" -l gallery -r -f -a '0 1'
 complete -c glob2 -n "__glob2_at 'map validate-set'" -l phase -r
 complete -c glob2 -n "__glob2_at 'map validate-set'" -l variation -r
 complete -c glob2 -n "__glob2_at 'map validate-set'" -l help
+complete -c glob2 -n "__glob2_at 'game migrate'" -l output-dir -r -f -a '(__fish_complete_directories)'
+complete -c glob2 -n "__glob2_at 'game migrate'" -l profile -r
+complete -c glob2 -n "__glob2_at 'game migrate'" -l building-catalog -r
+complete -c glob2 -n "__glob2_at 'game migrate'" -l data-dir -r -f -a '(__fish_complete_directories)'
+complete -c glob2 -n "__glob2_at 'game migrate'" -l generator-package -r
+complete -c glob2 -n "__glob2_at 'game migrate'" -l input -r
+complete -c glob2 -n "__glob2_at 'game migrate'" -l legacy-adaptive-174
+complete -c glob2 -n "__glob2_at 'game migrate'" -l help
 complete -c glob2 -n "__glob2_at 'game run'" -l output-dir -r -f -a '(__fish_complete_directories)'
 complete -c glob2 -n "__glob2_at 'game run'" -l profile -r
 complete -c glob2 -n "__glob2_at 'game run'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'game run'" -l data-dir -r -f -a '(__fish_complete_directories)'
 complete -c glob2 -n "__glob2_at 'game run'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'game run'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'game run'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'game run'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'game run'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'game run'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'game run'" -l map-file -r
 complete -c glob2 -n "__glob2_at 'game run'" -l load-game -r
 complete -c glob2 -n "__glob2_at 'game run'" -l generator -r
@@ -274,9 +293,13 @@ complete -c glob2 -n "__glob2_at 'game run'" -l gradient-delay -r
 complete -c glob2 -n "__glob2_at 'game run'" -l resource-growth-delay -r
 complete -c glob2 -n "__glob2_at 'game run'" -l ai-order-delay -r
 complete -c glob2 -n "__glob2_at 'game run'" -l save -r
-complete -c glob2 -n "__glob2_at 'game run'" -l telemetry -r -f -a 'checksums team-timeline maxima gradient-stats'
+complete -c glob2 -n "__glob2_at 'game run'" -l telemetry -r -f -a 'checksums team-timeline maxima'
 complete -c glob2 -n "__glob2_at 'game run'" -l write-replay
 complete -c glob2 -n "__glob2_at 'game run'" -l benchmark-warmup -r
+complete -c glob2 -n "__glob2_at 'game run'" -l gradient-work-stats -r
+complete -c glob2 -n "__glob2_at 'game run'" -l resource-gradient-probe
+complete -c glob2 -n "__glob2_at 'game run'" -l resource-gradient-exploration -r
+complete -c glob2 -n "__glob2_at 'game run'" -l resource-gradient-exploration-seed -r
 complete -c glob2 -n "__glob2_at 'game run'" -l diagnostic-fields -r -f -a 'maxima'
 complete -c glob2 -n "__glob2_at 'game run'" -l diagnostic-interval -r
 complete -c glob2 -n "__glob2_at 'game run'" -l diagnostic-png
@@ -292,7 +315,7 @@ complete -c glob2 -n "__glob2_at 'game repeat'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'game repeat'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'game repeat'" -l mute
 complete -c glob2 -n "__glob2_at 'game repeat'" -l no-mute
-complete -c glob2 -n "__glob2_at 'game repeat'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'game repeat'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'game repeat'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'game repeat'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'game repeat'" -l username -r
@@ -306,6 +329,8 @@ complete -c glob2 -n "__glob2_at 'game repeat'" -l record-chapter-ticks -r
 complete -c glob2 -n "__glob2_at 'game repeat'" -l display
 complete -c glob2 -n "__glob2_at 'game repeat'" -l compute-threads -r
 complete -c glob2 -n "__glob2_at 'game repeat'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'game repeat'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'game repeat'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'game repeat'" -l ticks -r
 complete -c glob2 -n "__glob2_at 'game repeat'" -l runs -r
 complete -c glob2 -n "__glob2_at 'game repeat'" -l building-catalog -r
@@ -323,7 +348,7 @@ complete -c glob2 -n "__glob2_at 'online join'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'online join'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'online join'" -l mute
 complete -c glob2 -n "__glob2_at 'online join'" -l no-mute
-complete -c glob2 -n "__glob2_at 'online join'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'online join'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'online join'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'online join'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'online join'" -l username -r
@@ -338,7 +363,10 @@ complete -c glob2 -n "__glob2_at 'online join'" -l data-dir -r -f -a '(__fish_co
 complete -c glob2 -n "__glob2_at 'online join'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'online join'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'online join'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'online join'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'online join'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'online join'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'online join'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'online join'" -l instance -r
 complete -c glob2 -n "__glob2_at 'online join'" -l help
 complete -c glob2 -n "__glob2_at 'online play-map'" -l fullscreen
@@ -349,7 +377,7 @@ complete -c glob2 -n "__glob2_at 'online play-map'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'online play-map'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'online play-map'" -l mute
 complete -c glob2 -n "__glob2_at 'online play-map'" -l no-mute
-complete -c glob2 -n "__glob2_at 'online play-map'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'online play-map'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'online play-map'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'online play-map'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'online play-map'" -l username -r
@@ -364,7 +392,10 @@ complete -c glob2 -n "__glob2_at 'online play-map'" -l data-dir -r -f -a '(__fis
 complete -c glob2 -n "__glob2_at 'online play-map'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'online play-map'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'online play-map'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'online play-map'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'online play-map'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'online play-map'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'online play-map'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'online play-map'" -l instance -r
 complete -c glob2 -n "__glob2_at 'online play-map'" -l hash -r
 complete -c glob2 -n "__glob2_at 'online play-map'" -l title -r
@@ -377,7 +408,7 @@ complete -c glob2 -n "__glob2_at 'online host-map'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'online host-map'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'online host-map'" -l mute
 complete -c glob2 -n "__glob2_at 'online host-map'" -l no-mute
-complete -c glob2 -n "__glob2_at 'online host-map'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'online host-map'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'online host-map'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'online host-map'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'online host-map'" -l username -r
@@ -392,7 +423,10 @@ complete -c glob2 -n "__glob2_at 'online host-map'" -l data-dir -r -f -a '(__fis
 complete -c glob2 -n "__glob2_at 'online host-map'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'online host-map'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'online host-map'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'online host-map'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'online host-map'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'online host-map'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'online host-map'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'online host-map'" -l instance -r
 complete -c glob2 -n "__glob2_at 'online host-map'" -l hash -r
 complete -c glob2 -n "__glob2_at 'online host-map'" -l title -r
@@ -433,7 +467,7 @@ complete -c glob2 -n "__glob2_at 'dev random-games'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l mute
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l no-mute
-complete -c glob2 -n "__glob2_at 'dev random-games'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'dev random-games'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l username -r
@@ -446,6 +480,8 @@ complete -c glob2 -n "__glob2_at 'dev random-games'" -l record-crf -r
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l record-chapter-ticks -r
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l compute-threads -r
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'dev random-games'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'dev random-games'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l display
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l runs -r
 complete -c glob2 -n "__glob2_at 'dev random-games'" -l ticks -r
@@ -466,7 +502,7 @@ complete -c glob2 -n "__glob2_at 'dev textshots'" -l custom-cursor
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l no-custom-cursor
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l mute
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l no-mute
-complete -c glob2 -n "__glob2_at 'dev textshots'" -l renderer -r -f -a 'gpu software'
+complete -c glob2 -n "__glob2_at 'dev textshots'" -l renderer -r -f -a 'auto sdl-gpu programmable-gl webgpu portable-sdl software legacy-gl gpu webgl2 sdl opengl'
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l graphics-detail -r -f -a 'full reduced'
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l window-size -r
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l username -r
@@ -481,7 +517,10 @@ complete -c glob2 -n "__glob2_at 'dev textshots'" -l data-dir -r -f -a '(__fish_
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l generator-package -r
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l building-catalog -r
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l compute-threads -r
+complete -c glob2 -n "__glob2_at 'dev textshots'" -l compute-telemetry -r -f -a 'off waits trace'
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l gpu -r -f -a 'on off'
+complete -c glob2 -n "__glob2_at 'dev textshots'" -l gradient-backend -r -f -a 'cpu scalar sse2 neon opencl vulkan webgpu'
+complete -c glob2 -n "__glob2_at 'dev textshots'" -l gradient-algorithm -r -f -a 'buckets frozen8 jacobi'
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l output-dir -r -f -a '(__fish_complete_directories)'
 complete -c glob2 -n "__glob2_at 'dev textshots'" -l help
 complete -c glob2 -n "__glob2_at 'dev dump-resources'" -l data-dir -r -f -a '(__fish_complete_directories)'

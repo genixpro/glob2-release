@@ -65,6 +65,7 @@ struct TeamStatsMeasurementFixture
 	{
 		b->shootingCooldown = 0;
 		b->bullets = 1;
+		glob2test::prepareTurretTargets(*b);
 		b->turretStep(0);
 	}
 	static void medical(Unit *u) { u->handleMedical(); }
@@ -136,7 +137,7 @@ namespace
 
 static void compare(TeamStats& expected, TeamStats& actual)
 {
-	require(expected.measurements == actual.measurements,
+	require(expected.measurements() == actual.measurements(),
 			"new measurement totals and snapshots survive loading");
 	require(expected.coverageStartTick == actual.coverageStartTick &&
 				expected.extendedCoverageStartTick == actual.extendedCoverageStartTick &&
@@ -199,7 +200,7 @@ class LocatedOutput : public GAGCore::BinaryOutputStream
 public:
   size_t statsPosition = 0, smoothingPosition = 0, coveragePosition = 0,
 		 measurementCountPosition = 0;
-  void writeUint32(Uint32 value, const std::string name) override
+  void writeUint32(Uint32 value, std::string_view name) override
   {
 	  if (name == "coverageStartTick")
 		  coveragePosition = getPosition();
@@ -208,7 +209,7 @@ public:
 	  BinaryOutputStream::writeUint32(value, name);
   }
   explicit LocatedOutput(GAGCore::StreamBackend *backend) : BinaryOutputStream(backend) {}
-  void writeSint32(Sint32 value, const std::string name) override
+  void writeSint32(Sint32 value, std::string_view name) override
   {
 	  if (name == "statsIndex")
 		  statsPosition = getPosition();
@@ -329,12 +330,12 @@ static void measurementScenarios()
 				if (dx || dy) w.game.map.setGroundUnit(20+dx,20+dy,u->gid);
 		auto &stats = w.game.teams[0]->stats;
 		stats.sampleTraps(w.game.teams[0]);
-		require(stats.measurements.trappedUnits[0][WORKER] == 0 &&
-			stats.measurements.trappedUnits[1][WORKER] == 1,
+		require(stats.measurements().trappedUnits[0][WORKER] == 0 &&
+			stats.measurements().trappedUnits[1][WORKER] == 1,
 			"temporary occupancy is separate from structural blockage");
-		require(stats.measurements.lowHP[0][WORKER] == 1 &&
-			stats.measurements.lowFood[1][WORKER] == 1 &&
-			stats.measurements.lowFood[0][WORKER] == 0,
+		require(stats.measurements().lowHP[0][WORKER] == 1 &&
+			stats.measurements().lowFood[1][WORKER] == 1 &&
+			stats.measurements().lowFood[0][WORKER] == 0,
 			"health and food cutoffs are inclusive and independent");
 	}
 	{
@@ -349,10 +350,10 @@ static void measurementScenarios()
 			require(w.game.map.incResourceByIndex(x,8,WHEAT,0), "fixture resource seeded");
 			w.game.map.recordNaturalGrowth(x,8,WHEAT,NO_RES_TYPE,0);
 		}
-		require(stats.measurements.growthGlobal[0][WHEAT] == 2 &&
-			stats.measurements.growthAmount[0][WHEAT] == 1 &&
-			stats.measurements.growthAmount[1][WHEAT] == 2 &&
-			stats.measurements.growthAmount[2][WHEAT] == 2,
+		require(stats.measurements().growthGlobal[0][WHEAT] == 2 &&
+			stats.measurements().growthAmount[0][WHEAT] == 1 &&
+			stats.measurements().growthAmount[1][WHEAT] == 2 &&
+			stats.measurements().growthAmount[2][WHEAT] == 2,
 			"growth distance boundary is inclusive and global events remain exact");
 		w.game.stepCounter = 77;
 		auto loaded = roundTrip(w.game);
@@ -366,7 +367,7 @@ static void measurementScenarios()
 			require(g->map.incResourceByIndex(nextX,8,WHEAT,0), "continuation resource seeded");
 			g->map.recordNaturalGrowth(nextX,8,WHEAT,NO_RES_TYPE,0);
 		}
-		require(stats.measurements == loaded->game.teams[0]->stats.measurements,
+		require(stats.measurements() == loaded->game.teams[0]->stats.measurements(),
 			"mid-interval growth telemetry continues identically after load");
 	}
 	{
@@ -424,45 +425,45 @@ static void measurementScenarios()
 		auto *t = w.game.teams[0];
 		for (int i = 0; i < NB_UNIT_TYPE; ++i)
 			w.unit(i, 20 + i, 20);
-		require(birthsCounted(t->stats.measurements) == 0,
+		require(birthsCounted(t->stats.measurements()) == 0,
 				"starting/editor units are not births");
-		require(buildingsCompleted(t->stats.measurements) == 0,
+		require(buildingsCompleted(t->stats.measurements()) == 0,
 				"starting/editor buildings are not completions");
 		swarm->ratio[0] = 1;
 		swarm->ratio[1] = swarm->ratio[2] = 0;
-		swarm->materials[WHEAT] = swarm->type->foodPerUnit;
+		swarm->setMaterial(WHEAT, swarm->type->foodPerUnit);
 		swarm->productionTimeout = -1;
 		swarm->swarmStep();
-		require(t->stats.measurements.births[WORKER] == 1, "successful swarm birth");
-		require(t->stats.measurements.consumed[Measurements::SPAWNING][WHEAT] ==
+		require(t->stats.measurements().births[WORKER] == 1, "successful swarm birth");
+		require(t->stats.measurements().consumed[Measurements::SPAWNING][WHEAT] ==
 					Uint64(swarm->type->foodPerUnit),
 				"spawning wheat cost");
 		for (int y = 0; y < 32; ++y)
 			for (int x = 0; x < 32; ++x)
 				w.game.map.setGroundUnit(x, y, 0);
-		swarm->materials[WHEAT] = swarm->type->foodPerUnit;
+		swarm->setMaterial(WHEAT, swarm->type->foodPerUnit);
 		swarm->productionTimeout = -1;
 		swarm->swarmStep();
-		require(t->stats.measurements.births[WORKER] == 1, "blocked birth produces no event");
-		require(swarm->materials[WHEAT] == swarm->type->foodPerUnit,
+		require(t->stats.measurements().births[WORKER] == 1, "blocked birth produces no event");
+		require(swarm->material(WHEAT) == swarm->type->foodPerUnit,
 				"blocked birth consumes nothing");
 	}
 	{
 		TeamStatsMeasurementFixture w;
 		auto *inn = w.building("inn");
-		auto &m = w.game.teams[0]->stats.measurements;
-		inn->materials[WHEAT] = inn->type->maxMaterial[WHEAT] - 1;
+		auto &m = w.game.teams[0]->stats.editMeasurements();
+		inn->setMaterial(WHEAT, inn->type->maxMaterial[WHEAT] - 1);
 		inn->addMaterialIntoBuilding(WHEAT);
 		inn->addMaterialIntoBuilding(WHEAT);
 		require(m.delivered[WHEAT] == 1, "delivery uses accepted capacity-clamped amount");
-		inn->materials[CHERRY] = 1;
+		inn->setMaterial(CHERRY, 1);
 		inn->eatOnce(nullptr);
 		require(m.meals == 1 && m.consumed[Measurements::MEAL][WHEAT] == 1 &&
 					m.consumed[Measurements::MEAL][CHERRY] == 1,
 				"meal wheat and fruit consumed");
 		auto *market = w.building("market", 14, 8);
 		w.building("market", 20, 8);
-		market->materials[CHERRY] = 7;
+		market->setMaterial(CHERRY, 7);
 		w.game.teams[0]->stats.refreshMeasurements(w.game.teams[0]);
 		require(m.stock[CHERRY] == 7, "shared storage counted once across two markets");
 		market->removeMaterialFromBuilding(CHERRY);
@@ -472,7 +473,7 @@ static void measurementScenarios()
 		require(m.withdrawn[CHERRY] == m.transferredOut[CHERRY] && m.harvested[CHERRY] == 0,
 				"withdrawal is transfer, not harvest");
 		auto *tower = w.building("defencetower", 8, 16);
-		tower->materials[STONE] = 1;
+		tower->setMaterial(STONE, 1);
 		tower->bullets = 0;
 		TeamStatsMeasurementFixture::ammunition(tower);
 		require(m.consumed[Measurements::AMMUNITION][STONE] == 1,
@@ -482,7 +483,7 @@ static void measurementScenarios()
 		TeamStatsMeasurementFixture w;
 		auto *worker = w.unit();
 		auto *inn = w.building("inn");
-		auto &m = w.game.teams[0]->stats.measurements;
+		auto &m = w.game.teams[0]->stats.editMeasurements();
 		w.game.map.incResourceByIndex(21, 20, WHEAT, 0);
 		worker->attachedBuilding = inn;
 		worker->setTargetBuilding(inn);
@@ -515,25 +516,25 @@ static void measurementScenarios()
 		attacker->dx = 1;
 		attacker->dy = 0;
 		victim->hp = 1;
-		attacker->performance[ATTACK_STRENGTH] = 1000;
+		attacker->setPerformance(ATTACK_STRENGTH,1000);
 		attacker->syncStep();
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::MELEE]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::MELEE]
 															   [Measurements::UNIT] == 1,
 				"melee overkill is capped to HP removed");
 		require(victim->diagnosticDeathCause == Measurements::COMBAT,
 				"first lethal transition attributed to combat");
 		attacker->delta = UNIT_ATTACK_HIT_DELTA;
 		attacker->syncStep();
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::MELEE]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::MELEE]
 															   [Measurements::UNIT] == 1,
 				"repeated damage before death removes zero HP");
 		victim->hungry = 0;
 		TeamStatsMeasurementFixture::medical(victim);
 		TeamStatsMeasurementFixture::medical(victim);
-		require(w.game.teams[1]->stats.measurements.deaths[WORKER][Measurements::COMBAT] == 1,
+		require(w.game.teams[1]->stats.measurements().deaths[WORKER][Measurements::COMBAT] == 1,
 				"death counted once and starvation cannot overwrite cause");
-		require(w.game.teams[1]->stats.measurements.combatDeathPlace[WORKER][Measurements::FIELD] == 1 &&
-					w.game.teams[1]->stats.measurements.combatDeathAssignment[WORKER][Measurements::UNASSIGNED] == 1,
+		require(w.game.teams[1]->stats.measurements().combatDeathPlace[WORKER][Measurements::FIELD] == 1 &&
+					w.game.teams[1]->stats.measurements().combatDeathAssignment[WORKER][Measurements::UNASSIGNED] == 1,
 				"a real combat death is attributed once by place and assignment");
 	}
 	{
@@ -541,13 +542,13 @@ static void measurementScenarios()
 		auto *explorer = w.unit(EXPLORER, 20, 20, 0);
 		auto *victim = w.unit(WORKER, 21, 20, 1);
 		victim->hp = 3;
-		explorer->performance[MAGIC_ATTACK_GROUND] = 1000;
+		explorer->setPerformance(MAGIC_ATTACK_GROUND,1000);
 		explorer->magicActionTimeout = 0;
 		TeamStatsMeasurementFixture::magic(explorer);
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::MAGIC]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::MAGIC]
 															   [Measurements::UNIT] == 3,
 				"magic damage excludes overkill");
-		require(w.game.teams[1]->stats.measurements.damageReceived[Measurements::MAGIC]
+		require(w.game.teams[1]->stats.measurements().damageReceived[Measurements::MAGIC]
 																  [Measurements::UNIT] == 3,
 				"magic received damage");
 	}
@@ -560,7 +561,7 @@ static void measurementScenarios()
 		sector->bullets.push_front(bullet);
 		victim->hp = 2;
 		sector->step();
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::TOWER]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::TOWER]
 															   [Measurements::UNIT] == 2,
 				"tower projectile source attribution");
 		require(victim->diagnosticDeathCause == Measurements::COMBAT, "tower lethal attribution");
@@ -570,15 +571,15 @@ static void measurementScenarios()
 		bullet->sourceTeam = 0;
 		sector->bullets.push_front(bullet);
 		sector->step();
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::TOWER]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::TOWER]
 															   [Measurements::BUILDING] == 2,
 				"tower building overkill excluded");
-		require(w.game.teams[1]->stats.measurements.removed[Measurements::DESTROYED]
+		require(w.game.teams[1]->stats.measurements().removed[Measurements::DESTROYED]
 														   [target->type->shortTypeNum]
 														   [target->getLongLevel()] == 1,
 				"combat building removal");
 		target->kill();
-		require(w.game.teams[1]->stats.measurements.removed[Measurements::OTHER]
+		require(w.game.teams[1]->stats.measurements().removed[Measurements::OTHER]
 														   [target->type->shortTypeNum]
 														   [target->getLongLevel()] == 0,
 				"repeated kill does not count removal twice");
@@ -602,7 +603,7 @@ static void measurementScenarios()
 		else
 			u->hp = -1;
 		TeamStatsMeasurementFixture::medical(u);
-		require(w.game.teams[0]->stats.measurements.deaths[WORKER][cause] == 1,
+		require(w.game.teams[0]->stats.measurements().deaths[WORKER][cause] == 1,
 				"noncombat death cause");
 	}
 	{
@@ -612,7 +613,7 @@ static void measurementScenarios()
 		w.inside(patient, hospital, HEAL, -hospital->type->timeToHealUnit / 2);
 		patient->hp = patient->performance[HP] - 20;
 		TeamStatsMeasurementFixture::partial(patient);
-		auto &m = w.game.teams[0]->stats.measurements;
+		auto &m = w.game.teams[0]->stats.editMeasurements();
 		require(m.hpRestored == 10 && m.healingVisits == 0,
 				"partial healing credits actual restored HP, not a completed visit");
 		patient->insideTimeout = 0;
@@ -627,7 +628,7 @@ static void measurementScenarios()
 		auto *school = w.building("school");
 		auto *student = w.unit();
 		w.inside(student, school, BUILD);
-		auto &m = w.game.teams[0]->stats.measurements;
+		auto &m = w.game.teams[0]->stats.editMeasurements();
 		TeamStatsMeasurementFixture::displacement(student);
 		require(m.trainingVisits[WORKER] == 1 && m.abilityGains[WORKER][BUILD] == 1 &&
 					m.abilityGains[WORKER][HARVEST] == 1,
@@ -644,14 +645,14 @@ static void measurementScenarios()
 																		   : Building::REPAIR;
         // Seed a fully paid construction ledger. Storage capacity is independent
         // of the construction budget; repair deliveries are reserved as they arrive.
-        for (int r = 0; r < MaterialCount; ++r) site->materials[r]=site->constructionBudget[r];
+        for (int r = 0; r < MaterialCount; ++r) site->setMaterial(r, site->constructionBudget[r]);
         require(site->reserveMaterials(site->constructionBudget),"fixture construction resources reserve");
         site->constructionReserved=site->constructionBudget;
 		int level = site->type->level, shortType = site->type->shortTypeNum;
 		const int wheatCost = site->constructionBudget[WHEAT];
 		site->update();
 		site->update();
-		auto &m = w.game.teams[0]->stats.measurements;
+		auto &m = w.game.teams[0]->stats.editMeasurements();
 		require(m.completed[kind][shortType][level] == 1,
 				"construction/upgrade/repair completion counted once");
 		if (kind != Measurements::REPAIRED)
@@ -664,8 +665,8 @@ static void measurementScenarios()
 	{
 		TeamStatsMeasurementFixture w;
 		auto *inn = w.building("inn", 8, 8, 1);
-		inn->materials[WHEAT] = 10;
-		inn->materials[CHERRY] = 10;
+		inn->setMaterial(WHEAT, 10);
+		inn->setMaterial(CHERRY, 10);
 		inn->updateCallLists();
 		TeamStatsMeasurementFixture::allowConversion(inn);
 		w.game.teams[1]->sharedVisionFood |= w.game.teams[0]->me;
@@ -673,13 +674,13 @@ static void measurementScenarios()
 		auto *u = w.unit(EXPLORER, 12, 8);
 		u->hungry = u->trigHungry;
 		u->medical = Unit::MED_HUNGRY;
-		u->needToRecheckMedical = true;
+		u->setNeedToRecheckMedical(true);
 		TeamStatsMeasurementFixture::activity(u);
 		require(u->owner == w.game.teams[1], "foreign inn converts hungry explorer");
-		require(w.game.teams[0]->stats.measurements.conversionsOut[EXPLORER] == 1 &&
-					w.game.teams[1]->stats.measurements.conversionsIn[EXPLORER] == 1,
+		require(w.game.teams[0]->stats.measurements().conversionsOut[EXPLORER] == 1 &&
+					w.game.teams[1]->stats.measurements().conversionsIn[EXPLORER] == 1,
 				"successful conversion tracked separately");
-		require(birthsCounted(w.game.teams[1]->stats.measurements) == 0,
+		require(birthsCounted(w.game.teams[1]->stats.measurements()) == 0,
 				"conversion is not a birth");
 	}
 	{
@@ -692,7 +693,7 @@ static void measurementScenarios()
 				w.game.map.setGroundUnit(x, y, u->gid);
 		inn->kill(Measurements::DESTROYED);
 		require(u->isDead &&
-					w.game.teams[0]->stats.measurements.deaths[WORKER][Measurements::TRAPPED] == 1,
+					w.game.teams[0]->stats.measurements().deaths[WORKER][Measurements::TRAPPED] == 1,
 				"trapped occupant counted once");
 	}
 	{
@@ -702,9 +703,9 @@ static void measurementScenarios()
 		site->launchDelete();
 		w.game.teams[0]->syncStep();
 		require(
-			w.game.teams[0]->stats.measurements.removed[Measurements::DEMOLISHED][type][level] == 1,
+			w.game.teams[0]->stats.measurements().removed[Measurements::DEMOLISHED][type][level] == 1,
 			"site cancellation counted as demolition");
-		require(buildingsCompleted(w.game.teams[0]->stats.measurements) == 0,
+		require(buildingsCompleted(w.game.teams[0]->stats.measurements()) == 0,
 				"cancelled site is not a completion");
 	}
 	{
@@ -717,9 +718,9 @@ static void measurementScenarios()
 		attacker->delta = UNIT_ATTACK_HIT_DELTA;
 		attacker->dx = 1;
 		attacker->dy = 0;
-		attacker->performance[ATTACK_STRENGTH] = 1000;
+		attacker->setPerformance(ATTACK_STRENGTH,1000);
 		attacker->syncStep();
-		require(w.game.teams[0]->stats.measurements.damageDealt[Measurements::MELEE]
+		require(w.game.teams[0]->stats.measurements().damageDealt[Measurements::MELEE]
 															   [Measurements::BUILDING] == 1,
 				"melee building damage is capped");
 	}
@@ -730,7 +731,7 @@ static void measurementScenarios()
 		target->speed = 1;
 		target->delta = 0;
 		TeamStatsMeasurementFixture::fire(tower);
-		require(w.game.teams[0]->stats.measurements.shots[Measurements::TOWER] == 1,
+		require(w.game.teams[0]->stats.measurements().shots[Measurements::TOWER] == 1,
 				"real turret firing counts one launched projectile");
 	}
 	{
@@ -740,7 +741,7 @@ static void measurementScenarios()
 		require(barracks->type->upgradeInParallel, "barracks trains abilities in parallel");
 		w.inside(student, barracks, ATTACK_SPEED);
 		TeamStatsMeasurementFixture::displacement(student);
-		const auto &m = w.game.teams[0]->stats.measurements;
+		const auto &m = w.game.teams[0]->stats.editMeasurements();
 		require(m.trainingVisits[WARRIOR] == 1 && m.abilityGains[WARRIOR][ATTACK_SPEED] == 1 &&
 					m.abilityGains[WARRIOR][ATTACK_STRENGTH] == 1,
 				"parallel training counts one visit and each ability gain");
@@ -749,9 +750,9 @@ static void measurementScenarios()
 		TeamStatsMeasurementFixture w;
 		auto *site = w.building("inn", 8, 8, 0, true);
 		site->constructionResultState = Building::REPAIR;
-		site->materials[WOOD] = 0;
+		site->setMaterial(WOOD, 0);
 		site->addMaterialIntoBuilding(WOOD);
-		require(w.game.teams[0]->stats.measurements.repairDelivered[WOOD] ==
+		require(w.game.teams[0]->stats.measurements().repairDelivered[WOOD] ==
 					Uint64(site->type->materialMultiplier[WOOD]),
 				"repair deliveries recorded separately");
 	}
@@ -763,7 +764,7 @@ static void measurementScenarios()
 		const int hp = u->hp;
 		TeamStatsMeasurementFixture::medical(u);
 		require(u->hp == hp && !u->isDead, "no hunger rule preserves health");
-		require(w.game.teams[0]->stats.measurements.deaths[WORKER][Measurements::STARVATION] == 0,
+		require(w.game.teams[0]->stats.measurements().deaths[WORKER][Measurements::STARVATION] == 0,
 				"no hunger produces no starvation event");
 	}
 	{
@@ -774,7 +775,7 @@ static void measurementScenarios()
 		const int level = u->level[ATTACK_SPEED];
 		w.inside(u, b, ATTACK_SPEED);
 		TeamStatsMeasurementFixture::displacement(u);
-		const auto &m = w.game.teams[0]->stats.measurements;
+		const auto &m = w.game.teams[0]->stats.editMeasurements();
 		require(u->displacement == Unit::DIS_EXITING_BUILDING &&
 				u->level[ATTACK_SPEED] == level && m.trainingVisits[WARRIOR] == 0 &&
 				m.abilityGains[WARRIOR][ATTACK_SPEED] == 0,
@@ -785,7 +786,7 @@ static void measurementScenarios()
 		w.game.gameHeader.setInstantConstructionEnabled(true);
 		auto *b = w.building("inn", 8, 8, 0, true);
 		b->update();
-		const auto &m = w.game.teams[0]->stats.measurements;
+		const auto &m = w.game.teams[0]->stats.editMeasurements();
 		require(!b->type->isBuildingSite, "instant site completes");
 		for (int r = 0; r < MaterialCount; ++r)
 			require(m.consumed[Measurements::CONSTRUCTION][r] == 0,
@@ -843,10 +844,13 @@ static void measurementReplayBoundaries()
 	// Format 124 introduced experiments; format 125 adds JavaScript identities.
 	// Format 128 changes save encoding, retaining the format-127 replay floor.
 	// Format 130 adds the farm-areas tile mask, still retaining that floor.
-	// Save compatibility is independent of the integrated replay/network gates.
-	require(REPLAY_MINIMUM_VERSION_MINOR == 154 && NET_PROTOCOL_VERSION == 69,
+	// Format 166 makes append-order populations authoritative; format 167
+	// changes completed-observation timing. Format 171 unifies flyer routing.
+	// Network and saved-game floors remain.
+	require(REPLAY_MINIMUM_VERSION_MINOR == VERSION_MINOR && NET_PROTOCOL_VERSION == 72,
+
 			"integrated simulation uses current replay and network gates");
-	for (int version : {98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 115, 119, 120, 121, 122, 123, 124, 133, 134, 135, FILE_FORMAT_VERSION_RUNTIME_TERRAIN, FILE_FORMAT_VERSION_TERRAIN_SEED, 139, FILE_FORMAT_VERSION_RUNTIME_RESOURCES, FILE_FORMAT_VERSION_TERRAIN_CATALOGUE, FILE_FORMAT_VERSION_AI_PIPELINE, FILE_FORMAT_VERSION_BUILDING_ARTWORK, FILE_FORMAT_VERSION_VERTEX_TERRAIN, FILE_FORMAT_VERSION_GREEDY_FETCHING, FILE_FORMAT_VERSION_PRIVATE_RANDOM-1, FILE_FORMAT_VERSION_PRIVATE_RANDOM, FILE_FORMAT_VERSION_ENTITY_RANDOM, VERSION_MINOR, VERSION_MINOR+1})
+	for (int version : {98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 115, 119, 120, 121, 122, 123, 124, 133, 134, 135, FILE_FORMAT_VERSION_RUNTIME_TERRAIN, FILE_FORMAT_VERSION_TERRAIN_SEED, 139, FILE_FORMAT_VERSION_RUNTIME_RESOURCES, FILE_FORMAT_VERSION_TERRAIN_CATALOGUE, FILE_FORMAT_VERSION_AI_PIPELINE, FILE_FORMAT_VERSION_BUILDING_ARTWORK, FILE_FORMAT_VERSION_VERTEX_TERRAIN, FILE_FORMAT_VERSION_GREEDY_FETCHING, FILE_FORMAT_VERSION_PRIVATE_RANDOM-1, FILE_FORMAT_VERSION_PRIVATE_RANDOM, FILE_FORMAT_VERSION_ENTITY_RANDOM, 155, 156, 167, 168, 169, 170, REPLAY_MINIMUM_VERSION_MINOR-1, VERSION_MINOR, VERSION_MINOR+1})
 	{
 		auto *bytes = new GAGCore::MemoryStreamBackend;
 		GAGCore::BinaryOutputStream writer(bytes);
@@ -879,10 +883,10 @@ static void measurementContinuation()
 	for (int t = 0; t < 2; ++t)
 		w.game.teams[t]->stats.initializeMeasurements(700);
 	auto &stats = w.game.teams[0]->stats;
-	stats.measurements.births[WORKER] = (Uint64(1) << 40) + 17;
-	stats.measurements.abilityGains[EXPLORER][MAGIC_ATTACK_GROUND] = (Uint64(1) << 50) + 1;
+	stats.editMeasurements().births[WORKER] = (Uint64(1) << 40) + 17;
+	stats.editMeasurements().abilityGains[EXPLORER][MAGIC_ATTACK_GROUND] = (Uint64(1) << 50) + 1;
 	auto loaded = roundTrip(w.game);
-	require(loaded->game.teams[0]->stats.measurements == stats.measurements,
+	require(loaded->game.teams[0]->stats.measurements() == stats.measurements(),
 			"large counters survive save/load");
 	auto *restored = loaded->game.teams[1]->myUnits[0];
 	require(restored->diagnosticDeathCause == Measurements::CLEARING,
@@ -898,7 +902,7 @@ static void measurementContinuation()
 	TeamStatsMeasurementFixture::medical(u);
 	TeamStatsMeasurementFixture::medical(restored);
 	for (int t = 0; t < 2; ++t)
-		require(w.game.teams[t]->stats.measurements == loaded->game.teams[t]->stats.measurements,
+		require(w.game.teams[t]->stats.measurements() == loaded->game.teams[t]->stats.measurements(),
 				"projectile and pending death continuation totals match");
 }
 
@@ -1153,10 +1157,10 @@ static void measurementScreenshots(const std::string &directory)
 		for (unsigned tick = 0; tick <= 4096; tick += 512)
 		{
 			game.stepCounter = tick;
-			stats.measurements.births[WORKER] = (Uint64(1) << 40) + (t + 1) * tick;
-			stats.measurements.harvested[WHEAT] = (t + 1) * tick;
-			stats.measurements.completed[Measurements::NEW_BUILDING][0][0] = (t + 1) * tick / 512;
-			stats.measurements.damageDealt[Measurements::MELEE][Measurements::UNIT] =
+			stats.editMeasurements().births[WORKER] = (Uint64(1) << 40) + (t + 1) * tick;
+			stats.editMeasurements().harvested[WHEAT] = (t + 1) * tick;
+			stats.editMeasurements().completed[Measurements::NEW_BUILDING][0][0] = (t + 1) * tick / 512;
+			stats.editMeasurements().damageDealt[Measurements::MELEE][Measurements::UNIT] =
 				(t + 1) * tick;
 			stats.getLatestStat()->totalUnit = 20 + (t + 1) * int(tick / 512);
 			stats.step(game.teams[t]);
@@ -1166,6 +1170,9 @@ static void measurementScreenshots(const std::string &directory)
 										   stats.measurementHistory.begin() + 2);
 		for (auto &sample : stats.measurementHistory)
 		{
+            sample.movementClassesKnown=true;
+            for (int c=0;c<SWIM_CLASS_COUNT;++c)
+                sample.groundUnitsByMovementClass[c]=(c+1)*(1+t%3)+sample.tick/512;
 			sample.growthGlobal[1][WHEAT] = Uint64(t+1) * sample.tick;
 			sample.growthAmount[1][WHEAT] = Uint64(t+1) * sample.tick / 2;
 			sample.trappedUnits[1][WORKER] = t+1;
@@ -1174,10 +1181,10 @@ static void measurementScreenshots(const std::string &directory)
 			sample.lowFood[2][WORKER] = t+12;
 			sample.deaths[WORKER][Measurements::STARVATION] = Uint64(t) * sample.tick / 256;
 		}
-		stats.measurements.growthGlobal[1][WHEAT] = Uint64(t+1) * 4096;
-		stats.measurements.growthAmount[1][WHEAT] = Uint64(t+1) * 2048;
-		stats.measurements.trappedUnits[1][WORKER] = t+1;
-		stats.measurements.lowFood[0][WORKER] = t+2;
+		stats.editMeasurements().growthGlobal[1][WHEAT] = Uint64(t+1) * 4096;
+		stats.editMeasurements().growthAmount[1][WHEAT] = Uint64(t+1) * 2048;
+		stats.editMeasurements().trappedUnits[1][WORKER] = t+1;
+		stats.editMeasurements().lowFood[0][WORKER] = t+2;
 		requireJoinedHistory(t, stats, t % 2 == 0);
 	}
 	gui.localTeamNo = 0;
@@ -1194,7 +1201,7 @@ static void measurementScreenshots(const std::string &directory)
 			// The overview, then one chart of each form: a level, a smoothed rate, a
 			// split counter, bands of the population, a net value and a global series.
 			const std::pair<const char *, bool> charts[] = {{"population", false}, {"births", false}, {"births", true},
-															{"hunger", false},	 {"net growth", false}, {"growth map", false}};
+															{"hunger", false},	 {"net growth", false}, {"growth map", false}, {"ground movement", true}};
 			screen.selectMetric(EndGameScreen::OVERVIEW);
 			screen.paintFrame(0);
 			require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(), (directory + "/overview-" + suffix).c_str()),
@@ -1273,11 +1280,11 @@ TEST_CASE("clearing telemetry counts operations once by configured primary mater
                 auto *worker = w.unit();
                 auto *inn = w.building("inn");
                 inn->unitStayRange = 32;
-                inn->clearingMaterials[materialIndex(MaterialId::Gold)] = true;
+                inn->setClearsMaterial(materialIndex(MaterialId::Gold),true);
                 worker->attachedBuilding = inn;
                 worker->medical = Unit::MED_FREE;
                 worker->displacement = Unit::DIS_RANDOM;
-                auto &measurements = w.game.teams[0]->stats.measurements;
+                auto &measurements = w.game.teams[0]->stats.editMeasurements();
                 for (unsigned attempt = 0; attempt < 2; ++attempt)
                 {
                     worker->movement = Unit::MOV_HARVESTING;
@@ -1310,6 +1317,7 @@ TEST_SUITE("TeamStatsSave")
         GAGCore::BinaryInputStream legacy(new GAGCore::FileStreamBackend(file));
         auto& stats=world.team->stats;
         REQUIRE(stats.load(&legacy,152));
+        world.game.gameHeader.setTeamStatsDelay(0); // New samples publish at the next boundary; historical pending samples keep their deadlines.
         REQUIRE(legacy.getPosition()==345648);
         // This retained game's explorer has positive air damage at all levels.
         // Its one ground-trained explorer is already in the air histogram.
@@ -1335,6 +1343,8 @@ TEST_SUITE("TeamStatsSave")
         };
         REQUIRE(stats.aiTelemetry.size()==1);
         REQUIRE(stats.aiTelemetry[0]->active);
+        // Admit the initial completed boundary before counting subsequent ticks.
+        world.game.observeCompletedWorld();
         auto restored=roundTrip(world.game);
         CHECK(stats.aiTelemetry.size()==1);
         CHECK_FALSE(stats.aiTelemetry[0]->active);
@@ -1352,10 +1362,15 @@ TEST_SUITE("TeamStatsSave")
             return state;
         };
         REQUIRE(components(restored->game)==components(world.game));
+        // Establish the initial completed boundary before counting future samples.
+        world.game.observeCompletedWorld();
+        restored->game.observeCompletedWorld();
+        REQUIRE(components(restored->game)==components(world.game));
         const auto phase=stats.smoothedIndex;
         const auto index=stats.statsIndex;
         for(int tick=1;tick<=32;++tick) {
-            world.game.syncStep(0); restored->game.syncStep(0);
+            world.game.step(0); restored->game.step(0);
+            world.game.observeCompletedWorld(); restored->game.observeCompletedWorld();
             CHECK(components(restored->game)==components(world.game));
             CHECK(wire(restored->game.teams[0]->stats)==wire(stats));
             CHECK(restored->game.syncRandom==world.game.syncRandom);
@@ -1439,7 +1454,7 @@ TEST_SUITE("TeamStatsSave")
 							"old measurements start at loaded tick");
 					require(game.teams[t]->stats.measurementHistory.empty(),
 							"old new-history is unavailable, not zero samples");
-					require(birthsCounted(game.teams[t]->stats.measurements) == 0,
+					require(birthsCounted(game.teams[t]->stats.measurements()) == 0,
 							"loading does not count births");
 				}
 				require(game.mapHeader.getVersionMinor() <= 88, "fixture is a genuine legacy format");
@@ -1476,7 +1491,7 @@ TEST_SUITE("TeamStatsSave")
 							"old measurements start at loaded tick");
 					require(game.teams[t]->stats.measurementHistory.empty(),
 							"old new-history is unavailable, not zero samples");
-					require(birthsCounted(game.teams[t]->stats.measurements) == 0,
+					require(birthsCounted(game.teams[t]->stats.measurements()) == 0,
 							"loading does not count births");
 				}
 				require(game.mapHeader.getVersionMinor() <= 88, "fixture is a genuine legacy format");
@@ -1504,8 +1519,8 @@ TEST_SUITE("TeamStatsSave")
 	TEST_CASE("AI telemetry continues across a save [save-format]")
 	{
 		glob2test::HeadlessGlobals globals;
-		// A four-controller game saved at tick 256 (see test/fixtures/echo/README.md).
-		aiTelemetryContinuation(glob2test::inflated("echo/v121-shared-gradient-256.game.gz").string().c_str());
+		// A four-controller game saved at tick 256.
+		aiTelemetryContinuation(glob2test::inflated("echo/current159-shared-gradient-256.game.gz").string().c_str());
 	}
 }
 
@@ -1514,8 +1529,8 @@ TEST_CASE("Scripting identity survives conversion and save load" * doctest::test
  glob2test::HeadlessGlobals globals;
  TeamStatsMeasurementFixture w;
  auto *inn=w.building("inn",8,8,1);
- inn->materials[WHEAT]=10;
- inn->materials[CHERRY]=10;
+ inn->setMaterial(WHEAT, 10);
+ inn->setMaterial(CHERRY, 10);
  inn->updateCallLists();
  TeamStatsMeasurementFixture::allowConversion(inn);
  w.game.teams[1]->sharedVisionFood |= w.game.teams[0]->me;
@@ -1523,7 +1538,7 @@ TEST_CASE("Scripting identity survives conversion and save load" * doctest::test
  auto *u=w.unit(EXPLORER,12,8);
  u->hungry=u->trigHungry;
  u->medical=Unit::MED_HUNGRY;
- u->needToRecheckMedical=true;
+ u->setNeedToRecheckMedical(true);
  u->entityRandom.nextU32();
  const auto randomBefore=u->entityRandom;
  TeamStatsMeasurementFixture::activity(u);
@@ -1556,13 +1571,13 @@ TEST_CASE("Scripting conversion allocates fresh identity in a reused destination
  auto previousReference=Script::Value::object().set("id",unsigned(previous->gid)).set("generation",previous->scriptIdentity);
  REQUIRE(w.game.removeUnitAndBuildingAndFlags(20,20,Game::DEL_UNIT));
  auto *inn=w.building("inn",8,8,1);
- inn->materials[WHEAT]=10; inn->materials[CHERRY]=10; inn->updateCallLists();
+ inn->setMaterial(WHEAT, 10); inn->setMaterial(CHERRY, 10); inn->updateCallLists();
  TeamStatsMeasurementFixture::allowConversion(inn);
  w.game.teams[1]->sharedVisionFood |= w.game.teams[0]->me;
  w.game.teams[1]->allies &= ~w.game.teams[0]->me;
  auto *u=w.unit(EXPLORER,12,8);
  auto originalReference=Script::Value::object().set("id",unsigned(u->gid)).set("generation",u->scriptIdentity);
- u->hungry=u->trigHungry; u->medical=Unit::MED_HUNGRY; u->needToRecheckMedical=true;
+ u->hungry=u->trigHungry; u->medical=Unit::MED_HUNGRY; u->setNeedToRecheckMedical(true);
  TeamStatsMeasurementFixture::activity(u);
  REQUIRE(u->owner==w.game.teams[1]);
  CHECK(u->scriptIdentity==2);
@@ -1668,7 +1683,7 @@ TEST_CASE("Scripting building completion upgrade and repair preserve identity" *
   }
   REQUIRE(site->type->isBuildingSite);
   REQUIRE(site->constructionResultState==kind);
-  for(int resource=0;resource<MaterialCount;++resource)site->materials[resource]=site->constructionBudget[resource];
+  for(int resource=0;resource<MaterialCount;++resource)site->setMaterial(resource, site->constructionBudget[resource]);
   REQUIRE(site->reserveMaterials(site->constructionBudget));
   site->constructionReserved=site->constructionBudget;
   site->update(); site->update();
@@ -1688,22 +1703,22 @@ TEST_CASE("Scripting conversion back never resurrects the original reference" * 
  TeamStatsMeasurementFixture world;
  auto *destination=world.building("inn",8,8,1);
  auto *home=world.building("inn",16,8,0);
- destination->materials[WHEAT]=10; destination->materials[CHERRY]=10; destination->updateCallLists();
+ destination->setMaterial(WHEAT, 10); destination->setMaterial(CHERRY, 10); destination->updateCallLists();
  TeamStatsMeasurementFixture::allowConversion(destination);
  world.game.teams[1]->sharedVisionFood |= world.game.teams[0]->me;
  world.game.teams[1]->allies &= ~world.game.teams[0]->me;
  auto *unit=world.unit(EXPLORER,12,8);
  auto reference=Script::Value::object().set("id",unsigned(unit->gid)).set("generation",unit->scriptIdentity);
- unit->hungry=unit->trigHungry; unit->medical=Unit::MED_HUNGRY; unit->needToRecheckMedical=true;
+ unit->hungry=unit->trigHungry; unit->medical=Unit::MED_HUNGRY; unit->setNeedToRecheckMedical(true);
  TeamStatsMeasurementFixture::activity(unit);
  REQUIRE(unit->owner==world.game.teams[1]);
  auto converted=Script::Value::object().set("id",unsigned(unit->gid)).set("generation",unit->scriptIdentity);
- destination->materials[WHEAT]=0; destination->materials[CHERRY]=0; destination->updateCallLists();
- home->materials[WHEAT]=10; home->materials[CHERRY]=10; home->updateCallLists();
+ destination->setMaterial(WHEAT, 0); destination->setMaterial(CHERRY, 0); destination->updateCallLists();
+ home->setMaterial(WHEAT, 10); home->setMaterial(CHERRY, 10); home->updateCallLists();
  TeamStatsMeasurementFixture::allowConversion(home);
  world.game.teams[0]->sharedVisionFood |= world.game.teams[1]->me;
  world.game.teams[0]->allies &= ~world.game.teams[1]->me;
- unit->hungry=unit->trigHungry; unit->medical=Unit::MED_HUNGRY; unit->needToRecheckMedical=true;
+ unit->hungry=unit->trigHungry; unit->medical=Unit::MED_HUNGRY; unit->setNeedToRecheckMedical(true);
  TeamStatsMeasurementFixture::activity(unit);
  REQUIRE(unit->owner==world.game.teams[0]);
  CHECK(unit->scriptIdentity==2);
@@ -1790,7 +1805,7 @@ TEST_CASE("Compact identity tables preserve unused slots and reject invalid entr
         using BinaryOutputStream::BinaryOutputStream;
         std::vector<size_t> indices,values;
         bool identities=false;
-        void writeUint32(const Uint32 v,const std::string name) override
+        void writeUint32(const Uint32 v,std::string_view name) override
         {
             if(name=="nonzero") identities=true;
             if(identities && name=="index") indices.push_back(getPosition());
@@ -1832,8 +1847,8 @@ TEST_CASE("Compact team histories preserve samples across two batch boundaries" 
     {
         world.game.stepCounter = n * 512;
         world.team->prestige = n * 7;
-        stats.measurements.births[0] = Uint64(n) * 0x100000001ULL;
-        stats.measurements.deaths[1][GameplayMeasurements::COMBAT] = UINT64_MAX - n;
+        stats.editMeasurements().births[0] = Uint64(n) * 0x100000001ULL;
+        stats.editMeasurements().deaths[1][GameplayMeasurements::COMBAT] = UINT64_MAX - n;
         stats.step(world.team);
     }
     REQUIRE(stats.getEndOfGameStats().size() == 513);
@@ -1866,24 +1881,24 @@ TEST_CASE("Sparse variant snapshot reset clears vanished types without clearing 
     auto& stats=world.team->stats;
     stats.beginMeasurementSnapshot(world.team);
     stats.observeMeasurementBuilding(first); stats.observeMeasurementBuilding(second); stats.observeMeasurementBuilding(rare);
-    REQUIRE(stats.measurements.variants[inn].count==2);
-    REQUIRE(stats.measurements.variants[1023].count==1);
-    auto& history=stats.measurements.variants[1023];
+    REQUIRE(stats.measurements().variants[inn].count==2);
+    REQUIRE(stats.measurements().variants[1023].count==1);
+    auto& history=stats.editMeasurements().variants[1023];
     history.completed[0]=7; history.removed[1]=9; history.trapped[1][0]=11;
     // The next observed cohort no longer contains either inn; old counts must
     // disappear while cumulative and independently sampled fields survive.
     stats.beginMeasurementSnapshot(world.team); stats.observeMeasurementBuilding(rare);
-    CHECK(stats.measurements.variants[inn].count==0);
-    CHECK(stats.measurements.variants[1023].count==1);
+    CHECK(stats.measurements().variants[inn].count==0);
+    CHECK(stats.measurements().variants[1023].count==1);
     CHECK(history.completed[0]==7); CHECK(history.removed[1]==9); CHECK(history.trapped[1][0]==11);
     stats.beginMeasurementSnapshot(world.team);
-    CHECK(stats.measurements.variants[1023].count==0);
+    CHECK(stats.measurements().variants[1023].count==0);
     stats.beginMeasurementSnapshot(world.team);
-    CHECK(stats.measurements.variants[inn].count==0);
+    CHECK(stats.measurements().variants[inn].count==0);
     stats.initializeMeasurements(123);
     stats.beginMeasurementSnapshot(world.team); stats.observeMeasurementBuilding(first);
-    CHECK(stats.measurements.variants[inn].count==1);
-    CHECK(stats.measurements.variants[1023]==BuildingMeasurement{});
+    CHECK(stats.measurements().variants[inn].count==1);
+    CHECK(stats.measurements().variants[1023]==BuildingMeasurement{});
 }
 
 TEST_CASE("Sparse variant reset accepts refreshed diagnostics and restored snapshots" * doctest::test_suite("TeamStatsSave"))
@@ -1899,10 +1914,10 @@ TEST_CASE("Sparse variant reset accepts refreshed diagnostics and restored snaps
         const auto absent=size_t(world.game.buildingsTypes.getTypeNum("stonewall",0,false));
         auto& stats=world.team->stats;
         stats.refreshMeasurements(world.team);
-        stats.measurements.variants[absent].count=99; // public diagnostic replacement
+        stats.editMeasurements().variants[absent].count=99; // public diagnostic replacement
         stats.refreshMeasurements(world.team);
-        CHECK(stats.measurements.variants[absent].count==0);
-        CHECK(stats.measurements.variants[type].count==1);
+        CHECK(stats.measurements().variants[absent].count==0);
+        CHECK(stats.measurements().variants[type].count==1);
         auto* memory=new GAGCore::MemoryStreamBackend;
         std::unique_ptr<GAGCore::OutputStream> out(text
             ? static_cast<GAGCore::OutputStream*>(new GAGCore::TextOutputStream(memory))
@@ -1917,13 +1932,13 @@ TEST_CASE("Sparse variant reset accepts refreshed diagnostics and restored snaps
                 : static_cast<GAGCore::InputStream*>(new GAGCore::BinaryInputStream(source.release())));
             GameGUI restored; REQUIRE(restored.game.load(in.get()));
             auto& loaded=restored.game.teams[0]->stats;
-            REQUIRE(loaded.measurements.variants[type].count==1);
+            REQUIRE(loaded.measurements().variants[type].count==1);
             loaded.beginMeasurementSnapshot(restored.game.teams[0]);
-            CHECK(loaded.measurements.variants[type].count==0);
+            CHECK(loaded.measurements().variants[type].count==0);
             loaded.observeMeasurementBuilding(restored.game.teams[0]->myBuildings[0]);
-            CHECK(loaded.measurements.variants[type].count==1);
+            CHECK(loaded.measurements().variants[type].count==1);
             loaded.beginMeasurementSnapshot(restored.game.teams[0]);
-            CHECK(loaded.measurements.variants[type].count==0);
+            CHECK(loaded.measurements().variants[type].count==0);
         }
     }
 }

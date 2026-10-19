@@ -31,6 +31,7 @@
 #include "TurnTelemetry.h"
 #include "Version.h"
 #include "WinningConditions.h"
+#include "field/GradientAccelerators.h"
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -139,6 +140,7 @@ MatchVerifier::Verdict MatchVerifier::verify(const Turn::MatchRecord& record, co
 		versionProblem = "the record names sim version " + record.simVersion + " but this verifier is " + current.key();
 
 	const auto runStart = std::chrono::steady_clock::now();
+    std::map<std::uint32_t, Uint32> checksums; // Outlives engine callbacks on every exit.
 	Engine engine;
 	Engine::TurnMatchStart start;
 	start.setup = setup;
@@ -160,7 +162,6 @@ MatchVerifier::Verdict MatchVerifier::verify(const Turn::MatchRecord& record, co
 	globals.replayWriter = std::make_unique<ReplayWriter>();
 	globals.replayWriter->init(replay, engine.gui);
 
-	std::map<std::uint32_t, Uint32> checksums;
 	Turn::TurnLockstepSession& lockstep = *engine.turnLockstep();
 	lockstep.onChecksum = [&checksums](std::uint32_t tick, Uint32 checksum) { checksums.emplace(tick, checksum); };
 
@@ -174,7 +175,14 @@ MatchVerifier::Verdict MatchVerifier::verify(const Turn::MatchRecord& record, co
 	{
 		engine.stepSession(++now);
 		engine.trackTeamEliminations();
-		engine.gui.isRunning = true;
+		if (!engine.gui.isRunning)
+		{
+			// A recorded quit may stop the GUI's viewpoint seat. The verifier
+			// continues the match, so establish the completed boundary that a
+			// normally stopping owner intentionally leaves unobserved.
+			engine.gui.isRunning = true;
+			engine.establishObservation(false);
+		}
 		if (lockstep.turn().executedTick() != lastProgress)
 		{
 			lastProgress = lockstep.turn().executedTick();
@@ -186,6 +194,7 @@ MatchVerifier::Verdict MatchVerifier::verify(const Turn::MatchRecord& record, co
 	// The checksum a client would report for endTick itself: the state before the
 	// next tick, taken where the engine takes it.
 	engine.gatherAndAdvanceOrders(true);
+    engine.flushChecksums();
 	engine.trackTeamEliminations();
 	const auto runEnd = std::chrono::steady_clock::now();
 	Game& game = engine.gui.game;
@@ -275,13 +284,34 @@ MatchVerifier::Verdict MatchVerifier::verify(const Turn::MatchRecord& record, co
 	result << "]},";
 	Headless::playersAndTeamsJson(result, game, engine.teamEliminatedTick);
 	result << ",\"verification\":" << verification.dump()
-	       << ",\"network\":" << Turn::recordNetworkSummary(record).dump() << '}';
+	       << ",\"network\":" << Turn::recordNetworkSummary(record).dump() << ",\"compute_telemetry\":";
+    ComputeTelemetry::writeJson(result, game.map.computeExecutor().telemetrySnapshot());
+    result << '}';
 	Headless::writeJson((output / "result.json").string(), result.str());
-	Headless::writeJson((output / "compute.json").string(), json{
+	const auto gradient = gradient_kernel::configuration();
+	json compute{
 	    {"compute_requested_threads", globals.computeThreads ? std::to_string(globals.computeThreads) : "auto"},
-	    {"compute_resolved_threads", resolveComputeThreadCount(globals.computeThreads)},
+	    {"compute_resolved_threads", globals.resourcePlan.computeParticipants},
 	    {"compute_threads", game.map.computeExecutor().threadCount()},
-	    {"compute_workers", game.map.computeExecutor().threadCount() - 1}}.dump());
+	    {"compute_workers", game.map.computeExecutor().threadCount() - 1}};
+    std::ostringstream resources;
+    writeApplicationResourcePlanJson(resources, globals.resourcePlan);
+    compute["resource_plan"] = json::parse(resources.str());
+    // CPU-only verification performs no device-status or diagnostic formatting.
+    if (gradient_kernel::isGPU(gradient.backend)) {
+        const auto accelerator = gradient_kernel::acceleratorStatus(gradient.backend);
+        compute.update(json{
+	    {"gradient_backend", gradient_kernel::backendName(gradient.backend)},
+	    {"gradient_algorithm", gradient_kernel::algorithmName(gradient.algorithm)},
+	    {"gradient_device", accelerator.device},
+	    {"gradient_driver", accelerator.driver},
+	    {"gradient_shader", accelerator.shaderIdentity},
+	    {"gradient_gpu_fields", accelerator.fields},
+	    {"gradient_dispatches", accelerator.dispatches},
+	    {"gradient_cpu_fallbacks", accelerator.fallbacks}});
+
+    }
+	Headless::writeJson((output / "compute.json").string(), compute.dump());
 
 	json teams = json::array();
 	for (int t = 0; t < game.mapHeader.getNumberOfTeams(); ++t)

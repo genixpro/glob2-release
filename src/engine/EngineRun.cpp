@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <PresentationWork.h>
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <GameplayRecording.h>
@@ -9,11 +10,11 @@
 #include <FormatableString.h>
 
 #include "AINames.h"
-#include "ComputeThreads.h"
 #include "ChecksumSidecar.h"
 #include "ConnectionOverlay.h"
 #include "DatasetWriter.h"
 #include "Engine.h"
+#include "sim/snapshot/SnapshotChecksum.h"
 #include "hive/HiveClient.h"
 #include "GameDiagnostics.h"
 #include <utility>
@@ -175,10 +176,9 @@ void Engine::gatherAndAdvanceOrders(bool wasReadyLastTick)
         gui.game.players[orderPlayer]->ai;
     const auto eligible=observationPlayers(wasReadyLastTick);
     const bool paused=gui.gamePaused || globalContainer->replaying;
-    // After startup, the completed world's union was published before pacing.
+    // After startup, the completed world's snapshot was published before pacing.
     // AI polling and delivery remain at their original logical deadline.
-    const auto world=openReadBoundary(eligible,paused,!readBoundaryOpened);
-    const auto scheduled=gui.game.prepareAIOrders(eligible,paused,diagnostics,&world);
+    const auto scheduled=gui.game.deliverAIOrders(eligible,paused);
     for(const auto& [actor,order]:scheduled) {
         if(localAI && actor==unsigned(orderPlayer)) localOrder=order;
         else net->pushOrder(order,actor,true);
@@ -188,21 +188,20 @@ void Engine::gatherAndAdvanceOrders(bool wasReadyLastTick)
 	if (wasReadyLastTick)
 	{
 		PERF_SCOPE_TIME(Replay);
-		const bool legacy152 = globalContainer->replayReader && globalContainer->replayReader->formatVersion() <= 152;
-		Uint32 checksum = gui.game.checkSum(NULL, NULL, NULL, false, legacy152);
-		net->advanceStep(checksum);
-
-		if (globalContainer->replayWriter) globalContainer->replayWriter->setCheckSum(checksum);
+        collectChecksums();
+        net->advanceStep();
 
 		if (checksumSidecar)
         {
-			checksumSidecar->writeTick(gui.game.stepCounter, checksum, gui.game,legacy152);
+			// Explicit diagnostic mode retains exhaustive live-world coverage.
+            const auto deep=gui.game.checkSum(nullptr,nullptr,nullptr,true);
+            checksumSidecar->writeTick(gui.game.stepCounter, deep, gui.game);
             // Explicit verification only: joins private growth and hashes every
             // resource and pending proposal without slowing routine checksums.
             if (!headlessOutput.empty())
                 std::ofstream(headlessOutput + "/world.checksums", std::ios::app)
                     << gui.game.stepCounter << ' '
-                    << gui.game.checkSum(nullptr, nullptr, nullptr, true) << '\n';
+                    << deep << '\n';
         }
 	}
 	// advanceStep inserts the local order. Measuring earlier leaves a stale
@@ -212,13 +211,12 @@ void Engine::gatherAndAdvanceOrders(bool wasReadyLastTick)
 
 // Once tickReady() is true for this tick, commit the tick: validate
 // checksums (assert on desync), execute the matched orders, pump the replay
-// reader if we're in playback, and run game.syncStep. Called only from inside
-// the !hardPause branch, so the original !gui.hardPause guard on syncStep is
+// reader if we're in playback, and advance live simulation. Called only from inside
+// the !hardPause branch, so the original !gui.hardPause guard on advancement is
 // implicit here.
 void Engine::executeOrdersAndStep(bool readyNow)
 {
-	// Defensive drain for paused/stalled/no-controller paths and direct callers.
-	gui.game.map.preparePendingWorld();
+    const bool wasPaused = gui.gamePaused;
 	if (readyNow)
 	{
 		// A turn session never reports a mismatch here: the relay arbitrates the
@@ -276,14 +274,21 @@ void Engine::executeOrdersAndStep(bool readyNow)
 			}
 		}
 
-		if (globalContainer->replayReader->isFinished())
-		{
-			gui.showEndOfReplayScreen();
+        if (globalContainer->replayReader->isFinished())
+        {
+            if (!globalContainer->replayReader->isValid()) throw std::ios_base::failure("Replay playback failed");
+            flushChecksums();
+            globalContainer->replayReader->finishChecksumValidation();
+            gui.showEndOfReplayScreen();
 		}
 	}
 
+	// A resume order opens the following delivery phase at this same tick.
+    // Restored AI outputs due now must be delivered before the clock advances.
+    const bool advancing = readyNow && !gui.gamePaused && !wasPaused;
+    gui.game.finishOrderPhase(advancing);
 	// here we do the real work
-	if (readyNow && !gui.gamePaused)
+	if (advancing)
 	{
 		if (globalContainer->replaying)
 		{
@@ -291,7 +296,7 @@ void Engine::executeOrdersAndStep(bool readyNow)
 			globalContainer->replayReader->advanceStep();
 		}
 
-		gui.game.syncStep(gui.localTeamNo, Game::PreparationCompletion::Deferred);
+		gui.game.advanceLiveSimulation(gui.localTeamNo);
 		// Hand the tick's notices to the GUI now, also under --nox where
 		// gui.step never runs, so the event queue cannot grow unbounded. With a
 		// simulation thread the GUI consumes them while the simulation is parked.
@@ -303,6 +308,7 @@ void Engine::executeOrdersAndStep(bool readyNow)
 
 void Engine::drawFrame(MainLoopState& st, bool everyFrame, const PresentationFrame* scene)
 {
+    GAGCore::PresentationWorkScope cpuWork(gui.game.map.computeExecutor());
     GAGCore::ApplicationHost::matchFrame(gui.gamePaused);
 	const bool renderedFrame = everyFrame || st.nextGuiStep == 0;
 	if (renderedFrame)
@@ -311,12 +317,25 @@ void Engine::drawFrame(MainLoopState& st, bool everyFrame, const PresentationFra
 		// reading the live simulation's tick or timing from the rendering thread.
 		GAGCore::Recording::recorder().matchFrame(scene ? scene->tick : gui.game.stepCounter,
 				gui.gamePaused || gui.hardPause, scene ? int(scene->tickInterval) : st.speed);
-		gui.drawAll(gui.localTeamNo);
-		{
-			PERF_SCOPE_TIME(Present);
-			globalContainer->gfx->nextFrame();
-		}
-		PerformanceTelemetry::collector().presented();
+        try
+        {
+            gui.drawAll(gui.localTeamNo);
+            PERF_SCOPE_TIME(Present);
+            globalContainer->gfx->nextFrame();
+        }
+        catch (...)
+        {
+            globalContainer->gfx->discardFrame();
+            throw;
+        }
+        auto &perf = PerformanceTelemetry::collector();
+        if (scene && scene->tickTime)
+        {
+            const auto now = SDL_GetTicks();
+            perf.record(PerformanceTelemetry::Id::SceneAge,
+                        (now >= scene->tickTime ? now - scene->tickTime : 0) * 1000000ULL);
+        }
+        perf.presented();
 	}
 
 }
@@ -337,16 +356,69 @@ std::vector<unsigned> Engine::observationPlayers(bool wasReadyLastTick) const
     return eligible;
 }
 
-SimulationSnapshot::Handle Engine::openReadBoundary(std::span<const unsigned> players, bool paused, bool present)
+SimulationSnapshot::Handle Engine::establishObservation(bool present)
 {
-    const bool worldAdvanced=!retainedPresentation || retainedPresentation->world.tick!=gui.game.stepCounter;
+    SimulationSnapshot::CaptureOptions options;
+    // Capture the requested graphical payload even while scene preparation is
+    // busy. A later extraction must use this frozen observation, never live state.
+    if (!globalContainer->runNoX) {
+        // A paused camera/panel toggle must never consult a newer live world.
+        // Frozen history/display storage shares its immutable backing buffers.
+        options = {.presentation=true, .history=true, .telemetry=true,
+            .entityDiagnostics=true, .annotations=true};
+    }
+    if (diagnostics) options.include(diagnostics->captureOptions(gui.game.stepCounter));
+    const bool paused=gui.gamePaused || gui.hardPause;
+    if (!checksumPipeline) checksumPipeline=std::make_unique<SimulationChecksum::Pipeline>(gui.game.map.computeExecutor());
+    checksumPipeline->synchronizeWorld(gui.game.map.identity());
+    // Retire due leases before the owner acquires its next pooled buffers.
+    // Reconfigured serial fallback also releases its inputs before capture.
+    collectChecksums();
+    const auto world=gui.game.observeCompletedWorld(options);
+    checksumPipeline->submit(world,turn ? turn->turn().executedTick() : world.tick,routineMapChecksums());
+    if (globalContainer->replayWriter)
+        globalContainer->replayWriter->enableDeferredChecksums([this] { flushChecksums(); });
+    if (globalContainer->replayReader) globalContainer->replayReader->enableDeferredChecksums();
+    // Presentation follows the retained owner's identity, not the inspection
+    // cache revision that live entity helpers may invalidate during orders.
+    const bool worldAdvanced=!retainedPresentation || retainedPresentation->world.tick!=world.tick
+        || retainedPresentation->world.observationRevision!=world.observationRevision;
     const auto presentation=present ? admitPresentation(worldAdvanced) : std::optional<SceneRequest>{};
-    const auto world=gui.game.captureReadBoundary(players,paused,
-        (presentation ? presentationRequirements(*presentation) : 0)
-        | (diagnostics ? diagnostics->observationRequirements(gui.game.stepCounter) : 0));
-    readBoundaryOpened=true;
-    if (presentation) publishPresentation(world.project(presentationRequirements(*presentation)),*presentation);
+    gui.game.admitAIOrders(observationPlayers(session ? session->wasReadyLastTick : true),
+        paused || globalContainer->replaying, diagnostics, world);
+    if (presentation) publishPresentation(world,*presentation);
     return world;
+}
+
+bool Engine::routineMapChecksums() const
+{
+    return sessionMapChecksums;
+}
+
+void Engine::collectChecksums(bool flush)
+{
+    if (!checksumPipeline) return;
+    const auto now=turn ? turn->turn().executedTick() : gui.game.stepCounter;
+    for (const auto& result:checksumPipeline->collect(now,flush,gui.game.stepCounter)) {
+        latestChecksum=result.sample;
+        if (net) net->publishChecksum(result.sample);
+        const ChecksumSample worldSample{result.worldTick,result.sample.value};
+        if (globalContainer->replayWriter) globalContainer->replayWriter->publishChecksum(worldSample);
+        if (globalContainer->replayReader) globalContainer->replayReader->publishChecksum(worldSample);
+        if (!headlessOutput.empty() && checksumSidecar)
+            std::ofstream(headlessOutput+"/snapshot.checksums",std::ios::app)
+                <<result.sample.sourceTick<<' '<<result.worldTick<<' '<<result.sample.value<<'\n';
+    }
+}
+void Engine::flushChecksums()
+{
+    if (!checksumPipeline || !net) return;
+    checksumPipeline->synchronizeWorld(gui.game.map.identity());
+    collectChecksums(true);
+    // The normal stop path may leave its terminal completed world unobserved.
+    const auto& world=gui.game.observeCompletedWorld();
+    checksumPipeline->submit(world,turn ? turn->turn().executedTick() : world.tick,routineMapChecksums());
+    collectChecksums(true);
 }
 
 std::optional<SceneRequest> Engine::admitPresentation(bool worldAdvanced)
@@ -360,17 +432,11 @@ std::optional<SceneRequest> Engine::admitPresentation(bool worldAdvanced)
     if (request) gui.stampPresentationRequest(*request);
     return request;
 }
-SimulationSnapshot::Requirements Engine::presentationRequirements(const SceneRequest& request) const
-{
-    auto required=SceneExtractor::requirements(request);
-    if (gui.game.gameHeader.hasExperiment(ExperimentId::FarmAreas)) required|=SimulationSnapshot::bit(SimulationSnapshot::Component::Growth);
-    return required;
-}
 void Engine::publishPresentation(const SimulationSnapshot::Handle& world,SceneRequest request)
 {
-    retainedPresentation=std::make_shared<const SceneInputs>(SceneInputs{world,request});
-    if (runner) runner->publishPresentation(world,std::move(request));
-    else serialPresentation->submit(std::make_shared<const SceneInputs>(SceneInputs{world,std::move(request)}));
+    retainedPresentation=SceneExtractor::inputs(world,request);
+    if (runner) runner->publishPresentation(retainedPresentation->world,std::move(request));
+    else serialPresentation->submit(retainedPresentation);
 }
 
 void Engine::refreshRetainedPresentation()
@@ -386,9 +452,10 @@ void Engine::refreshRetainedPresentation()
     request->tickTime=retainedPresentation->request.tickTime;
     request->tickInterval=retainedPresentation->request.tickInterval;
     if (*request==retainedPresentation->request) return;
-    const auto required=presentationRequirements(*request);
-    if ((retainedPresentation->world.requirements & required)!=required) return;
-    const auto world=retainedPresentation->world;
+    const auto& world=gui.game.observation();
+    if (world.tick!=retainedPresentation->world.tick
+        || world.observationRevision!=retainedPresentation->world.observationRevision) return;
+    if (!world.supportsPresentation(SceneExtractor::captureOptions(*request))) return;
     publishPresentation(world,*request);
 }
 
@@ -472,15 +539,76 @@ void Engine::stopSimulationThread()
     gui.consumeClientEvents();
 }
 
-bool Engine::threadedClientFrame(Uint64 now, const std::vector<SDL_Event>& events)
+void Engine::trackInputDispatch(std::shared_ptr<GAGCore::InputDispatchReceipt> receipt,
+								std::size_t first, std::size_t count)
 {
-    if (!runner) throw std::logic_error("Simulation thread not running");
-    publishSessionClock(now);
-    runner->rethrowFailure();
-    for (const auto& event : events) sessionInput.push_back(event);
-    // Selection and hit testing need this world's first immutable view. Preserve
-    // early input until it arrives; never fall back to a previous world's PresentationFrame.
-    if (!runner->sceneReady())
+	inputDispatches.push_back({std::move(receipt), sessionInput.events().size() + first, count});
+}
+void Engine::pruneCancelledInput()
+{
+	for (std::size_t i = 0; i < inputDispatches.size();)
+	{
+		const auto &tracked = inputDispatches[i];
+		if (!tracked.receipt->cancelled || !tracked.receipt->cancelled())
+		{
+			++i;
+			continue;
+		}
+		const auto first = tracked.first, count = tracked.count;
+		sessionInput.erase(first, count);
+		tracked.receipt->consumed = 0;
+		inputDispatches.erase(inputDispatches.begin() + i);
+		for (auto &remaining : inputDispatches)
+			if (remaining.first >= first + count)
+				remaining.first -= count;
+	}
+}
+void Engine::cancelInputDispatches()
+{
+	// Retire in reverse order so offsets remain valid, preserving human events.
+	for (auto i = inputDispatches.rbegin(); i != inputDispatches.rend(); ++i)
+	{
+		// Failure before the next event append can retire a future range too.
+		if (i->first < sessionInput.events().size())
+			sessionInput.erase(i->first,
+							   std::min(i->count, sessionInput.events().size() - i->first));
+		i->receipt->consumed = 0;
+	}
+	inputDispatches.clear();
+}
+void Engine::completeInputDispatches()
+{
+	for (const auto &tracked : inputDispatches)
+		tracked.receipt->consumed = tracked.count;
+	inputDispatches.clear();
+}
+void Engine::dispatchClientInput(const std::vector<SDL_Event> &events)
+{
+	if (inputDispatches.empty())
+	{
+		clientStep(events);
+		return;
+	}
+	for (const auto &event : events)
+		sessionInput.push_back(event);
+	pruneCancelledInput();
+	clientStep(sessionInput.events());
+	completeInputDispatches();
+	sessionInput.clear();
+}
+
+bool Engine::threadedClientFrame(Uint64 now, const std::vector<SDL_Event> &events)
+{
+	if (!runner)
+		throw std::logic_error("Simulation thread not running");
+	publishSessionClock(now);
+	runner->rethrowFailure();
+	for (const auto &event : events)
+		sessionInput.push_back(event);
+	pruneCancelledInput();
+	// Selection and hit testing need this world's first immutable view. Preserve
+	// early input until it arrives; never fall back to a previous world's PresentationFrame.
+	if (!runner->sceneReady())
     {
         const auto* scene=runner->acquireScene();
         if (!scene) return gui.isRunning && !runner->ended();
@@ -489,6 +617,7 @@ bool Engine::threadedClientFrame(Uint64 now, const std::vector<SDL_Event>& event
     if (gui.isRunning)
     {
         clientStep(sessionInput.events());
+        completeInputDispatches();
         sessionInput.clear();
         runner->requestScene(gui.sceneRequest(false));
         absorbSimulationTelemetry();
@@ -661,20 +790,16 @@ void Engine::printTeamResults()
 		if (!team)
 			continue;
 		int units = 0, workers = 0, explorers = 0, warriors = 0, buildings = 0, sites = 0;
-		for (int i = 0; i < Unit::MAX_COUNT; i++)
+		for (const Unit* unit : team->liveUnits.entries())
 		{
-			const Unit* unit = team->myUnits[i];
-			if (!unit)
-				continue;
 			units++;
 			workers += unit->typeNum == WORKER;
 			explorers += unit->typeNum == EXPLORER;
 			warriors += unit->typeNum == WARRIOR;
 		}
-		for (int i = 0; i < Building::MAX_COUNT; i++)
+		for (const Building* building : team->liveBuildings.entries())
 		{
-			const Building* building = team->myBuildings[i];
-			if (!building || building->type->isVirtual)
+			if (building->type->isVirtual)
 				continue;
 			if (building->type->isBuildingSite)
 				sites++;
@@ -740,7 +865,6 @@ void Engine::printTeamTimeline()
 				<< std::endl;
 		}
 
-		team->stats.refreshMeasurements(team);
 		team->stats.printMeasurements(t, true);
 		AITelemetry::capture(team, false, true, true);
 		// Final detailed snapshot: composition + food economy + building mix.
@@ -772,8 +896,23 @@ void Engine::teardownSession()
 {
     // Complete private jobs before session-owned telemetry/diagnostic sinks
     // close. Logical deadlines and queued commands remain game-owned.
+    flushChecksums();
     gui.game.drainAI();
-	gui.waitForAutosave();
+    gui.waitForAutosave();
+    if (std::getenv("GLOB2_TEAM_TIMELINE")) {
+        // Summary snapshots use existing synchronization; trace export requires
+        // a drained lifecycle boundary and never reads a running stream.
+        auto& executor = gui.game.map.computeExecutor();
+        if (executor.telemetryMode() == ComputeTelemetryMode::Trace) {
+            gui.game.map.finishGradientPipeline({JoinReason::Teardown, ComputeTelemetry::NoTick});
+            gui.game.map.finishResourceGrowth({JoinReason::Teardown, ComputeTelemetry::NoTick});
+            executor.cancelPresentationAndWait();
+            executor.joinAll({JoinReason::Teardown, ComputeTelemetry::NoTick});
+        }
+        std::cout << "GLOB2_COMPUTE_SUMMARY ";
+        ComputeTelemetry::writeJson(std::cout, executor.telemetrySnapshot(executor.telemetryMode() == ComputeTelemetryMode::Trace));
+        std::cout << std::endl;
+    }
 
 	if (checksumSidecar)
 	{
@@ -791,8 +930,9 @@ void Engine::teardownSession()
 
 	leaveTurnMatch();
 	gui.connectionOverlay.reset();
-	exportTurnTelemetry();
-	turn = nullptr;
+    exportTurnTelemetry();
+    checksumPipeline.reset();
+    turn = nullptr;
 	turnMatch.reset();
 	net.reset();
 }
@@ -839,7 +979,12 @@ void Engine::pumpTurnSession(Uint64 now)
 
 void Engine::reloadTurnInitialState()
 {
+    // Finish the old recording before replacing its world and executor inputs.
+    flushChecksums();
+    if (globalContainer->replayWriter) globalContainer->replayWriter->finish();
+    checksumPipeline.reset(); latestChecksum.reset();
     serialPresentation.reset();
+    retainedPresentation.reset();
     gui.setPublishedScene(nullptr);
 	assert(turn && turnMatch);
 	TurnMatchState& state = *turnMatch;
@@ -876,7 +1021,11 @@ void Engine::reloadTurnInitialState()
 			checksumSidecar.reset();
 	}
 	if (!globalContainer->structuredHeadless || turn)
-		gui.game.map.configureCompute(resolveComputeThreadCount(globalContainer->computeThreads));
+		{
+            gui.game.map.configureCompute(globalContainer->resourcePlan.computeParticipants);
+            if (gui.game.map.computeExecutor().telemetryMode() != globalContainer->computeTelemetry)
+                gui.game.map.computeExecutor().configureTelemetry(globalContainer->computeTelemetry);
+        }
 	teamEliminatedTick.clear();
 	if (session)
 		session->wasReadyLastTick = true;
@@ -884,6 +1033,9 @@ void Engine::reloadTurnInitialState()
 	turn->turn().telemetry().reloadLoad(static_cast<std::uint64_t>(
 		std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count()));
 	turn->turn().reloadDone();
+    // Reload clears the old observation. Reset the turn queues first so AI
+    // eligibility belongs to the restored tick before admitting its work.
+    establishObservation(!globalContainer->runNoX);
 	std::cerr << "Turn session: reloaded the initial state in "
 		<< std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count()
 		<< " ms; fast-forwarding" << std::endl;
@@ -900,7 +1052,7 @@ void Engine::reloadTurnInitialState()
 //   3. gui.step                   - GUI input (skipped under --nox / off-cadence)
 //   4. gatherAndAdvanceOrders     - push local+AI orders, advance net (if prev tick committed)
 //   5. (gate flip) readyNow = net->tickReady()
-//   6. executeOrdersAndStep       - run matched orders, replay reader, sim syncStep
+//   6. executeOrdersAndStep       - run matched orders, replay reader, advance live simulation
 //   7. automatic-ending step-count check
 //   8. drawSession / sessionDelay  - draw, gameplay capture, host pacing
 //   9. handleExitRequest           - drain on exit request
@@ -910,9 +1062,17 @@ void Engine::beginSession(Uint64 now)
 {
     if (session) throw std::logic_error("Engine session is already active");
     if (!net) throw std::logic_error("Engine session requires an initialized game");
-    globalContainer->configureGradientBackend();
 	if (!globalContainer->structuredHeadless || turn)
-		gui.game.map.configureCompute(resolveComputeThreadCount(globalContainer->computeThreads));
+		{
+            globalContainer->configureExecutionResources();
+            gui.game.map.configureCompute(globalContainer->resourcePlan.computeParticipants);
+            if (gui.game.map.computeExecutor().telemetryMode() != globalContainer->computeTelemetry)
+                gui.game.map.computeExecutor().configureTelemetry(globalContainer->computeTelemetry);
+        }
+    else
+        // Structured runners configure their executor before session entry.
+        // Preserve the existing backend setup for those runners and harnesses.
+        globalContainer->configureGradientBackend();
     sessionEndingTarget = globalContainer->automaticEndingSteps;
     MainLoopState st{};
     st.adjustableGameSpeed = gui.canChangeGameSpeed();
@@ -923,7 +1083,6 @@ void Engine::beginSession(Uint64 now)
     st.startTime = now;
     teamEliminatedTick.clear();
     session = st;
-    readBoundaryOpened = false;
     automaticGameStartTick = now;
 	if (!globalContainer->runNoX)
 		GAGCore::Recording::recorder().beginMatch(
@@ -954,6 +1113,7 @@ void Engine::beginSession(Uint64 now)
 		perf.describe(metadata.str());
 	}
 	printTurnTelemetrySession();
+    establishObservation(!globalContainer->runNoX);
 
 }
 
@@ -986,12 +1146,15 @@ void Engine::abortSession() noexcept
     catch (...)
     {
         std::cerr << "Failure while closing game resources; session cannot continue\n";
+        checksumPipeline.reset();
+        turn=nullptr; turnMatch.reset();
         net.reset();
         checksumSidecar.reset();
         globalContainer->datasetWriter.reset();
     }
     if (diagnostics) diagnostics->drain();
     session.reset();
+    cancelInputDispatches();
     sessionInput.clear();
     globalContainer->replayWriter.reset();
     PerformanceTelemetry::collector().reset();
@@ -1005,11 +1168,13 @@ bool Engine::stepSessionImpl(Uint64 now, const std::vector<SDL_Event>& events)
     turnDrawPending = true;
     --st.nextGuiStep;
     for (const auto &event : events) sessionInput.push_back(event);
+    pruneCancelledInput();
     return advanceSession(now, [&] {
         if (!globalContainer->runNoX && st.nextGuiStep == 0) {
             // Touch event timestamps use SDL time, which keeps advancing while
             // the session clock is suspended in the background.
             gui.step(sessionInput.events(), SDL_GetTicks());
+            completeInputDispatches();
             sessionInput.clear();
         }
     }, true);
@@ -1030,7 +1195,7 @@ bool Engine::serialClientFrame(Uint64 now, const std::vector<SDL_Event>& events,
     return guardedSessionStep(*this, [&]() -> bool {
         if (!session) throw std::logic_error("No active engine session");
         const Uint64 started = SDL_GetTicks();
-        clientStep(events);
+        dispatchClientInput(events);
         // Apply speed/pause input before deciding whether a tick is due.
         updateTickSpeedAndDrawCadence(*session, now);
         bool advanced = false;
@@ -1116,7 +1281,7 @@ void Engine::absorbSimulationTelemetry()
     const auto frameBudget=globalContainer->runNoX || fps==0 ? 0ULL : (1000000000ULL+fps-1)/fps;
     perf.configure(tick, globalContainer->runNoX ? 0ULL : std::uint64_t(scene.tickInterval)*1000000ULL, frameBudget,
         gui.gamePaused || gui.hardPause ? "paused" : globalContainer->runNoX ? "headless" :
-        globalContainer->replaying ? "replay" : scene.panels.hud.state().anyPlayerWaited ? "waiting" : "live");
+        globalContainer->replaying ? "replay" : gui.clientEvents.waitingMask() ? "waiting" : "live");
     runner->absorbTelemetry(perf);
     perf.capture(tick);
 }
@@ -1143,14 +1308,22 @@ bool Engine::advanceSession(Uint64 now, const std::function<void()>& clientWork,
         gatherAndAdvanceOrders(st.wasReadyLastTick);
         readyNow = net->tickReady();
         const Uint32 tickBefore = gui.game.stepCounter;
+        const Sint64 elapsed = static_cast<Sint64>(now - st.startTime) * 1000000;
+        const Uint64 lateness =
+            st.speedNs && elapsed > st.needToBeTime ? elapsed - st.needToBeTime : 0;
         executeOrdersAndStep(readyNow);
         if (gui.game.stepCounter != tickBefore)
+        {
+            observedSimulationLateness.store(lateness, std::memory_order_relaxed);
+            perf.record(PerformanceTelemetry::Id::SimulationLateness, lateness);
             gui.recordTick(SDL_GetTicks(), Uint32(st.speed));
+        }
     }
     if (globalContainer->automaticEndingGame && (int)gui.game.stepCounter == sessionEndingTarget) {
         gui.isRunning = false;
         automaticGameEndTick = now;
-        printf("nox::gui.game.checkSum() = %08x\n", gui.game.checkSum());
+        flushChecksums();
+        printf("nox::gui.game.checkSum() = %08x\n", latestChecksum ? latestChecksum->value : 0);
     }
 
 		if (!headlessOutput.empty() && readyNow)
@@ -1178,14 +1351,13 @@ bool Engine::advanceSession(Uint64 now, const std::function<void()>& clientWork,
     // waiting for the relay poll quickly instead of sleeping a whole tick.
     if (turn ? readyNow : !globalContainer->runNoX) st.needToBeTime += st.speedNs;
     if (handleExit) handleExitRequest();
-    if (gui.isRunning && !globalContainer->runNoX)
+    if (gui.isRunning)
     {
-        // Open the next shared read phase now, before the host's pacing wait.
+        // Establish the next completed observation before pacing.
         // Its AI/gradient projections are consumed at the next gather without
         // another world copy. Presentation can prepare this completed tick
         // immediately, with the timestamp and receipts belonging to that tick.
-        const auto players=gui.hardPause ? std::vector<unsigned>{} : observationPlayers(st.wasReadyLastTick);
-        openReadBoundary(players,gui.hardPause || gui.gamePaused || globalContainer->replaying,true);
+        establishObservation(!globalContainer->runNoX);
     }
     workTime.stop();
     loopTime.stop();
@@ -1200,7 +1372,17 @@ bool Engine::advancePendingSave(const std::vector<SDL_Event>& events)
     // before touching that state, and never resume simulation during teardown.
     stopSimulationThread();
     // Save/retry dialogs share the SDL input clock, just like active gameplay.
-    if (gui.savePending()) gui.step(events, SDL_GetTicks());
+    if (inputDispatches.empty()) {
+        if (gui.savePending()) gui.step(events, SDL_GetTicks());
+    } else {
+        for (const auto &event : events) sessionInput.push_back(event);
+        pruneCancelledInput();
+        if (gui.savePending()) {
+            gui.step(sessionInput.events(), SDL_GetTicks());
+            completeInputDispatches();
+        } else cancelInputDispatches();
+        sessionInput.clear();
+    }
     return gui.savePending();
 }
 
@@ -1221,6 +1403,7 @@ std::optional<Engine::PendingLoad> Engine::finishSessionForHost()
 
     if (diagnostics) diagnostics->drain();
     session.reset();
+    cancelInputDispatches();
     sessionInput.clear();
     const auto filename = std::exchange(gui.toLoadGameFileName, {});
     if (gui.exitGlobCompletely || filename.empty()) return std::nullopt;

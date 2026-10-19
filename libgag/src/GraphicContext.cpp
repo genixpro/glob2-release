@@ -609,12 +609,17 @@ int GraphicContext::maximumTextureSize() const
         if (applied) {
             if (fullscreen) optionFlags |= FULLSCREEN; else optionFlags &= ~FULLSCREEN;
             if (!fullscreen) {
-                SDL_SetWindowResizable(window, (optionFlags & RESIZABLE) ? true : false);
-                SDL_SetWindowSize(window, requestedW, requestedH);
+                // Let the window manager restore decorations before resizing the
+                // client area; overlapping requests can subtract the frame height.
+                if (nativeDesktop) applied = SDL_SyncWindow(window);
+                if (applied) {
+                    SDL_SetWindowResizable(window, (optionFlags & RESIZABLE) ? true : false);
+                    SDL_SetWindowSize(window, requestedW, requestedH);
+                }
             }
             // Fullscreen and its restoration resize can outlive the flag change.
             // Read and persist dimensions only after both requests have settled.
-            if (nativeDesktop) applied = SDL_SyncWindow(window) && refreshNativeWindow();
+            if (nativeDesktop) applied = applied && SDL_SyncWindow(window) && refreshNativeWindow();
         }
         if (!applied) {
             if (previous) optionFlags |= FULLSCREEN; else optionFlags &= ~FULLSCREEN;
@@ -805,7 +810,7 @@ int GraphicContext::maximumTextureSize() const
 		if (watchingEvents) SDL_RemoveEventWatch(watchWindow, this);
 		watchingEvents = false;
 		releaseFrameCache();
-        cancelRecordingCaptures();
+        cancelCaptures();
         if (renderer) {
             try { renderer->flush(); }
             catch (const std::exception &error) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Retiring renderer: %s", error.what()); }
@@ -1107,7 +1112,7 @@ int GraphicContext::maximumTextureSize() const
 		const auto title = windowTitle + suffix;
 		if (window && title != SDL_GetWindowTitle(window))
 			SDL_SetWindowTitle(window, title.c_str());
-        pollRecordingCaptures();
+        pollCaptures();
         if (presentationDevice) {
             if (nextBackend || changingBackend) return;
             auto ticket = capture.reserveCapture();
@@ -1215,6 +1220,7 @@ int GraphicContext::maximumTextureSize() const
 			// A transformed software pass may end before nextFrame. Keep the
 			// request independent of the borrowed active-backend pointer.
             captureScreenshot();
+            captureMemoryFrame();
 
 			if (renderer && !nativeSoftware)
 			{
@@ -1238,7 +1244,10 @@ int GraphicContext::maximumTextureSize() const
 			if (optionFlags & USEGPU)
 				Sprite::checkAllSpritesDrawn();
 #endif
-			if (renderer && nativeSoftware) renderer->flush();
+			// The active transform may already have restored renderer=null.
+            // Complete the owned software backend and trim its warm sources
+            // at every CPU frame boundary, independent of that borrowed pointer.
+            if (softwareRasterizer) softwareRasterizer->present();
 			cacheFrame();
 			if (optionFlags & USEGPU)
 				swapBuffers();

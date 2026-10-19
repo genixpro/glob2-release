@@ -1,8 +1,10 @@
+#include "HiringPipeline.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real-engine regression for hiring a fetcher: the hunger check that decides
 // whether a unit may be hired for a resource measures the walk to that resource,
 // not the whole fetch-and-carry trip, and the score estimates that whole trip.
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include "GlobalContainer.h"
 #include "FileManager.h"
 #include <SDL3/SDL.h>
@@ -12,6 +14,7 @@
 #include "Unit.h"
 #include "Team.h"
 #include "Building.h"
+#include "HiringPlanner.h"
 #include "BuildingType.h"
 #include "MapInternal.h"
 #include "Race.h"
@@ -29,21 +32,28 @@ class FetchHiringScoreHarness
 public:
     static std::vector<Unit*> candidates(Building* building)
     {
-        Building::BringMaterialsCandidate candidates[Unit::MAX_COUNT];
-        const int count=building->gatherBringMaterialsCandidates(candidates, WHEAT);
+        for(auto* unit:building->owner->liveUnits.entries())
+            glob2test::awaitBuildingGradient(*building->owner->game,building,unit->swimClass(),BuildingRoute::Footprint);
+        building->resetFailureTallies();
         std::vector<Unit*> units;
-        for (int i=0; i<count; ++i) units.push_back(candidates[i].unit);
+        for(auto* unit:building->owner->liveUnits.entries()) {
+            int distance=0;
+            if(unit->hasCapability(UnitRuntimeTraits::Transport) && unit->performance[HARVEST] && unit->performance[BUILD] && building->considerUnitForMaterial(unit,WHEAT,&distance))units.push_back(unit);
+        }
+        // This helper checks membership; carrying() checks the planner's ranking.
+        std::sort(units.begin(),units.end(),[](const Unit* a,const Unit* b) { return a->gid<b->gid; });
         return units;
     }
     static int unavailable(Building* building)
         { return building->unitsFailingRequirements[Building::UnitNotAvailable]; }
     static Unit* carrying(Building* building)
     {
-        int targets[MaterialSlotCount], served[MaterialSlotCount];
-        building->fetchApportionment(targets, served);
-        Building::BringMaterialsSelection selection{-1, 0x7fffffff, nullptr};
-        building->selectUnitCarryingWantedMaterial(targets, served, selection);
-        return selection.choosen;
+        auto& game=*building->owner->game;game.snapshotStore().invalidateBoundary();
+        HiringPlanner::Planner cache;
+        const auto output=cache.rank(HiringPipeline::bindRoutes(game,game.captureReadBoundary()),building->owner->teamNumber,8);
+        for(const auto& b:output.buildings)if(b.building==Game::refOf(building))
+            for(const auto& list:b.jobs)if(list.key.job==Hiring::Job::Delivery && !list.candidates.empty())return game.resolveUnit(list.candidates.front().unit);
+        return nullptr;
     }
 	static bool consider(Building* building, Unit* unit, int resource, int* dist)
 		{ return building->considerUnitForMaterial(unit, resource, dist); }
@@ -78,8 +88,7 @@ static void aUnitIsJudgedOnTheWalkToTheResource()
 	const int siteX = 8, siteY = 8;
 	Building* site = new Building(siteX, siteY, Building::GIDfrom(0, 0), siteType, team,
 	                              &globalContainer->buildingsTypes, 4, 4);
-	team->myBuildings[0] = site;
-	team->rebuildLiveLists();
+	team->attachBuilding(0, site);
 	game.map.setBuilding(siteX, siteY, type->width, type->height, site->gid);
 	require(site->neededMaterial(WOOD) > 0, "the site still wants wood");
 
@@ -88,17 +97,19 @@ static void aUnitIsJudgedOnTheWalkToTheResource()
 	require(game.map.incResourceByIndex(woodX, woodY, WOOD, 0), "seed the wood tile");
 
 	Unit* unit = new Unit(siteX - 2, siteY, 0, WORKER, team, 0);
-	team->myUnits[0] = unit;
-	team->rebuildLiveLists();
-	unit->performance[WALK] = 10;
-	unit->performance[HARVEST] = 10;
+	team->attachUnit(0, unit);
+	unit->setPerformance(WALK,10);
+	unit->setPerformance(HARVEST,10);
 	unit->activity = Unit::ACT_RANDOM;
 	unit->displacement = Unit::DIS_RANDOM;
 	unit->medical = Unit::MED_FREE;
 	unit->attachedBuilding = NULL;
 	const int swimClass = unit->swimClass();
 
+	game.map.buildingGradient(site,swimClass);
+	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,WOOD,swimClass); });
 	int distBuilding = 0, distResource = 0;
+	glob2test::awaitBuildingGradient(game,site,swimClass);
 	require(game.map.buildingAvailable(site, swimClass, unit->posX, unit->posY, &distBuilding),
 		"the site is reachable");
 	require(game.map.materialAvailableSlot(0, WOOD, swimClass, unit->posX, unit->posY, &distResource),
@@ -145,8 +156,7 @@ static void theScoreEstimatesTheWholeTrip()
 	const int siteX = 8, siteY = 8;
 	Building* site = new Building(siteX, siteY, Building::GIDfrom(0, 0), siteType, team,
 	                              &globalContainer->buildingsTypes, 4, 4);
-	team->myBuildings[0] = site;
-	team->rebuildLiveLists();
+	team->attachBuilding(0, site);
 	game.map.setBuilding(siteX, siteY, type->width, type->height, site->gid);
 
 	require(game.map.incResourceByIndex(siteX + 9, siteY, WOOD, 0), "seed the wood tile");
@@ -154,10 +164,9 @@ static void theScoreEstimatesTheWholeTrip()
 	// Standing at the building, so the walk out and the carry home are close to
 	// the same length and the whole job is close to twice the walk.
 	Unit* unit = new Unit(siteX - 2, siteY, 0, WORKER, team, 0);
-	team->myUnits[0] = unit;
-	team->rebuildLiveLists();
-	unit->performance[WALK] = 10;
-	unit->performance[HARVEST] = 10;
+	team->attachUnit(0, unit);
+	unit->setPerformance(WALK,10);
+	unit->setPerformance(HARVEST,10);
 	unit->activity = Unit::ACT_RANDOM;
 	unit->displacement = Unit::DIS_RANDOM;
 	unit->medical = Unit::MED_FREE;
@@ -166,7 +175,10 @@ static void theScoreEstimatesTheWholeTrip()
 	unit->hungry = unit->trigHungry + 1000 * unit->race->hungriness;
 
 	const int swimClass = unit->swimClass();
+	game.map.buildingGradient(site,swimClass);
+	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,WOOD,swimClass); });
 	int distBuilding = 0, distResource = 0;
+	glob2test::awaitBuildingGradient(game,site,swimClass);
 	require(game.map.buildingAvailable(site, swimClass, unit->posX, unit->posY, &distBuilding),
 		"the site is reachable");
 	require(game.map.materialAvailableSlot(0, WOOD, swimClass, unit->posX, unit->posY, &distResource),
@@ -195,12 +207,15 @@ TEST_SUITE("FetchHiringScore")
             .loadDefaultRace=true, .header=true});
         auto* inn=world.addBuilding("inn",8,8,0,0);
         REQUIRE(inn);
-        inn->materials[WHEAT]=0;
+        inn->setMaterial(WHEAT, 0);
         REQUIRE(world.game.map.incResourceByIndex(18,8,WHEAT,0));
         auto* unit=world.addUnit(WORKER,6,8);
         REQUIRE(unit);
         unit->activity=Unit::ACT_RANDOM; unit->medical=Unit::MED_FREE;
+        world.game.map.buildingGradient(inn,unit->swimClass());
+        glob2test::awaitGradient(world.game, [&] { return world.game.map.getMaterialGradientSlot(0,WHEAT,unit->swimClass()); });
         int buildingDistance=0,resourceDistance=0;
+        glob2test::awaitBuildingGradient(world.game,inn,unit->swimClass());
         REQUIRE(world.game.map.buildingAvailable(inn,unit->swimClass(),unit->posX,unit->posY,&buildingDistance));
         REQUIRE(world.game.map.materialAvailableSlot(0,WHEAT,unit->swimClass(),unit->posX,unit->posY,&resourceDistance));
         REQUIRE(buildingDistance<resourceDistance);
@@ -237,16 +252,16 @@ TEST_SUITE("FetchHiringScore")
         query(INT_MIN,INT_MAX,-1,true,0);
     }
 
-    TEST_CASE("carrying selection preserves saturated wide hunger ties and purpose writes")
+    TEST_CASE("carrying selection preserves saturated wide hunger ties without purpose writes")
     {
         glob2test::HeadlessGlobals globals;
         glob2test::HeadlessGame world({.teams=1, .discovered=true, .clearImmobile=true,
             .loadDefaultRace=true, .header=true});
         auto* inn=world.addBuilding("inn",8,8,0,0);
-        REQUIRE(inn); inn->materials[WHEAT]=0;
+        REQUIRE(inn); inn->setMaterial(WHEAT, 0);
         for(int slot : {Unit::MAX_COUNT-1,3}) {
             auto* unit=new Unit(6,8,Unit::GIDfrom(slot,world.team->teamNumber),WORKER,world.team,0);
-            world.team->myUnits[slot]=unit; world.team->attachUnit(slot);
+            world.team->attachUnit(slot,unit);
             unit->activity=Unit::ACT_RANDOM; unit->medical=Unit::MED_FREE;
             unit->carriedMaterial=WHEAT; unit->destinationPurpose=-1;
             unit->hungry=INT_MAX; unit->trigHungry=slot==3 ? -1 : -2; unit->hungriness=1;
@@ -254,35 +269,40 @@ TEST_SUITE("FetchHiringScore")
         // Both positive quotients saturate to the same signed32 budget; the
         // lower slot wins the unchanged traversal tie, and both are evaluated.
         CHECK(FetchHiringScoreHarness::carrying(inn)==world.team->myUnits[3]);
-        CHECK(world.team->myUnits[3]->destinationPurpose==WHEAT);
-        CHECK(world.team->myUnits[Unit::MAX_COUNT-1]->destinationPurpose==WHEAT);
+        CHECK(world.team->myUnits[3]->destinationPurpose==-1);
+        CHECK(world.team->myUnits[Unit::MAX_COUNT-1]->destinationPurpose==-1);
     }
 
-    TEST_CASE("carrying candidates preserve sparse slot ties and all purpose writes")
+    TEST_CASE("carrying candidates preserve sparse slot ties without live writes")
     {
         glob2test::HeadlessGlobals globals;
         glob2test::HeadlessGame world({.teams=1, .discovered=true, .clearImmobile=true, .loadDefaultRace=true, .header=true});
         auto* team = world.game.teams[0];
         auto* inn = world.addBuilding("inn", 8, 8, 0, 0);
         REQUIRE(inn);
-        inn->materials[WHEAT] = 0;
+        inn->setMaterial(WHEAT, 0);
         // Identical positions and hunger deliberately tie the candidates.
-        // Attach in reverse order to exercise sorted traversal rather than insertion order.
+        // Attach in reverse slot order to verify local hiring tie ordering independently of population order.
         for (int slot : {Unit::MAX_COUNT-1, 3})
         {
             auto* unit = new Unit(6, 8, slot, WORKER, team, 0);
-            team->myUnits[slot] = unit;
-            team->attachUnit(slot);
-            unit->performance[HARVEST] = 10;
+            team->attachUnit(slot,unit);
+            unit->setPerformance(HARVEST,10);
             unit->activity = Unit::ACT_RANDOM;
             unit->medical = Unit::MED_FREE;
             unit->carriedMaterial = WHEAT;
             unit->destinationPurpose = -1;
         }
         CHECK(FetchHiringScoreHarness::carrying(inn) == team->myUnits[3]);
-        CHECK(team->myUnits[3]->destinationPurpose == WHEAT);
-        CHECK(team->myUnits[Unit::MAX_COUNT-1]->destinationPurpose == WHEAT);
+        CHECK(team->myUnits[3]->destinationPurpose == -1);
+        CHECK(team->myUnits[Unit::MAX_COUNT-1]->destinationPurpose == -1);
         REQUIRE(world.game.map.incResourceByIndex(16, 8, WHEAT, 0));
+        glob2test::awaitGradient(world.game,[&] {
+            return world.game.map.getMaterialGradientSlot(0,WHEAT,team->myUnits[3]->swimClass());
+        });
+        world.game.map.prepareBuildingGradient(inn,team->myUnits[3]->swimClass(),BuildingRoute::Footprint);
+        // Membership is sorted by gid; the ranked delivery choice above
+        // independently proves that equal scores prefer low gid.
         CHECK(FetchHiringScoreHarness::candidates(inn) == std::vector<Unit*>{team->myUnits[3], team->myUnits[Unit::MAX_COUNT-1]});
         team->myUnits[Unit::MAX_COUNT-1]->activity = Unit::ACT_FILLING;
         CHECK(FetchHiringScoreHarness::candidates(inn) == std::vector<Unit*>{team->myUnits[3]});

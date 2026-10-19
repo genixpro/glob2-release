@@ -132,15 +132,14 @@ namespace
 		for (int t = 0; t < ticks; t++)
 		{
 			world.step();
-			for (int i = 0; i < Unit::MAX_COUNT; ++i)
-				if (Unit* u = world.team->myUnits[i])
+			for (Unit* u : world.team->liveUnits.entries())
 					u->hungry = Unit::HUNGRY_MAX;
 		}
 		FieldRun run;
 		for (int y = y0; y < y0 + 6; y++)
 			for (int x = x0; x < x0 + 6; x++)
 				run.tilesAlive += wheatAt(map, x, y) > 0;
-		run.harvested = world.team->stats.measurements.harvested[WHEAT];
+		run.harvested = world.team->stats.measurements().harvested[WHEAT];
 		return run;
 	}
 }
@@ -190,13 +189,12 @@ namespace
 		for (int t = 1; t <= 3000; t++)
 		{
 			world.step();
-			for (int i = 0; i < Unit::MAX_COUNT; ++i)
-				if (Unit* u = world.team->myUnits[i])
+			for (Unit* u : world.team->liveUnits.entries())
 					u->hungry = Unit::HUNGRY_MAX;
 			if (t % 100 == 0)
 				trace << t << ' ' << std::hex << simulationChecksum(world.game) << std::dec
-				      << " wheat " << world.team->stats.measurements.harvested[WHEAT]
-				      << " cleared " << world.team->stats.measurements.cleared[WOOD] << '\n';
+				      << " wheat " << world.team->stats.measurements().harvested[WHEAT]
+				      << " cleared " << world.team->stats.measurements().cleared[WOOD] << '\n';
 		}
 		return trace.str();
 	}
@@ -236,15 +234,14 @@ TEST_SUITE("FarmAreas")
 			for (int t = 0; t < 1500; t++)
 			{
 				world.step();
-				for (int i = 0; i < Unit::MAX_COUNT; ++i)
-					if (Unit* u = world.team->myUnits[i])
+				for (Unit* u : world.team->liveUnits.entries())
 					{
 						u->hungry = Unit::HUNGRY_MAX;
 						carrying += u->carriedMaterial == WHEAT;
 					}
 			}
 			struct { int harvested, left, carrying; } result{
-				int(world.team->stats.measurements.harvested[WHEAT]), totalWheat(map), carrying};
+				int(world.team->stats.measurements().harvested[WHEAT]), totalWheat(map), carrying};
 			return result;
 		};
 		const auto farmed = run(true);

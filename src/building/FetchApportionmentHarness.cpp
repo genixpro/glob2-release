@@ -3,6 +3,7 @@
 // spread its fetchers across them, instead of sending everyone to whichever
 // resource happens to be nearest and leaving the others with nobody.
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include <list>
 #include "GlobalContainer.h"
 #include "FileManager.h"
@@ -36,7 +37,7 @@ struct TestBuilding : Building
 	TestBuilding(int x, int y, Uint16 gid, Sint32 typeNum, Team* team, BuildingsTypes* types,
 	             Sint32 unitWorking, Sint32 unitWorkingFuture)
 		: Building(x, y, gid, typeNum, team, types, unitWorking, unitWorkingFuture) {}
-	bool hireOne() { return subscribeToBringMaterialsStep(); }
+	bool hireOne() { glob2test::publishCurrentHiringSuggestions(*owner->game);return subscribeToBringMaterialsStep(); }
 	void refreshCallLists() { updateCallLists(); }
 };
 
@@ -59,8 +60,7 @@ static void siteSpreadsItsFetchersAcrossBothResources()
 	const int siteX = 16, siteY = 16;
 	TestBuilding* site = new TestBuilding(siteX, siteY, Building::GIDfrom(0, 0), siteType, team,
 	                                      &globalContainer->buildingsTypes, 8, 8);
-	team->myBuildings[0] = site;
-	team->rebuildLiveLists();
+	team->attachBuilding(0, site);
 	game.map.setBuilding(siteX, siteY, type->width, type->height, site->gid);
 
 	// Wood right beside the site, stone across the map: the layout that made the
@@ -78,10 +78,9 @@ static void siteSpreadsItsFetchersAcrossBothResources()
 		// Spread candidates through the array, including its final slot.
 		const int slot = n * (Unit::MAX_COUNT - 1) / (workers - 1);
 		Unit* unit = new Unit(siteX - 2, siteY - 2 + (n % 5), slot, WORKER, team, 0);
-		team->myUnits[slot] = unit;
-		team->rebuildLiveLists();
-		unit->performance[WALK] = 10;
-		unit->performance[HARVEST] = 10;
+		team->attachUnit(slot, unit);
+		unit->setPerformance(WALK,10);
+		unit->setPerformance(HARVEST,10);
 		unit->activity = Unit::ACT_RANDOM;
 		unit->displacement = Unit::DIS_RANDOM;
 		unit->medical = Unit::MED_FREE;
@@ -90,6 +89,8 @@ static void siteSpreadsItsFetchersAcrossBothResources()
 
 	// Confirm the layout really is lopsided, so a pass here means the
 	// apportionment did the work and not an accidentally even map.
+	game.map.buildingGradient(site,0);
+	for (int material : {WOOD,STONE}) glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,material,0); });
 	int woodDistance = 0, stoneDistance = 0;
 	Unit* probe = team->myUnits[0];
 	require(game.map.materialAvailableSlot(0, WOOD, probe->swimClass(), probe->posX, probe->posY, &woodDistance),
@@ -136,12 +137,11 @@ static int hireOneOfTwo(int emptyX, int emptyY, int loadedX, int loadedY, int* e
 	const int siteX = 8, siteY = 8;
 	TestBuilding* site = new TestBuilding(siteX, siteY, Building::GIDfrom(0, 0), siteType, team,
 	                                      &globalContainer->buildingsTypes, 1, 1);
-	team->myBuildings[0] = site;
-	team->rebuildLiveLists();
+	team->attachBuilding(0, site);
 	game.map.setBuilding(siteX, siteY, type->width, type->height, site->gid);
 
 	// Stone only, so the apportionment has exactly one job to staff.
-	site->materials[WOOD] = type->maxMaterial[WOOD];
+	site->setMaterial(WOOD, type->maxMaterial[WOOD]);
 	require(site->neededMaterial(WOOD) == 0, "the site wants no more wood");
 	require(site->neededMaterial(STONE) > 0, "the site still wants stone");
 	require(game.map.incResourceByIndex(22, 9, STONE, 0), "seed the stone tile");
@@ -150,10 +150,9 @@ static int hireOneOfTwo(int emptyX, int emptyY, int loadedX, int loadedY, int* e
 	for (int n = 0; n < 2; ++n)
 	{
 		Unit* unit = new Unit(positions[n][0], positions[n][1], n, WORKER, team, 0);
-		team->myUnits[n] = unit;
-		team->rebuildLiveLists();
-		unit->performance[WALK] = 10;
-		unit->performance[HARVEST] = 10;
+		team->attachUnit(n, unit);
+		unit->setPerformance(WALK,10);
+		unit->setPerformance(HARVEST,10);
 		unit->activity = Unit::ACT_RANDOM;
 		unit->displacement = Unit::DIS_RANDOM;
 		unit->medical = Unit::MED_FREE;
@@ -166,6 +165,8 @@ static int hireOneOfTwo(int emptyX, int emptyY, int loadedX, int loadedY, int* e
 	require(site->neededMaterial(WHEAT) == 0, "the wheat is of no use here");
 
 	const int swimClass = team->myUnits[0]->swimClass();
+	game.map.buildingGradient(site,swimClass);
+	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,STONE,swimClass); });
 	for (int n = 0; n < 2; ++n)
 	{
 		Unit* unit = team->myUnits[n];

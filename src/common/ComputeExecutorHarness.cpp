@@ -20,10 +20,13 @@
 
 TEST_SUITE("ComputeExecutor")
 {
-TEST_CASE("automatic sizing respects platform limits and supports unknown CPU counts")
+TEST_CASE("automatic sizing adds an owner below four CPUs and respects platform limits")
 {
     CHECK(defaultComputeThreadCount(0) == 1);
-    CHECK(defaultComputeThreadCount(1) == 1);
+    CHECK(defaultComputeThreadCount(1) == 2);
+    CHECK(defaultComputeThreadCount(2) == 3);
+    CHECK(defaultComputeThreadCount(3) == 4);
+    CHECK(defaultComputeThreadCount(4) == 4);
 #ifdef __EMSCRIPTEN__
     CHECK(defaultComputeThreadCount(12) == 8);
     CHECK(defaultComputeThreadCount(128) == 8);
@@ -31,6 +34,14 @@ TEST_CASE("automatic sizing respects platform limits and supports unknown CPU co
     CHECK(defaultComputeThreadCount(12) == 12);
     CHECK(defaultComputeThreadCount(128) == 128);
 #endif
+}
+TEST_CASE("CPU availability provenance distinguishes affinity from hardware hints")
+{
+    CHECK(std::string(cpuAvailabilitySourceName(cpuAvailabilityObservation(32, 6))) == "affinity-mask");
+    const auto hinted = cpuAvailabilityObservation(32);
+    CHECK(std::string(cpuAvailabilitySourceName(hinted)) == "hardware-hint-only");
+    CHECK_FALSE(hinted.eligibleLogicalCpuCount.has_value());
+    CHECK(std::string(cpuAvailabilitySourceName(cpuAvailabilityObservation(0))) == "unknown");
 }
 TEST_CASE("thread configuration accepts auto and rejects malformed or overflowing overrides")
 {
@@ -41,6 +52,12 @@ TEST_CASE("thread configuration accepts auto and rejects malformed or overflowin
     CHECK(parseComputeThreadCount("128") == 128);
     CHECK(parseComputeThreadCount(std::to_string(std::numeric_limits<unsigned>::max())) == std::numeric_limits<unsigned>::max());
     CHECK(resolveComputeThreadCount(0, 0) == 1);
+    for (unsigned hardware : {1u, 2u, 3u, 4u})
+    {
+        CHECK(resolveComputeThreadCount(0, hardware) == (hardware < 4 ? hardware + 1 : hardware));
+        for (unsigned requested : {1u, 2u, 3u, 4u})
+            CHECK(resolveComputeThreadCount(requested, hardware) == requested);
+    }
 #ifdef __EMSCRIPTEN__
     CHECK(resolveComputeThreadCount(0, 128) == 8);
 #else
@@ -55,6 +72,7 @@ TEST_CASE("supported platforms execute jobs concurrently on distinct threads")
     if constexpr (GAGCore::ThreadSupport::available)
     {
         ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
         executor.configure(2);
         REQUIRE(executor.threadCount() == 2);
         std::atomic<unsigned> entered{0};
@@ -75,6 +93,7 @@ TEST_CASE("supported platforms execute jobs concurrently on distinct threads")
 TEST_CASE("exclusive slots; nested batches; reuse; errors; barriers and reconfiguration")
 {
 	ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
 	for (unsigned threads : {1, 2, 4, 8, 1})
 	{
 		executor.configure(threads);
@@ -135,6 +154,7 @@ TEST_CASE("deferred batches complete with lanes and isolated errors")
 	{
 		CAPTURE(threads);
 		ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
 		executor.configure(threads);
 		// Joining the newest batch first completes it; equal deadlines keep submission order.
 		Counter a, b, c;
@@ -209,6 +229,190 @@ TEST_CASE("deferred batches complete with lanes and isolated errors")
 		CHECK(executor.metrics().deferredBatches == 0); CHECK(executor.metrics().ownerJobs + executor.metrics().workerJobs == 0);
 	}
 }
+
+TEST_CASE("idle workers retain parallelism for independent and mixed lane groups")
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    for (const auto mode : {ComputeTelemetryMode::Off, ComputeTelemetryMode::Waits,
+                            ComputeTelemetryMode::Trace})
+    {
+        ComputeExecutor executor;
+        executor.configureTelemetry(mode);
+        for (unsigned participants : {3u, 5u})
+        {
+            CAPTURE(participants);
+            executor.configure(participants);
+            // Browser pools and failed worker creation can provide fewer workers.
+            // Keep the two-worker coverage, but do not claim the partial branch
+            // was exercised unless all four requested workers are available.
+            if (executor.threadCount() != participants) {
+                WARN("Requested worker pool unavailable; partial wake coverage skipped");
+                continue;
+            }
+            for (unsigned shape = 0; shape < 5; ++shape)
+            {
+                CAPTURE(mode); CAPTURE(shape);
+                struct Gate {
+                    std::atomic<unsigned> entered{0};
+                    std::atomic<bool> release{false};
+                    static void run(void* value, std::size_t) {
+                        auto& gate = *static_cast<Gate*>(value);
+                        ++gate.entered;
+                        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+                        while (!gate.release && std::chrono::steady_clock::now() < deadline)
+                            std::this_thread::yield();
+                    }
+                } gate;
+                // Let workers park between bursts. Held callbacks must enter in
+                // parallel before release: with four workers, two or three ready
+                // heads exercise partial wakeups rather than the broadcast path.
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                const ComputeExecutor::Job job{Gate::run, &gate};
+                std::array<ComputeExecutor::Group, 2> groups;
+                switch (shape) {
+                    case 0: groups = {{{2, job}, {0, job}}}; break;
+                    case 1: groups = {{{1, job, 4}, {1, job, 5}}}; break;
+                    case 2: groups = {{{2, job, 4}, {1, job, 5}}}; break;
+                    case 3: groups = {{{1, job, 4}, {1, job}}}; break;
+                    default: groups = {{{3, job}, {0, job}}}; break;
+                }
+                const unsigned runnable = shape == 4 ? 3u : 2u;
+                // The two-worker configuration cannot start three held jobs.
+                if (runnable >= executor.threadCount()) continue;
+                auto batch = executor.submit(groups, shape);
+                struct ReleaseAndJoin {
+                    Gate& gate;
+                    ComputeExecutor& executor;
+                    ComputeExecutor::Batch& batch;
+                    ~ReleaseAndJoin() {
+                        gate.release = true;
+                        try { executor.join(batch); } catch (...) {}
+                    }
+                } cleanup{gate, executor, batch};
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (gate.entered < runnable && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::yield();
+                CHECK(gate.entered >= runnable);
+                gate.release = true;
+                executor.join(batch);
+                CHECK(gate.entered == (shape == 2 || shape == 4 ? 3u : 2u));
+            }
+        }
+    }
+}
+
+TEST_CASE("repeated lane groups and empty groups preserve ordering and independent work")
+{
+    for (unsigned threads : {1u, 3u})
+    {
+        CAPTURE(threads);
+        ComputeExecutor executor;
+        executor.configure(threads);
+        struct State {
+            std::atomic<unsigned> entered{0}, active{0}, overlaps{0};
+            std::atomic<bool> release{false}, first{true};
+            std::mutex mutex;
+            std::vector<std::size_t> order;
+            static void wait(State& state) {
+                ++state.entered;
+                const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                while (!state.release && std::chrono::steady_clock::now() < deadline)
+                    std::this_thread::yield();
+            }
+            static void ordered(void* value, std::size_t index) {
+                auto& state = *static_cast<State*>(value);
+                if (state.active.fetch_add(1)) ++state.overlaps;
+                if (state.first.exchange(false)) wait(state);
+                { std::lock_guard lock(state.mutex); state.order.push_back(index); }
+                --state.active;
+            }
+            static void independent(void* value, std::size_t) { wait(*static_cast<State*>(value)); }
+        } state;
+        const ComputeExecutor::Job job{State::ordered, &state};
+        const std::array<ComputeExecutor::Group, 5> groups{{
+            {0, job, 4}, {2, job, 4}, {0, job, 4}, {2, job, 4},
+            {1, {State::independent, &state}}}};
+        // Serial fallback starts at join; threaded submission must expose both heads.
+        if (threads == 1 || !GAGCore::ThreadSupport::available) state.release = true;
+        auto batch = executor.submit(groups, 10);
+        if (!state.release)
+        {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (state.entered < 2 && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::yield();
+            CHECK(state.entered == 2);
+            state.release = true;
+        }
+        executor.join(batch);
+        CHECK(state.order == std::vector<std::size_t>{0, 1, 0, 1});
+        CHECK(state.overlaps == 0);
+        CHECK(state.entered == 2);
+        CHECK(executor.liveBatches() == 0);
+    }
+}
+
+TEST_CASE("external completion and continuation wake parked lane successors")
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    for (const auto mode : {ComputeTelemetryMode::Off, ComputeTelemetryMode::Waits,
+                            ComputeTelemetryMode::Trace})
+    {
+        ComputeExecutor executor;
+        executor.configureTelemetry(mode);
+        executor.configure(2);
+        for (bool resume : {false, true})
+        for (bool early : {false, true})
+        {
+            CAPTURE(mode); CAPTURE(resume); CAPTURE(early);
+            struct Suspended {
+                ComputeExecutor& executor;
+                std::mutex mutex;
+                std::condition_variable ready;
+                ComputeExecutor::CompletionTicket ticket;
+                std::atomic<bool> allowReturn{true};
+                static void run(void* value, std::size_t) {
+                    auto& state = *static_cast<Suspended*>(value);
+                    auto ticket = state.executor.defer();
+                    { std::lock_guard lock(state.mutex); state.ticket = std::move(ticket); }
+                    state.ready.notify_one();
+                    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+                    while (!state.allowReturn && std::chrono::steady_clock::now() < deadline)
+                        std::this_thread::yield();
+                }
+            } state{executor};
+            state.allowReturn = !early;
+            const ComputeExecutor::Group suspend{1, {Suspended::run, &state}, 7};
+            auto first = executor.submit(std::span(&suspend, 1), 10);
+            ComputeExecutor::CompletionTicket ticket;
+            {
+                std::unique_lock lock(state.mutex);
+                REQUIRE(state.ready.wait_for(lock, std::chrono::seconds(5), [&] { return bool(state.ticket); }));
+                ticket = state.ticket;
+            }
+            Counter continued, successor, unrelated;
+            const ComputeExecutor::Group next{3, {bump, &successor}, 7};
+            auto second = executor.submit(std::span(&next, 1), 11);
+            const ComputeExecutor::Group loose{1, {bump, &unrelated}};
+            auto other = executor.submit(std::span(&loose, 1), 11);
+            // The late case parks the worker after the callback returns. The
+            // early case resolves the ticket while its callback is still active.
+            if (!early)
+            {
+                executor.join(other);
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            CHECK(successor.value == 0);
+            CHECK_FALSE(executor.finished(first));
+            CHECK(resume ? ticket->resume({bump, &continued}) : ticket->complete());
+            state.allowReturn = true;
+            executor.join(other);
+            executor.join(first);
+            executor.join(second);
+            CHECK(continued.value == (resume ? 1 : 0));
+            CHECK(successor.value == 6);
+        }
+    }
+}
 }
 
 TEST_SUITE("ComputeExecutor")
@@ -238,6 +442,7 @@ TEST_CASE("lane groups run in index order and the horizon is bounded")
 	{
 		CAPTURE(threads);
 		ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
 		executor.configure(threads);
 		// Several jobs of one lane group are sequenced by their offsets.
 		Ordered ordered;
@@ -298,7 +503,8 @@ TEST_CASE("workers run deferred batches earliest due first and the owner only wa
 	for (unsigned threads : {3u, 5u})
 	{
 		CAPTURE(threads);
-		ComputeExecutor executor; executor.configure(threads);
+		ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(threads);
 		// Hold every worker on its own gate, queue a long deadline before short
 		// ones, then free one worker: it alone runs the three in claim order.
 		std::vector<std::unique_ptr<Hold>> gates;
@@ -331,7 +537,8 @@ TEST_CASE("workers run deferred batches earliest due first and the owner only wa
 TEST_CASE("without workers the owner runs the jobs due no later than the join")
 {
 	{
-		ComputeExecutor executor; executor.configure(1);
+		ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(1);
 		Trace trace;
 		Tagged late{&trace, 9}, soon{&trace, 3}, lane0{&trace, 10}, lane1{&trace, 11};
 		ComputeExecutor::Group lateGroup{1, {traced, &late}}, soonGroup{1, {traced, &soon}};
@@ -356,7 +563,8 @@ TEST_CASE("a lane keeps submission order: a lane job due before a live earlier o
 	for (unsigned threads : {1u, 3u})
 	{
 		CAPTURE(threads);
-		ComputeExecutor executor; executor.configure(threads);
+		ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(threads);
 		Trace lane; Busy others;
 		std::array<Tagged, 6> tags;
 		std::vector<ComputeExecutor::Batch> batches;
@@ -384,9 +592,9 @@ TEST_CASE("a lane keeps submission order: a lane job due before a live earlier o
 TEST_CASE("the slot count covers every producer's horizon")
 {
 	static_assert(ComputeExecutor::Slots >= (ComputeExecutor::AIHorizon + 1) + (ComputeExecutor::GradientHorizon + 1)
-		+ (ComputeExecutor::BuildingHorizon + 1) + (ComputeExecutor::GrowthHorizon + 1));
+		+ (ComputeExecutor::BuildingHorizon + 1) + (ComputeExecutor::GrowthHorizon + 1) + (ComputeExecutor::StatisticsHorizon + 1) + (ComputeExecutor::TurretHorizon + 1) + (ComputeExecutor::HiringHorizon + 1));
 	static_assert(ComputeExecutor::boundaryDue(7) < ComputeExecutor::advanceDue(7) && ComputeExecutor::advanceDue(7) < ComputeExecutor::boundaryDue(8));
-	CHECK(ComputeExecutor::Slots == 65);
+	CHECK(ComputeExecutor::Slots == 84);
 }
 }
 
@@ -395,6 +603,7 @@ TEST_SUITE("ReadOnlyPhase") {
 TEST_CASE("borrowed groups cover serial parallel empty and exception barriers") {
     for (unsigned threads : {1, 4}) {
         ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
         executor.configure(threads);
         ReadOnlyPhase empty;
         empty.run(executor);
@@ -429,6 +638,7 @@ TEST_CASE("presentation cannot delay simulation barriers with spare workers or r
     for (unsigned threads : {3u, 5u})
     {
         ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
         executor.configure(threads);
         std::atomic<bool> entered{false}, release{false}, ownerRan{false};
         const auto owner = std::this_thread::get_id();
@@ -468,6 +678,7 @@ TEST_CASE("with one worker the owner waits through its presentation chunk and ne
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
     ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
     executor.configure(2);
     std::atomic<bool> entered{false}, release{false}, ownerRan{false};
     const auto owner = std::this_thread::get_id();
@@ -515,6 +726,7 @@ TEST_CASE("presentation progresses before a continuous simulation backlog drains
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
     ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
     executor.configure(2);
     struct State { std::atomic<bool> entered{false}, release{false}; std::atomic<size_t> completed{0}; } state;
     ComputeExecutor::Group group{10000, {[](void* p, size_t index) {
@@ -541,6 +753,7 @@ TEST_CASE("presentation progresses before a continuous simulation backlog drains
 TEST_CASE("presentation replacement, chunk pumping, cancellation and errors retain no captures")
 {
     ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
     executor.configure(1);
     int count = 0;
     auto input = std::make_shared<int>(4);
@@ -576,6 +789,7 @@ TEST_CASE("presentation replacement, chunk pumping, cancellation and errors reta
 TEST_CASE("resumable presentation yields without advancing or retaining canceled inputs")
 {
     ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
     executor.configure(1);
     auto input=std::make_shared<int>(0);
     std::weak_ptr<int> weak=input;
@@ -609,6 +823,7 @@ TEST_CASE("worker only maintenance never uses the owner including creation failu
     };
     for(bool fail:{false,true}) {
         ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
         if(fail) executor.configure(8,[](auto)->std::thread {throw std::runtime_error("injected creation failure");});
         else executor.configure(1);
         REQUIRE(executor.threadCount()==1);
@@ -635,7 +850,8 @@ TEST_CASE("worker only maintenance yields to required jobs and cannot delay thei
             while(!release.load()) std::this_thread::yield(); // test-only held pass
         }
     };
-    ComputeExecutor executor; executor.configure(3); REQUIRE(executor.threadCount()==3);
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(3); REQUIRE(executor.threadCount()==3);
     std::atomic<unsigned> required{0},entered{0}; std::atomic<bool> release{false};
     struct Context {std::atomic<unsigned>& required;std::atomic<unsigned>& entered;std::atomic<bool>& release;} context{required,entered,release};
     const ComputeExecutor::Group first{2,{[](void* p,std::size_t){
@@ -661,7 +877,8 @@ TEST_CASE("worker only maintenance yields to required jobs and cannot delay thei
 TEST_CASE("suspended device work releases the only worker and preserves lane completion" * doctest::test_suite("ComputeExecutor"))
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
-    ComputeExecutor executor; executor.configure(2);
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(2);
     struct Context {
         ComputeExecutor& executor;
         std::mutex mutex;
@@ -696,7 +913,8 @@ TEST_CASE("suspended device work releases the only worker and preserves lane com
 TEST_CASE("early device failure resumes exactly once on the worker at its original lane position" * doctest::test_suite("ComputeExecutor"))
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
-    ComputeExecutor executor; executor.configure(2);
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(2);
     struct Context {
         ComputeExecutor& executor;
         std::atomic<unsigned> recovered{0}, successor{0};
@@ -727,7 +945,8 @@ TEST_CASE("early device failure resumes exactly once on the worker at its origin
 TEST_CASE("early asynchronous completion cannot release an invoking callback's inputs" * doctest::test_suite("ComputeExecutor"))
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
-    ComputeExecutor executor; executor.configure(2);
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(2);
     struct Context { ComputeExecutor& executor; std::atomic<bool> finishedInside{true}; } context{executor};
     const ComputeExecutor::Group group{1, {[](void* value, std::size_t) {
         auto& state = *static_cast<Context*>(value);
@@ -743,7 +962,8 @@ TEST_CASE("early asynchronous completion cannot release an invoking callback's i
 TEST_CASE("continuation of a nonzero lane-group index keeps its original sequence" * doctest::test_suite("ComputeExecutor"))
 {
     if constexpr (!GAGCore::ThreadSupport::available) return;
-    ComputeExecutor executor; executor.configure(2);
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(2);
     struct Context { ComputeExecutor& executor; std::vector<unsigned> order; } context{executor};
     const ComputeExecutor::Group group{3, {[](void* value,std::size_t index) {
         auto& state=*static_cast<Context*>(value);
@@ -764,7 +984,8 @@ TEST_CASE("retained completion tickets can be resolved after executor destructio
     if constexpr (!GAGCore::ThreadSupport::available) return;
     ComputeExecutor::CompletionTicket ticket;
     {
-        ComputeExecutor executor; executor.configure(2);
+        ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace); executor.configure(2);
         struct Context { ComputeExecutor& executor; ComputeExecutor::CompletionTicket& ticket; } context{executor,ticket};
         const ComputeExecutor::Group group{1,{[](void* value,std::size_t) {
             auto& state=*static_cast<Context*>(value);
@@ -773,4 +994,738 @@ TEST_CASE("retained completion tickets can be resolved after executor destructio
         auto batch=executor.submit(std::span(&group,1)); executor.join(batch);
     }
     CHECK_FALSE(ticket->complete());
+}
+
+TEST_CASE("graphics batches finish once, retain failures and release captures" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    for (unsigned threads : {1u, 2u, 5u})
+    {
+        ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+        executor.configure(threads);
+        auto retained = std::make_shared<int>(42);
+        std::weak_ptr<int> weak = retained;
+        std::array<std::atomic<unsigned>, 37> results{};
+        auto batch = executor.submitPresentationBatch(
+            results.size(), {2},
+            [&, retained](auto context)
+            {
+                ++results[context.index];
+                #if defined(__EMSCRIPTEN__)
+                // Browser presentation batches deliberately run on their owner,
+                // including builds with simulation workers.
+                CHECK(ComputeExecutor::workerSlot() == 0);
+#else
+                CHECK((ComputeExecutor::workerSlot() != 0 || executor.threadCount() == 1));
+#endif
+            });
+        retained.reset();
+        executor.finishPresentationBatch(batch);
+        executor.finishPresentationBatch(batch);
+        CHECK(batch.status() == ComputeExecutor::Presentation::Status::Complete);
+        CHECK(weak.expired());
+        for (const auto &result : results)
+            CHECK(result.load() == 1);
+        auto empty = executor.submitPresentationBatch(0, {2}, {});
+        CHECK(empty.finished());
+        executor.finishPresentationBatch(empty);
+        auto bad = executor.submitPresentationBatch(
+            8, {2}, [](auto) { throw std::runtime_error("graphics error"); });
+        CHECK_THROWS_WITH_AS(executor.finishPresentationBatch(bad), "graphics error",
+                             std::runtime_error);
+        CHECK(bad.finished());
+        CHECK_THROWS_WITH_AS(bad.rethrowFailure(), "graphics error", std::runtime_error);
+    }
+}
+TEST_CASE(
+    "serial graphics finish never pumps scene or required work and abandonment releases captures" *
+    doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    unsigned scene = 0, simulation = 0, graphics = 0;
+    auto preparation = executor.submitPresentation(3, [&](auto) { ++scene; });
+    ComputeExecutor::Group group{
+        3, {[](void *p, std::size_t) { ++*static_cast<unsigned *>(p); }, &simulation}};
+    auto required = executor.submit(std::span(&group, 1));
+    auto batch = executor.submitPresentationBatch(3, {2}, [&](auto) { ++graphics; });
+    executor.finishPresentationBatch(batch);
+    CHECK(graphics == 3);
+    CHECK(scene == 0);
+    CHECK(simulation == 0);
+    auto capture = std::make_shared<int>(1);
+    std::weak_ptr<int> weak = capture;
+    {
+        auto abandoned = executor.submitPresentationBatch(3, {2}, [capture](auto) {});
+        capture.reset();
+    }
+    CHECK(weak.expired());
+    executor.join(required);
+    executor.cancelPresentationAndWait();
+}
+TEST_CASE("graphics cancellation drains claimed work and reconfiguration releases inputs" *
+          doctest::test_suite("ComputeExecutor"))
+{
+#ifndef __EMSCRIPTEN__
+    ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(4);
+    std::mutex mutex;
+    std::condition_variable changed;
+    unsigned entered = 0;
+    bool release = false;
+    auto retained = std::make_shared<int>(7);
+    std::weak_ptr<int> weak = retained;
+    auto batch = executor.submitPresentationBatch(50, {2},
+                                                  [&, retained](auto context)
+                                                  {
+                                                      std::unique_lock lock(mutex);
+                                                      ++entered;
+                                                      changed.notify_all();
+                                                      changed.wait(lock, [&] { return release; });
+                                                      CHECK(context.cancellation.canceled());
+                                                  });
+    retained.reset();
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered == 2; }));
+    }
+    batch.cancel();
+    CHECK_FALSE(batch.finished());
+    CHECK_FALSE(weak.expired());
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    changed.notify_all();
+    executor.finishPresentationBatch(batch);
+    CHECK(entered == 2);
+    CHECK(weak.expired());
+    CHECK(batch.status() == ComputeExecutor::Presentation::Status::Canceled);
+    // A pending batch with no workers is canceled by reconfiguration.
+    executor.configure(1);
+    retained = std::make_shared<int>(9);
+    weak = retained;
+    auto pending = executor.submitPresentationBatch(3, {2}, [retained](auto) {});
+    retained.reset();
+    executor.configure(3);
+    CHECK(pending.finished());
+    CHECK(weak.expired());
+#endif
+}
+TEST_CASE("both presentation classes progress during required lane backlog" *
+          doctest::test_suite("ComputeExecutor"))
+{
+#ifndef __EMSCRIPTEN__
+    ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(2);
+    std::atomic<unsigned> required{0}, scene{0}, graphics{0};
+    std::atomic<bool> sceneEarly{false}, graphicsEarly{false};
+    ComputeExecutor::Group group{
+        512,
+        {[](void *p, std::size_t) { ++*static_cast<std::atomic<unsigned> *>(p); }, &required},
+        3};
+    // Hold the sole worker until all three classes are admitted.
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool entered = false, release = false;
+    ComputeExecutor::Group gate{1,
+                                {[](void *p, std::size_t)
+                                 {
+                                     auto &invoke = *static_cast<std::function<void()> *>(p);
+                                     invoke();
+                                 },
+                                 nullptr}};
+    std::function<void()> hold = [&]
+    {
+        std::unique_lock lock(mutex);
+        entered = true;
+        changed.notify_all();
+        changed.wait(lock, [&] { return release; });
+    };
+    gate.job.context = &hold;
+    auto held = executor.submit(std::span(&gate, 1));
+    {
+        std::unique_lock lock(mutex);
+        REQUIRE(changed.wait_for(lock, std::chrono::seconds(5), [&] { return entered; }));
+    }
+    auto simulation = executor.submit(std::span(&group, 1));
+    auto preparation = executor.submitPresentation(4,
+                                                   [&](auto)
+                                                   {
+                                                       if (required.load() < 512)
+                                                           sceneEarly.store(true);
+                                                       ++scene;
+                                                   });
+    auto batch = executor.submitPresentationBatch(4, {2},
+                                                  [&](auto)
+                                                  {
+                                                      if (required.load() < 512)
+                                                          graphicsEarly.store(true);
+                                                      ++graphics;
+                                                  });
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    changed.notify_all();
+    executor.finishPresentationBatch(batch);
+    executor.join(held);
+    executor.join(simulation);
+    executor.cancelPresentationAndWait();
+    CHECK(graphics == 4);
+    CHECK(scene > 0);
+    CHECK(sceneEarly.load());
+    CHECK(graphicsEarly.load());
+#endif
+}
+TEST_CASE("graphics callback barriers are rejected and completed tickets do not pump newer work" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    auto first = executor.submitPresentationBatch(
+        1, {2},
+        [&](auto)
+        {
+            auto empty = ComputeExecutor::PresentationBatchTicket{};
+            CHECK_THROWS_AS(executor.finishPresentationBatch(empty), std::logic_error);
+            CHECK_THROWS_AS(executor.configure(1), std::logic_error);
+            CHECK_THROWS_AS(executor.submitPresentationBatch(0, {2}, {}), std::logic_error);
+        });
+    executor.finishPresentationBatch(first);
+    first.cancel();
+    CHECK(first.status() == ComputeExecutor::Presentation::Status::Complete);
+    unsigned ran = 0;
+    auto second = executor.submitPresentationBatch(2, {2}, [&](auto) { ++ran; });
+    executor.finishPresentationBatch(first);
+    CHECK(ran == 0);
+    ComputeExecutor other;
+    CHECK_THROWS_AS(other.finishPresentationBatch(second), std::logic_error);
+    executor.finishPresentationBatch(second);
+    CHECK(ran == 2);
+}
+TEST_CASE("empty graphics submissions bypass occupied admission and concurrency metrics respect "
+          "ceilings" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    auto pending = executor.submitPresentationBatch(2, {1}, [](auto) {});
+    auto empty = executor.submitPresentationBatch(0, {2}, {});
+    CHECK(empty.finished());
+    executor.finishPresentationBatch(empty);
+    CHECK_FALSE(pending.finished());
+    executor.finishPresentationBatch(pending);
+    CHECK(executor.graphicsMetrics().parallelBatches == 0);
+    for (unsigned threads : {2u, 4u})
+    {
+        executor.configure(threads);
+        auto one = executor.submitPresentationBatch(10, {1}, [](auto) {});
+        executor.finishPresentationBatch(one);
+        CHECK(executor.graphicsMetrics().parallelBatches == 0);
+    }
+    ComputeExecutor::PresentationBatchTicket retained;
+    auto input = std::make_shared<int>(1);
+    std::weak_ptr<int> weak = input;
+    {
+        ComputeExecutor retired;
+        retained = retired.submitPresentationBatch(4, {2}, [input](auto) {});
+        input.reset();
+    }
+    CHECK(retained.finished());
+    CHECK(weak.expired());
+}
+TEST_CASE("graphics capture destruction can inspect scheduler metrics before completion" * doctest::test_suite("ComputeExecutor"))
+{
+    for(unsigned threads : {1u,4u}) {
+        ComputeExecutor executor;
+        executor.configureTelemetry(ComputeTelemetryMode::Trace);executor.configure(threads);
+        std::atomic<bool> released{false};
+        auto capture=std::shared_ptr<int>(new int(1),[&](int* value) {
+            const auto metrics=executor.graphicsMetrics();
+            CHECK(metrics.jobs==1);
+            released.store(true);delete value;
+        });
+        auto batch=executor.submitPresentationBatch(1,{2},[capture](auto){});capture.reset();
+        executor.finishPresentationBatch(batch);CHECK(released.load());
+    }
+}
+
+TEST_SUITE("ComputeExecutor")
+{
+namespace {
+struct TelemetryCounter { std::atomic<int> value{0}; };
+void telemetryBump(void* context, std::size_t index) { static_cast<TelemetryCounter*>(context)->value.fetch_add(int(index)+1); }
+std::atomic<std::uint64_t> diagnosticTime{0};
+std::uint64_t diagnosticClock() noexcept { return diagnosticTime.fetch_add(10); }
+std::promise<void>* inspected = nullptr;
+std::atomic<unsigned> waitClockReads{0};
+std::uint64_t waitClock() noexcept {
+    const auto read = waitClockReads.fetch_add(1);
+    if (read == 2) inspected->set_value();
+    return read*10;
+}
+struct TelemetryGate {
+    std::promise<void> entered, release;
+    std::shared_future<void> released = release.get_future().share();
+    static void run(void* context, std::size_t) {
+        auto& gate = *static_cast<TelemetryGate*>(context);
+        gate.entered.set_value(); gate.released.wait();
+    }
+};
+const ComputeTelemetry::JoinSummary& summary(const ComputeTelemetry::Snapshot& s, ComputeProducer producer, JoinReason reason) {
+    return s.summary.joins[unsigned(producer)][unsigned(reason)];
+}
+}
+TEST_CASE("disabled diagnostics do not read the injected clock or collect counters")
+{
+    diagnosticTime = 0;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Off, 0, diagnosticClock);
+    for (unsigned threads : {1u, 3u}) {
+        executor.configure(threads);
+        TelemetryCounter counter;
+        ComputeExecutor::Group group{7, {telemetryBump, &counter}};
+        auto batch = executor.submit(std::span(&group, 1), 3, {ComputeProducer::Hiring, 1, 3});
+        executor.join(batch, {JoinReason::TickDeadline, 3});
+        executor.run(9, [](auto) {});
+        executor.advancingTick(3);
+        CHECK(counter.value == 28);
+        CHECK(executor.metrics().deferredJobs == 0);
+        CHECK(executor.activeNs() == 0);
+        CHECK_FALSE(executor.telemetrySnapshot().available);
+    }
+    CHECK(diagnosticTime == 0);
+}
+TEST_CASE("owner execution, stale handles, reuse and lifecycle attribution use one locked inspection")
+{
+    diagnosticTime = 0;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Waits, 0, diagnosticClock);
+    TelemetryCounter counter;
+    ComputeExecutor::Group group{1, {telemetryBump, &counter}};
+    auto batch = executor.submit(std::span(&group, 1), 4, {ComputeProducer::Hiring, 1, 2});
+    auto stale = batch;
+    executor.join(batch, {JoinReason::TickDeadline, 2});
+    auto snapshot = executor.telemetrySnapshot();
+    const auto& value = summary(snapshot, ComputeProducer::Hiring, JoinReason::TickDeadline);
+    CHECK(value.joined == 1); CHECK(value.incomplete == 1);
+    CHECK(value.ownerExecutions == 1); CHECK(value.backgroundAttempts == 0);
+    CHECK(value.lock.totalNs == 10); CHECK(value.owner.totalNs == 10); CHECK(value.total.totalNs == 40);
+    CHECK(value.owner.histogram[4] == 1);
+    auto reused = executor.submit(std::span(&group, 1), 5, {ComputeProducer::Mixed, 2, 3});
+    executor.join(stale, {JoinReason::TickDeadline, 2});
+    CHECK(stale.empty());
+    for (auto reason : {JoinReason::Save, JoinReason::Verification, JoinReason::Reconfigure, JoinReason::Teardown}) {
+        executor.join(reused, {reason, ComputeTelemetry::NoTick});
+        CHECK(summary(executor.telemetrySnapshot(), ComputeProducer::Mixed, reason).joined == 1);
+        reused = executor.submit(std::span(&group, 1), 5, {ComputeProducer::Mixed, 2, 3});
+    }
+    executor.joinAll();
+    snapshot = executor.telemetrySnapshot();
+    CHECK(summary(snapshot, ComputeProducer::Hiring, JoinReason::TickDeadline).joined == 1);
+    CHECK(snapshot.summary.backgroundTicks == 0);
+    executor.resetTelemetry();
+    CHECK(summary(executor.telemetrySnapshot(), ComputeProducer::Hiring, JoinReason::TickDeadline).joined == 0);
+}
+TEST_CASE("worker waits aggregate distinct ticks globally and per producer without worker timing")
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    ComputeExecutor executor;
+    executor.configure(2);
+    executor.configureTelemetry(ComputeTelemetryMode::Waits, 0, waitClock);
+    for (auto producer : {ComputeProducer::Hiring, ComputeProducer::Hiring, ComputeProducer::PeriodicGradient}) {
+        TelemetryGate gate;
+        std::promise<void> inspection; inspected = &inspection; waitClockReads = 0;
+        auto inspectionDone = inspection.get_future();
+        ComputeExecutor::Group group{1, {TelemetryGate::run, &gate}};
+        auto batch = executor.submit(std::span(&group, 1), 20, {producer, 1, 10});
+        gate.entered.get_future().wait();
+        std::thread release([&] { inspectionDone.wait(); gate.release.set_value(); });
+        executor.join(batch, {JoinReason::TickDeadline, 10}); release.join();
+    }
+    executor.advancingTick(10); executor.advancingTick(10); executor.advancingTick(11);
+    const auto snapshot = executor.telemetrySnapshot();
+    CHECK(snapshot.summary.backgroundTicks == 1);
+    CHECK(snapshot.summary.affectedTicks[unsigned(ComputeProducer::Hiring)] == 1);
+    CHECK(snapshot.summary.affectedTicks[unsigned(ComputeProducer::PeriodicGradient)] == 1);
+    CHECK(snapshot.summary.advancingTicks == 2);
+    CHECK(snapshot.summary.tickBackground.samples == 1);
+    CHECK(summary(snapshot, ComputeProducer::Hiring, JoinReason::TickDeadline).backgroundAttempts == 2);
+    CHECK(executor.activeNs() == 0);
+    CHECK(executor.metrics().workerJobs == 0);
+}
+TEST_CASE("complete joins and trace overflow remain valid and snapshots require drain")
+{
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace, sizeof(ComputeTelemetry::Event)*2);
+    TelemetryCounter counter;
+    ComputeExecutor::Group group{1, {telemetryBump, &counter}};
+    auto first = executor.submit(std::span(&group, 1), 1, {ComputeProducer::AI, 0, 1});
+    auto second = executor.submit(std::span(&group, 1), 2, {ComputeProducer::ResourceGrowth, 0, 1});
+    CHECK_THROWS_AS(executor.telemetrySnapshot(true), std::logic_error);
+    executor.join(second, {JoinReason::TickDeadline, 1}); // Owner executes both in deadline order.
+    executor.join(first, {JoinReason::TickDeadline, 1});
+    auto snapshot = executor.telemetrySnapshot(true);
+    CHECK(summary(snapshot, ComputeProducer::AI, JoinReason::TickDeadline).incomplete == 0);
+    std::uint64_t lost = 0; for (const auto& stream : snapshot.streams) lost += stream.lost;
+    CHECK(lost > 0);
+    CHECK(snapshot.traceBytes <= sizeof(ComputeTelemetry::Event)*2);
+    std::ostringstream out; ComputeTelemetry::writeJson(out, snapshot);
+    CHECK(out.str().find("\"lost_events\"") != std::string::npos);
+    executor.resetTelemetry();
+    snapshot = executor.telemetrySnapshot(true);
+    for (const auto& stream : snapshot.streams) { CHECK(stream.used == 0); CHECK(stream.lost == 0); }
+}
+TEST_CASE("trace preserves early external resolution and continuation callback ordering")
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    ComputeExecutor executor;
+    executor.configure(2); executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    struct Work {
+        ComputeExecutor& executor;
+        static void continuation(void*, std::size_t) {}
+        static void run(void* context, std::size_t) {
+            auto& work = *static_cast<Work*>(context);
+            auto ticket = work.executor.defer();
+            REQUIRE(ticket->resume({continuation, nullptr})); // Resolution precedes callback return.
+        }
+    } work{executor};
+    ComputeExecutor::Group group{1, {Work::run, &work}, 2};
+    auto batch = executor.submit(std::span(&group, 1), 8, {ComputeProducer::PeriodicGradient, 1, 4});
+    executor.join(batch, {JoinReason::TickDeadline, 4});
+    const auto snapshot = executor.telemetrySnapshot(true);
+    unsigned starts = 0, ends = 0, completes = 0, suspensions = 0, resolutions = 0, runnable = 0;
+    for (const auto& stream : snapshot.streams) for (std::size_t i=0; i<stream.used; ++i) {
+        const auto& event = stream.storage[i];
+        CHECK(event.producer == ComputeProducer::PeriodicGradient);
+        CHECK(event.serial != 0);
+        if (event.kind == ComputeTelemetry::EventKind::CallbackStart) ++starts;
+        if (event.kind == ComputeTelemetry::EventKind::CallbackEnd) ++ends;
+        if (event.kind == ComputeTelemetry::EventKind::Complete) ++completes;
+        if (event.kind == ComputeTelemetry::EventKind::Suspend) ++suspensions;
+        if (event.kind == ComputeTelemetry::EventKind::ExternalResolution) ++resolutions;
+        if (event.kind == ComputeTelemetry::EventKind::Runnable) ++runnable;
+    }
+    CHECK(starts == 2); CHECK(ends == 2); CHECK(completes == 1);
+    CHECK(suspensions == 1); CHECK(resolutions == 1); CHECK(runnable == 1);
+}
+}
+
+TEST_SUITE("ComputeExecutor")
+{
+TEST_CASE("trace storage allocation failure downgrades without losing required work")
+{
+    // On a 32-bit address space this budget can approach real addressable
+    // memory rather than fail immediately; avoid exhausting the test host.
+    if constexpr (sizeof(std::size_t) < 8) return;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace, std::numeric_limits<std::size_t>::max());
+    CHECK(executor.telemetryMode() == ComputeTelemetryMode::Waits);
+    CHECK(executor.telemetrySnapshot().available);
+    CHECK(executor.telemetrySnapshot().requested == ComputeTelemetryMode::Trace);
+    int value = 0;
+    executor.run(1, [&](auto) { ++value; }, {ComputeProducer::Hiring, 0, 0}, {JoinReason::Verification, ComputeTelemetry::NoTick});
+    CHECK(value == 1);
+    CHECK(executor.telemetrySnapshot().summary.joins[unsigned(ComputeProducer::Hiring)][unsigned(JoinReason::Verification)].joined == 1);
+}
+TEST_CASE("blocking fork join failures and presentation remain traced without entering tick waits")
+{
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    CHECK_THROWS_AS(executor.run(1, [](auto) { throw std::runtime_error("failure"); },
+        {ComputeProducer::Other, 0, 0}, {JoinReason::Save, ComputeTelemetry::NoTick}), std::runtime_error);
+    auto ticket = executor.submitPresentation(2, [](auto) {});
+    while (executor.pumpPresentation()) {}
+    CHECK(ticket->finished());
+    const auto snapshot = executor.telemetrySnapshot(true);
+    CHECK(snapshot.summary.backgroundTicks == 0);
+    CHECK(snapshot.summary.joins[unsigned(ComputeProducer::Other)][unsigned(JoinReason::Save)].joined == 1);
+    unsigned presentationEnds=0, runEnds=0;
+    for (const auto& stream:snapshot.streams) for (std::size_t i=0; i<stream.used; ++i) {
+        const auto& event=stream.storage[i];
+        if(event.kind==ComputeTelemetry::EventKind::CallbackEnd) {
+            if(event.executionKind==1) ++runEnds;
+            if(event.executionKind==2) ++presentationEnds;
+        }
+    }
+    CHECK(runEnds == 1); CHECK(presentationEnds == 2);
+}
+}
+
+TEST_CASE("graphics diagnostics are optional and waits mode attributes the owner barrier" * doctest::test_suite("ComputeExecutor"))
+{
+    for (auto mode : {ComputeTelemetryMode::Off, ComputeTelemetryMode::Waits, ComputeTelemetryMode::Trace}) {
+        ComputeExecutor executor;
+        executor.configureTelemetry(mode);
+        auto ticket = executor.submitPresentationBatch(3, {2}, [](auto) {});
+        if (mode == ComputeTelemetryMode::Trace) CHECK_THROWS_AS(executor.telemetrySnapshot(true), std::logic_error);
+        executor.finishPresentationBatch(ticket, {JoinReason::Verification, ComputeTelemetry::NoTick});
+        executor.finishPresentationBatch(ticket, {JoinReason::Verification, ComputeTelemetry::NoTick});
+        const auto snapshot = executor.telemetrySnapshot(mode == ComputeTelemetryMode::Trace);
+        const auto& summary = snapshot.summary.joins[unsigned(ComputeProducer::Presentation)][unsigned(JoinReason::Verification)];
+        CHECK(summary.joined == (mode == ComputeTelemetryMode::Off ? 0 : 1));
+        CHECK(summary.ownerExecutions == (mode == ComputeTelemetryMode::Off ? 0 : 1));
+        CHECK(executor.graphicsMetrics().jobs == (mode == ComputeTelemetryMode::Trace ? 3 : 0));
+        CHECK(snapshot.summary.backgroundTicks == 0);
+    }
+}
+
+TEST_CASE("yielded presentation chunks keep callback indices paired" * doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    unsigned attempts = 0;
+    auto ticket = executor.submitResumablePresentation(2, [&](std::size_t index) { return index == 0 || ++attempts > 1; });
+    while (executor.pumpPresentation()) {}
+    CHECK(ticket->finished());
+    auto snapshot = executor.telemetrySnapshot(true);
+    std::array<unsigned,2> starts{}, ends{};
+    for (const auto& stream : snapshot.streams) for(std::size_t i=0;i<stream.used;++i) {
+        const auto& event = stream.storage[i];
+        if(event.kind==ComputeTelemetry::EventKind::CallbackStart) ++starts.at(event.job);
+        if(event.kind==ComputeTelemetry::EventKind::CallbackEnd) ++ends.at(event.job);
+    }
+    CHECK(starts == ends); CHECK(starts[0] == 1); CHECK(starts[1] == 2);
+}
+TEST_CASE("worker-only maintenance is traced as other work without a required join" * doctest::test_suite("ComputeExecutor"))
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    struct Service : ComputeExecutor::WorkerOnly {
+        std::atomic<bool> needs{true};
+        std::promise<void> completed;
+        std::shared_ptr<std::promise<void>> retired;
+        explicit Service(std::shared_ptr<std::promise<void>> retired) : retired(std::move(retired)) {}
+        ~Service() override { retired->set_value(); }
+        bool pending() const noexcept override { return needs.load(); }
+        void process() noexcept override { needs=false; completed.set_value(); }
+    };
+    ComputeExecutor executor;
+    executor.configure(3); executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    auto retired = std::make_shared<std::promise<void>>();
+    auto retiredFuture = retired->get_future();
+    auto service = std::make_shared<Service>(retired);
+    executor.setWorkerOnly(service); service->completed.get_future().wait();
+    executor.setWorkerOnly({}); service.reset();
+    // The worker's retained service is released after its locked trace events.
+    retiredFuture.wait();
+    const auto snapshot = executor.telemetrySnapshot(true);
+    unsigned ends=0;
+    for(const auto& stream:snapshot.streams) for(std::size_t i=0;i<stream.used;++i) {
+        const auto& event=stream.storage[i];
+        if(event.executionKind==4 && event.kind==ComputeTelemetry::EventKind::CallbackEnd) {
+            CHECK(event.producer==ComputeProducer::Other); ++ends;
+        }
+    }
+    CHECK(ends == 1); CHECK(snapshot.summary.backgroundTicks == 0);
+}
+
+TEST_CASE("session reset suppresses a returning maintenance interval from the previous epoch" * doctest::test_suite("ComputeExecutor"))
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    struct Service : ComputeExecutor::WorkerOnly {
+        std::atomic<bool> needs{true};
+        std::promise<void> entered, release;
+        std::shared_future<void> released = release.get_future().share();
+        std::shared_ptr<std::promise<void>> retired;
+        explicit Service(std::shared_ptr<std::promise<void>> retired) : retired(std::move(retired)) {}
+        ~Service() override { retired->set_value(); }
+        bool pending() const noexcept override { return needs.load(); }
+        void process() noexcept override { needs=false; entered.set_value(); released.wait(); }
+    };
+    ComputeExecutor executor;
+    executor.configure(3); executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    auto retired = std::make_shared<std::promise<void>>(); auto retiredFuture = retired->get_future();
+    auto service = std::make_shared<Service>(retired);
+    executor.setWorkerOnly(service); service->entered.get_future().wait();
+    executor.resetTelemetry();
+    CHECK(executor.telemetrySnapshot(true).traceCoverageGap);
+    service->release.set_value(); executor.setWorkerOnly({}); service.reset(); retiredFuture.wait();
+    const auto snapshot=executor.telemetrySnapshot(true);
+    for(const auto& stream:snapshot.streams) CHECK(stream.used==0);
+    CHECK(snapshot.traceCoverageGap); CHECK_FALSE(snapshot.traceOpenWork);
+}
+
+TEST_CASE("synchronous graphics adapter keeps empty calls idle and guards owner callbacks" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(1);
+    executor.executePresentationJobs(0, {});
+    CHECK(executor.graphicsMetrics().batches == 0);
+    const auto owner = std::this_thread::get_id();
+    executor.executePresentationJobs(1, [&](std::size_t index)
+    {
+        CHECK(index == 0);
+        CHECK(std::this_thread::get_id() == owner);
+        CHECK(ComputeExecutor::workerSlot() == 0);
+        CHECK_THROWS_AS(executor.configure(1), std::logic_error);
+        CHECK_THROWS_AS(executor.executePresentationJobs(0, {}), std::logic_error);
+        CHECK_THROWS_AS(executor.submitPresentationBatch(0, {2}, {}), std::logic_error);
+        auto empty = ComputeExecutor::PresentationBatchTicket{};
+        CHECK_THROWS_AS(executor.finishPresentationBatch(empty), std::logic_error);
+    });
+    const auto metrics = executor.graphicsMetrics();
+    CHECK(metrics.batches == 1);
+    CHECK(metrics.jobs == 1);
+    CHECK(metrics.parallelBatches == 0);
+    CHECK(metrics.waitNs >= metrics.activeNs);
+    auto admitted = executor.submitPresentationBatch(1, {2}, [](auto) {});
+    CHECK_THROWS_WITH_AS(executor.executePresentationJobs(1, [](auto) {}),
+                         "Graphics batch already admitted", std::logic_error);
+    CHECK(executor.graphicsMetrics().jobs == 1);
+    executor.finishPresentationBatch(admitted);
+}
+TEST_CASE("graphics adapter restores callback state on failure and never pumps other work" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    unsigned scene = 0, required = 0, graphics = 0;
+    auto preparation = executor.submitPresentation(1, [&](auto) { ++scene; });
+    ComputeExecutor::Group group{
+        1, {[](void *value, std::size_t) { ++*static_cast<unsigned *>(value); }, &required}};
+    auto pending = executor.submit(std::span(&group, 1));
+    CHECK_THROWS_WITH_AS(executor.executePresentationJobs(5, [&](std::size_t index)
+    {
+        ++graphics;
+        CHECK(ComputeExecutor::workerSlot() == 0);
+        if (index == 1) throw std::runtime_error("adapter failure");
+    }), "adapter failure", std::runtime_error);
+    CHECK(graphics == 2);
+    CHECK(scene == 0);
+    CHECK(required == 0);
+    CHECK(executor.graphicsMetrics().jobs == 2);
+    executor.executePresentationJobs(2, [&](auto) { ++graphics; });
+    CHECK(graphics == 4);
+    executor.join(pending);
+    CHECK(required == 1);
+    executor.cancelPresentationAndWait();
+    executor.configure(2);
+#ifdef __EMSCRIPTEN__
+    const auto owner = std::this_thread::get_id();
+    executor.executePresentationJobs(3, [&](auto)
+    {
+        CHECK(std::this_thread::get_id() == owner);
+        CHECK_THROWS_AS(executor.configure(1), std::logic_error);
+    });
+#endif
+}
+TEST_CASE("synchronous graphics cancellation rejects incomplete output after draining" *
+          doctest::test_suite("ComputeExecutor"))
+{
+#ifndef __EMSCRIPTEN__
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(2);
+    std::promise<void> entered, release;
+    auto enteredFuture = entered.get_future();
+    auto released = release.get_future();
+    auto scene = executor.submitPresentation(1, [&](auto)
+    {
+        entered.set_value();
+        // A bounded wait also lets a failed assertion retire the executor.
+        released.wait_for(std::chrono::seconds(5));
+    });
+    REQUIRE(enteredFuture.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    std::atomic<unsigned> drawn{0};
+    std::atomic<bool> admitted{false};
+    std::thread reconfigure([&]
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (executor.graphicsMetrics().batches == 0 &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        admitted.store(executor.graphicsMetrics().batches == 1);
+        // The only worker is in scene preparation, so this cancels the pending
+        // raster batch. Its owner must wake before scene preparation is released.
+        executor.configure(1);
+    });
+    CHECK_THROWS_WITH_AS(executor.executePresentationJobs(3, [&](auto) { ++drawn; }),
+                         "Synchronous graphics batch was canceled", std::runtime_error);
+    CHECK(admitted.load());
+    CHECK(drawn.load() == 0);
+    CHECK_FALSE(scene->finished());
+    release.set_value();
+    reconfigure.join();
+    // Cancellation must leave no occupied graphics admission or callback state.
+    executor.executePresentationJobs(2, [&](auto) { ++drawn; });
+    CHECK(drawn.load() == 2);
+#endif
+}
+TEST_CASE("graphics adapter preserves occupied admission and serial finish shares the scene cap" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(2);
+    std::atomic<bool> sceneEntered{false}, releaseScene{false}, sceneInside{false}, overlap{false};
+    auto scene = executor.submitPresentation(1, [&](auto)
+    {
+        sceneInside.store(true);
+        sceneEntered.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!releaseScene.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        sceneInside.store(false);
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!sceneEntered.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(sceneEntered.load());
+    auto admitted = executor.submitPresentationBatch(3, {1}, [&](auto)
+    {
+        if (sceneInside.load()) overlap.store(true);
+    });
+    CHECK_THROWS_WITH_AS(executor.executePresentationJobs(1, [](auto) {}),
+                         "Graphics batch already admitted", std::logic_error);
+    std::thread release([&]
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        releaseScene.store(true);
+    });
+    executor.finishPresentationBatch(admitted);
+    release.join();
+    CHECK_FALSE(overlap.load());
+    CHECK(scene->finished());
+    CHECK(executor.graphicsMetrics().jobs == 3);
+}
+TEST_CASE("canceling a slot-blocked graphics batch wakes its owner before scene completion" *
+          doctest::test_suite("ComputeExecutor"))
+{
+    if constexpr (!GAGCore::ThreadSupport::available) return;
+    ComputeExecutor executor;
+    executor.configureTelemetry(ComputeTelemetryMode::Trace);
+    executor.configure(2);
+    std::atomic<bool> sceneEntered{false}, releaseScene{false};
+    auto scene = executor.submitPresentation(1, [&](auto)
+    {
+        sceneEntered.store(true);
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!releaseScene.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+    });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!sceneEntered.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    REQUIRE(sceneEntered.load());
+    auto admitted = executor.submitPresentationBatch(3, {1}, [](auto) {});
+    std::thread cancel([&]
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        admitted.cancel();
+    });
+    executor.finishPresentationBatch(admitted);
+    cancel.join();
+    CHECK(admitted.status() == ComputeExecutor::Presentation::Status::Canceled);
+    CHECK_FALSE(scene->finished());
+    CHECK(executor.graphicsMetrics().jobs == 0);
+    releaseScene.store(true);
+    executor.cancelPresentationAndWait();
 }

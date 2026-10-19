@@ -147,10 +147,10 @@ Game options:
 | `--experiment KEY` | Repeatable [experimental feature](../features/experimental-features.md) baked into a new game, e.g. `guard-area-balancing`; the profile's settings never apply to structured runs; forbidden when loading a save. Listed in `result.json` under `resolved.experiments` |
 | `--rule name=value` | Repeatable custom rules, using the names and ranges in [headless rules](../development/headless-replays.md#glob2_test_rules). New games only; effective values are recorded in `resolved.rules`. Tournament game configurations accept the equivalent `rules` object, e.g. `{"noUpgrades": 1, "peaceful": 1}` |
 | `--ticks N` | Absolute tick limit, default 90000; must exceed saved tick |
-| `--compute-threads auto\|N` | Shared executor participants including the owner; default `auto` uses reported logical CPUs; explicit N is a positive unsigned integer |
+| `--compute-threads auto\|N` | Shared executor participants including the owner; native `auto` prefers eligible physical cores, falling back to logical CPUs then one; browser auto uses logical CPUs capped at eight; explicit N is a positive unsigned integer |
 | `--write-replay` | Boolean switch; absent by default; writes `game.replay` when present |
 | `--save initial/final/every:N` | Repeatable opt-in saves; checkpoints are diagnostics, not automatic recovery |
-| `--telemetry NAME` | Repeatable checksums, team-timeline, maxima, gradient-stats ([building field statistics](../development/performance-telemetry.md#building-field-statistics)); default none |
+| `--telemetry NAME` | Repeatable checksums, team-timeline, maxima; default none |
 | `--profile NAME` | Optional isolated profile name |
 
 GUI autosaving defaults off for tournament/headless runs, independently of the
@@ -273,9 +273,35 @@ Each host has `name`, `directory`, optional `transport` (ssh default, or local),
 | spool_budget_bytes | 10 GiB |
 | cache_budget_bytes | 20 GiB |
 | memory_mb | null (optional process address-space limit) |
+| cpu_ids | absent: inherit the host CPU affinity; otherwise a nonempty list of caller-owned logical CPU IDs |
+| participants_per_game | absent: use every CPU in each allocated share; optional positive owner-inclusive count |
 
-Worker `slots`, `collect_slots`, backlog and storage limits reload on every daemon
-tick; reconfiguration no longer requires restarting the daemon. Packaging compresses
+With `cpu_ids`, specify `slots` explicitly. The coordinator partitions those CPU
+IDs into disjoint shares and freezes each attempt's share and compute-participant
+count. The worker validates the plan, pins the dedicated job supervisor before
+launch, and passes the existing `--compute-threads` flag to game jobs. An explicit
+participant count cannot exceed the smallest share. Completed game results must
+report the assigned resolved and actual counts; silent serial fallback is rejected.
+Map jobs inherit the share without a compute-thread override. Explicit affinity
+requires Linux-style `sched_getaffinity`/`sched_setaffinity` support.
+
+For one host, `run --cpu-ids 2,3,6,7 --jobs 2 --compute-participants 1` supplies the
+same fields. `collect` and `doctor` accept the same options; repeat the frozen
+budget on later calls or store it in host JSON. Use per-host JSON for multiple
+hosts. The budget is caller-supplied;
+the coordinator checks overlap among known local hosts but cannot infer that two
+SSH aliases name the same machine or reserve CPUs from unrelated processes.
+Allocation receipts persist in the results database. CPU plans cannot change
+mid-cohort. With experiment `settings.measured=true`, retries retain their
+original host and slot; ordinary retries may select another allocation.
+A share is reserved while its job is queued or running. This bounds outstanding
+work without another scheduling queue, but the next job waits for a coordinator
+poll and transfer after the share is released. For very short jobs that gap can
+reduce throughput; explicit allocation is not a universal speedup claim.
+
+For hosts without explicit CPU allocations, worker `slots`, `collect_slots`,
+backlog and storage limits reload on every daemon tick; reconfiguration does not
+require restarting the daemon. Packaging compresses
 into private attempt staging in parallel. A short shared lock publishes objects and
 the record atomically with respect to acknowledgement cleanup, preserving shared
 artifacts needed by other attempts. `collect_slots` therefore controls actual
@@ -342,7 +368,9 @@ reduces stale-PID risk; the check and signal are not atomic. It leaves files and
 running game supervisors intact. Only reap installs whose work should stop.
 
 A `configure` RPC updates `host.json`; the daemon reads it on every tick, so
-slot/build/budget changes take effect without restarting the worker.
+ordinary slot/build/storage-budget changes take effect without restarting the
+worker. A frozen CPU plan cannot change while work is live or within the same
+coordinator cohort.
 
 Continue `run` or invoke `collect` after changing controls so connected workers
 receive them. Disconnected workers may finish before learning cancellation; those
@@ -381,8 +409,7 @@ plausible computation errors from faulty RAM. pharaoh-dev-1 is a normal pilot ho
 
 ## Experiment designs and reanalysis
 
-All experiment modules (`ai_comparison`, `fairness`, `generator_stress`, `ablations`,
-`gradient_depth`) support `plan CONFIG --bundle DIR --output FILE`,
+All experiment modules (`ai_comparison`, `fairness`, `generator_stress`, `ablations`) support `plan CONFIG --bundle DIR --output FILE`,
 `submit CONFIG --bundle DIR --output RESULTS`, and
 `reanalyze RESULTS [--policy prestige|survivor_draw|military] [--seed 1] [--draws 1000]
 [--k 32] [--output DIR]`. Reports are JSON, CSV and Markdown; no rerun is required.
@@ -480,21 +507,6 @@ unsupported combinations remain reported failures rather than being filtered out
   exact map artifacts. format defaults to 1v1 for two players, otherwise ffa;
   alliances is optional. Paired effects, raw pairs, intervals, configurations and
   failure rates are exported. No automatic best-variant selection occurs.
-* `gradient_depth`: data for the [building-field depth model](../ai/architecture/building-gradient-depth-model.md).
-  `sample_games` (default 48) independently drawn games; each draws a map size
-  first, then a format that size admits, then AIs and a generator, all from
-  `sample_seed`. `sizes` defaults to 64x64 (duels only, since four colonies do not
-  fit every generator there), 128x128 and 256x256; an entry's optional `formats`
-  list restricts its formats, and its optional `generators` list its generator pool.
-  `formats` defaults to 1v1, 2v2 and ffa, `ais` to every active
-  AI, `generators` to every playable generator and `ticks` to 18048. The planner
-  pins the `aiOrderDelay` rule to 8 and adds `gradient-stats` to
-  `outputs.telemetry` (which publishes scheduled building fields at lazy depth, so
-  rows record what readers needed), and workers then require `gradient-stats.csv`
-  in each game's artifacts. Preflight the generator list against the sizes and colony
-  counts (two colonies for duels, four for 2v2 and ffa), give each size the
-  generators that passed there, and publish exclusions. `reanalyze` is not the analysis here; read the
-  results with `tools/gradient_depth_fit.py dataset RESULTS`.
 
 Engine-declared winners are authoritative under every policy. Capped games rank
 survivors by prestige, unit count, then finished buildings; exact ties stay tied.

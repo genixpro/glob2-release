@@ -16,6 +16,10 @@
 #include "OutcomeReason.h"
 #include "NetEngine.h"
 #include "Player.h"
+#include "AI.h"
+#include "AIJavaScript.h"
+#include <array>
+#include <StreamBackend.h>
 #include "sim/SimulationRunner.h"
 #include "sim/presentation/SceneInputs.h"
 #include "sim/presentation/ScenePreparation.h"
@@ -54,6 +58,7 @@
 #include "GlobalContainer.h"
 #include "CampaignEditor.h"
 #include "ReplayWriter.h"
+#include "sim/snapshot/SnapshotChecksum.h"
 #include "online/ReplayAppearance.h"
 #include "online/SkinDownloads.h"
 #include "online/OnlineStorage.h"
@@ -80,8 +85,73 @@ GAGCore::CooperativeSlice fixedSlice()
 
 TEST_SUITE("EngineSession")
 {
+    TEST_CASE("buffered input receipts wait for GUI dispatch and cancel exact ranges [display]")
+	{
+		glob2test::ScopedEnvironment serial("GLOB2_SIM_THREAD", "0");
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .loadStrings = true, .width = 800, .height = 600});
+		REQUIRE(NET_Init());
+		struct NetworkScope
+		{
+			~NetworkScope() { NET_Quit(); }
+		} network;
+		globalContainer->automaticEndingGame = false;
+		globalContainer->settings.gameSpeed = Settings::GAME_SPEED_MAXIMUM;
+		Engine engine;
+		REQUIRE(engine.initCampaign("maps/balanced.map") == Engine::EE_NO_ERROR);
+		engine.beginSession(1000);
+		// An online/fast-forward producer can consume GUI input several ticks later.
+		engine.session->adjustableGameSpeed = true;
+		engine.session->nextGuiStep = 3;
+		SDL_Event motion{};
+		motion.type = SDL_EVENT_MOUSE_MOTION;
+		motion.motion.x = 123;
+		motion.motion.y = 234;
+		auto receipt = std::make_shared<GAGCore::InputDispatchReceipt>();
+		engine.trackInputDispatch(receipt, 0, 1);
+		REQUIRE(engine.stepSession(1000, {motion}));
+		CHECK_FALSE(receipt->consumed.has_value());
+		REQUIRE(engine.stepSession(1040, {}));
+		CHECK_FALSE(receipt->consumed.has_value());
+		REQUIRE(engine.stepSession(1080, {}));
+		REQUIRE(receipt->consumed.has_value());
+		CHECK(*receipt->consumed == 1);
+		CHECK(engine.gui.lastMouseX == 123);
+		CHECK(engine.gui.lastMouseY == 234);
 
-    TEST_CASE("automatic GUI sessions poll asset finalizers on the presentation thread [display]")
+		engine.session->nextGuiStep = 3;
+		bool cancel = false;
+		auto cancelled = std::make_shared<GAGCore::InputDispatchReceipt>();
+		cancelled->cancelled = [&] { return cancel; };
+		std::string remotePayload = "remote é";
+		SDL_Event remoteText{};
+		remoteText.type = SDL_EVENT_TEXT_INPUT;
+		remoteText.text.text = remotePayload.c_str();
+		engine.trackInputDispatch(cancelled, 0, 1);
+		REQUIRE(engine.stepSession(1120, {remoteText}));
+		CHECK_FALSE(cancelled->consumed.has_value());
+		remotePayload.assign("replaced source buffer");
+		REQUIRE(engine.sessionInput.events().size() == 1);
+		CHECK(std::string(engine.sessionInput.events()[0].text.text) == "remote é");
+		cancel = true;
+		std::string humanPayload = "human 世界";
+		SDL_Event humanText{};
+		humanText.type = SDL_EVENT_TEXT_INPUT;
+		humanText.text.text = humanPayload.c_str();
+		REQUIRE(engine.stepSession(1160, {humanText}));
+		REQUIRE(cancelled->consumed.has_value());
+		CHECK(*cancelled->consumed == 0);
+		REQUIRE(engine.sessionInput.events().size() == 1);
+		CHECK(std::string(engine.sessionInput.events()[0].text.text) == humanPayload);
+		humanPayload.assign("changed human source");
+		CHECK(std::string(engine.sessionInput.events()[0].text.text) == "human 世界");
+		REQUIRE(engine.stepSession(1200, {}));
+		CHECK(engine.sessionInput.events().empty());
+		engine.gui.isRunning = false;
+		engine.finishSession();
+	}
+
+	TEST_CASE("automatic GUI sessions poll asset finalizers on the presentation thread [display]")
     {
         for (const char* mode : {"0", "1"})
         {
@@ -200,6 +270,54 @@ TEST_SUITE("EngineSession")
         CHECK_FALSE(engine.gui.isRunning);
     }
 
+    TEST_CASE("paused restore delivers pending AI orders before an unpause can advance")
+    {
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame source({.teams=2,.loadDefaultRace=true,.header=true});
+        source.addBuilding("swarm",4,4,0,1);
+        source.addUnit(WORKER,12,12,1);
+        auto& original=source.game;
+        original.setWaitingOnMask(0);
+        original.gameHeader.setAIOrderDelay(0);
+        original.gameHeader.setAIConfig(1,Script::config(
+            "function step(c){return {type:'workers',building:c.game.buildings({team:c.myTeam})[0],workers:3};}"));
+        original.players[1]->makeItAI(AI::JAVASCRIPT);
+        constexpr std::array<unsigned,1> actors{1};
+        const auto initial=original.observeCompletedWorld();
+        original.admitAIOrders(actors,false,{},initial);
+        REQUIRE(original.deliverAIOrders(actors,false)[0].second->getOrderType()==ORDER_NULL);
+        original.advanceLiveSimulation(0);
+        REQUIRE(original.stepCounter==1);
+        auto* memory=new GAGCore::MemoryStreamBackend;
+        GAGCore::BinaryOutputStream output(memory);
+        original.save(&output,false,"pending AI before paused restore"); output.flush();
+        const auto saved=memory->takeContents();
+
+        Engine engine;
+        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(saved.data(),saved.size()));
+        input.seekFromStart(0); REQUIRE(engine.gui.game.load(&input));
+        auto& game=engine.gui.game;
+        engine.gui.localPlayer=0; engine.gui.localTeamNo=0;
+        engine.net=std::make_unique<NetEngine>(2,0);
+        engine.gui.gamePaused=true;
+        engine.establishObservation(false);
+        engine.net->pushOrder(std::make_shared<PauseGameOrder>(false),0,false);
+        engine.net->pushOrder(std::make_shared<NullOrder>(),1,true);
+        engine.gatherAndAdvanceOrders(false);
+        engine.executeOrdersAndStep(true);
+        CHECK_FALSE(engine.gui.gamePaused);
+        REQUIRE(game.stepCounter==1);
+        // The resumed owner admits work using the retained observation, then
+        // delivers the original due output before its next advancement.
+        engine.establishObservation(false);
+        engine.net->pushOrder(std::make_shared<NullOrder>(),0,false);
+        engine.gatherAndAdvanceOrders(false);
+        REQUIRE(engine.net->retrieveOrder(1));
+        CHECK(engine.net->retrieveOrder(1)->getOrderType()==ORDER_MODIFY_BUILDING);
+        engine.executeOrdersAndStep(true);
+        CHECK(game.stepCounter==2);
+    }
+
     TEST_CASE("observation players preserve seat order and spectator readiness")
     {
         glob2test::HeadlessGlobals globals;
@@ -253,7 +371,7 @@ TEST_SUITE("EngineSession")
         const auto captures=engine.gui.game.snapshots().metrics.captures;
         engine.gatherAndAdvanceOrders(true);
         CHECK(engine.gui.game.snapshots().metrics.captures==captures);
-        const auto reused=engine.gui.game.captureReadBoundary({},true,published.requirements);
+        const auto reused=engine.gui.game.captureReadBoundary({.presentation=true});
         CHECK(reused.entities==published.entities);
         CHECK(reused.resources==published.resources);
         CHECK(engine.gui.game.snapshots().metrics.captures==captures);
@@ -276,7 +394,7 @@ TEST_SUITE("EngineSession")
         SceneRequest request;
         request.view.displayW=128; request.view.displayH=128;
         runner.requestScene(request);
-        const auto world=game.captureReadBoundary({},true,SceneExtractor::requirements(request));
+        const auto world=game.captureReadBoundary(SceneExtractor::captureOptions(request));
         const auto captures=game.snapshots().metrics.captures;
         REQUIRE(runner.admitPresentation());
         runner.publishPresentation(world,request);
@@ -321,9 +439,26 @@ TEST_SUITE("EngineSession")
                 if (engine.runner) REQUIRE(engine.runner->acquireScene());
                 else REQUIRE(engine.serialPresentation->acquire());
             };
+            const auto completedGraphical=[](const SimulationSnapshot::Handle& world) {
+                CHECK_NOTHROW(world.simulationView());
+                REQUIRE(world.entities);
+                REQUIRE(world.resourceFields);
+                REQUIRE(world.statisticsInputs);
+                REQUIRE(world.session);
+                REQUIRE(world.effects);
+                REQUIRE(world.statistics);
+            };
             engine.gui.recordTick(1000,33);
             camera(0);
-            engine.openReadBoundary({},true,true);
+            const auto initial=engine.establishObservation(false);
+            completedGraphical(initial);
+            const auto initialMaterializations=game.snapshots().metrics.coreMaterializations;
+            CHECK(initialMaterializations==1);
+            CHECK_FALSE(engine.retainedPresentation);
+            const auto firstFrame=engine.establishObservation(true);
+            CHECK(firstFrame.entities==initial.entities);
+            CHECK(firstFrame.supportsPresentation());
+            CHECK(game.snapshots().metrics.coreMaterializations==initialMaterializations);
             finish();
 
             // A completed camera refresh consumes the client request before the
@@ -333,7 +468,7 @@ TEST_SUITE("EngineSession")
             finish();
             ++game.stepCounter;
             engine.gui.recordTick(1033,33);
-            engine.openReadBoundary({},true,true);
+            engine.establishObservation(true);
             REQUIRE(engine.retainedPresentation->world.tick==game.stepCounter);
             CHECK(engine.retainedPresentation->request.tickTime==1033);
             finish();
@@ -345,27 +480,94 @@ TEST_SUITE("EngineSession")
             engine.refreshRetainedPresentation();
             ++game.stepCounter;
             engine.gui.recordTick(1066,33);
-            engine.openReadBoundary({},true,true);
+            const auto busy=engine.establishObservation(true);
+            completedGraphical(busy);
+            const auto busyMaterializations=game.snapshots().metrics.coreMaterializations;
+            CHECK(busyMaterializations==initialMaterializations+2);
             CHECK(engine.retainedPresentation->world.tick==game.stepCounter-1);
             finish();
             camera(3);
             const auto retained=engine.retainedPresentation;
             engine.refreshRetainedPresentation();
             CHECK(engine.retainedPresentation==retained);
-            engine.openReadBoundary({},true,true);
+            const auto admitted=engine.establishObservation(true);
+            CHECK(admitted.entities==busy.entities);
+            CHECK(admitted.supportsPresentation());
+            CHECK(admitted.effects==busy.effects);
+            CHECK(admitted.statistics==busy.statistics);
+            CHECK(game.snapshots().metrics.coreMaterializations==busyMaterializations);
             REQUIRE(engine.retainedPresentation->world.tick==game.stepCounter);
             CHECK(engine.retainedPresentation->request.tickTime==1066);
             finish();
 
             // Camera-only refreshes remain available while game time is stopped.
+            engine.gui.gamePaused=true;
             const auto captures=game.snapshots().metrics.captures;
             camera(4);
             engine.refreshRetainedPresentation();
             CHECK(engine.retainedPresentation->request.view.viewportX==4);
             CHECK(engine.retainedPresentation->request.tickTime==1066);
+            CHECK(engine.retainedPresentation->world.entities==admitted.entities);
+            CHECK(engine.retainedPresentation->world.effects==admitted.effects);
+            CHECK(game.snapshots().metrics.coreMaterializations==busyMaterializations);
             CHECK(game.snapshots().metrics.captures==captures);
             finish();
         }
+    }
+
+    TEST_CASE("paused selection history and debug requests reuse the complete graphical observation")
+    {
+        glob2test::HeadlessGlobals globals;
+        Engine engine;
+        struct RestoreHeadless { ~RestoreHeadless() { globalContainer->runNoX=true; } } restore;
+        globalContainer->runNoX=false;
+        auto& game=engine.gui.game;
+        game.map.setSize(5,5,GRASS);
+        game.map.setGame(&game);
+        game.addTeam();
+        game.teams[0]->race.loadDefault();
+        const auto type=game.buildingsTypes.getTypeNum("inn",0,false);
+        REQUIRE(type>=0);
+        auto* building=game.addBuilding(4,4,type,0); REQUIRE(building);
+        game.map.setBuilding(4,4,building->type->width,building->type->height,building->gid);
+        building->verbose=1;
+        auto& executor=game.map.computeExecutor();
+        executor.configure(1);
+        engine.runner=std::make_unique<SimulationRunner>(engine);
+        SceneRequest request;
+        request.includePanels=false;
+        request.view.displayW=128; request.view.displayH=128;
+        engine.runner->requestScene(request);
+        const auto world=engine.establishObservation(true);
+        while(executor.pumpPresentation()) {}
+        REQUIRE(engine.runner->acquireScene());
+        const auto materializations=game.snapshots().metrics.coreMaterializations;
+        REQUIRE(materializations==1);
+
+        engine.gui.gamePaused=true;
+        request.selectedBuilding=Game::refOf(building);
+        request.includePanels=true;
+        request.includeHistory=true;
+        request.includeTelemetry=true;
+        request.includeScriptAreas=true;
+        request.view.debugLayers=1;
+        engine.runner->requestScene(request);
+        CHECK_NOTHROW(engine.refreshRetainedPresentation());
+        while(executor.pumpPresentation()) {}
+        const auto* frame=engine.runner->acquireScene(); REQUIRE(frame);
+        REQUIRE(engine.retainedPresentation);
+        const auto& retained=engine.retainedPresentation->world;
+        CHECK(engine.retainedPresentation->request.selectedBuilding==Game::refOf(building));
+        CHECK(retained.tick==world.tick);
+        CHECK(retained.observationRevision==world.observationRevision);
+        CHECK(retained.entities==world.entities);
+        CHECK(retained.effects==world.effects);
+        CHECK(retained.history==world.history);
+        CHECK(retained.entityDiagnostics==world.entityDiagnostics);
+        REQUIRE(retained.history); REQUIRE(retained.telemetry);
+        REQUIRE(retained.entityDiagnostics); REQUIRE(retained.annotations);
+        CHECK(frame->world.entities==world.entities);
+        CHECK(game.snapshots().metrics.coreMaterializations==materializations);
     }
 
     TEST_CASE("menu colony rendering consumes its shared boundary without recapture [display]")
@@ -414,26 +616,15 @@ TEST_SUITE("EngineSession")
         CHECK(work->status() == ComputeExecutor::Presentation::Status::Canceled);
     }
 
-    TEST_CASE("a retained version-152 stock replay preserves recorded simulation checksums [save-format]")
+    TEST_CASE("a retained version-152 stock replay is rejected [save-format]")
     {
-        glob2test::HeadlessGlobals globals({.loadStrings=true});
-        REQUIRE(NET_Init());
-        struct NetworkScope {~NetworkScope(){NET_Quit();}} network;
-        globals->automaticEndingGame=false;
-        const auto path=glob2test::inflated("unit-catalog/legacy152-stock.replay.gz");
-        Engine engine; REQUIRE(engine.loadReplayTask(path.string()).run());
-        auto& reader=*globals->replayReader;
-        REQUIRE(reader.formatVersion()==152);
-        REQUIRE(reader.getNumStepsTotal()==128);
-        engine.beginSession(0);
-        for(unsigned tick=0;tick<128;++tick) {
-            reader.setCheckSum(engine.gui.game.checkSum(nullptr,nullptr,nullptr,false,true));
-            REQUIRE(engine.stepSession(tick*40,{}));
-            REQUIRE(reader.isValid());
-            CHECK(engine.gui.game.stepCounter==tick+1);
-        }
-        engine.gui.isRunning=false; engine.finishSession();
-    }
+    glob2test::HeadlessGlobals globals({.loadStrings=true});
+    REQUIRE(NET_Init());
+    struct NetworkScope {~NetworkScope(){NET_Quit();}} network;
+    const auto path=glob2test::inflated("unit-catalog/legacy152-stock.replay.gz");
+    Engine engine;
+    CHECK_FALSE(engine.loadReplayTask(path.string()).run());
+}
 
     TEST_CASE("external replay retains recorded simulation checksums [benchmark][artifacts]")
     {
@@ -449,13 +640,19 @@ TEST_SUITE("EngineSession")
         engine.beginSession(0);
         std::ofstream trace(glob2test::artifactDir()/"external-replay.checksums.txt");
         for(unsigned tick=0;tick<ticks;++tick) {
-            const auto checksum=engine.gui.game.checkSum(nullptr,nullptr,nullptr,SDL_getenv_unsafe("GLOB2_REFERENCE_HEAVY")!=nullptr,reader.formatVersion()<=152);
+            const auto checksum=SDL_getenv_unsafe("GLOB2_REFERENCE_HEAVY")
+                ? engine.gui.game.checkSum(nullptr,nullptr,nullptr,true)
+                : SimulationChecksum::snapshotChecksum(engine.gui.game.observation(),engine.routineMapChecksums());
             trace<<engine.gui.game.stepCounter<<' '<<checksum<<'\n';
-            reader.setCheckSum(checksum);
             REQUIRE(engine.stepSession(tick*40,{}));
             REQUIRE(reader.isValid());
             CHECK(engine.gui.game.stepCounter==initialTick+tick+1);
         }
+        // The terminator is read on the next boundary and carries the final hash.
+        REQUIRE(engine.stepSession(Uint64(ticks)*40,{}));
+        REQUIRE(reader.isFinished());
+        REQUIRE(reader.isValid());
+        CHECK_NOTHROW(reader.finishChecksumValidation());
         engine.gui.isRunning=false;engine.finishSession();
     }
     TEST_CASE("render ceilings preserve per tick simulation checksums [display][artifacts]")
@@ -553,7 +750,7 @@ TEST_SUITE("EngineSession")
         REQUIRE(engine.initCampaign("maps/balanced.map")==Engine::EE_NO_ERROR);
         engine.beginSession(SDL_GetTicks());
         engine.gui.gamePaused=true;
-        REQUIRE(engine.admitPresentation());
+        // beginSession already admitted the first observation's presentation.
         REQUIRE(engine.serialPresentation);
         REQUIRE(engine.startSimulationThread(SDL_GetTicks()));
         CHECK_FALSE(engine.serialPresentation);

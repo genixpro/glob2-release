@@ -29,7 +29,10 @@
 #include <AssetLoader.h>
 #include "DatasetWriter.h"
 #include "FileFormatVersions.h"
+#include "Version.h"
 #include "Game.h"
+#include "ChecksumSchedule.h"
+#include "TurretTargeting.h"
 #include "EntityRandomIO.h"
 #include <DeferredStream.h>
 #include "GameUtilities.h"
@@ -151,13 +154,13 @@ namespace
 	// checksum mixers in the codebase share one definition.
 }
 
-bool Game::load(GAGCore::InputStream *stream)
+bool Game::load(GAGCore::InputStream *stream,SaveLoadProfile profile,MapLoadInitialization initialization)
 {
 	PERF_SCOPE_TIME(Load);
-    return loadTask(stream).run();
+    return loadTask(stream,profile,initialization).run();
 }
 
-GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
+GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadProfile profile,MapLoadInitialization initialization)
 {
 	assert(stream);
 	GAGCore::BinaryInputStream::CheckedReads checkedInput(stream);
@@ -177,6 +180,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		printf("Loading map header\n");
 	if (!tempMapHeader.load(stream))
 		co_return false;
+	tempMapHeader.applyLoadProfile(profile);
 	mapHeader=tempMapHeader;
 	mapHeader.resolveGrowthLayout(stream);
 	Sint32 versionMinor=mapHeader.loadingVersion();
@@ -232,11 +236,11 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
         if (!(co_await teams[i]->loadTask(stream, &buildingsTypes, versionMinor)))
             co_return false;
 		if (teams[i]->teamNumber != i) co_return false;
-		for (int slot = 0; slot < Building::MAX_COUNT; ++slot)
-			if (const Building *b = teams[i]->myBuildings[slot]; b && !isBuildingTypeAvailable(b->typeNum)) co_return false;
+		for (const Building* b : teams[i]->liveBuildings.entries())
+			if (!isBuildingTypeAvailable(b->typeNum)) co_return false;
         if (versionMinor >= FILE_FORMAT_VERSION_UNIT_CATALOG)
-            for (int slot = 0; slot < Unit::MAX_COUNT; ++slot)
-                if (const Unit *unit = teams[i]->myUnits[slot]; unit && !isUnitTypeAvailable(unit->typeNum))
+            for (const Unit* unit : teams[i]->liveUnits.entries())
+                if (!isUnitTypeAvailable(unit->typeNum))
                     co_return false;
 		stream->readLeaveSection();
 	}
@@ -254,8 +258,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
         for(int team=0;team<mapHeader.getNumberOfTeams();++team)
         {
             teams[team]->race.setCatalog(gameHeader.getUnitCatalog());
-            for (int slot = 0; slot < Unit::MAX_COUNT; ++slot)
-                if (auto *unit = teams[team]->myUnits[slot])
+            for (auto* unit : teams[team]->liveUnits.entries())
                 {
                     const auto &traits = teams[team]->race.getRuntime(unit->typeNum);
                     unit->capabilityFlags = traits.flags;
@@ -308,11 +311,25 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 		co_return false;
 	if (versionMinor >= FILE_FORMAT_VERSION_AI_PIPELINE && mapHeader.getIsSavedGame())
 		if (!loadAI(stream)) co_return false;
+    // Earlier saves have no cache record. Leave the new pipeline empty and
+    // let ordinary admission/publication populate it without stepping on load.
+    if (versionMinor >= FILE_FORMAT_VERSION_TURRET_TARGETING && mapHeader.getIsSavedGame()) {
+        ensureTurretTargeting();
+        if (!turretTargetingPipeline->load(*this,stream,versionMinor)) co_return false;
+    }
+
+	if(versionMinor >= FILE_FORMAT_VERSION_TEAM_STATS_PIPELINE && mapHeader.getIsSavedGame()) loadTeamStats(stream,versionMinor);
+    if(versionMinor>=FILE_FORMAT_VERSION_CACHED_HIRING && mapHeader.getIsSavedGame())loadHiring(stream,versionMinor);
 
 	// Legacy saves reconstruct service lists by running building updates. That
 	// changes tie-breaking order and can even advance construction. New saved
 	// games carry the live lists and bookkeeping instead.
-	if (versionMinor < FILE_FORMAT_VERSION_SIMULATION_CONTINUATION || !mapHeader.getIsSavedGame())
+    // Migration must not initialize a map twice (once while converting, then
+    // again when playing it). Modern maps already encode service/call lists.
+    // Legacy reconstruction and ordinary gameplay retain their existing path.
+    const bool preserveEncodedMap=initialization==MapLoadInitialization::PreserveEncoded
+        && !mapHeader.getIsSavedGame() && versionMinor>=FILE_FORMAT_VERSION_SIMULATION_CONTINUATION;
+	if (!preserveEncodedMap && (versionMinor < FILE_FORMAT_VERSION_SIMULATION_CONTINUATION || !mapHeader.getIsSavedGame()))
 		for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
 			teams[i]->update();
 
@@ -450,18 +467,15 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream)
 			stream->readLeaveSection();
 		}
 		stream->readLeaveSection();
-		for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
-			for (int slot = 0; slot < SCRIPT_ENTITY_SLOTS_PER_TEAM; ++slot)
-			{
-				const auto *unit = teams[t]->myUnits[slot];
-				const auto *building = teams[t]->myBuildings[slot];
-				if (unit && (!unit->scriptIdentity || unit->scriptIdentity !=
-					scriptGenerations[scriptGenerationIndex(false, t, slot)]))
+		for (int t=0; t<mapHeader.getNumberOfTeams(); ++t) {
+			for (const Unit* unit : teams[t]->liveUnits.entries())
+				if (!unit->scriptIdentity || unit->scriptIdentity!=scriptGenerations[scriptGenerationIndex(false,t,Unit::GIDtoID(unit->gid))])
 					throw std::runtime_error("Invalid unit script identity");
-				if (building && (!building->scriptIdentity || building->scriptIdentity !=
-					scriptGenerations[scriptGenerationIndex(true, t, slot)]))
+			for (const Building* building : teams[t]->liveBuildings.entries())
+				if (!building->scriptIdentity || building->scriptIdentity!=scriptGenerations[scriptGenerationIndex(true,t,Building::GIDtoID(building->gid))])
 					throw std::runtime_error("Invalid building script identity");
-			}
+		}
+
 	}
 	gameSection.commit();
 
@@ -500,11 +514,8 @@ bool Game::checkBuildingsDoNotOverlapAndHealMissing() {
 	for (int ti=0; ti<mapHeader.getNumberOfTeams(); ti++)
 	{
 		Team *team = teams[ti];
-		for (int bi=0; bi<Building::MAX_COUNT; bi++)
+		for (const Building* building : team->liveBuildings.entries())
 		{
-			const auto building = team->myBuildings[bi];
-			if (!building)
-				continue;
 			if (building->buildingState==Building::DEAD)  // kill() cleared its footprint
 				continue;
 			const auto x = building->posX;
@@ -528,7 +539,7 @@ bool Game::checkBuildingsDoNotOverlapAndHealMissing() {
 					{
 						std::cerr << "Missing map cell GBID at " << xi << "," << yi
 							<< " for team " << ti
-							<< " building " << bi
+							<< " building " << Building::GIDtoID(gid)
 							<< " (" << building->type->type << "), healing!"
 							<< std::endl;
 						auto cell = map.getTile(xi, yi);
@@ -659,6 +670,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 {
 	PERF_SCOPE_TIME(Serialize);
 	assert(stream);
+	drainTeamStats();
 	drainAI(); // Freeze submissions and finish private state, without delivering future orders.
 	for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
 		if (teams[t])
@@ -778,7 +790,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	}
 	stream->writeLeaveSection();
 	stream->write(FILE_SIG_GAME_PLAYER, FILE_SIG_LEN, "signatureAfterPlayers");
-	if (!fileIsAMap) saveAI(stream);
+	if (!fileIsAMap) {saveAI(stream);turretTargeting()->save(*this,stream);saveTeamStats(stream);saveHiring(stream);}
 
 	// Save the old map script state
 	sgslScript.save(stream, this);
@@ -788,7 +800,7 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 
 	///Save game objectives
 	objectives.encodeData(stream);
-	stream->writeText(missionBriefing, "missionBriefing");
+	stream->writeText(missionBriefing, "briefing");
 	gameHints.encodeData(stream);
 
 	saveBuildProjects(stream);
@@ -914,11 +926,13 @@ Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 	{
 		if (players[i]->type==BasePlayer::P_IP)
 		{
-			heavy=true;
+            // Full verification remains exhaustive. Remote clients add the
+            // map-cell sweep periodically, rather than on every normal tick.
+            heavy = heavy || legacy152 || SimulationChecksum::secondaryDue(stepCounter);
 			break;
 		}
 	}
-	Uint32 mapCs=map.checkSum(heavy, includePending);
+	Uint32 mapCs=map.checkSum(heavy, includePending, legacy152);
 	cs^=mapCs;
 	if (checkSumsVector)
 		checkSumsVector->push_back(mapCs);// [3+t*20+p*2]
@@ -941,6 +955,9 @@ Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
     {
         const auto catalogCs=unitCatalog().checksum();
         cs=rotr1(cs)^catalogCs;
+        const auto statsCs=teamStatsChecksum(heavy && includePending);
+        cs=rotr1(cs)^statsCs;
+        if(checkSumsVector)checkSumsVector->push_back(statsCs);
         if(checkSumsVector)checkSumsVector->push_back(catalogCs);
     }
 	return cs;

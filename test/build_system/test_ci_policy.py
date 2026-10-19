@@ -2,6 +2,7 @@
 import argparse
 from contextlib import redirect_stdout
 import io
+import math
 import json
 import os
 from pathlib import Path
@@ -20,6 +21,18 @@ import ci_inventory as inventory
 import ci_dependency_cache as dependencies
 import ci_compare_evidence as evidence
 import ci_run_metrics as metrics
+import ci_check_inventory as checks
+
+
+def prediction_inputs():
+    """Known frozen histories and a constant forest keep policy tests offline."""
+    rows = [dict(name=check["name"], branch="topic", event="pull_request", sha="a" * 40,
+                 run_id=index + 1, attempt=1, created_at=0, end=1, seconds=1, failed=0, paths=[])
+            for index, check in enumerate(checks.inventory())]
+    model = dict(schema=1, feature_schema="history54-v1", model_id="policy-fixture",
+                 feature_names=["last_failed"], scales=[1.0],
+                 trees=[dict(left=[-1], right=[-1], feature=[-2], threshold=[-2.0], probability=[.1])])
+    return {"schema": 1, "updated_at": 1, "records": rows}, model, []
 
 
 class PolicyTest(unittest.TestCase):
@@ -92,14 +105,17 @@ class PolicyTest(unittest.TestCase):
         assets = self.select(['data/zik/woodland/a1.ogg', 'data/zik/woodland/LICENSE.txt'])
         self.assertEqual({flag for flag, on in assets.items() if on}, {'native', 'browser'})
         self.assertEqual(self.select(['data/zik/SConscript']), policy.full())
-        # Pull requests run the cheap music job without ci:run, and stay cheap-contracts.
+        # Music-only PRs stay cheap; mixing engine code also runs the predictive budget.
         report, _ = self.exercise('pull_request', ['tools/music/glob2music/cli.py'])
         self.assertEqual({flag for flag, on in report['selection'].items() if on}, {'music'})
         self.assertEqual(report['verification_mode'], 'cheap-contracts')
         report, _ = self.exercise('pull_request', ['tools/music/glob2music/cli.py', 'src/game/Game_sync.cpp'])
-        self.assertEqual({flag for flag, on in report['selection'].items() if on}, {'music'})
+        self.assertTrue(report['selection']['music'])
+        self.assertEqual(report['verification_mode'], 'predictive')
+        self.assertGreater(report['execution_plan']['ranked_count'], 0)
         report, _ = self.exercise('pull_request', ['data/zik/woodland/a1.ogg'])
-        self.assertFalse(any(report['selection'].values()))
+        self.assertEqual(report['verification_mode'], 'predictive')
+        self.assertTrue(any(report['selection'].values()))
         report, _ = self.exercise('pull_request', ['data/zik/woodland/a1.ogg'], labels=['ci:run'])
         self.assertTrue(report['selection']['native'] and report['selection']['browser'])
         self.assertFalse(report['selection']['music'])
@@ -157,10 +173,24 @@ class PolicyTest(unittest.TestCase):
         self.assertFalse(any('scripting' in r['name'] or 'WSS and simulation' in r['name'] for r in ui_rows))
         self.assertLess(len(ui_rows),len(json.loads((ROOT/'.github/scripts/ci_browser_matrix.json').read_text())))
 
+    def test_full_browser_jobs_select_all_required_catalog_producers(self):
+        import re
+        import shlex
+        rows = json.loads((ROOT / '.github/scripts/ci_browser_matrix.json').read_text())
+        for browser in ('firefox', 'webkit'):
+            row = next(row for row in rows if row['name'] == f'{browser} WSS and simulation')
+            pattern = next(arg.split('=', 1)[1] for arg in shlex.split(row['command'])
+                           if arg.startswith('--grep='))
+            for variant in ('serial', 'threaded'):
+                for selection in ('registry', 'composition', 'unit-registry', 'unit-composition'):
+                    title = f'WebAssembly preserves runtime catalog {selection} contracts ({variant})'
+                    with self.subTest(browser=browser, title=title):
+                        self.assertRegex(title, re.compile(pattern))
+
     def test_release_metadata_does_not_compile_engine(self):
         paths=['fdroid/metadata.yml','fastlane/metadata/title.txt','tools/package_steam_windows.py',
                '.github/workflows/steam-windows-package.yml','.github/workflows/mac-app-store.yml',
-               'mobile/android_release.py','test/build_system/test_ci_policy.py',
+               'mobile/android_release.py',
                '.github/workflows/deploy-online.yml','deploy/online-deploy.sh','deploy/online_remote.py',
                'test/deployment/test_online_deploy.py']
         self.assertFalse(any(self.select(paths).values()))
@@ -170,11 +200,11 @@ class PolicyTest(unittest.TestCase):
     def exercise(self,event,paths,draft=False,labels=(),enabled=True,reused_run=None,extra_env=None):
         with tempfile.TemporaryDirectory() as directory:
             payload=Path(directory)/'event.json'
-            payload.write_text(json.dumps({'pull_request':{'draft':draft,'labels':[{'name':label} for label in labels]}}))
+            payload.write_text(json.dumps({'pull_request':{'draft':draft,'head':{'ref':'topic'},'labels':[{'name':label} for label in labels]}}))
             old=Path.cwd()
             try:
                 os.chdir(directory)
-                with patch.dict(os.environ,{'GITHUB_EVENT_NAME':event,'GITHUB_EVENT_PATH':str(payload),'GITHUB_REPOSITORY':'o/r','GH_TOKEN':'token','GITHUB_STEP_SUMMARY':str(Path(directory)/'summary'), **(extra_env or {})},clear=True),patch.object(sys,'argv',['selector','--base','pr-base']),patch.object(selector,'changed_paths',return_value=paths) as diff,patch.object(baseline,'activated',return_value=enabled),patch.object(baseline,'successful_full_run',return_value=reused_run),patch.object(selector.subprocess,'check_output',return_value='candidate-sha\n'),redirect_stdout(io.StringIO()):
+                with patch.dict(os.environ,{'GITHUB_EVENT_NAME':event,'GITHUB_EVENT_PATH':str(payload),'GITHUB_REPOSITORY':'o/r','GH_TOKEN':'token','GITHUB_STEP_SUMMARY':str(Path(directory)/'summary'), **(extra_env or {})},clear=True),patch.object(sys,'argv',['selector','--base','pr-base']),patch.object(selector,'changed_paths',return_value=paths) as diff,patch.object(selector,'_prediction_inputs',side_effect=prediction_inputs),patch.object(baseline,'activated',return_value=enabled),patch.object(baseline,'successful_full_run',return_value=reused_run),patch.object(selector.subprocess,'check_output',return_value='candidate-sha\n'),redirect_stdout(io.StringIO()):
                     selector.main()
                 report = json.loads(Path('artifacts/ci-selection.json').read_text())
                 summary = Path('summary').read_text()
@@ -189,10 +219,23 @@ class PolicyTest(unittest.TestCase):
         for draft in (False, True):
             for labels in ([], ['ci:windows'], ['ci:android', 'ci:browsers']):
                 report,_ = self.exercise('pull_request', ['src/game/Game_sync.cpp'], draft=draft, labels=labels)
-                self.assertFalse(any(report['selection'].values()))
-                self.assertEqual(report['verification_mode'], 'cheap-contracts')
+                self.assertEqual(report['verification_mode'], 'predictive')
+                self.assertTrue(report['predictive_enabled'])
+                self.assertFalse(report['tiers_enabled'])
+                plan = report['execution_plan']
+                predictor = plan['predictor']
+                candidates = [check for check in checks.inventory() if not check.get('full_only')]
+                self.assertEqual(predictor['selected_count'], math.ceil(.12 * len(candidates)))
+                self.assertEqual(predictor['unknown_ids'], [])
+                self.assertEqual(predictor['model_id'], 'policy-fixture')
+                self.assertGreaterEqual(plan['executed_count'], plan['ranked_count'])
                 self.assertEqual(report['draft'], draft)
                 self.assertFalse(report['checkpoint_eligible'])
+                if 'ci:windows' in labels:self.assertTrue(report['selection']['windows'])
+                if 'ci:android' in labels:self.assertTrue(report['selection']['android'])
+                if 'ci:browsers' in labels:
+                    browser_ids = {check['id'] for check in checks.inventory() if check['job'] == 'web-test'}
+                    self.assertTrue(browser_ids <= set(plan['executed_ids']))
             report,_ = self.exercise('pull_request', ['src/game/Game_sync.cpp'], draft=draft, labels=['ci:run'])
             self.assertTrue(report['selection']['native'])
             self.assertEqual(report['verification_mode'], 'affected')
@@ -204,8 +247,22 @@ class PolicyTest(unittest.TestCase):
                                        labels=['ci:run', 'ci:windows', 'ci:android', 'ci:browsers'])
             for flag in ('native', 'windows', 'android', 'browser'):
                 self.assertTrue(expanded['selection'][flag])
-        removed,_ = self.exercise('pull_request', ['src/game/Game_sync.cpp'], labels=['ci:windows'])
-        self.assertFalse(any(removed['selection'].values()))
+        removed,_ = self.exercise('pull_request', ['src/game/Game_sync.cpp'])
+        windows,_ = self.exercise('pull_request', ['src/game/Game_sync.cpp'], labels=['ci:windows'])
+        self.assertEqual(removed['verification_mode'], 'predictive')
+        self.assertNotIn('windows', removed['execution_plan']['executed_ids'])
+        self.assertIn('windows', windows['execution_plan']['executed_ids'])
+
+    def test_ci_build_and_selector_changes_force_full_verification(self):
+        for path in ('.github/workflows/build.yml', '.github/scripts/ci_predictive.py',
+                     'test/build_system/test_ci_policy.py', 'SConstruct'):
+            with self.subTest(path=path):
+                report,_ = self.exercise('pull_request', [path])
+                self.assertEqual(report['verification_mode'], 'full')
+                self.assertEqual(report['selection'], policy.full())
+                self.assertTrue(report['full_matrix'])
+                self.assertIsNone(report['execution_plan']['predictor'])
+                self.assertFalse(report['checkpoint_eligible'])
 
     def test_timing_inventory_does_not_change_for_equivalent_policy_implementation(self):
         with patch.object(policy, 'fingerprint', return_value='implementation-one'):
@@ -273,17 +330,39 @@ class ReuseTest(unittest.TestCase):
         self.assertEqual(metrics.compare([run]*10,[dict(run,inventory_fingerprint='b')]*10),[])
 
     def test_native_and_browser_evidence_must_include_every_selected_identity(self):
+        import ast
         import hashlib
+        import re
+        producer = (ROOT / 'browser/tests/determinism.spec.js').read_text()
+        variants = ast.literal_eval(re.search(
+            r'for \(const \[variant, threads\] of (\[.*?\])\) \{', producer).group(1))
+        self.assertEqual(tuple(map(tuple, variants)), evidence.BROWSER_TRACE_VARIANTS)
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory);trace=b'x'*1501
             for platform in ['ubuntu-24.04','windows']:
                 path=root/f'browser-determinism-{platform}'/'native.replay.checksums';path.parent.mkdir();path.write_bytes(trace)
-            for variant,threads in [('serial',1),('threaded',1),('threaded',2),('threaded',4)]:
+            for variant,threads in variants:
                 path=root/'browser-determinism-wasm-0'/'wasm'/f'{variant}-{threads}';path.mkdir(parents=True)
                 (path/'wasm.replay.checksums').write_bytes(trace)
                 (path/'manifest.json').write_text(json.dumps(dict(project='chromium',variant=variant,threads=threads,ticks=1500,seed=42,trace_sha256=hashlib.sha256(trace).hexdigest())))
-            self.assertEqual(evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'}),6)
+            self.assertEqual(evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'}),8)
             with self.assertRaises(ValueError):evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium','firefox'})
+            for threads in (8, 'auto'):
+                path=root/'browser-determinism-wasm-0'/'wasm'/f'threaded-{threads}'
+                manifest=path/'manifest.json';saved=manifest.read_text();manifest.unlink()
+                with self.subTest(missing=threads), self.assertRaisesRegex(ValueError, 'Missing browser/thread traces'):
+                    evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'})
+                manifest.write_text(saved)
+                checksum=path/'wasm.replay.checksums';checksum.write_bytes(b'y'*1501)
+                with self.subTest(mismatch=threads), self.assertRaisesRegex(ValueError, 'Browser simulation differs'):
+                    evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'})
+                checksum.write_bytes(trace)
+            import shutil
+            duplicate=root/'browser-determinism-wasm-1'/'wasm'/'threaded-auto'
+            shutil.copytree(root/'browser-determinism-wasm-0'/'wasm'/'threaded-auto',duplicate)
+            with self.assertRaisesRegex(ValueError, 'Unexpected or repeated browser trace'):
+                evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'})
+            shutil.rmtree(duplicate.parents[1])
             (root/'browser-determinism-windows'/'native.replay.checksums').write_bytes(b'y'*1501)
             with self.assertRaises(ValueError):evidence.validate_traces(root,['ubuntu-24.04','windows'],{'chromium'})
 

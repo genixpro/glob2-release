@@ -33,20 +33,28 @@ struct Fixture {
 };
 }
 namespace {
+// These tests exercise the explicit reference seeder against authored resource
+// predicates. Public simulation getters now return Pending on a cold field;
+// allocate reference storage directly rather than pretending a read builds it.
+void ensureClearingReferenceStorage(Map& map, Building* flag, int swim)
+{
+    auto& field=flag->globalGradient[flag->routeSlot(swim,BuildingRoute::Clearing)];
+    if (!field) field=map.acquireBuildingGradientBuffer();
+}
 void clearingUsesMaterialSwitchesAndResourceProperties() {
     Fixture f;
     auto* flag=f.building(20,20,0,"clearingflag");
     flag->unitStayRange=6;
-    // Vary actual alignment padding after the fixed material switches. This
+    // Vary actual alignment padding after compact private inventory. This
     // reproduces different heap histories without corrupting active switches,
     // including the newly-supported high material bits.
     auto* bytes=reinterpret_cast<unsigned char*>(flag);
-    const auto begin=reinterpret_cast<unsigned char*>(flag->clearingMaterials)-bytes+MaterialCount;
-    const auto end=reinterpret_cast<unsigned char*>(&flag->minLevelToFlag)-bytes;
+    const auto begin=reinterpret_cast<unsigned char*>(flag->localMaterials)-bytes+sizeof(flag->localMaterials);
+    const auto end=reinterpret_cast<unsigned char*>(flag->wishedMaterials)-bytes;
     REQUIRE(end>=begin);
     for(int swim=0;swim<SWIM_CLASS_COUNT;++swim) {
         const int slot=flag->routeSlot(swim, BuildingRoute::Clearing);
-        f.game.map.buildingGradient(flag,swim,BuildingRoute::Clearing);
+        ensureClearingReferenceStorage(f.game.map,flag,swim);
         for(unsigned char padding:{0,1}) {
             std::fill(bytes+begin,bytes+end,padding);
             for(unsigned resource=0;resource<=f.game.map.resourceRegistry().size();++resource) {
@@ -55,8 +63,8 @@ void clearingUsesMaterialSwitchesAndResourceProperties() {
                 tile.type=type;tile.amount=type==NO_RES_TYPE?0:1;
                 f.game.map.replaceResource(21,20,tile);
                 for(unsigned material=0;material<MaterialCount;++material) for(bool enabled:{false,true}) {
-                    std::fill_n(flag->clearingMaterials,MaterialCount,false);
-                    flag->clearingMaterials[material]=enabled;
+                    flag->clearingMaterialMask=0;
+                    flag->setClearsMaterial(material,enabled);
                     f.game.map.updateGlobalGradient(flag,swim,BuildingRoute::Clearing);
                     f.game.map.finishBuildingGradient(flag,swim,BuildingRoute::Clearing);
                     const bool expected=type!=NO_RES_TYPE && enabled && f.game.map.resourcePropertiesByIndex(type).clearable
@@ -89,8 +97,8 @@ TEST_CASE("passable clearing sources respect forbidden paint buildings and immob
     auto* flag=fixture.building(20,20,0,"clearingflag");
     auto* obstacle=fixture.building(30,30,0);
     flag->unitStayRange=6;
-    std::fill_n(flag->clearingMaterials,MaterialCount,false);
-    flag->clearingMaterials[materialIndex(MaterialId::Fabric)]=true;
+    flag->clearingMaterialMask=0;
+    flag->setClearsMaterial(materialIndex(MaterialId::Fabric),true);
     using Json=nlohmann::json;
     const auto cottonId=*map.resourceRegistry().find("cotton");
     auto definition=Json::parse(map.resourceRegistry().serialize())["resources"][resourceIndex(cottonId)];
@@ -106,7 +114,7 @@ TEST_CASE("passable clearing sources respect forbidden paint buildings and immob
     for (int swim=0;swim<SWIM_CLASS_COUNT;++swim)
     {
         const auto verify=[&](Uint16 expected) {
-            map.buildingGradient(flag,swim,BuildingRoute::Clearing);
+            ensureClearingReferenceStorage(map,flag,swim);
             map.updateGlobalGradient(flag,swim,BuildingRoute::Clearing);
             map.finishBuildingGradient(flag,swim,BuildingRoute::Clearing);
             CHECK(flag->globalGradient[flag->routeSlot(swim,BuildingRoute::Clearing)][index]==expected);
@@ -136,7 +144,7 @@ TEST_CASE("empty persistent deposits remain clearing flag goals and worker targe
         auto& map=f.game.map;
         auto* flag=f.building(20,20,0,"clearingflag");
         flag->unitStayRange=6;
-        std::fill_n(flag->clearingMaterials,MaterialCount,false);
+        flag->clearingMaterialMask=0;
         using Json=nlohmann::json;
         auto definition=Json::parse(map.resourceRegistry().serialize())["resources"][0];
         definition["key"]="empty-clearable-gold";
@@ -155,12 +163,12 @@ TEST_CASE("empty persistent deposits remain clearing flag goals and worker targe
         const auto index=map.coordToIndex(21,21);
         REQUIRE(map.getResource(index).type!=NO_RES_TYPE);
         REQUIRE(map.materialMaskAt(index)==0);
-        CHECK_FALSE(map.isClearableResourceForMaterials(21,21,flag->clearingMaterials));
-        flag->clearingMaterials[materialIndex(MaterialId::Gold)]=true;
-        REQUIRE(map.isClearableResourceForMaterials(21,21,flag->clearingMaterials));
+        CHECK_FALSE(map.isClearableResourceForMaterials(21,21,flag->clearingMaterialMask));
+        flag->setClearsMaterial(materialIndex(MaterialId::Gold),true);
+        REQUIRE(map.isClearableResourceForMaterials(21,21,flag->clearingMaterialMask));
         for (int swim=0;swim<SWIM_CLASS_COUNT;++swim)
         {
-            map.buildingGradient(flag,swim,BuildingRoute::Clearing);
+            ensureClearingReferenceStorage(map,flag,swim);
             map.updateGlobalGradient(flag,swim,BuildingRoute::Clearing);
             map.finishBuildingGradient(flag,swim,BuildingRoute::Clearing);
             CHECK(flag->globalGradient[flag->routeSlot(swim,BuildingRoute::Clearing)][index]==GRADIENT_AT_GOAL);
@@ -175,6 +183,6 @@ TEST_CASE("empty persistent deposits remain clearing flag goals and worker targe
         CHECK(worker->dy==0);
         worker->handleMovementClearingResources();
         CHECK(map.getResource(index).type==NO_RES_TYPE);
-        CHECK(f.game.teams[0]->stats.measurements.cleared[materialIndex(MaterialId::Gold)]==1);
+        CHECK(f.game.teams[0]->stats.measurements().cleared[materialIndex(MaterialId::Gold)]==1);
     }
 }

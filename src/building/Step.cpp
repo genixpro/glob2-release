@@ -6,48 +6,34 @@
 #include <math.h>
 #include <stdlib.h>
 #include <algorithm>
+#include <bit>
 #include <climits>
+#include <optional>
 
 #include "Building.h"
+#include "MaterialDemand.h"
 #include "FetchApportionment.h"
+#include "HiringPlanner.h"
 #include "BuildingType.h"
 #include "FixedPoint.h"
 #include "Game.h"
 #include "Team.h"
 #include "Unit.h"
 #include "Order.h"
-#include "field/AirPathfind.h"
 #include "field/TerrainMovementCosts.h"
-
-namespace
-{
-	/// Weight of the harvest level in a material-fetching candidate's ranking key. The
-	/// harvest level dominates the comparison; the walk level breaks ties.
-	constexpr int HARVEST_LEVEL_WEIGHT = 10;
-
-	/// Tiles of detour a candidate pays for turning up with a material this
-	/// building cannot take. Legacy one-packet workers discard rejected cargo on
-	/// their next harvest; extended carriers can retain unrelated packets. The
-	/// penalty gives a building that wants the cargo a better chance to hire the
-	/// unit. A price, not a veto: beyond this margin the loaded unit is still hired.
-	constexpr int CARRIED_MATERIAL_PENALTY_TILES = 5;
-
-	/// Composite "experience" key used to rank material-carrying candidates;
-	/// higher is preferred.
-	int bringMaterialsLevel(const Unit* unit)
-	{
-		return unit->workerLevel() * HARVEST_LEVEL_WEIGHT + unit->level[WALK];
-	}
-}
 
 void Building::step(void)
 {
 	if (type->isBuildingSite && (siteCompletionPending || type->useTeamMaterials)) updateBuildingSite();
-	computeWishedMaterials(wishedMaterials);
-	if (((owner->game->stepCounter + gid) & 255) == 0)
-		freeIdleGradients();
-
-	updateCallLists();
+	{
+		// Site completion above can change the type and stock. Reuse demand only
+		// for this operation, before the later production and worker updates.
+		const auto demand = materialDemand();
+		computeWishedMaterials(wishedMaterials, demand);
+		if (((owner->game->stepCounter + gid) & 255) == 0)
+			freeIdleGradients();
+		updateCallLists(demand);
+	}
 	if(underAttackTimer>0)
 		underAttackTimer--;
 	if(canNotConvertUnitTimer>0)
@@ -67,7 +53,7 @@ void Building::setRecordFailingUnits(bool on)
 void Building::noteUnitFailing(Unit* unit, UnitCantWorkReason reason)
 {
 	unitsFailingRequirements[reason] += 1;
-	// "Not available" is every busy unit of the colony: counted, never marked.
+	// Unavailable suggestions are counted only when admission examines them.
 	if(recordFailingUnits && reason!=UnitNotAvailable)
 		unitsFailingByReason[reason].push_back(unit->gid);
 }
@@ -111,21 +97,16 @@ bool considerBuildingCandidate(Building& building, Unit* unit, int* distBuilding
 	}
 
 	timeLeft=remainingFoodTime(*unit);
-	bool accessible=true;
-    if(unit->performance[FLY] && airDistance>=0) {
-        *distBuilding=airDistance;accessible=airDistance!=INT_MAX;
-    } else if(unit->performance[FLY]) {
-        const Map& map=*building.owner->map;
-        field::AirDistanceField routes(map.getW(),map.getH(),building.posX,building.posY,
-            [&map](int x,int y){return map.terrainPropertiesAt(x,y).flyable;},
-            [&map](int x,int y){return map.cellRule(map.coordToIndex(x,y)).airCost;},
-            map.hasAirTerrainConstraints(),field::AirDistanceDirection::ToDestination);
-        if(routes.enabled()) {
-            const auto cost=routes.costTo(unit->posX,unit->posY);
-            accessible=cost!=decltype(routes)::unreachable;
-            *distBuilding=accessible?int((cost+GRADIENT_STEP-1)/GRADIENT_STEP):INT_MAX;
-        } else *distBuilding=building.owner->map->warpDistMax(unit->posX,unit->posY,building.posX,building.posY);
-    } else accessible=building.owner->map->buildingAvailable(&building,unit->swimClass(),unit->posX,unit->posY,distBuilding,BuildingRoute::Footprint);
+    bool accessible=true;
+    Map* map=building.owner->map;
+    if (unit->performance[FLY] && !map->hasAirRoutingConstraints()) {
+        *distBuilding=airDistance>=0 ? airDistance : map->warpDistMax(unit->posX,unit->posY,building.posX,building.posY);
+        accessible=*distBuilding!=INT_MAX;
+    } else {
+        const auto route=map->queryBuildingDistance(&building,unit->movementClass(),unit->posX,unit->posY,distBuilding,BuildingRoute::Footprint);
+        if (route==RouteResult::Pending) return false;
+        accessible=route==RouteResult::Reachable;
+    }
     if(!accessible)
 	{
 		building.noteUnitFailing(unit, Building::UnitCantAccessBuilding);
@@ -157,8 +138,10 @@ bool Building::considerUnitForMaterial(Unit* unit, int wantedMaterial, int* dist
 		return false;
 
 	int distMaterial = 0;
-	Sint32 materialX=0,materialY=0;
-	if(!(unit->performance[FLY] ? unit->findMaterialDestination(wantedMaterial,&materialX,&materialY,&distMaterial,fetchesFromMarkets(),this) : owner->map->materialAvailableSlot(owner->teamNumber,wantedMaterial,unit->swimClass(),unit->posX,unit->posY,&distMaterial,fetchesFromMarkets(),this)))
+	const auto materialRoute=unit->queryMaterialDestination(wantedMaterial,nullptr,nullptr,&distMaterial,fetchesFromMarkets(),this);
+	if (materialRoute==RouteResult::Pending) return false;
+	if (materialRoute!=RouteResult::Reachable)
+
 	{
 		if(wantedMaterial<HAPPINESS_BASE || wantedMaterial>=HAPPINESS_BASE+HAPPINESS_COUNT)
 			noteUnitFailing(unit, UnitCantAccessResource);
@@ -184,49 +167,54 @@ bool Building::considerUnitForMaterial(Unit* unit, int wantedMaterial, int* dist
 	return true;
 }
 
-int Building::gatherBringMaterialsCandidates(BringMaterialsCandidate* candidates, int wantedMaterial, const int* airDistances)
+namespace
 {
-	// The tallies count units, and the same unit is offered every material the
-	// building tries to staff, so start each scan from zero: what the info panel
-	// ends up showing is one coherent pass, for the last material attempted.
-	resetFailureTallies();
-
-	int count=0;
-	for(Unit* unit : owner->liveUnits.entries())
+BuildingMaterialDemand collectApportionment(const Building& building, int* targets, int* served)
+{
+	BuildingMaterialDemand demand;
+	std::fill_n(targets, MaterialSlotCount, 0);
+	std::fill_n(served, MaterialSlotCount, 0);
+	// Sites can have live budgets in any slot, including reserved slots.
+	unsigned candidates = building.type->isBuildingSite ? (1u<<MaterialSlotCount)-1 : building.runtime->replenishMaterialMask;
+	while (candidates)
 	{
-		if(!unit->hasCapability(UnitRuntimeTraits::Transport) || !unit->performance[HARVEST] || !unit->performance[BUILD])
-			continue;
-		if(unit->attachedBuilding == this && unit->activity == Unit::ACT_FILLING)
-			continue;
-
-		int dist;
-		if(considerUnitForMaterial(unit, wantedMaterial, &dist,airDistances?airDistances[Unit::GIDtoID(unit->gid)]:-1))
+		const unsigned r = std::countr_zero(candidates);
+		candidates &= candidates-1;
+		const int multiplier = building.type->materialMultiplier[r];
+		targets[r] = (building.materialDeliveryTarget(r)+multiplier-1)/multiplier;
+		const int deliveries = (building.materialDeliveryNeed(r)+multiplier-1)/multiplier;
+		served[r] = targets[r]-deliveries;
+		if (deliveries)
 		{
-			candidates[count].unit = unit;
-			candidates[count++].distance = dist;
+			demand.full = false;
+			demand.deliveries[r] = deliveries;
+			if (r < MaterialCount) demand.totalDeliveries += deliveries;
 		}
 	}
-	return count;
+	for (const Unit* unit : building.unitsWorking)
+	{
+		const int purpose = unit->destinationPurpose;
+		if (purpose>=0 && purpose<MaterialSlotCount)
+			served[purpose]++;
+	}
+	return demand;
 }
 
+std::array<unsigned, 4> workRoleTargets(const Building& building)
+{
+	bool delivery = false;
+	for (int material = 0; material < MaterialCount; ++material)
+		if (building.materialDeliveryNeed(material) > 0) { delivery = true; break; }
+	return Hiring::roleTargets(
+		unsigned(std::max(0, building.desiredMaxUnitWorking)), delivery,
+		{building.runtime->attractsRole(0), building.runtime->attractsRole(1), building.runtime->attractsRole(2)});
+}
+}
 
 void Building::fetchApportionment(int targets[MaterialSlotCount], int served[MaterialSlotCount]) const
 {
-	for(int r=0; r<MaterialSlotCount; ++r)
-	{
-		int multiplier = type->materialMultiplier[r];
-		targets[r] = (materialDeliveryTarget(r)+multiplier-1)/multiplier;
-		const int missing=materialDeliveryNeed(r);
-		served[r] = targets[r]-(missing+multiplier-1)/multiplier;
-	}
-	for(std::list<Unit *>::const_iterator ui=unitsWorking.begin(); ui!=unitsWorking.end(); ++ui)
-	{
-		int purpose = (*ui)->destinationPurpose;
-		if(purpose>=0 && purpose<MaterialSlotCount)
-			served[purpose]++;
-	}
+	collectApportionment(*this, targets, served);
 }
-
 
 bool Building::wantsAnotherDelivery(int r, const int* targets, const int* served)
 {
@@ -236,82 +224,9 @@ bool Building::wantsAnotherDelivery(int r, const int* targets, const int* served
 	return neededMaterial(r)>0 && served[r]<targets[r];
 }
 
-void Building::selectUnitCarryingWantedMaterial(const int* targets, const int* served, BringMaterialsSelection& sel, const int* airDistances)
-{
-	for(Unit* unit : owner->liveUnits.entries())
-	{
-		if(!unit->hasCapability(UnitRuntimeTraits::Transport) || !unit->performance[BUILD])
-			continue;
-		if(unit->attachedBuilding == this && unit->activity == Unit::ACT_FILLING)
-			continue;
-
-		int r=unit->carriedMaterial;
-		if (unit->hasCapability(UnitRuntimeTraits::ExtendedCargo)) {
-			r=-1;
-			for (unsigned material=0;material<MaterialCount;++material)
-				if (unit->hasDeliverableCargo(*this,material) && wantsAnotherDelivery(material,targets,served)) {
-					r=material;
-					break;
-				}
-		}
-		if(r<0 || !wantsAnotherDelivery(r, targets, served))
-			continue;
-		int distBuilding, timeLeft;
-		if(!considerBuildingCandidate(*this,unit,&distBuilding,airDistances?airDistances[Unit::GIDtoID(unit->gid)]:-1,timeLeft))
-			continue;
-
-		int value=distBuilding-(timeLeft>>1);
-		int level = bringMaterialsLevel(unit);
-		// Every carrying candidate has its destinationPurpose set to the
-		// material it carries, not only the one finally chosen.
-		unit->destinationPurpose=r;
-		if ((level>sel.maxLevel) || (level==sel.maxLevel && value<sel.minValue))
-		{
-			sel.minValue=value;
-			sel.maxLevel=level;
-			sel.choosen=unit;
-		}
-	}
-}
-
-void Building::selectFetcher(const BringMaterialsCandidate* candidates, int count, int wantedMaterial, BringMaterialsSelection& sel)
-{
-	for(int n=0; n<count; ++n)
-	{
-		Unit* unit=candidates[n].unit;
-
-		// A unit already carrying what is wanted is a delivery, not a fetch, and
-		// selectUnitCarryingWantedMaterial has first refusal on it.
-		int carried=unit->carriedMaterial;
-		if(carried==wantedMaterial)
-			continue;
-
-		int value=candidates[n].distance;
-		if(carried>=0)
-			value += CARRIED_MATERIAL_PENALTY_TILES<<Q8_FIXED_POINT_SHIFT;
-		int level = bringMaterialsLevel(unit);
-		if ((level>sel.maxLevel) || (level==sel.maxLevel && value<sel.minValue))
-		{
-			sel.minValue=value;
-			sel.maxLevel=level;
-			sel.choosen=unit;
-			unit->destinationPurpose=wantedMaterial;
-		}
-	}
-}
-
-
 int Building::workRoleTarget(int role) const
 {
-	bool active[4]{};
-	for (int r=0; r<MaterialCount; ++r)
-		active[0] |= materialDeliveryNeed(r)>0;
-	int count=active[0];
-	for (unsigned job=0;job<3;++job) count+=active[job+1]=runtime->attractsRole(job);
-	if (!count || !active[role+1]) return 0;
-	int rank=0;
-	for (int i=0; i<role+1; ++i) rank+=active[i];
-	return desiredMaxUnitWorking/count + (rank < desiredMaxUnitWorking%count);
+	return workRoleTargets(*this)[role + 1];
 }
 
 bool Building::subscribeWorkStep()
@@ -324,103 +239,104 @@ bool Building::subscribeWorkStep()
 	if (recruitmentRound) while (subscribeToBringMaterialsStep()) hired=true;
 	hired=subscribeForFlagingStep() || hired;
 	// Attraction exhausted its eligible candidates; unused seats may deliver.
-	if (recruitmentRound) while (subscribeToBringMaterialsStep(true)) hired=true;
+	if (recruitmentRound && !subscriptionWorkingTimer) while (subscribeToBringMaterialsStep(true)) hired=true;
 	return hired;
 }
 
 bool Building::subscribeToBringMaterialsStep(bool borrowUnused)
 {
 	resetFailureTallies();
-	if (buildingState==DEAD)
+	if (buildingState == DEAD)
 		return false;
 	if (verbose)
 		printf("bgid=%d, subscribeToBringMaterialsStep()...\n", gid);
 
-	bool hired=false;
-	int delivering=0;
-	for (const Unit* unit : unitsWorking) delivering += unit->activity == Unit::ACT_FILLING;
-	if ((Sint32)unitsWorking.size()<desiredMaxUnitWorking && (borrowUnused || delivering<workRoleTarget(-1)))
+	bool hired = false;
+	std::optional<BuildingMaterialDemand> demand;
+	int delivering = 0;
+	for (const Unit *unit : unitsWorking)
+		delivering += unit->activity == Unit::ACT_FILLING;
+	if ((Sint32)unitsWorking.size() < desiredMaxUnitWorking &&
+		(borrowUnused || delivering < workRoleTarget(-1)))
 	{
 		int targets[MaterialSlotCount];
 		int served[MaterialSlotCount];
-		fetchApportionment(targets, served);
+		demand = collectApportionment(*this, targets, served);
 
-		hired = type->runtimeFlyingCarriers
-			? hireMaterialUnitWithFlyingDistances(targets, served)
-			: hireMaterialUnit(targets, served, nullptr);
+		hired = hireMaterialUnit(targets, served);
 	}
 
-	updateCallLists();
+	// Failed admission only queries routes and records failure tallies. A hire
+	// can change worker assignments, so discard this operation's demand then.
+	if (!hired && demand) updateCallLists(*demand);
+	else updateCallLists();
 
 	if (verbose)
 		printf(" ...done\n");
 	return hired;
 }
 
-
-// Active selection keeps its scratch frame out of the admission wrapper.
-bool Building::hireMaterialUnit(const int* targets, const int* served, const int* airDistances)
+// Lists are suggestions, not reservations. Every attempt restarts at the
+// front; temporary unavailability never permanently consumes a candidate.
+bool Building::hireMaterialUnit(const int *targets, const int *served)
 {
-	BringMaterialsSelection sel;
-	sel.maxLevel = -1;
-	sel.minValue = INT_MAX;
-	sel.choosen = NULL;
+	const auto *lists = owner->game->hiringCandidates(*this);
+	if (!lists)
+		return false;
 
-	// A unit already holding something we want delivers without a fetch trip,
-	// so it is taken ahead of the apportionment, which only directs the units
-	// we still have to send out. It is subscription-aware in its own right, so
-	// it cannot oversubscribe a material either.
-	selectUnitCarryingWantedMaterial(targets, served, sel,airDistances);
+	const auto choose = [&](Hiring::Job job, int material) -> Unit *
+	{
+		if (!wantsAnotherDelivery(material, targets, served))
+			return nullptr;
+		for (const auto &list : lists->jobs)
+			if (list.key == Hiring::Key{job, material})
+				for (const auto &suggestion : list.candidates)
+				{
+					auto *u = owner->game->resolveUnit(suggestion.unit);
+					if (!u || u->isDead || u->owner != owner ||
+						!u->hasCapability(UnitRuntimeTraits::Transport) || !u->performance[BUILD] ||
+						u->activity != Unit::ACT_RANDOM || u->medical != Unit::MED_FREE)
+						continue;
+					int airDistance = -1;
 
-	// Otherwise staff the material whose subscriptions sit furthest below its
-	// share of the building's targets, falling to the next one whenever no
-	// unit can actually be hired for it.
-	if (sel.choosen==NULL)
+					int distance = 0;
+					if (job == Hiring::Job::Delivery)
+					{
+						if (!u->hasDeliverableCargo(*this, material) ||
+							!considerUnitForBuilding(u, &distance, airDistance))
+							continue;
+					}
+					else
+					{
+						if (!u->performance[HARVEST] || u->hasCarriedMaterial(material) ||
+							!considerUnitForMaterial(u, material, &distance, airDistance))
+							continue;
+						Sint32 x, y;
+						if (u->queryMaterialDestination(material, &x, &y, nullptr,
+                                                        fetchesFromMarkets(), this)!=RouteResult::Reachable)
+							continue;
+					}
+					u->destinationPurpose = material;
+					return u;
+				}
+		return nullptr;
+	};
+	Unit *selected = nullptr;
+	for (int material = 0; material < MaterialCount && !selected; ++material)
+		selected = choose(Hiring::Job::Delivery, material);
+	if (!selected)
 	{
 		int order[MaterialSlotCount];
-		int wanted = FetchApportionment::rank(targets, served, MaterialSlotCount, order);
-		for(int i=0; i<wanted && sel.choosen==NULL; ++i)
-		{
-			int r = order[i];
-			if(!wantsAnotherDelivery(r, targets, served))
-				continue;
-			BringMaterialsCandidate candidates[Unit::MAX_COUNT];
-			const int count=gatherBringMaterialsCandidates(candidates, r,airDistances);
-			selectFetcher(candidates, count, r, sel);
-		}
+		const int count = FetchApportionment::rank(targets, served, MaterialSlotCount, order);
+		for (int i = 0; i < count && !selected; ++i)
+			selected = choose(Hiring::Job::Fetch, order[i]);
 	}
-
-	if (sel.choosen)
-	{
-		unitsWorking.push_back(sel.choosen);
-		sel.choosen->subscriptionSuccess(this, false);
-		owner->swapTask(sel.choosen);
-		return true;
-	}
-	return false;
-}
-
-bool Building::hireMaterialUnitWithFlyingDistances(const int* targets, const int* served)
-{
-        std::array<int,Unit::MAX_COUNT> flyerDistances;
-        const int* airDistances=nullptr;
-        {
-            flyerDistances.fill(-1);airDistances=flyerDistances.data();
-            const Map& map=*owner->map;
-            field::AirDistanceField routes(map.getW(),map.getH(),posX,posY,
-                [&map](int x,int y){return map.terrainPropertiesAt(x,y).flyable;},
-                [&map](int x,int y){return map.cellRule(map.coordToIndex(x,y)).airCost;},
-                map.hasAirTerrainConstraints(),field::AirDistanceDirection::ToDestination);
-            for(const auto* unit:owner->liveUnits.entries())if(unit->performance[FLY]) {
-                int distance=owner->map->warpDistMax(unit->posX,unit->posY,posX,posY);
-                if(routes.enabled()) {
-                    const auto cost=routes.costTo(unit->posX,unit->posY);
-                    distance=cost==decltype(routes)::unreachable?INT_MAX:int((cost+GRADIENT_STEP-1)/GRADIENT_STEP);
-                }
-                flyerDistances[Unit::GIDtoID(unit->gid)]=distance;
-            }
-        }
-	return hireMaterialUnit(targets, served, airDistances);
+	if (!selected)
+		return false;
+	unitsWorking.push_back(selected);
+	selected->subscriptionSuccess(this, false);
+	owner->swapTask(selected);
+	return true;
 }
 
 bool Building::considerUnitForExplorerFlag(Unit* unit, int* dist, int terrainDistance)
@@ -436,9 +352,12 @@ bool Building::considerUnitForExplorerFlag(Unit* unit, int* dist, int terrainDis
 		return false;
 	}
 	int timeLeft = remainingFoodTime(*unit);
-    if(!unit->performance[FLY]) {
+    if (!unit->performance[FLY] || owner->map->hasAirRoutingConstraints())
+    {
         int distance=0;
-        if(!owner->map->buildingAvailable(this,unit->swimClass(),unit->posX,unit->posY,&distance,BuildingRoute::Combat)) {
+        const auto route=owner->map->queryBuildingDistance(this,unit->movementClass(),unit->posX,unit->posY,&distance,BuildingRoute::Combat);
+        if (route==RouteResult::Pending) return false;
+        if (route!=RouteResult::Reachable) {
             noteUnitFailing(unit,UnitCantAccessBuilding);return false;
         }
         terrainDistance=distance;
@@ -486,19 +405,17 @@ bool Building::considerUnitForWorkerFlag(Unit* unit, int* dist)
 		noteUnitFailing(unit, UnitTooLowLevel);
 		return false;
 	}
-	if(unit->performance[FLY]) {
-        Sint32 x,y;int distance;
-        if(!unit->findAirClearingDestination(this,&x,&y,&distance)){noteUnitFailing(unit,UnitCantAccessResource);return false;}
-        if(unit->hungriness>0 && distance>=remainingFoodTime(*unit)){noteUnitFailing(unit,UnitTooFarFromBuilding);return false;}
-        *dist=distance;return true;
-    }
+
+
 	int distBuilding = 0;
 	// timeLeft and distBuilding are both linear (in ticks-remaining and
 	// linear gradient steps respectively); compare as-is. The corresponding
 	// check in subscribeToBringMaterialsStep uses the same pairing.
 	int timeLeft = remainingFoodTime(*unit);
 	bool canSwim = unit->performance[SWIM];
-	if (!owner->map->buildingAvailable(this, unit->swimClass(), unit->posX, unit->posY, &distBuilding, BuildingRoute::Clearing))
+	const auto route=owner->map->queryBuildingDistance(this, unit->movementClass(), unit->posX, unit->posY, &distBuilding, BuildingRoute::Clearing);
+	if (route==RouteResult::Pending) return false;
+	if (route!=RouteResult::Reachable)
 	{
 		noteUnitFailing(unit, UnitCantAccessBuilding);
 		return false;
@@ -508,7 +425,7 @@ bool Building::considerUnitForWorkerFlag(Unit* unit, int* dist)
 		noteUnitFailing(unit, UnitTooFarFromBuilding);
 		return false;
 	}
-	if (anyResourceToClear[unit->swimClass()==SWIM_CLASS_COUNT-1 ? 2 : int(canSwim)] == 2)
+	if (anyResourceToClear[swimAccessVariant(unit->movementClass())] == 2)
 	{
 		noteUnitFailing(unit, UnitCantAccessResource);
 		return false;
@@ -539,12 +456,12 @@ bool Building::considerUnitForWarriorFlag(Unit* unit, int* dist, int terrainDist
 	// linear gradient steps respectively); compare as-is. The corresponding
 	// check in subscribeToBringMaterialsStep uses the same pairing.
 	int timeLeft = remainingFoodTime(*unit);
-	if (unit->performance[FLY]) distBuilding=terrainDistance>=0 ? terrainDistance : owner->map->warpDistMax(unit->posX,unit->posY,posX,posY);
-    else if (!owner->map->buildingAvailable(this, unit->swimClass(), unit->posX, unit->posY, &distBuilding, BuildingRoute::Combat))
-	{
-		noteUnitFailing(unit, UnitCantAccessBuilding);
-		return false;
-	}
+	if (unit->performance[FLY] && !owner->map->hasAirRoutingConstraints()) distBuilding=terrainDistance>=0 ? terrainDistance : owner->map->warpDistMax(unit->posX,unit->posY,posX,posY);
+    else {
+        const auto route=owner->map->queryBuildingDistance(this,unit->movementClass(),unit->posX,unit->posY,&distBuilding,BuildingRoute::Combat);
+        if (route==RouteResult::Pending) return false;
+        if (route!=RouteResult::Reachable) { noteUnitFailing(unit,UnitCantAccessBuilding); return false; }
+    }
 	if ((!unit->performance[FLY] && !unit->performance[WALK] && !unit->performance[SWIM] && distBuilding>0) || distBuilding >= timeLeft)
 	{
 		noteUnitFailing(unit, UnitTooFarFromBuilding);
@@ -572,97 +489,87 @@ bool Building::subscribeForFlagingStep()
 		resetFailureTallies();
 		if (Sint32(unitsWorking.size()) < desiredMaxUnitWorking)
 			hired = hireFlagUnits();
-
+		// Suggestions may be missing or stale, so an owed round retries briefly
+		// rather than waiting another full clock cycle.
+		bool owed=false;
+		const auto quotas = workRoleTargets(*this);
+		for (int role=0; role<3; ++role)
+		{
+			int assigned=0;
+			for (const auto* unit : unitsWorking)
+				assigned += unit->activity==Unit::ACT_FLAG && int(unit->jobPurpose)==int(UnitJobPurpose::Clear)+role;
+			owed |= assigned<int(quotas[role + 1]);
+		}
+		if (!owed || subscriptionWorkingTimer>32+int(Hiring::RecruitmentRetryTicks))
+			subscriptionWorkingTimer=0;
 		updateCallLists();
-
-		subscriptionWorkingTimer=0;
 	}
 	return hired;
 }
 
-
-
-// Timer-only and fully staffed flags never allocate qualification arrays.
 bool Building::hireFlagUnits()
 {
+	const auto *lists = owner->game->hiringCandidates(*this);
+	if (!lists)
+		return false;
+
 	bool hired = false;
-	// One reverse search serves every explorer candidate and all hiring
-	// iterations. Ignore temporary flyer occupancy, as building selection
-	// does; individual steering resolves it. Uniform maps allocate nothing.
-	const Map& map = *owner->map;
-	field::AirDistanceField airRoutes(map.getW(),map.getH(),posX,posY,
-		[&map](int x,int y) { return map.terrainPropertiesAt(x,y).flyable; },
-		[&map](int x,int y) { return map.cellRule(map.coordToIndex(x,y)).airCost; },
-		type->runtimeFlyingAttractions && Sint32(unitsWorking.size())<desiredMaxUnitWorking && map.hasAirTerrainConstraints(),
-		field::AirDistanceDirection::ToDestination);
-	while (((Sint32)unitsWorking.size()<desiredMaxUnitWorking))
+	while (Sint32(unitsWorking.size()) < desiredMaxUnitWorking)
 	{
-		// Per-iteration reset: the same Unit::MAX_COUNT array is rescanned
-		// each iteration (already-hired units are filtered via
-		// attachedBuilding==this); without this, the same failing units
-		// would be counted N times across N iterations.
 		resetFailureTallies();
-
-            // A hybrid may be eligible for multiple jobs, but receives one
-            // assignment and consumes one building seat after selection.
-            Uint8 possibleJobs[Unit::MAX_COUNT]{};
-            // Successful qualification writes its distance; reads require the matching job bit.
-            int distances[3][Unit::MAX_COUNT];
-            for (int n=0;n<Unit::MAX_COUNT;++n) {
-                Unit* unit=owner->myUnits[n];
-                if (!unit || unit->attachedBuilding==this) continue;
-                const auto& interaction=runtime->interaction(unit->typeNum);
-                int travelDistance=-1;
-                if(unit->performance[FLY] && airRoutes.enabled()){const auto cost=airRoutes.costTo(unit->posX,unit->posY);travelDistance=cost==decltype(airRoutes)::unreachable ? INT_MAX : int((cost+GRADIENT_STEP-1)/GRADIENT_STEP);}
-                if (interaction.recruits(1)) {
-                    if (considerUnitForExplorerFlag(unit,&distances[1][n],travelDistance)) possibleJobs[n]|=2;
-                }
-                if (interaction.recruits(0) && considerUnitForWorkerFlag(unit,&distances[0][n])) possibleJobs[n]|=1;
-                if (interaction.recruits(2) && considerUnitForWarriorFlag(unit,&distances[2][n],travelDistance)) possibleJobs[n]|=4;
-            }
-
 		int assigned[3]{};
-		for (const Unit* unit : unitsWorking)
-			if (unit->activity == Unit::ACT_FLAG) {
-                    const int job=int(unit->jobPurpose)-int(UnitJobPurpose::Clear);
-                    if (job>=0 && job<3) ++assigned[job];
-                }
-		Unit* choosen=nullptr;
-		int chosenCount=INT_MAX;
-            int chosenJob=-1;
-		// Choose the least staffed eligible attraction role, then use that
-		// role's established ranking among its candidate units.
-		for (int pass=0; pass<2 && !choosen; ++pass)
-		for (int role=0; role<3; ++role)
-		{
-			if (!runtime->attractsRole(role) || (!pass && assigned[role] >= workRoleTarget(role))) continue;
-			Unit* best=nullptr;
-			Sint64 bestLevel=role == 2 ? INT64_MIN : INT64_MAX;
-			Sint64 bestValue=INT64_MAX;
-			for (int n=0; n<Unit::MAX_COUNT; ++n)
+		for (const auto *u : unitsWorking)
+			if (u->activity == Unit::ACT_FLAG)
 			{
-				if (!(possibleJobs[n]&(1u<<role))) continue;
-				Unit* unit=owner->myUnits[n];
-				Sint64 timeLeft=(unit->hungriness>0 ? (Sint64(unit->hungry)-(role == 0 ? unit->trigHungry : 0))/unit->hungriness : INT_MAX);
-				Sint64 hp=(Sint64(unit->hp)*16)/std::max(1,unit->runtimeTraits().flagRankingHealth);
-				if (role == 1) { timeLeft=std::clamp<Sint64>(timeLeft,-1000000000,1000000000); timeLeft*=timeLeft; hp=std::clamp<Sint64>(hp,-1000000000,1000000000); hp*=hp; }
-				const Sint64 value=distances[role][n]-(role == 0 ? 1 : 2)*(timeLeft+hp);
-				const Sint64 level=role == 0 ? unit->workerLevel() : role == 1 ? unit->level[MAGIC_ATTACK_GROUND] : Sint64(unit->performance[ATTACK_SPEED])*unit->getRealAttackStrength();
-				if ((role == 2 ? level>bestLevel : level<bestLevel) || (level==bestLevel && value<bestValue))
-				{ best=unit; bestLevel=level; bestValue=value; }
+				const int role = int(u->jobPurpose) - int(UnitJobPurpose::Clear);
+				if (role >= 0 && role < 3)
+					++assigned[role];
 			}
-			if (best && assigned[role]<chosenCount)
-			{ choosen=best; chosenCount=assigned[role]; chosenJob=role; }
-		}
+		// Recompute after each successful hire, before the next candidate scan.
+		const auto quotas = workRoleTargets(*this);
+		Unit *selected = nullptr;
+		int selectedRole = -1, count = INT_MAX;
+		for (int pass = 0; pass < 2 && !selected; ++pass)
+			for (int role = 0; role < 3; ++role)
+			{
+				if (!runtime->attractsRole(role) ||
+					(!pass && assigned[role] >= int(quotas[role + 1])))
+					continue;
+				Unit *candidate = nullptr;
+				for (const auto &list : lists->jobs)
+					if (list.key.job == Hiring::Job(unsigned(Hiring::Job::Clear) + role))
+						for (const auto &entry : list.candidates)
+						{
+							auto *u = owner->game->resolveUnit(entry.unit);
+							if (!u || u->isDead || u->owner != owner || u->attachedBuilding == this)
+								continue;
+							int travel = -1, distance = 0;
 
-		if (choosen)
+							const bool eligible =
+								role == 0   ? considerUnitForWorkerFlag(u, &distance)
+								: role == 1 ? considerUnitForExplorerFlag(u, &distance, travel)
+											: considerUnitForWarriorFlag(u, &distance, travel);
+							if (eligible)
+							{
+								candidate = u;
+								break;
+							}
+						}
+				if (candidate && assigned[role] < count)
+				{
+					selected = candidate;
+					selectedRole = role;
+					count = assigned[role];
+				}
+			}
+		if (!selected)
 		{
-			unitsWorking.push_back(choosen);
-			choosen->subscriptionSuccess(this,false,true,static_cast<UnitJobPurpose>(int(UnitJobPurpose::Clear)+chosenJob));
-			hired=true;
-		}
-		else
 			break;
+		}
+		unitsWorking.push_back(selected);
+		selected->subscriptionSuccess(this, false, true,
+									  UnitJobPurpose(int(UnitJobPurpose::Clear) + selectedRole));
+		hired = true;
 	}
 	return hired;
 }

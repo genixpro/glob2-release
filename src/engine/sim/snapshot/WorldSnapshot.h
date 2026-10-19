@@ -87,18 +87,36 @@ static_assert(std::is_trivially_copyable_v<OccupancyCell>);
 static_assert(std::is_trivially_copyable_v<AreaCell>);
 static_assert(std::is_trivially_copyable_v<VisibilityCell>);
 struct ExtraProductionState { Sint32 ratio=0, used=0, constructionOriginRatio=0; };
+struct FundingState
+{
+    std::array<Sint32, MaterialSlotCount> constructionBudget{}, constructionReserved{}, reservedMaterials{};
+};
 struct Entities
 {
+	std::array<Uint16,16> availableMovementClasses{}; // Available movement classes, filled during normal unit extraction.
+    // Sparse raw funding facts: absent means all zero. Shared, pooled storage.
+    std::vector<FundingState> funding;
     UnitCargoStore unitCargo;
     std::vector<ExtraProductionState> extraProduction;
 	static constexpr Uint32 NoRecord = std::numeric_limits<Uint32>::max();
 	std::vector<BuildingView> buildings;
 	std::vector<UnitView> units;
+	std::vector<UnitRange> buildingRanges, unitRanges;
 	// Global entity slots index the compact records directly. Captured once in
 	// the entity extraction pass and shared by all readers; no controller table.
 	std::vector<Uint32> buildingSlotIndices, unitSlotIndices;
 	std::vector<UnitRef> relationships;
 	std::vector<BuildProjectView> projects;
+	std::span<const UnitView> unitsForTeam(int team) const {
+		if (team<0 || std::size_t(team)>=unitRanges.size()) return {};
+		const auto range=unitRanges[team];
+		return std::span<const UnitView>(units).subspan(range.offset,range.count);
+	}
+	std::span<const BuildingView> buildingsForTeam(int team) const {
+		if (team<0 || std::size_t(team)>=buildingRanges.size()) return {};
+		const auto range=buildingRanges[team];
+		return std::span<const BuildingView>(buildings).subspan(range.offset,range.count);
+	}
 };
 struct Teams { std::vector<TeamView> values; int totalPrestige = 0; };
 struct Rules
@@ -138,6 +156,7 @@ struct Handle
 	std::shared_ptr<const Session> session;
 	std::shared_ptr<const Effects> effects;
 	std::shared_ptr<const Statistics> statistics;
+	std::shared_ptr<const StatisticsInputs> statisticsInputs;
 	std::shared_ptr<const History> history;
 	std::shared_ptr<const Telemetry> telemetry;
 	std::shared_ptr<const EntityDiagnostics> entityDiagnostics;
@@ -156,6 +175,20 @@ struct Handle
 	std::shared_ptr<const BuildingAreaEffects::FertilitySnapshot> areaFertility;
 	Uint64 worldIdentity = 0, configurationRevision = 0;
 	std::array<Uint64, 5> mapGenerations{};
+	//! Named views share existing buffers and retain only their consumer's inputs.
+	Handle simulationView() const;
+    Handle checksumView(bool mapChecksums = false) const;
+    Handle turretView() const;
+    // Retain map inputs only on spatial-diagnostic sample ticks.
+    Handle statisticsView() const;
+	Handle gradientView() const;
+	Handle buildingGradientView() const;
+	Handle growthView() const;
+	Handle sceneMapView() const;
+	// Presentation helpers imply options.presentation and omit resource-gradient planes.
+	Handle presentationView(CaptureOptions options = {}) const;
+	bool supportsPresentation(CaptureOptions options = {}) const;
+	// Internal projection behind named views and low-level capture/storage tests.
 	Handle project(Requirements requested) const;
 	// Scalar readers touch only their requested immutable component. Defaults
 	// match a combined tile whose corresponding component was not captured.
@@ -184,7 +217,8 @@ private:
 std::shared_ptr<const std::vector<BuildingKindView>> captureCatalog(const Game& game);
 struct Storage;
 Handle capture(const Game& game, std::shared_ptr<const std::vector<BuildingKindView>> catalog,
-	Requirements requirements = All, const Handle* previous = nullptr, Storage* storage = nullptr);
+	Requirements requirements = All, const Handle* previous = nullptr, Storage* storage = nullptr,
+	bool unchangedBoundary = false);
 //! Throw if a captured map array or entity list differs from the live game.
 void verifyCapture(const Game& game, const Handle& handle);
 } // namespace SimulationSnapshot

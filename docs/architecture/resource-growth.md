@@ -5,8 +5,9 @@ Resource ecology runs from captured inputs and publishes at fixed logical deadli
 ## Delayed resource growth
 
 Natural growth reads the completed-tick engine observation through `MapState::View`.
-The snapshot store captures resource, occupancy, terrain, ecology, catalog and rule
-requirements together with AI and periodic gradients. One batch per advancing tick
+The snapshot store publishes the complete simulation preset shared with AI and
+periodic gradients. Growth jobs retain its `growthView()`, containing resource,
+occupancy, terrain, ecology, catalog and rule inputs. One batch per advancing tick
 uses one owner-drawn seed and a private MT19937 stream; calculation never reads or
 writes live map state. Every attempt sees the original snapshot, so proposals do
 not seed further growth within the same pass.
@@ -63,7 +64,7 @@ Capacity and pooling decisions do not affect simulation results.
 ## Save continuation and configuration
 
 Resource-growth integration introduced save format 149 and network protocol 67.
-The current version gates live in [Version.h](../../src/app/Version.h) and [ReplayReader.h](../../src/replay/ReplayReader.h). The save compatibility floor remains 58. Released layouts
+The current version gates live in [Version.h](../../src/app/Version.h) and [ReplayReader.h](../../src/replay/ReplayReader.h). Maps and saved matches retain the version-58 compatibility floor. Released layouts
 146–148 and historical growth-draft layouts with the same numbers are resolved
 before loading game state: the map catalog or a bounded terrain-block probe
 identifies vertex versus legacy corner storage. Historical growth layouts retain

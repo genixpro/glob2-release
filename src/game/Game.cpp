@@ -19,6 +19,9 @@
 
 #include "DatasetWriter.h"
 #include "Game.h"
+#include "TurretTargeting.h"
+#include "TeamStatsPipeline.h"
+#include "HiringPipeline.h"
 #include "BuildingArtwork.h"
 #include "ai/BuildingCapabilities.h"
 #include "GameUtilities.h"
@@ -40,6 +43,7 @@
 #include "render/GameAnimations.h"
 #include "render/SoftwareTerrainCache.h"
 #include "ai/engine/AIPipeline.h"
+#include "TurretTargeting.h"
 
 #define BULLET_IMGID 0
 
@@ -93,8 +97,8 @@ void Game::configureUnitCatalog()
     // Setup may replace definitions for units already present in a map. Check
     // occupancy before rebinding so a changed flight mode cannot overwrite a unit.
     for (Team* team : teams) if (team) {
-        for (int slot=0;slot<Unit::MAX_COUNT;++slot) {
-            Unit* unit=team->myUnits[slot];
+        for (Unit* unit : team->liveUnits.entries())
+        {
             if (!unit) continue;
             if (!catalog.valid(unit->typeNum)) throw std::runtime_error("Unit catalog removes a live unit definition");
             if (!availability[unit->typeNum])
@@ -149,8 +153,8 @@ void Game::configureUnitCatalog()
     for (Team* team : teams) if (team && team->race.getCatalog()!=gameHeader.getUnitCatalog()) {
         team->race.setCatalog(gameHeader.getUnitCatalog());
         team->stats.configureUnits(catalog.size());
-        for (int slot=0;slot<Unit::MAX_COUNT;++slot) {
-            Unit* unit=team->myUnits[slot];
+        for (Unit* unit : team->liveUnits.entries())
+        {
             if (!unit) continue;
             const bool oldFlight=unit->performance[FLY]!=0;
             const auto& traits=catalog.runtime(unit->typeNum);
@@ -167,6 +171,7 @@ void Game::configureUnitCatalog()
         }
     }
     worldSnapshots.invalidateCatalog();
+    completedObservation.reset(); // Setup/catalog replacement is an explicit owner edit.
 }
 
 void Game::configureBuildingCatalog()
@@ -192,8 +197,8 @@ void Game::configureBuildingCatalog()
 		{
 			team->stockSuppliers.clear();
 			team->directStockSuppliers.clear();
-			for (int i=0; i<Building::MAX_COUNT; ++i)
-				if (Building* building=team->myBuildings[i]; building && building->buildingState==Building::ALIVE)
+			for (Building* building : team->liveBuildings.entries())
+			if (building && building->buildingState==Building::ALIVE)
 				{
 					if (building->type->runtimeSuppliesStock) team->stockSuppliers.push_back(building);
 					if (building->type->runtimeSuppliesDirectStock) team->directStockSuppliers.push_back(building);
@@ -238,9 +243,8 @@ void Game::init(GameGUI *gui, MapEdit* edit)
 	for (int i=0; i<TICK_PROFILE_BUF_LEN; i++)
 		ticksGameSum[i]=0;
 
-	maskAwayPlayer = 0;
-	// Only setGameHeader and setWaitingOnMask assigned this before; a Game that never
-	// receives a header (headless tests) otherwise gates every syncStep on garbage.
+	// Games created without a header (headless tests) may advance until an
+	// explicit network wait state says otherwise.
 	anyPlayerWaited = false;
 }
 
@@ -249,8 +253,11 @@ void Game::init(GameGUI *gui, MapEdit* edit)
 void Game::clearGame()
 {
     unitCargo.clear();
-	map.resetGradientPipeline(); // Discard reservations and drain callbacks before team destruction.
+    turretTargetingPipeline.reset();
+	map.resetGradientPipeline(true); // Drain callbacks and discard old-world caches before team destruction.
 	clearAI(); // Join all controller work before deleting teams or players.
+    map.computeExecutor().cancelPresentationAndWait();
+    map.computeExecutor().resetTelemetry();
 	scriptGenerations.fill(0);
 	recordingFailingUnits=BuildingRef();
 	hasSavedRandomState = false;
@@ -298,6 +305,7 @@ void Game::clearGame()
 void Game::setGameHeader(const GameHeader& newGameHeader, bool saveAI)
 {
 	if (saveAI) {
+        if(statsPipeline && statsPipeline->hasState() && gameHeader.getTeamStatsDelay()!=newGameHeader.getTeamStatsDelay())throw std::logic_error("A saved match cannot change its statistics delay");
 		drainAI();
 		if (aiPipeline && gameHeader.getAIOrderDelay()!=newGameHeader.getAIOrderDelay())
 			throw std::logic_error("A saved match cannot change its AI delay");
@@ -382,11 +390,9 @@ void Game::setGameHeader(const GameHeader& newGameHeader, bool saveAI)
 	if (!mapHeader.getIsSavedGame())
 		for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
 		{
-			for (int slot = 0; slot < Unit::MAX_COUNT; ++slot)
-				if (Unit* unit = teams[t]->myUnits[slot])
+			for (Unit* unit : teams[t]->liveUnits.entries())
 					unit->entityRandom.initialize(newGameHeader.getRandomSeed(), EntityRandom::Kind::Unit, unit->gid, unit->scriptIdentity);
-			for (int slot = 0; slot < Building::MAX_COUNT; ++slot)
-				if (Building* building = teams[t]->myBuildings[slot])
+			for (Building* building : teams[t]->liveBuildings.entries())
 					building->entityRandom.initialize(newGameHeader.getRandomSeed(), EntityRandom::Kind::Building, building->gid, building->scriptIdentity);
 		}
 	if (gameSeedChanged)
@@ -487,14 +493,13 @@ void Game::applyStartingRules(void)
 	const int buildingHpMultiplier = gameHeader.getBuildingHpMultiplier();
 	for (int t=0; t<mapHeader.getNumberOfTeams(); ++t)
 	{
-		for (int i=0; i<Unit::MAX_COUNT; ++i)
+		for (Unit *unit : teams[t]->liveUnits.entries())
 		{
-			Unit *unit = teams[t]->myUnits[i];
 			if (!unit)
 				continue;
 			if (hpDivisor != 1)
 			{
-				unit->performance[HP] = std::max(1, unit->performance[HP] / hpDivisor);
+				unit->setPerformance(HP,std::max(1,int(unit->performance[HP])/hpDivisor));
 				unit->hp = std::max(1, unit->hp / hpDivisor);
 				unit->trigHP /= hpDivisor;
 			}
@@ -502,17 +507,15 @@ void Game::applyStartingRules(void)
 				unit->trigHP = 0;
 		}
 		if (buildingHpMultiplier != 1)
-			for (int i=0; i<Building::MAX_COUNT; ++i)
-				if (teams[t]->myBuildings[i])
-					teams[t]->myBuildings[i]->hp *= buildingHpMultiplier;
+			for (Building* building : teams[t]->liveBuildings.entries())
+				building->hp *= buildingHpMultiplier;
 	}
 }
 
 void Game::setWaitingOnMask(Uint32 mask)
 {
-    if (maskAwayPlayer!=mask || anyPlayerWaited!=(mask!=0)) snapshots().invalidateBoundary();
-	maskAwayPlayer = mask;
 	anyPlayerWaited = (mask != 0);
+	if (clientEvents) clientEvents->publishWaitingMask(mask);
 }
 
 
@@ -562,28 +565,6 @@ bool Game::isPrestigeWinCondition(void)
 
 static_assert(ClientEvents::MaxTeams >= Team::MAX_COUNT, "ClientEvents pulse must cover every team");
 
-BuildingRef Game::refOf(const Building *b)
-{
-	BuildingRef ref;
-	if (b)
-	{
-		ref.gid = b->gid;
-		ref.generation = b->scriptIdentity;
-	}
-	return ref;
-}
-
-UnitRef Game::refOf(const Unit *u)
-{
-	UnitRef ref;
-	if (u)
-	{
-		ref.gid = u->gid;
-		ref.generation = u->scriptIdentity;
-	}
-	return ref;
-}
-
 Building *Game::resolveBuilding(BuildingRef ref) const
 {
 	if (ref.empty())
@@ -611,9 +592,7 @@ Unit *Game::resolveUnit(UnitRef ref) const
 void Game::publishClientEvent(ClientEventVariant event)
 {
     if (clientEvents) {
-        const bool acknowledgement=std::holds_alternative<ClientEvent::OrderExecuted>(event);
         clientEvents->push(std::move(event));
-        if (acknowledgement) snapshots().invalidateBoundary();
     }
 }
 

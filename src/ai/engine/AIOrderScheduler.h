@@ -3,6 +3,7 @@
 
 #include "ComputeExecutor.h"
 #include <atomic>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <map>
@@ -59,8 +60,6 @@ private:
 		Decide decide;
 		std::optional<Command> completed;
 		std::exception_ptr failure;
-		Uint64 computationNs = 0;
-		OrderScheduler* owner = nullptr;
 		static void run(void* context, std::size_t);
 	};
 	// The decisions admitted at one observation tick, dispatched to the executor
@@ -76,38 +75,35 @@ private:
 	};
 	std::deque<TickBatch> batches;
 	ComputeExecutor* executor = nullptr;
-	bool shared = false;
-	// Smoothed decision work of recent batches. A delay-zero batch is handed to
-	// the workers only when it carries enough work to repay waking them;
-	// otherwise the owner decides it inline. Neither changes a decision.
-	Uint64 recentWorkNs = SharedWorkThresholdNs;
-	std::atomic<Uint64> computationNs{0};
 	std::map<unsigned, RequestId> lastSubmitted;
 	unsigned delay = 0;
 	std::optional<Uint32> submissionTick;
 	std::optional<Uint32> deliveryTick;
 	static Command& complete(Pending& entry);
 	TickBatch& batchFor(Uint32 observedTick);
-	void joinBatch(TickBatch& batch);
-	void joinAll();
+	void joinBatch(TickBatch& batch, JoinContext context);
+	void joinAll(JoinContext context = {JoinReason::Teardown, ComputeTelemetry::NoTick});
 	bool liveWork() const;
 
 public:
-	static constexpr Uint64 SharedWorkThresholdNs = 100000;
 	struct Metrics { Uint64 submitted = 0, delivered = 0, deadlineMisses = 0, deadlineWaitNs = 0, maximumPending = 0, sharedBatches = 0; } metrics;
 	OrderScheduler() = default;
 	OrderScheduler(const OrderScheduler&) = delete;
 	// Joins every admitted decision; the executor must outlive the scheduler.
 	~OrderScheduler();
 	// Shared execution hands batches to the executor's workers and the
-	// submitter waits for them at the deadline; otherwise the submitter decides
-	// when it dispatches. Either way decisions are delivered at the deadline.
-	void configure(unsigned delayTicks, ComputeExecutor& executor, bool sharedExecution);
-	void configureExecution(ComputeExecutor& executor, bool sharedExecution);
+	// submitter waits for them at the deadline. Without workers, the executor
+	// runs the decisions on the owner at that same join.
+	void configure(unsigned delayTicks, ComputeExecutor& executor);
+	void configureExecution(ComputeExecutor& executor);
 	unsigned delayTicks() const { return delay; }
-	bool sharedExecution() const { return shared; }
+	// Configuration zero now means delivery at the next completed observation.
+	unsigned effectiveDelay() const { return std::max(1u, delay); }
+	bool wasDelivered(Uint32 tick) const { return deliveryTick && *deliveryTick == tick; }
+	bool validDeadline(Uint32 observed, Uint32 due) const {
+		return due >= observed && (due - observed == delay || (!delay && due - observed == 1));
+	}
 	bool hasExecutor() const { return executor != nullptr; }
-	Uint64 activeNs() const { return computationNs.load(std::memory_order_relaxed); }
 	std::size_t pendingCount() const;
 	bool wasSubmitted(unsigned player, Uint32 generation, Uint32 tick) const {
 		const auto it=lastSubmitted.find(player);
@@ -121,7 +117,7 @@ public:
 	// batch before returning any outputs; errors cannot partially publish it.
 	std::vector<Delivery> takeDue(Uint32 tick);
 	// Lifecycle barriers finish private work without advancing deadlines.
-	void drain();
+	void drain(JoinContext context = {JoinReason::Verification, ComputeTelemetry::NoTick});
 	void adoptDiagnostics(GameDiagnostics::Session& session);
 	std::vector<Delivery> cancel(unsigned player, Uint32 generation);
 	void clear();

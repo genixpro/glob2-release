@@ -128,8 +128,8 @@ std::shared_ptr<Order> AI::getOrder(bool paused)
 	// native controllers before planning; hospitals and barracks can still heal.
 	std::shared_ptr<Order> order;
 	if (implementationID!=JAVASCRIPT && player->game->gameHeader.isUnitUpgradesDisabled())
-		for (int i=0;i<Building::MAX_COUNT;++i)
-			if (auto* b=player->team->myBuildings[i]; b && !b->type->isBuildingSite
+		for (auto* b : player->team->liveBuildings.entries())
+			if (!b->type->isBuildingSite
 				&& AIRules::trainingBuilding(*b->type) && b->maxUnitWorking>0
 				&& !AIRules::usefulWithoutTraining(*player->game,b->typeNum))
 			{ order=std::make_shared<OrderModifyBuilding>(b->gid,0); break; }
@@ -151,15 +151,6 @@ std::shared_ptr<Order> AI::getOrder(bool paused)
 	return order;
 }
 
-SimulationSnapshot::Requirements AI::observationRequirements() const
-{
- auto required=aiImplementation->observationRequirements();
- if(implementationID!=JAVASCRIPT && player->game->gameHeader.isUnitUpgradesDisabled())
-  required|=SimulationSnapshot::bit(SimulationSnapshot::Component::Catalogs)
-   |SimulationSnapshot::bit(SimulationSnapshot::Component::Entities)
-   |SimulationSnapshot::bit(SimulationSnapshot::Component::Rules);
- return required;
-}
 void AI::prepareDecision()
 {
 	if (!aiImplementation->supportsObservation()) throw std::logic_error("AI decision boundary audit incomplete");

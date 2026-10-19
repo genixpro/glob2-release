@@ -203,7 +203,7 @@ TEST_SUITE("ResourceGrowth")
 		b.proposals = {increment(m, m.coordToIndex(8, 8), id)};
 		ResourceGrowth::apply(m, b, metrics);
 		CHECK(m.getResource(8, 8).type == NO_RES_TYPE);
-		const auto &stats = world.game.teams[0]->stats.measurements;
+		const auto &stats = world.game.teams[0]->stats.editMeasurements();
 		CHECK(stats.growthGlobal[0][materialIndex(MaterialId::Food)] == 1);
 		CHECK(stats.growthGlobal[0][materialIndex(MaterialId::Paper)] == 1);
 		CHECK(stats.growthGlobal[1][materialIndex(MaterialId::Food)] == 6);
@@ -300,8 +300,7 @@ TEST_SUITE("ResourceGrowth")
 		auto &m = world.game.map;
 		const auto id = crop(m, true);
 		seed(m, id);
-		const auto snapshot = world.game.snapshotStore().captureBoundary(
-			world.game, ResourceGrowth::Pipeline::requirements());
+		const auto snapshot = world.game.snapshotStore().captureBoundary(world.game);
 		const auto before = m.checkSum(true);
 		ResourceGrowth::Batch a, b;
 		MersenneTwister r1(991), r2(991);
@@ -364,17 +363,19 @@ TEST_SUITE("ResourceGrowth")
 				return total;
 			};
 			const auto initialFood = foodStocks();
+			// Conservation compares the current map and live event ledger;
+			// published measurements deliberately lag the simulation.
 			const auto initialAdded =
-				shared.game.teams[0]->stats.measurements.growthGlobal[1][materialIndex(MaterialId::Food)];
-            const auto initialRemoved = shared.game.teams[0]->stats.measurements.growthGlobal[2][materialIndex(MaterialId::Food)];
+				shared.game.teams[0]->stats.events().growthGlobal[1][materialIndex(MaterialId::Food)];
+            const auto initialRemoved = shared.game.teams[0]->stats.events().growthGlobal[2][materialIndex(MaterialId::Food)];
 			for (int tick = 0; tick < 40; ++tick)
 			{
 				fallback.step();
 				shared.step();
 				const auto &metrics = shared.game.map.resourceGrowthMetrics();
 				CHECK(metrics.publishedProposals == metrics.accepted + metrics.rejected);
-				CHECK(foodStocks() + shared.game.teams[0]->stats.measurements.growthGlobal[2][materialIndex(MaterialId::Food)] - initialRemoved == initialFood + metrics.stockAdded);
-				CHECK(shared.game.teams[0]->stats.measurements.growthGlobal[1][materialIndex(MaterialId::Food)] ==
+				CHECK(foodStocks() + shared.game.teams[0]->stats.events().growthGlobal[2][materialIndex(MaterialId::Food)] - initialRemoved == initialFood + metrics.stockAdded);
+				CHECK(shared.game.teams[0]->stats.events().growthGlobal[1][materialIndex(MaterialId::Food)] ==
 					  initialAdded + metrics.stockAdded);
 				CHECK(shared.game.checkSum(nullptr, nullptr, nullptr, true) ==
 					  fallback.game.checkSum(nullptr, nullptr, nullptr, true));
@@ -394,14 +395,12 @@ TEST_SUITE("ResourceGrowth")
 		CHECK_THROWS(map.setResourceGrowthDelay(3));
 		CHECK(pipeline.needsPreparation());
 		CHECK(pipeline.count() == 0);
-		auto snapshot = world.game.snapshotStore().captureBoundary(
-			world.game, ResourceGrowth::Pipeline::requirements());
+		auto snapshot = world.game.snapshotStore().captureBoundary(world.game);
 		pipeline.prepare(snapshot, map.computeExecutor());
 		map.setResourceGrowthDelay(8);
 		CHECK_THROWS(map.setResourceGrowthDelay(3));
 		CHECK(pipeline.count() == 1);
 		CHECK_FALSE(map.computeExecutor().finished(pipeline.pending.front()->work));
-		CHECK(pipeline.metrics.computeNs == 0);
 		pipeline.finish();
 		CHECK(pipeline.metrics.sampled > 0);
 	}
@@ -419,11 +418,28 @@ TEST_SUITE("ResourceGrowth")
 		CHECK(world.game.stepCounter == 1);
 		CHECK(m.resourceGrowthMetrics().published == 0);
 		world.game.anyPlayerWaited = false;
-		world.step(3);
-		CHECK(world.game.stepCounter == 4);
+		world.step(2);
+		REQUIRE(world.game.stepCounter == 3);
 		CHECK(m.resourceGrowthMetrics().published == 0);
-		world.step();
-		CHECK(m.resourceGrowthMetrics().published == 1);
+
+        // Observation zero admitted the first batch with a three-tick delay.
+        // Publication occurs at observation three, before advancing live state.
+        const auto due = world.game.observeCompletedWorld();
+        CHECK(due.tick == 3);
+        CHECK(m.resourceGrowthMetrics().published == 1);
+        const auto submitted = m.resourceGrowthMetrics().submitted;
+        world.game.anyPlayerWaited = true;
+        world.step(5);
+        CHECK(world.game.stepCounter == 3);
+        CHECK(m.resourceGrowthMetrics().published == 1);
+        CHECK(m.resourceGrowthMetrics().submitted == submitted);
+        CHECK(world.game.observeCompletedWorld().entities == due.entities);
+        world.game.anyPlayerWaited = false;
+        world.step();
+        REQUIRE(world.game.stepCounter == 4);
+        CHECK(m.resourceGrowthMetrics().published == 1);
+        world.game.observeCompletedWorld();
+        CHECK(m.resourceGrowthMetrics().published == 2);
 	}
 	TEST_CASE("frozen input outlives terrain and resource edits and wrapping remains valid")
 	{
@@ -431,8 +447,7 @@ TEST_SUITE("ResourceGrowth")
 		glob2test::HeadlessGame world({.header = true});
 		auto &m = world.game.map;
 		seed(m, crop(m));
-		const auto snapshot = world.game.snapshotStore().captureBoundary(
-			world.game, ResourceGrowth::Pipeline::requirements());
+		const auto snapshot = world.game.snapshotStore().captureBoundary(world.game);
 		ResourceGrowth::Batch a, b;
 		MersenneTwister first(991), second(991);
 		ResourceGrowth::calculate(snapshot.view(), first, a);
@@ -465,9 +480,7 @@ TEST_SUITE("ResourceGrowth")
 		m.setResourceGrowthDelay(8);
 		world.step();
 		REQUIRE(m.gradientRuntime->growth.count() == 1);
-		CHECK(m.resourceGrowthMetrics().computeNs == 0);
 		m.checkSum(false);
-		CHECK(m.resourceGrowthMetrics().computeNs == 0);
 		m.finishResourceGrowth();
 		CHECK(m.resourceGrowthMetrics().sampled > 0);
 		CHECK(m.resourceGrowthMetrics().published == 0);
@@ -483,8 +496,7 @@ TEST_SUITE("ResourceGrowth")
 		seed(map, crop(map));
 		ResourceGrowth::Pipeline pipeline;
 
-		auto snapshot = world.game.snapshotStore().captureBoundary(
-			world.game, ResourceGrowth::Pipeline::requirements());
+		auto snapshot = world.game.snapshotStore().captureBoundary(world.game);
 		pipeline.stage(snapshot.tick, 991);
 		pipeline.prepare(snapshot, map.computeExecutor());
 		pipeline.finish();
@@ -507,8 +519,7 @@ TEST_SUITE("ResourceGrowth")
 		map.configureCompute(3);
 		auto &executor = map.computeExecutor();
 		ResourceGrowth::Pipeline pipeline;
-		auto first = world.game.snapshotStore().captureBoundary(
-			world.game, ResourceGrowth::Pipeline::requirements());
+		auto first = world.game.snapshotStore().captureBoundary(world.game);
 		pipeline.stage(first.tick, 1);
 		pipeline.prepare(first, executor);
 		pipeline.finish();
@@ -531,8 +542,7 @@ TEST_SUITE("ResourceGrowth")
 			pipeline.pending.front()->work = fence.work;
 			fence.entered.wait();
 			world.game.stepCounter = 1;
-			auto second = world.game.snapshotStore().captureBoundary(
-				world.game, ResourceGrowth::Pipeline::requirements());
+			auto second = world.game.snapshotStore().captureBoundary(world.game);
 			pipeline.stage(second.tick, 2);
 			pipeline.prepare(second, executor);
 			// Join only the later job; the first worker remains blocked.
@@ -658,7 +668,7 @@ TEST_CASE("configured seeds preserve rates variety collisions and saved output" 
     for (int y = 0; y < map.getH(); y += 2)
         for (int x = 0; x < map.getW(); x += 2)
             map.replaceResource(map.coordToIndex(x, y), Resource{Uint16(resourceIndex(id)), 3, 1, 0});
-    auto snapshot = world.game.snapshotStore().captureBoundary(world.game, ResourceGrowth::Pipeline::requirements());
+    auto snapshot = world.game.snapshotStore().captureBoundary(world.game);
     ResourceGrowth::Batch batch;
     MersenneTwister random(991);
     ResourceGrowth::calculate(snapshot.view(), random, batch);
@@ -806,14 +816,14 @@ TEST_CASE("typed proposal loading validates fields and preserves old queued unit
     }
 }
 
-TEST_CASE("finishing the last deferred tick computes without publishing early" * doctest::test_suite("ResourceGrowth"))
+TEST_CASE("finishing admitted world work does not publish early" * doctest::test_suite("ResourceGrowth"))
 {
     glob2test::HeadlessGlobals globals;
     glob2test::HeadlessGame world({.header = true});
     auto &map = world.game.map;
     map.setResourceGrowthDelay(8);
-    world.game.syncStep(-1, Game::PreparationCompletion::Deferred);
-    REQUIRE(map.gradientRuntime->growth.needsPreparation());
+    world.game.step(-1);
+    REQUIRE_FALSE(map.gradientRuntime->growth.needsPreparation());
     const auto published = map.resourceGrowthMetrics().published;
     map.finishResourceGrowth();
     CHECK_FALSE(map.gradientRuntime->growth.needsPreparation());
@@ -822,20 +832,21 @@ TEST_CASE("finishing the last deferred tick computes without publishing early" *
     CHECK(map.gradientRuntime->growth.count() == 1);
 }
 
-TEST_CASE("engine preflight opens both historical growth and released vertex saves" * doctest::test_suite("ResourceGrowth"))
+TEST_CASE("historical growth payloads retain pending work after header preflight" * doctest::test_suite("ResourceGrowth"))
 {
-    glob2test::GlobalsOptions options; options.loadStrings=true;
-    glob2test::HeadlessGlobals globals(options);
-    for (const char *name : {"growth146.game.gz","growth148.game.gz","vertex148.game.gz"}) {
-        CAPTURE(std::string(name));
+    glob2test::HeadlessGlobals globals({.loadStrings=true});
+    for (const char* name : {"growth146.game.gz", "growth148.game.gz", "vertex148.game.gz"}) {
+        CAPTURE(name);
         Engine engine;
         const auto path=glob2test::inflated(std::string("resources/growth-save-layout/")+name);
-        // These simulation fixtures omit the optional GameGUI tail. Exercise the
-        // production header preflight, then load the complete simulation payload.
         MapHeader header; GameHeader players;
         auto input=engine.openGameInput(path.string(),header,players);
         REQUIRE(input != nullptr);
         REQUIRE(engine.gui.game.load(input.get()));
-        CHECK(engine.gui.game.map.resourceGrowthDelay()==8);
+        const bool growth = std::string_view(name).starts_with("growth");
+        // Header inspection must leave the original payload available, including
+        // computed growth outputs that must not be regenerated from live state.
+        CHECK((engine.gui.game.map.gradientRuntime->growth.count() != 0) == growth);
+        CHECK(engine.gui.game.mapHeader.getNumberOfTeams() == header.getNumberOfTeams());
     }
 }

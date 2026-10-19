@@ -189,7 +189,7 @@ void initialFlagStaffing()
             f.game.map.buildingGradient(flag,0);
             // Even if discovery/management is delayed past a recruitment cycle,
             // the default broad resource selector cannot recruit a worker.
-            for(int tick=0;tick<70;++tick)REQUIRE(!flag->subscribeForFlagingStep());
+            for(int tick=0;tick<70;++tick)REQUIRE(!(glob2test::publishCurrentHiringSuggestions(*flag->owner->game), flag->subscribeForFlagingStep()));
             REQUIRE(flag->unitsWorking.empty());
         }
     }
@@ -206,7 +206,7 @@ void applyFlagOrders(Context& c,Building* flag)
             if(move->gid==flag->gid){flag->posX=move->x;flag->posY=move->y;}
         if(auto selector=std::dynamic_pointer_cast<OrderModifyClearingFlag>(order))
             if(selector->gid==flag->gid)
-                for(int r=0;r<BASIC_COUNT;++r)flag->clearingMaterials[r]=selector->clearingMaterials[r];
+                for(int r=0;r<BASIC_COUNT;++r)flag->setClearsMaterial(r,selector->clearingMaterials[r]);
     }
     c.orders.clear();
 }

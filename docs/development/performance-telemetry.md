@@ -168,47 +168,99 @@ Periodic pipeline fields propagate on workers and are not included.
 
 ### Building field statistics
 
-`--telemetry gradient-stats` (environment `GLOB2_GRADIENT_STATS=1`) gives the map a
-diagnostic `BuildingGradientStats` (`src/map/gradient/BuildingGradientStats.h`). It only
-reads simulation state: checksums, RNG, saves and replays are identical with it on or
-off, and without it every hook is a null-pointer test. Each building walking-field
-lifetime ends with one row in `gradient-stats.csv` in the output directory: a rebuild
-(`reason` = `null`, `dirty`, `generation`, `clearing`, `stuck`, `scheduled` for a
-scheduled field's publication, or `other`), a `drop` (`Building::resetPathfindGradients`),
-an idle `evict` or the run's `end`. Unless `GLOB2_BUILDING_DEPTH` says otherwise, the
-statistics publish scheduled fields with only their seeds settled (`lazy` depth), so each
-lifetime's settled depth is what its readers needed; the depth moves CPU, never results.
-A row describes the lifetime that just ended (`age`, `prev_complete`, `prev_settled_cost`,
-`prev_settled_tiles`, `prev_popped`, `prev_queries` = resolve calls, `prev_extensions` =
-calls that expanded the search, and `popped_at_depth_0..31`, popped entries per 80-cost
-band of eight land tiles with the last band open-ended) together with how that
-lifetime began (`lifetime_reason`). The final columns are the
-inputs a depth prediction could read in O(1) when that lifetime started: map
-`width` and `height`, the building's `level`, `is_site`, `construction_state`
-(`none`, `new`, `upgrade`, `repair`), `progress` (the delivered/needed material
-quartile 0-3 on construction sites, empty otherwise), and its team's live
-`team_units` and `team_buildings`. The last three columns are the depth model's
-inputs at the moment the lifetime's depth was decided: `staged` is 1 when a
-scheduled refresh was staged for it (the context is then read at staging, not at
-publication), `previous_hint` is the reader-required depth of the lifetime before it
-(`settledCostHint`) and `serving_settled` is how deep readers of the field it
-replaced required it by then, each -1 when unknown. All are empty when the start was not
-seen, for example for a field restored from a save. The historical column names
-`serving_settled` and `previous_hint` now record reader-required depth, excluding
-worker preparation and serialization completion. `prev_settled_cost` still
-records the actual prepared search frontier.
+Per-search counters, depth histograms and lifetime CSV exports have been retired.
+The production depth predictor retains only reader-demand history. Use external
+profilers and the shared executor diagnostics to measure execution.
 
-`result.json` then has a `building_gradient` object: `rebuilds` by reason,
-`dirty_with_generation` (dirty rebuilds whose topology generation had also moved),
-`events`, `popped_total`, `popped_unknown_lifetime`, `popped_by_lifetime_reason` and
-`clearing_goal_gone`.
-[The building-field depth model](../ai/architecture/building-gradient-depth-model.md) is fitted
-from these rows.
+## Optional compute executor diagnostics
 
-The statistics stay compiled into release builds and are gated at run time, as
-`team-timeline` is: tournament workers run ordinary release binaries. With the flag
-off, the hooks reduce to null-pointer tests and a few always-on search counters.
-Measure disabled and enabled collection on the same retained fixture when changing instrumentation; publish matching source, toolchain and sampling inputs with the results.
+`play`, `replay` and `game run` accept `--compute-telemetry off|waits|trace`.
+The default is `off`. This option controls executor and producer pipeline diagnostic
+collection independently of ordinary performance scopes and GPU/backend diagnostics.
+Producer outcome counts (published/discarded work, proposals and throughput) remain ordinary
+telemetry; this mode controls optional executor accounting and producer timing.
+Mode changes drain required work before selecting worker and callback specializations.
+Reconfiguring workers or diagnostics starts a fresh collection interval; exports cover
+that interval or the time since the latest load/restart reset.
+No diagnostic metadata is saved, replayed, hashed, or used to choose simulation results.
 
+- `off` allocates no diagnostic sidecars or trace storage. Its worker specialization
+  contains no diagnostic clock calls, counter updates, event writes or mode tests.
+- `waits` records submissions and owner joins under the existing executor mutex.
+  Workers use the same specialization as `off`; worker callback timing is unavailable.
+- `trace` also records scheduling, callbacks, suspension, external resolution,
+  continuations, completion and retirement. Callback end is distinct from completion.
+  A continuation retains its batch/job identity; repeated claim/start/end events identify
+  successive invocations. Blocking fork/join and presentation events have separate
+  `execution_kind` namespaces (0 deferred, 1 fork/join, 2 scene preparation, 3 graphics batches, 4 worker-only maintenance).
+  Maintenance has no required join or simulation deadline; its events show worker occupancy.
 
-See [compute pipeline benchmarks](compute-benchmarks.md) for scheduled work and optimization comparisons.
+The zero-delay AI placement policy still measures decision duration in all modes: it
+uses that duration to choose owner or worker execution. Those clocks are scheduling
+inputs, rather than optional diagnostics. Delayed AI callbacks do not read that clock
+in `off` or `waits`. Optional gradient GPU diagnostics and backend calibration also
+retain their own controls and clocks. Turning compute diagnostics off does not disable
+those independent features.
+
+Headless `result.json`, turn network session summaries, and the local
+`GLOB2_COMPUTE_SUMMARY` JSON record emitted with `GLOB2_TEAM_TIMELINE=1` contain a
+versioned `compute_telemetry` object (the timeline record contains that object directly).
+Disabled exports contain `schema_version: 1`, `mode: "off"`, `available: false`.
+Allocation failure disables collection or downgrades tracing to waits; `requested_mode`
+identifies a downgrade. Legacy headless timing/counter fields are `null` when unavailable.
+Pipeline join timing is derived from the common executor summaries; its population
+now includes valid joins only, excluding empty/stale handles. AI deadline metrics also
+come from these summaries. Raw pipeline diagnostic structs do not independently time joins.
+
+Each producer/reason entry contains joined and incomplete batch counts, background wait
+attempts, owner execution joins, and duration totals, maxima and fixed histograms.
+Histogram bucket 0 is zero ns; bucket n>0 covers `[2^(n-1), 2^n-1]` ns, through bucket 64.
+An unfinished batch under the completion lock counts as a wait attempt even if completion
+occurs before the owner sleeps. Background wait duration includes completion notification,
+scheduling and mutex reacquisition. It is elapsed time, not worker CPU time.
+Join lock time measures acquisition; total join time ends after slot retirement/accounting,
+before mutex release and exception delivery. Failed batches are counted before rethrowing.
+Fork/join summaries also report the owner's work before its completion barrier.
+
+Producer attribution identifies the work awaited. Owner fallback duration can include earlier
+deadlines from other producers. It is not the awaited producer's callback execution time.
+A mixed batch has one `mixed` attribution. Save, reconfigure, teardown and verification joins
+remain separate from tick deadline and immediate required joins.
+
+Required joins with a tick must arrive in nondecreasing logical tick order within a session.
+Lifecycle calls use `ComputeTelemetry::NoTick`. Producers explicitly map their local advance
+boundaries onto the simulation tick, independently of executor deadline keys. Repeated waits
+on a tick add elapsed time, while per-producer and global affected-tick counts increment once.
+Advancing ticks are counted after successful simulation advancement, excluding pause and
+network stalls. Current tick duration is included in snapshots without mutating the collector.
+Frequency denominators are `required_batches_joined` and `advancing_ticks`; their numerators
+are `required_batches_incomplete` and `background_wait_ticks`. A zero denominator has no
+measured rate. Loading/restarting clears session summaries and streams after producers drain.
+
+Trace event arrays share a default 16 MiB budget per executor, split among simulation owner, graphics owner, workers
+and an external completion stream. The budget covers event storage; bounded summary and
+stream metadata are additional. Configuration allocates all arrays. Full arrays drop new
+events without blocking or allocating; `trace_lost_events` and `trace_incomplete` expose loss.
+Scheduler/external writes use existing executor locks; fork/join callback starts use their
+thread's single-writer stream. Summary snapshots copy synchronized counters. Full event
+snapshots require drained required work and idle scene/graphics presentation; they never inspect a running
+writer. Headless and final timeline exports satisfy that boundary. Network snapshots omit
+event arrays (`trace_included: false`) and retain loss counters.
+
+Analyze a full export with:
+
+```sh
+python3 tools/compute_trace.py artifacts/run/result.json --output artifacts/run/compute-analysis.json
+```
+
+The reader preserves missing evidence as `null`, reports truncation, and derives callback
+elapsed time, lane predecessor delay, time queued after eligibility, external resolution
+after callback return, and completion-to-join latency. These intervals describe observed
+elapsed delays; eligible queue time does not identify which competing producer occupied
+workers. Inspect overlapping events to investigate that cause.
+
+Worker-only maintenance can span a snapshot: its event writes still use the scheduler
+mutex, and `trace_open_work` marks an open interval. A session reset discards the
+previous maintenance interval; an epoch check suppresses its returning events, while
+`trace_coverage_gap` marks that missing prefix until the next configuration/reset.
+Both flags contribute to `trace_incomplete`, independently of dropped-event counts.

@@ -22,6 +22,13 @@
 
 namespace glob2test
 {
+    // Controlled admission fixtures use fresh planner suggestions, independently
+    // of scheduling. Continuation/pipeline tests exercise real tick deadlines.
+    void publishCurrentHiringSuggestions(Game&);
+    // Remove only premature injected buffers before testing normal persistence.
+    void discardPrematureHiringSuggestions(Game&);
+    // Isolated weapon fixtures advance observation/publication without stepping units.
+    void prepareTurretTargets(Building&);
 	// Deterministic continuation scheduler: collect each unpaused AI decision,
 	// then apply in player order and advance one tick. Returns type+wire payload
 	// per AI so paired continuations can compare decisions as well as state.
@@ -129,7 +136,7 @@ namespace glob2test
 		Building* addBuilding(const char* typeName, int x, int y, int level = 0, int teamNumber = 0);
 		// A unit at (x, y), or parked on a free tile in the lower-right quadrant.
 		Unit* addUnit(int typeNum, int x = -1, int y = -1, int teamNumber = 0, int level = 0);
-		// One simulation tick per call: Game::syncStep for the local team, then
+		// One simulation tick per call: Game::step for the local team, then
 		// GameGUI::consumeClientEvents as the engine does.
 		void step(int ticks = 1);
 		Uint32 checksum();

@@ -61,7 +61,9 @@ bool MenuColony::load(const std::string& path)
 		if (input.isEndOfStream()) throw std::runtime_error("missing menu snapshot");
 		if (input.readText("format") != "glob2-menu-colony-1") throw std::runtime_error("invalid menu snapshot");
 		auto loaded = std::make_unique<Game>(nullptr);
-		if (!loaded->load(&input) || loaded->mapHeader.getNumberOfTeams() != 1 ||
+		if (!loaded->load(&input))
+			throw std::runtime_error("menu snapshot game failed to load");
+		if (loaded->mapHeader.getNumberOfTeams() != 1 ||
 			loaded->gameHeader.getNumberOfPlayers() != 1 || !loaded->players[0] ||
 			!loaded->players[0]->ai || loaded->players[0]->ai->implementationID != AI::ECONO)
 			throw std::runtime_error("incompatible menu colony");
@@ -79,14 +81,13 @@ bool MenuColony::load(const std::string& path)
 		{
 			presentation = std::make_unique<ScenePreparation>(game->map.computeExecutor());
 			const auto request = colonyRequest(worldTickTime);
-			const auto required = SceneExtractor::requirements(request);
-			const std::array<unsigned, 1> actors{0};
-			const auto world = game->captureReadBoundary(actors, false, required);
+			const auto options = SceneExtractor::captureOptions(request);
+			const auto world = game->observeCompletedWorld(options);
 			// Build the first frame before exposing the menu. Later frames retain
 			// asynchronous preparation, with this scene available until they arrive.
 			initialScene = std::make_unique<PresentationFrame>();
 			SceneExtractor extractor;
-			extractor.prepare(world.project(required), request, *initialScene);
+			extractor.prepare(world, request, *initialScene);
 		}
 		return true;
 	}
@@ -120,15 +121,16 @@ void MenuColony::update(Uint64 now, bool visible)
         const std::array<unsigned,1> actors{0};
         const bool admitted = presentation && presentation->readyToCapture();
         const auto request = colonyRequest(worldTickTime);
-        const auto required = admitted ? SceneExtractor::requirements(request) : 0;
-        const auto world = game->captureReadBoundary(actors, false, required);
-        if (admitted) presentation->submit(SceneExtractor::inputs(world.project(required), request));
-        for(const auto& [actor,scheduled]:game->prepareAIOrders(actors,false,nullptr,&world)) {
+        const auto options = presentation ? SceneExtractor::captureOptions(request) : SimulationSnapshot::CaptureOptions{};
+        const auto world = game->observeCompletedWorld(options);
+        if (admitted) presentation->submit(SceneExtractor::inputs(world, request));
+        game->admitAIOrders(actors,false,{},world);
+        for(const auto& [actor,scheduled]:game->deliverAIOrders(actors,false)) {
             scheduled->sender=actor;
             auto order=game->validateAIOrder(scheduled,actor);
             game->executeOrder(order,0);
         }
-		game->syncStep(0);
+		game->advanceLiveSimulation(0);
 		worldTickTime = SDL_GetTicks();
 		pending -= GAME_TICK_NS;
 	}

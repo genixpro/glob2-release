@@ -34,6 +34,38 @@ static std::string save(Game &game)
 	stream.flush();
 	return memory->takeContents();
 }
+TEST_CASE("JavaScript compact population pagination preserves visibility and fixed query budgets" *
+          doctest::test_suite("JavaScriptIntegration"))
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture{glob2test::GameOptions{.wDec=5,.hDec=5,.teams=2,.clearImmobile=true,.loadDefaultRace=true}};
+    auto& game=fixture.game;
+    auto* first=fixture.addUnit(WORKER,2,2,0);
+    auto* survivor=fixture.addUnit(WORKER,3,2,0);
+    REQUIRE(first); REQUIRE(survivor);
+    const auto reused=first->gid;
+    REQUIRE(game.removeUnitAndBuildingAndFlags(2,2,unsigned(Game::DEL_UNIT)));
+    auto* appended=fixture.addUnit(WORKER,4,2,0); REQUIRE(appended);
+    REQUIRE(appended->gid==reused);
+    game.map.unsetMapDiscovered(); game.map.switchFogOfWar(); game.map.switchFogOfWar();
+    Observations fair(game,0);
+    std::size_t beforeWork=0,afterWork=0;
+    auto page=Value::object().set("team",0).set("offset",1).set("limit",1);
+    auto rows=fair.query("units",{page});
+    REQUIRE(rows.items.size()==1);
+    // Public script order stays ascending ID even though the live order is survivor, appended.
+    CHECK(rows.items[0].get("id").number==survivor->gid);
+    auto baseline=fair.query("units",{},[&](std::size_t nodes,std::size_t bytes){beforeWork+=nodes+bytes;});
+    std::size_t spatialBefore=0,spatialAfter=0,visibleBefore=0,visibleAfter=0;
+    fair.visitSpatialEntities(true,-1,[&](const auto&){++visibleBefore;},[&](std::size_t nodes,std::size_t bytes){spatialBefore+=nodes+bytes;});
+    for (int i=0;i<6;++i) REQUIRE(fixture.addUnit(WORKER,20+i,22,1));
+    auto after=fair.query("units",{},[&](std::size_t nodes,std::size_t bytes){afterWork+=nodes+bytes;});
+    fair.visitSpatialEntities(true,-1,[&](const auto&){++visibleAfter;},[&](std::size_t nodes,std::size_t bytes){spatialAfter+=nodes+bytes;});
+    CHECK(after.encode()==baseline.encode()); CHECK(afterWork==beforeWork);
+    CHECK(visibleAfter==visibleBefore); CHECK(spatialAfter==spatialBefore);
+    CHECK(spatialBefore==2*Unit::MAX_COUNT);
+    CHECK(fair.query("units",{Value::object().set("offset",2).set("limit",1)}).items.empty());
+}
 TEST_CASE("JavaScript observations visibility memory pagination and stale references" *
 		  doctest::test_suite("JavaScriptIntegration"))
 {
@@ -354,8 +386,8 @@ TEST_CASE("JavaScript orders execute and survive save load" *
 	GLOB2_REQUIRE(clearingLoaded.game.load(&clearingIn), "JavaScript contract");
 	auto *restoredFlag =
 		clearingLoaded.game.teams[0]->myBuildings[Building::GIDtoID(clearing->gid)];
-	GLOB2_REQUIRE(restoredFlag && !restoredFlag->clearingMaterials[STONE] &&
-					  restoredFlag->clearingMaterials[WOOD],
+	GLOB2_REQUIRE(restoredFlag && !restoredFlag->clearsMaterial(STONE) &&
+					  restoredFlag->clearsMaterial(WOOD),
 				  "JavaScript contract");
 }
 TEST_CASE("JavaScript scenario effects commit atomically and resume" *
@@ -775,7 +807,7 @@ TEST_CASE("JavaScript telemetry scene permissions and replay diagnostic roundtri
 	auto observe = [&] {
 		// Fixture writes bypass the simulation tick/order boundary.
 		game.snapshots().invalidateBoundary();
-		extractor.prepare(game.captureReadBoundary({}, true, SceneExtractor::requirements(request)), request, scene);
+		extractor.prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)), request, scene);
 	};
 	observe();
 	REQUIRE(scene.panels.aiTelemetry.size() == 1);
@@ -968,7 +1000,7 @@ TEST_CASE("JavaScript custom library and telemetry dialogs render [display:1280x
 		request.includeTelemetry = true;
 		PresentationFrame presentation;
 		world.game.snapshots().invalidateBoundary();
-		SceneExtractor().prepare(world.game.captureReadBoundary({}, true, SceneExtractor::requirements(request)), request, presentation);
+		SceneExtractor().prepare(world.game.captureReadBoundary(SceneExtractor::captureOptions(request)), request, presentation);
 		world.gui.setPublishedScene(&presentation);
 		glob2test::drawGUI(world.gui,0);
 		const auto before = world.checksum();
@@ -1776,9 +1808,8 @@ TEST_CASE("JavaScript projected boundary preserves history and spatial resources
     glob2test::HeadlessGlobals globals;
     glob2test::HeadlessGame fixture(glob2test::GameOptions{.wDec=4,.hDec=4,.clearImmobile=true,.loadDefaultRace=true,.header=true});
     auto& game=fixture.game;
-    game.gameHeader.setAIConfig(0,config("export function step(ctx){return null;}"));
-    AIJavaScript controller(game.players[0]);
-    const auto requirements=controller.observationRequirements();
+    const auto requirements=SimulationSnapshot::Simulation & ~(SimulationSnapshot::bit(SimulationSnapshot::Component::Growth)
+        | SimulationSnapshot::bit(SimulationSnapshot::Component::ResourceFields));
     CHECK_FALSE(SimulationSnapshot::needs(requirements,SimulationSnapshot::Component::Growth));
     CHECK_FALSE(SimulationSnapshot::needs(requirements,SimulationSnapshot::Component::ResourceFields));
     for(int y=0;y<16;++y)for(int x=0;x<16;++x)game.map.fogOfWar[game.map.coordToIndex(x,y)]=1;
@@ -1862,7 +1893,7 @@ TEST_CASE("JavaScript building clearing materials retain full fixed slots and le
     glob2test::HeadlessGame world({.discovered=true,.clearImmobile=true,.loadDefaultRace=true,.header=true});
     auto* building=world.game.addBuilding(5,5,world.game.buildingsTypes.getFinishedTypeNum("inn"),0);
     REQUIRE(building);
-    for(unsigned m=0;m<MaterialCount;++m) building->clearingMaterials[m]=(m%2)!=0;
+    for(unsigned m=0;m<MaterialCount;++m) building->setClearsMaterial(m,(m%2)!=0);
     Observations observations(world.game,-1);
     const auto buildings=observations.query("buildings",{});
     REQUIRE(buildings.items.size()==1);

@@ -92,6 +92,8 @@ TEST_SUITE("ResourceGrowthBenchmark")
 					auto &map = world.game.map;
 					setup(map, scenario);
 					map.configureCompute(variant == "shared" ? 4 : 1);
+                    if (const char* mode = std::getenv("GLOB2_COMPUTE_TELEMETRY"))
+                        map.computeExecutor().configureTelemetry(ComputeTelemetry::parseMode(mode));
 					map.setResourceGrowthDelay(delay);
 					auto scan = [&]()
 					{
@@ -119,8 +121,8 @@ TEST_SUITE("ResourceGrowthBenchmark")
 						const auto totals = scan();
 						if ((tick + 1) % 128 == 0)
 							checkpoints.push_back({{"tick", tick + 1}, {"stocks", totals}});
-						const auto &a = world.game.teams[0]->stats.measurements;
-						const auto &b = world.game.teams[1]->stats.measurements;
+						const auto &a = world.game.teams[0]->stats.events();
+						const auto &b = world.game.teams[1]->stats.events();
 						Uint64 added = 0;
 						Json global = Json::array();
 						for (unsigned material = 0; material < MaterialCount; ++material)
@@ -402,6 +404,8 @@ TEST_SUITE("ResourceGrowthBenchmark")
 					else REQUIRE(loadedChecksum == initialChecksum);
 					auto &map = game.map;
 					map.configureCompute(variant == "shared" ? 4 : 1);
+                    if (const char* mode = std::getenv("GLOB2_COMPUTE_TELEMETRY"))
+                        map.computeExecutor().configureTelemetry(ComputeTelemetry::parseMode(mode));
 					map.setResourceGrowthDelay(delay ? delay : 8);
 					auto scan = [&]()
 					{
@@ -427,7 +431,7 @@ TEST_SUITE("ResourceGrowthBenchmark")
 					if (!wide)
 						for (auto material : {MaterialId::Food, MaterialId::Wood, MaterialId::Algae})
 							REQUIRE(initial[0][materialIndex(material)] > 0);
-					const auto baseline = game.teams[0]->stats.measurements;
+					const auto baseline = game.teams[0]->stats.events();
 					Json checkpoints = Json::array(), statistics;
 					for (unsigned tick = 1; tick <= ticks; ++tick)
 					{
@@ -437,10 +441,10 @@ TEST_SUITE("ResourceGrowthBenchmark")
 							const auto random = game.bindRandom();
 							map.growResources();
 						}
-						else game.syncStep(-1);
+						else game.step(-1);
 						const auto counts = scan();
 						statistics = Json::array();
-						const auto &a = game.teams[0]->stats.measurements;
+						const auto &a = game.teams[0]->stats.events();
 						for (unsigned m = 0; m < MaterialCount; ++m)
 						{
 							REQUIRE(counts[0][m] + a.growthGlobal[2][m] - baseline.growthGlobal[2][m] ==
@@ -449,7 +453,7 @@ TEST_SUITE("ResourceGrowthBenchmark")
 								a.growthGlobal[0][m] - baseline.growthGlobal[0][m]);
 							for (unsigned k = 0; k < 3; ++k)
 							{
-								REQUIRE(a.growthGlobal[k][m] == game.teams[1]->stats.measurements.growthGlobal[k][m]);
+								REQUIRE(a.growthGlobal[k][m] == game.teams[1]->stats.events().growthGlobal[k][m]);
 								statistics.push_back(a.growthGlobal[k][m]);
 							}
 						}
@@ -481,7 +485,7 @@ TEST_SUITE("ResourceGrowthBenchmark")
 						sample["terminal_flush"] = scan();
 						// Reconcile the diagnostic tail too; it is never folded into normal checkpoints.
 						const auto flushed = scan();
-						const auto &after = game.teams[0]->stats.measurements;
+						const auto &after = game.teams[0]->stats.events();
 						for (unsigned material = 0; material < MaterialCount; ++material)
 							REQUIRE(flushed[0][material] + after.growthGlobal[2][material] - baseline.growthGlobal[2][material] ==
 								initial[0][material] + after.growthGlobal[1][material] - baseline.growthGlobal[1][material]);
@@ -508,8 +512,7 @@ TEST_SUITE("ResourceGrowthBenchmark")
 				auto &map = world.game.map;
 				setup(map, scenario);
 				map.resourceGrowthField();
-				const auto captured = world.game.snapshotStore().captureBoundary(
-					world.game, ResourceGrowth::Pipeline::requirements());
+				const auto captured = world.game.snapshotStore().captureBoundary(world.game);
 				const std::array<MapState::View, 2> views{map.stateView(), captured.view()};
 				ResourceGrowth::Batch output[2];
 				for (auto &batch : output)
@@ -583,6 +586,8 @@ TEST_SUITE("ResourceGrowthBenchmark")
 						auto &map = world.game.map;
 						setup(map, scenario);
 						map.configureCompute(variant == 3 ? 4 : 1);
+                    if (const char* mode = std::getenv("GLOB2_COMPUTE_TELEMETRY"))
+                        map.computeExecutor().configureTelemetry(ComputeTelemetry::parseMode(mode));
 						map.setResourceGrowthDelay(8);
 						// Warm ecology before timing; snapshot capture remains inside timing.
 						map.resourceGrowthField();
@@ -592,16 +597,15 @@ TEST_SUITE("ResourceGrowthBenchmark")
 						if (variant || sharedCapture)
 						{
 							const auto cold = Clock::now();
-							world.game.snapshotStore().captureBoundary(
-								world.game, sharedCapture
-												? SimulationSnapshot::All
-												: ResourceGrowth::Pipeline::requirements());
+							world.game.snapshotStore().captureBoundary(world.game, SimulationSnapshot::CaptureOptions{.presentation=sharedCapture});
 							coldCaptureNs = ns(cold);
 							world.game.snapshotStore().metrics = {};
+							world.game.snapshotStore().setDetailedMetrics(true);
 						}
 						const auto before = stocks(map);
 						const auto start = Clock::now();
 						ResourceGrowth::Metrics immediate;
+                        Uint64 immediateComputeNs = 0;
 						ResourceGrowth::Batch immediateBatch;
 						for (unsigned tick = 0; tick < 64; ++tick)
 						{
@@ -616,17 +620,16 @@ TEST_SUITE("ResourceGrowthBenchmark")
 										if (amount > 1)
 											map.setMaterialAmount(i, MaterialId::Food, amount - 1);
 									}
-							// Model the completed-tick capture already required by another
-							// consumer. All placements pay for the same component union;
-							// growth receives a projection of that capture, not another copy.
+							// Model an interactive boundary: every placement captures the
+							// standard simulation and ordinary presentation payloads.
+							// Growth retains its named view of those shared buffers.
 							SimulationSnapshot::Handle existing;
 							if (sharedCapture)
 							{
 								if (variant > 1)
 									map.gradientRuntime->growth.publish(map, tick);
 								world.game.snapshotStore().invalidateBoundary();
-								existing = world.game.snapshotStore().captureBoundary(
-									world.game, SimulationSnapshot::All);
+								existing = world.game.snapshotStore().captureBoundary(world.game, SimulationSnapshot::CaptureOptions{.presentation=true});
 							}
 							if (variant == 0)
 								map.growResources();
@@ -636,13 +639,12 @@ TEST_SUITE("ResourceGrowthBenchmark")
 									world.game.snapshotStore().invalidateBoundary();
 								auto snapshot =
 									sharedCapture
-										? existing.project(ResourceGrowth::Pipeline::requirements())
-										: world.game.snapshotStore().captureBoundary(
-											  world.game, ResourceGrowth::Pipeline::requirements());
+										? existing.growthView()
+										: world.game.snapshotStore().captureBoundary(world.game);
 								MersenneTwister random(syncRand());
 								const auto computing = Clock::now();
 								ResourceGrowth::calculate(snapshot.view(), random, immediateBatch);
-								immediate.computeNs += ns(computing);
+								immediateComputeNs += ns(computing);
 								immediate.sampled += immediateBatch.sampled;
 								immediate.proposals += immediateBatch.proposals.size();
 								ResourceGrowth::apply(map, immediateBatch, immediate);
@@ -653,9 +655,11 @@ TEST_SUITE("ResourceGrowthBenchmark")
 									map.gradientRuntime->growth.publish(map, tick);
 								map.stageResourceGrowth();
 								if (sharedCapture)
-									map.preparePendingWorld(existing);
-								else
-									map.preparePendingWorld();
+									map.gradientRuntime->growth.prepare(existing, map.computeExecutor());
+								else {
+                                    world.game.snapshotStore().invalidateBoundary();
+									map.gradientRuntime->growth.prepare(world.game.snapshotStore().captureBoundary(world.game), map.computeExecutor());
+                                }
 							}
 						}
 						map.finishResourceGrowth();
@@ -670,11 +674,16 @@ TEST_SUITE("ResourceGrowthBenchmark")
 							{"initial_food", before},
 							{"final_food", stocks(map)},
 							{"cold_capture_ns", coldCaptureNs},
-							{"capture_ns", world.game.snapshotStore().metrics.captureNs},
 							{"copied_bytes", world.game.snapshotStore().metrics.bytesCopied},
-							{"compute_ns", m.computeNs},
-							{"publication_ns", m.publicationNs},
-							{"wait_ns", m.waitNs},
+                            {"compute_telemetry_mode", ComputeTelemetry::ModeNames[unsigned(map.computeExecutor().telemetryMode())]},
+                            {"compute_ns", variant == 1 ? Json(immediateComputeNs) : Json(nullptr)},
+							{"wait_ns", [&]() -> Json {
+                                if (!map.computeExecutor().telemetryEnabled()) return nullptr;
+                                const auto snapshot = map.computeExecutor().telemetrySnapshot();
+                                std::uint64_t ns = 0;
+                                for(const auto& reason : snapshot.summary.joins[unsigned(ComputeProducer::ResourceGrowth)]) ns += reason.total.totalNs;
+                                return ns;
+                            }()},
 							{"proposals", m.proposals},
 							{"accepted", m.accepted},
 							{"sampled", m.sampled},
@@ -735,7 +744,8 @@ TEST_SUITE("ResourceGrowthBenchmark")
 						{
 							map.gradientRuntime->growth.publish(map, tick);
 							map.stageResourceGrowth();
-							map.preparePendingWorld();
+                            world.game.snapshotStore().invalidateBoundary();
+							map.gradientRuntime->growth.prepare(world.game.snapshotStore().captureBoundary(world.game), map.computeExecutor());
 						}
 					}
 					map.finishResourceGrowth();
@@ -747,7 +757,7 @@ TEST_SUITE("ResourceGrowthBenchmark")
 					const auto food = stocks(map);
 					REQUIRE(deposits + depleted >= initialDeposits);
 					const auto seeds = deposits + depleted - initialDeposits;
-                    const auto removed = world.game.teams[0]->stats.measurements.growthGlobal[2][materialIndex(MaterialId::Food)];
+                    const auto removed = world.game.teams[0]->stats.events().growthGlobal[2][materialIndex(MaterialId::Food)];
 					REQUIRE(food + harvested + removed >= initialFood + seeds);
 					report["samples"].push_back(
 						{{"seed", seed},

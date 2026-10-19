@@ -18,15 +18,15 @@ void Unit::handleActivity(void)
 		&& destinationPurpose!=FEED && destinationPurpose!=HEAL
 		&& displacement==DIS_GOING_TO_BUILDING && attachedBuilding)
 		stopAttachedForBuilding(true);
-	// freeze unit health when inside a building
+	// Finish finding an exit before a rebound visit can replace the attachment.
 	if ((displacement==DIS_ENTERING_BUILDING) || (displacement==DIS_INSIDE)
             || ((displacement==DIS_EXITING_BUILDING)
-                && ! (hasCapability(UnitRuntimeTraits::ServiceRebound) && (medical != MED_FREE))))
+                && (attachedBuilding || ! (hasCapability(UnitRuntimeTraits::ServiceRebound) && (medical != MED_FREE)))))
 		return;
 
 	if (verbose)
 		printf("guid=(%d) handleActivity (medical=%d, activity=%d) (needToRecheckMedical=%d) (attachedBuilding=%p)...\n",
-			gid, medical, activity, needToRecheckMedical, attachedBuilding);
+			gid, medical, activity, needToRecheckMedical(), attachedBuilding);
 
 	if(activity!=ACT_RANDOM)
 		jobTimer=0;
@@ -67,12 +67,12 @@ void Unit::handleActivity(void)
 						activity=ACT_UPGRADING;
 						attachedBuilding=b;
 						setTargetBuilding(b);
-						needToRecheckMedical=false;
+						setNeedToRecheckMedical(false);
 						if (verbose)
 							printf("guid=(%d) Going to heal building\n", gid);
 						targetX=attachedBuilding->getMidX();
 						targetY=attachedBuilding->getMidY();
-						validTarget=true;
+						setValidTarget(true);
 						b->subscribeUnitForInside(this);
 					}
 					else
@@ -81,7 +81,7 @@ void Unit::handleActivity(void)
 			}
 		}
 	}
-	else if (needToRecheckMedical)
+	else if (needToRecheckMedical())
 	{
 		// disconnect from building
 		if (attachedBuilding)
@@ -136,14 +136,11 @@ void Unit::handleActivity(void)
 						}
 						const Uint16 targetGID = GIDfrom(targetID, targetTeam->teamNumber);
 						const Uint32 identity = owner->game->allocateScriptIdentity(false, targetGID);
-						++currentTeam->stats.measurements.conversionsOut[typeNum];
-						++targetTeam->stats.measurements.conversionsIn[typeNum];
+						++currentTeam->stats.events().conversionsOut[typeNum];
+						++targetTeam->stats.events().conversionsIn[typeNum];
 						Sint32 currentID=Unit::GIDtoID(gid);
 						assert(currentTeam->myUnits[currentID]);
-						currentTeam->myUnits[currentID]=NULL;
 						currentTeam->detachUnit(currentID);
-						targetTeam->myUnits[targetID]=this;
-						targetTeam->attachUnit(targetID);
 
 						if (verbose)
 							printf("Unit guid=%d (%d) switched to guid=%d (%d)\n", gid, Unit::GIDtoTeam(gid), targetGID, Unit::GIDtoTeam(targetGID));
@@ -164,6 +161,7 @@ void Unit::handleActivity(void)
 						owner->game->unitCargo.transfer(gid,targetGID);
 						gid=targetGID;
 						owner=targetTeam;
+						targetTeam->attachUnit(targetID, this);
 						race=&targetTeam->race;
 					}
 				}
@@ -172,7 +170,7 @@ void Unit::handleActivity(void)
 				activity=ACT_UPGRADING;
 				attachedBuilding=b;
 				setTargetBuilding(b);
-				needToRecheckMedical=false;
+				setNeedToRecheckMedical(false);
 				if (verbose)
 					printf("guid=(%d) Subscribed to food at building gbid=(%d)\n", gid, b->gid);
 				b->subscribeUnitForInside(this);
@@ -191,7 +189,7 @@ void Unit::handleActivity(void)
 				activity=ACT_UPGRADING;
 				attachedBuilding=b;
 				setTargetBuilding(b);
-				needToRecheckMedical=false;
+				setNeedToRecheckMedical(false);
 				if (verbose)
 					printf("guid=(%d) Subscribed to heal at building gbid=(%d)\n", gid, b->gid);
 				b->subscribeUnitForInside(this);

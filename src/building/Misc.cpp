@@ -63,7 +63,7 @@ void Building::kill(int diagnosticRemoval)
 
 	if (!type->isVirtual)
 	{
-		auto& measurements=owner->stats.measurements;
+		auto& measurements=owner->stats.events();
 		measurements.variants.resize(owner->game->buildingsTypes.size());
 		++measurements.variants[typeNum].removed[diagnosticRemoval];
 		if (type->shortTypeNum>=0 && type->shortTypeNum<IntBuildingType::NB_BUILDING && getLongLevel()<NB_BUILDING_LONG_LEVELS)
@@ -125,7 +125,7 @@ void Building::kill(int diagnosticRemoval)
 		else
 		{
 			if (!u->isDead)
-				++u->owner->stats.measurements.deaths[u->typeNum][u->hp < UNIT_HP_DEATH_THRESHOLD ? u->diagnosticDeathCause : GameplayMeasurements::TRAPPED];
+				++u->owner->stats.events().deaths[u->typeNum][u->hp < UNIT_HP_DEATH_THRESHOLD ? u->diagnosticDeathCause : GameplayMeasurements::TRAPPED];
 			u->isDead=true;
 			u->standardRandomActivity();
 		}
@@ -139,7 +139,7 @@ void Building::kill(int diagnosticRemoval)
 	if (type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock) owner->map->invalidateSupplierLocations();
 	if (type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock)
 		for (int r=0; r<MaterialSlotCount; r++)
-			if (materials[r]>0)
+			if (material(r)>0)
 				owner->map->dirtyMarketGradientsSlot(owner->teamNumber, r);
 	
 	updateUnitsHarvesting();
@@ -205,17 +205,19 @@ void Building::removeUnitFromInside(Unit* unit)
 
 void Building::updateMaterialsPointer()
 {
-	if (type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock)
-		for (int r = 0; r < MaterialSlotCount; ++r)
-			owner->map->dirtyMarketGradientsSlot(owner->teamNumber, r);
 	if(!type->useTeamMaterials)
 	{
-		materials=localMaterials;
+		sharedMaterials=nullptr;
 	}
 	else
 	{
-		materials=owner->teamMaterials;
+		sharedMaterials=owner->teamMaterials;
 	}
+    // Membership is measured after switching the pool, not against the retired
+    // pointer. Other suppliers sharing the team pool are diffed at the same time.
+    if(type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock) {
+        for(int r=0;r<MaterialCount;++r)owner->map->dirtyMarketGradientsSlot(owner->teamNumber,r);
+    }
 }
 
 
@@ -231,13 +233,12 @@ MaterialDeliveryResult Building::deliverMaterialPacket(int resourceType, Materia
 		throw std::runtime_error("Invalid material packet");
 	const Uint64 multiplier=type->materialMultiplier[resourceType];
 	const Sint32 converted=Uint64(packet.numerator)*multiplier/packet.denominator;
-	const int before = materials[resourceType];
-	if ((type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock || type->useTeamMaterials) && availableMaterial(resourceType)<=0)
-		owner->map->dirtyMarketGradientsSlot(owner->teamNumber, resourceType);
+	const int before = material(resourceType);
+    const bool sourceWasEmpty=(type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock || type->useTeamMaterials) && availableMaterial(resourceType)<=0;
 	// A shared pool may already exceed this recipient's own acceptance limit.
 	// Reject excess delivery without deleting inventory owned by other consumers.
-	materials[resourceType] += std::min({materialDeliveryNeed(resourceType),converted,std::numeric_limits<Sint32>::max()-before});
-	const int accepted = std::max(0, materials[resourceType] - before);
+	changeMaterial(resourceType, std::min(materialDeliveryNeed(resourceType),converted));
+	const int accepted = std::max(0, material(resourceType) - before);
 	int funded=0;
 	if (type->isBuildingSite)
 	{
@@ -245,18 +246,21 @@ MaterialDeliveryResult Building::deliverMaterialPacket(int resourceType, Materia
 		funding[resourceType]=std::min(accepted,constructionMaterialNeed(resourceType));
 		if (reserveMaterials(funding)) { funded=funding[resourceType]; constructionReserved[resourceType]+=funded; }
 	}
-	owner->stats.measurements.delivered[resourceType] += accepted;
+    // Construction may immediately reserve delivery. Observe its final
+    // availability so an unavailable transient packet is not a fake goal.
+    if(sourceWasEmpty)owner->map->dirtyMarketGradientsSlot(owner->teamNumber,resourceType);
+	owner->stats.events().delivered[resourceType] += accepted;
 	if (type->canExchange)
-		owner->stats.measurements.transferredIn[resourceType] += accepted;
+		owner->stats.events().transferredIn[resourceType] += accepted;
 	if (constructionResultState == REPAIR)
-		owner->stats.measurements.repairDelivered[resourceType] += accepted;
+		owner->stats.events().repairDelivered[resourceType] += accepted;
 	applyConstructionHealth(funded);
 	MaterialDeliveryResult result; result.acceptedStock=accepted;
 	result.discardedNumerator=Uint64(packet.numerator)*multiplier-Uint64(accepted)*packet.denominator;
 	result.discardedDenominator=Uint64(packet.denominator)*multiplier;
 	const auto divisor=std::gcd(result.discardedNumerator,result.discardedDenominator);
 	result.discardedNumerator/=divisor; result.discardedDenominator/=divisor;
-	if (result.discardedNumerator) ++owner->stats.measurements.materialSpillageEvents;
+	if (result.discardedNumerator) ++owner->stats.events().materialSpillageEvents;
 	update();
 	return result;
 }
@@ -279,7 +283,7 @@ WideMaterialDeliveryResult Building::deliverCargoPacket(int resourceType, WideMa
     const Uint64 scaled=packet.numerator*scale;
     const Sint32 accepted=Sint32(std::min({scaled/stockDenominator,Uint64(multiplier),
         Uint64(std::max(0,materialDeliveryNeed(resourceType))),
-        Uint64(std::numeric_limits<Sint32>::max()-materials[resourceType])}));
+        Uint64(std::max<Sint64>(0,Sint64(materialStockLimit())-material(resourceType)))}));
     if (!accepted) return result;
     // This denomination is exact and has no discarded fraction. Cargo retains
     // everything the recipient did not accept, without a spillage event.
@@ -302,16 +306,16 @@ void Building::removeMaterialFromBuilding(int resourceType)
 
 MaterialPacket Building::withdrawMaterialPacket(int resourceType)
 {
-	const int before = materials[resourceType];
-	materials[resourceType]-=std::min(availableMaterial(resourceType), type->materialMultiplier[resourceType]);
-	materials[resourceType]= std::max(materials[resourceType], 0);
-	owner->stats.measurements.withdrawn[resourceType] += before - materials[resourceType];
+	const int before = material(resourceType);
+	changeMaterial(resourceType, -(std::min(availableMaterial(resourceType), type->materialMultiplier[resourceType])));
+	setMaterial(resourceType, std::max(material(resourceType), 0));
+	owner->stats.events().withdrawn[resourceType] += before - material(resourceType);
 	if (type->canExchange)
-		owner->stats.measurements.transferredOut[resourceType] += before - materials[resourceType];
+		owner->stats.events().transferredOut[resourceType] += before - material(resourceType);
 	if ((type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock || type->useTeamMaterials) && availableMaterial(resourceType)<=0)
 		owner->map->dirtyMarketGradientsSlot(owner->teamNumber, resourceType);
 	updateCallLists();
-	const Uint32 amount=before-materials[resourceType], denomination=type->materialMultiplier[resourceType];
+	const Uint32 amount=before-material(resourceType), denomination=type->materialMultiplier[resourceType];
 	const Uint32 divisor=std::gcd(amount,denomination);
 	return {amount/divisor,denomination/divisor};
 }
@@ -483,7 +487,7 @@ Uint32 Building::eatOnce(Uint32 *mask, Unit* visitor)
 		if (!reserveMaterials(cost)) throw std::runtime_error("Insufficient meal materials");
 		consumeReservedMaterials(cost, GameplayMeasurements::MEAL);
 	}
-	++owner->stats.measurements.meals;
+	++owner->stats.events().meals;
 	Uint32 fruitMask=0;
 	Uint32 fruitCount=0;
 	for (int i=0; i<HAPPINESS_COUNT; i++)
@@ -491,10 +495,10 @@ Uint32 Building::eatOnce(Uint32 *mask, Unit* visitor)
 		int resId=i+HAPPINESS_BASE;
 		if ((type->semantics.feeding.optionalFruitMask & (1u << i)) && availableMaterial(resId) > 0)
 		{
-			materials[resId]--;
+			changeMaterial(resId, -1);
 			if ((type->useTeamMaterials || type->runtimeSuppliesStock || type->runtimeSuppliesDirectStock) && availableMaterial(resId)==0)
 				owner->map->dirtyMarketGradientsSlot(owner->teamNumber,resId);
-			++owner->stats.measurements.consumed[GameplayMeasurements::MEAL][resId];
+			++owner->stats.events().consumed[GameplayMeasurements::MEAL][resId];
 			fruitMask|=(1<<i);
 			fruitCount++;
 		}
@@ -548,7 +552,8 @@ bool Building::integrity()
 	return true;
 }
 
-Uint32 Building::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
+template<bool Diagnostic>
+Uint32 Building::checkSumImpl(std::vector<Uint32> *checkSumsVector, bool legacy152)
 {
 	// `cs` is signed `int` so the open-coded `(cs<<31)|(cs>>1)` rotates
 	// use arithmetic right-shift (sign-extending). Do NOT replace these
@@ -561,73 +566,73 @@ Uint32 Building::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 	if (areaFunded || areaFundingType>=0) cs ^= Uint32(areaFundingType+1)*0x9e3779b9u ^ areaFundingTick ^ (Uint32(areaFundingTeam+1)<<24) ^ (areaFunded ? 0x61757261u : 0);
 
 	cs^=typeNum;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [0]
 
 	cs^=buildingState;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [1]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=constructionResultState;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [2]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=maxUnitWorking;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [3]
 
 	cs^=maxUnitWorkingFuture;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [4]
 
 	cs^=maxUnitWorkingPreferred;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [5]
 
 	cs^=maxUnitWorkingPrevious;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [6]
 
 	cs^=desiredMaxUnitWorking;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [7]
 
 	cs^=unitsWorking.size();
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [8]
 
 	cs^=subscriptionWorkingTimer;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [9]
 
 	cs^=unitsInside.size();
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [10]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=posX;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [11]
 
 	cs^=posY;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [12]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=unitStayRange;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [13]
 
 	for (int i=0; i<MaterialCount; i++)
 		cs^=localMaterials[i];
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [14]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=hp;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [15]
 
 	cs^=productionTimeout;
@@ -643,12 +648,12 @@ Uint32 Building::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 	cs^=siteCompletionPending ? 0x73697465 : 0;
 	cs^=explorersRequireBombing ? 0x626f6d62 : 0;
 	cs^=Uint32(minWorkerLevelToFlag)<<24;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [16]
 
 
 	cs^=totalRatio;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [17]
 
 
@@ -658,39 +663,39 @@ Uint32 Building::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 		cs^=productionUsed(i);
 		cs=(cs<<31)|(cs>>1);
 	}
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [18]
 
 	if (!legacy152) for (const auto preference:extraConstructionOriginRatios) { cs=(cs<<1)|(cs>>31); cs^=preference; }
 	cs^=shootingStep;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [19]
 
 
 	cs^=shootingCooldown;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [20]
 
 
 	cs^=bullets;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [21]
 	cs=(cs<<31)|(cs>>1);
 
 	cs^=seenByMask;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [22]
 
 	cs^=gid;
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [23]
 
 	
 	cs^=unitsHarvesting.size();
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 		checkSumsVector->push_back(cs);// [24]
 	
-	if (checkSumsVector)
+	if constexpr (Diagnostic)
 	{
 		const auto random = entityRandom.exportState();
 		checkSumsVector->push_back(Uint32(random.value >> 32));
@@ -700,7 +705,12 @@ Uint32 Building::checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152)
 	}
 
 	// Mix private RNG after the historical signed checksum rotations.
-	return Uint32(cs) ^ entityRandom.checksum();
+	return Uint32(cs) ^ (legacy152 ? entityRandom.legacyChecksum() : entityRandom.checksum());
+}
+
+Uint32 Building::checkSum(std::vector<Uint32> *fields, bool legacy152)
+{
+    return fields ? checkSumImpl<true>(fields, legacy152) : checkSumImpl<false>(nullptr, legacy152);
 }
 
 int Building::getEffectiveArmor() const

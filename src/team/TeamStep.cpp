@@ -24,11 +24,9 @@ bool hasExit(Building* building, bool fly, bool canSwim, bool canWalk)
 bool allRemainingUnitsTrapped(Team& team)
 {
 	bool foundUnit = false;
-	bool freeUnitSlot = false;
-	for (int i = 0; i < Unit::MAX_COUNT; ++i)
+	const bool freeUnitSlot = team.liveUnits.size()<Unit::MAX_COUNT;
+	for (Unit* unit : team.liveUnits)
 	{
-		Unit* unit = team.myUnits[i];
-		if (!unit) { freeUnitSlot = true; continue; }
 		foundUnit = true;
 		// Active service and normal entry/exit are not a loss of agency.
 		if (unit->displacement != Unit::DIS_EXITING_BUILDING
@@ -109,27 +107,43 @@ bool Team::buildingHasHigherPriority(Building* lhs, Building* rhs)
 
 void Team::addBuildingNeedingWork(Building* b, Sint32 priority)
 {
-	bool did_find_position=false;
-	Sint32 p = priority;
-	std::vector<Building*>& blist = buildingsNeedingUnits[p];
-	for(std::vector<Building*>::iterator i=blist.begin(); i!=blist.end(); ++i)
+	auto& bucket = buildingsNeedingUnits[priority];
+	for (auto position = bucket.begin(); position != bucket.end(); ++position)
 	{
-		if(buildingHasHigherPriority(b, *i))
+		if (buildingHasHigherPriority(b, *position))
 		{
-			buildingsNeedingUnits[p].insert(i, b);
-			did_find_position=true;
-			break;
+			bucket.insert(position, b);
+			return;
 		}
 	}
-	if(!did_find_position)
-		buildingsNeedingUnits[p].push_back(b);
+	bucket.push_back(b);
+}
+
+void Team::repositionBuildingNeedingWork(Building* b, Sint32 priority)
+{
+	auto& bucket = buildingsNeedingUnits[priority];
+	const auto current = std::find(bucket.begin(), bucket.end(), b);
+	assert(current != bucket.end());
+	// Another building's staffing or wishes can change without reordering this
+	// bucket. Reproduce insertion before the first lower-ranked entry even if
+	// the bucket is unsorted; a neighbor check or binary search is not enough.
+	auto position = bucket.begin();
+	while (position != bucket.end())
+	{
+		if (position != current && buildingHasHigherPriority(b, *position)) break;
+		++position;
+	}
+	if (position < current)
+		std::rotate(position, current, current + 1);
+	else if (position > current + 1)
+		std::rotate(current, current + 1, position);
 }
 
 
 void Team::removeBuildingNeedingWork(Building* b, Sint32 priority)
 {
-	Sint32 p = priority;
-	buildingsNeedingUnits[p].erase(std::find(buildingsNeedingUnits[p].begin(), buildingsNeedingUnits[p].end(), b));
+	auto& bucket = buildingsNeedingUnits[priority];
+	bucket.erase(std::find(bucket.begin(), bucket.end(), b));
 }
 
 
@@ -185,7 +199,7 @@ namespace
 	bool jobCost(Unit *u, Building *b, int resource, int *cost)
 	{
 		Map *map = b->owner->map;
-		int swimClass = u->swimClass();
+		int swimClass = u->movementClass();
 		if (b->globalGradient[swimClass] == NULL)
 			return false;
 		if (u->carriedMaterial >= 0)
@@ -211,12 +225,11 @@ namespace
 	bool innCost(Unit *u, Building *b, int *cost)
 	{
 		Map *map = b->owner->map;
-		if (u->performance[FLY])
-		{
-			*cost = 1 + (Sint32)sqrt(map->warpDistSquare(u->posX, u->posY, b->posX, b->posY));
-			return true;
-		}
-		return map->buildingAvailable(b, u->swimClass(), u->posX, u->posY, cost, BuildingRoute::Footprint);
+        if (u->performance[FLY] && !map->hasAirRoutingConstraints()) {
+            *cost=1+Sint32(std::sqrt(map->warpDistSquare(u->posX,u->posY,b->posX,b->posY)));
+            return true;
+        }
+		return map->buildingAvailable(b, u->movementClass(), u->posX, u->posY, cost, BuildingRoute::Footprint);
 	}
 
 	// Move `u`'s booking from one inn to the other; both keep their head count.
@@ -244,9 +257,9 @@ namespace
 		{
 			u->displacement = Unit::DIS_GOING_TO_RESOURCE;
 			u->setTargetBuilding(NULL);
-			b->owner->map->materialAvailableUpdateSlot(b->owner->teamNumber, resource, u->swimClass(), u->posX, u->posY, &u->targetX, &u->targetY, NULL, b->fetchesFromMarkets(), b);
+			b->owner->map->materialAvailableUpdateSlot(b->owner->teamNumber, resource, u->movementClass(), u->posX, u->posY, &u->targetX, &u->targetY, NULL, b->fetchesFromMarkets(), b);
 		}
-		u->validTarget = true;
+		u->setValidTarget(true);
 	}
 }
 
@@ -262,9 +275,8 @@ void Team::swapTask(Unit *unit)
 	int timeLeft = unit->foodStepsLeft(unit->trigHungry);
 	Unit *best = NULL;
 	int bestGain = SWAP_MIN_GAIN;
-	for (int i = 0; i < Unit::MAX_COUNT; i++)
+	for (Unit* mate : liveUnits)
 	{
-		Unit *mate = myUnits[i];
 		if (mate == unit || !isFetching(mate))
 			continue;
 		Building *b = mate->attachedBuilding;
@@ -301,9 +313,8 @@ void Team::swapInn(Unit *unit)
 		return;
 	Unit *best = NULL;
 	int bestGain = SWAP_MIN_GAIN;
-	for (int i = 0; i < Unit::MAX_COUNT; i++)
+	for (Unit* mate : liveUnits)
 	{
-		Unit *mate = myUnits[i];
 		if (mate == unit || !isWalkingToInn(mate) || mate->attachedBuilding == a || mate->attachedBuilding->owner != this)
 			continue;
 		Building *b = mate->attachedBuilding;
@@ -336,7 +347,6 @@ void Team::swapInn(Unit *unit)
 
 void Team::syncStep(void)
 {
-	integrity();
 
 	if (noMoreBuildingSitesCountdown>0)
 		noMoreBuildingSitesCountdown--;
@@ -348,10 +358,9 @@ void Team::syncStep(void)
 	// Select once per team. The usual loop has no aura branch per unit;
 	// pulse services still run immediately before that unit's normal update.
 	const auto stepUnits = [&]<bool areaPulse>() {
-	for (int i = 0; i < Unit::MAX_COUNT; i++)
+	auto walk=liveUnits.mutableWalk();
+	while (Unit* u=walk.next())
 	{
-		Unit *u = myUnits[i];
-		if (u)
 		{
 			if (u->hasCapability(UnitRuntimeTraits::CountsForSurvival))
 			{
@@ -374,9 +383,7 @@ void Team::syncStep(void)
 			{
 				// Client selections hold a UnitRef and notice the death when
 				// it no longer resolves; nothing to notify here.
-				delete u;
-				myUnits[i] = NULL;
-				detachUnit(i);
+				delete u->owner->detachUnit(Unit::GIDtoID(u->gid));
 			}
 		}
 	}
@@ -398,10 +405,10 @@ void Team::syncStep(void)
 			{
 				if (!building->type->isVirtual)
 				{
-					stats.measurements.variants.resize(game->buildingsTypes.size());
-					++stats.measurements.variants[building->typeNum].removed[GameplayMeasurements::DEMOLISHED];
+					stats.events().variants.resize(game->buildingsTypes.size());
+					++stats.events().variants[building->typeNum].removed[GameplayMeasurements::DEMOLISHED];
 					if (building->type->shortTypeNum>=0 && building->type->shortTypeNum<IntBuildingType::NB_BUILDING && building->getLongLevel()<NB_BUILDING_LONG_LEVELS)
-						++stats.measurements.removed[GameplayMeasurements::DEMOLISHED][building->type->shortTypeNum][building->getLongLevel()];
+						++stats.events().removed[GameplayMeasurements::DEMOLISHED][building->type->shortTypeNum][building->getLongLevel()];
 					map->setBuilding(building->posX, building->posY, building->type->width, building->type->height, NOGBID);
 					isDirtyGlobalGradient=true;
 				}
@@ -441,7 +448,6 @@ void Team::syncStep(void)
 		// the client still needs the gid to drop its pending per-gid shadow.
 		game->publishClientEvent(ClientEvent::BuildingRemoved{building->gid});
 
-		myBuildings[Building::GIDtoID(building->gid)]=NULL;
 		detachBuilding(Building::GIDtoID(building->gid));
 		delete building;
 	}
@@ -461,24 +467,27 @@ void Team::syncStep(void)
 	}
 
 	updateAllBuildingTasks();
-	for (int k = 0; k < SWAP_CHECKS_PER_TICK; k++)
-		swapTask(myUnits[(game->stepCounter * SWAP_CHECKS_PER_TICK + k) % Unit::MAX_COUNT]);
+	// Round robin visits at most four existing units, independent of empty IDs.
+	const auto candidates=std::min<std::size_t>(SWAP_CHECKS_PER_TICK,liveUnits.size());
+	for (std::size_t k=0; k<candidates; ++k) {
+		Unit* unit=taskSwapNext==0xffff ? liveUnits.front() : myUnits[taskSwapNext];
+		assert(unit);
+		Unit* next=unit->populationNext ? unit->populationNext : liveUnits.front();
+		taskSwapNext=Unit::GIDtoID(next->gid);
+		swapTask(unit);
+	}
 
 	bool isEnoughFoodInSwarm=false;
 
-	for (int i=0; i<Building::MAX_COUNT; ++i)
-	{
-		if(myBuildings[i])
-		{
-			//Step in myBuildings does virtually nothing
-			myBuildings[i]->step();
-			myBuildings[i]->regenerationStep();
-		}
+	auto buildingWalk=liveBuildings.mutableWalk();
+	while (Building* building=buildingWalk.next()) {
+		building->step();
+		building->regenerationStep();
 	}
 
 	for (std::list<Building *>::iterator it=swarms.begin(); it!=swarms.end(); ++it)
 		{
-			if (!(*it)->locked[SWIM_VARIANT_CAN_SWIM])
+			if (!(*it)->isLocked(SWIM_VARIANT_CAN_SWIM))
 				for (unsigned unitType : (*it)->type->semantics.production.enabledUnits)
 					if ((*it)->canAffordProduction(unitType)) { isEnoughFoodInSwarm = true; break; }
 			(*it)->swarmStep();
@@ -496,7 +505,7 @@ void Team::syncStep(void)
 	}
 
 	buildingTime.stop();
-	stats.step(this);
+
 	updateEvents();
 }
 
@@ -506,12 +515,8 @@ void Team::syncStep(void)
 void Team::dirtyGlobalGradient()
 {
 	game->dirtyWarFlagGradient();
-	for (int id=0; id<Building::MAX_COUNT; id++)
-	{
-		Building *b=myBuildings[id];
-		if (b)
-			b->resetPathfindGradients(Building::GradientDrop::Team);
-	}
+	for (Building* building : liveBuildings)
+		building->resetPathfindGradients(Building::GradientDrop::Team);
 }
 
 void Team::dirtyWarFlagGradient()

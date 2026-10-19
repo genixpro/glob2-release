@@ -110,8 +110,7 @@ static std::shared_ptr<Order> botOrder(Engine& engine, std::mt19937& bot)
 	default:
 	{
 		std::vector<Uint16> gids;
-		for (int i = 0; i < Building::MAX_COUNT; ++i)
-			if (const Building* b = team->myBuildings[i])
+		for (const Building* b : team->liveBuildings.entries())
 				if (!b->type->isVirtual && b->type->maxUnitWorking > 0)
 					gids.push_back(b->gid);
 		if (gids.empty())
@@ -163,6 +162,8 @@ static int play(const Options& options, const fs::path& output)
 		throw Usage("the match runs sim version " + setup.simVersion.key() + " but this client is " + local.key());
 
 	auto transport = std::make_shared<Online::RelayTransport>(relayUrl);
+    std::map<std::uint32_t, Uint32> checksums;
+    int reloads = 0;
 	Engine engine;
 	Engine::TurnMatchStart start;
 	start.setup = setup;
@@ -179,8 +180,6 @@ static int play(const Options& options, const fs::path& output)
 	if (engine.initTurnMatch(start) != Engine::EE_NO_ERROR)
 		throw Usage("cannot start the match: " + engine.getInitializationDiagnostic());
 	Turn::TurnLockstepSession& lockstep = *engine.turnLockstep();
-	std::map<std::uint32_t, Uint32> checksums;
-	int reloads = 0;
 	lockstep.onChecksum = [&](std::uint32_t tick, Uint32 checksum) {
 		if (tick == 0 && !checksums.empty())
 			++reloads;
@@ -274,14 +273,19 @@ static int play(const Options& options, const fs::path& output)
 	       << ",\"executed_ticks\":" << finalTick << ",\"game_ended\":" << (game.isGameEnded ? "true" : "false")
 	       << ",\"timed_out\":" << (timedOut ? "true" : "false") << ",\"desync_flagged\":" << (desync ? "true" : "false")
 	       << ",\"compute_requested_threads\":" << Headless::quote(options.computeThreads ? std::to_string(options.computeThreads) : "auto")
-	       << ",\"compute_resolved_threads\":" << resolveComputeThreadCount(options.computeThreads)
+	       << ",\"compute_resolved_threads\":" << globals.resourcePlan.computeParticipants
 	       << ",\"compute_threads\":" << game.map.computeExecutor().threadCount()
 	       << ",\"compute_workers\":" << game.map.computeExecutor().threadCount() - 1
 	       << ",\"reloads\":" << reloads << ",\"orders_queued\":" << ordersQueued
 	       << ",\"rtt_ms\":" << rtt / 1000 << ",\"jitter_ms\":" << jitter / 1000
 	       << ",\"wall_seconds\":" << elapsed() << ",\"first_tick_seconds\":" << firstTickAt
 	       << ",\"relay_error\":" << Headless::quote(transport->error()) << ",";
+    result << "\"resource_plan\":";
+    writeApplicationResourcePlanJson(result, globals.resourcePlan);
+    result << ',';
 	Headless::playersAndTeamsJson(result, game, engine.teamEliminatedTick);
+	result << ",\"compute_telemetry\":";
+    ComputeTelemetry::writeJson(result, game.map.computeExecutor().telemetrySnapshot());
 	result << '}';
 	Headless::writeJson((output / "result.json").string(), result.str());
 	{

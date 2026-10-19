@@ -23,6 +23,7 @@
 #include <StreamBackend.h>
 #include <nlohmann/json.hpp>
 #include <functional>
+#include <memory>
 
 namespace
 {
@@ -94,13 +95,13 @@ struct CatalogWorld
             const int offset=32*team;
             auto* building=game.addBuilding(4+offset,4+offset,anchor,team,4,4);
             REQUIRE(building);
-            building->materials[WHEAT]=building->type->maxMaterial[WHEAT];
+            building->setMaterial(WHEAT, building->type->maxMaterial[WHEAT]);
             game.teams[team]->addToStaticAbilitiesLists(building);
             game.teams[team]->startPosX=4+offset;game.teams[team]->startPosY=4+offset;
             game.teams[team]->startPosSet=Team::START_POS_FROM_UNIT;
             if(populatedProvider) {
                 auto* provider=game.addBuilding(10+offset,4+offset,completed,team,3,3);
-                REQUIRE(provider);provider->materials[WHEAT]=32;
+                REQUIRE(provider);provider->setMaterial(WHEAT, 32);
                 game.teams[team]->addToStaticAbilitiesLists(provider);
             }
             for(int i=0;i<12;++i)world.addUnit(i<10?WORKER:WARRIOR,4+offset+i,12+offset,team);
@@ -541,14 +542,40 @@ TEST_CASE("six native strategies construct and use separate demanded production 
         const unsigned expected=controller==AI::ECONO ? 1u<<EXPLORER : (1u<<EXPLORER)|(1u<<WARRIOR);
         CHECK((created&expected)==expected);CHECK((configured&expected)==expected);
         for(int unit=EXPLORER;unit<=WARRIOR;++unit) if(expected&(1u<<unit)) {
-            const auto before=team.stats.measurements.births[unit];
+            const auto before=team.stats.measurements().births[unit];
             for(auto* producer:team.swarms) if(producer->type->semantics.production.recipes[unit].enabled) {
                 REQUIRE(producer->ratio[unit]>0);
                 for(int step=0;step<3;++step) producer->swarmStep();
             }
-            CHECK(team.stats.measurements.births[unit]>before);
+            CHECK(team.stats.measurements().births[unit]>before);
         }
     }
+}
+TEST_CASE("flag room queries borrow compact team records with sparse and empty teams")
+{
+    glob2test::HeadlessGlobals globals;
+    glob2test::HeadlessGame fixture({.wDec=5,.hDec=5,.teams=3,.discovered=true,.loadDefaultRace=true});
+    auto* flag=fixture.addBuilding("warflag",8,8);
+    REQUIRE(flag);
+    REQUIRE(fixture.addBuilding("inn",12,12));
+    REQUIRE(fixture.addBuilding("clearingflag",16,16,0,2));
+    const AIEngine::AIWorldView world(fixture.game.captureReadBoundary());
+    const auto& type=world.catalog->at(flag->typeNum).resolvedType;
+    REQUIRE_FALSE(type.semantics.occupiesGround);
+    for(int team=-1;team<=3;++team)
+        for(int x=-2;x<world.width+2;++x)
+            for(int y=-2;y<world.height+2;++y)
+            {
+                bool reference=true;
+                for(const auto* building:world.buildingsForTeam(team))
+                    if(building && !AIEngine::ObservationQueries::buildingType(world,*building).semantics.occupiesGround
+                        && building->posX==world.normalizeX(x) && building->posY==world.normalizeY(y))
+                        reference=false;
+                CHECK(AIEngine::ObservationQueries::roomForBuilding(world,x,y,type,team)==reference);
+            }
+    CHECK_FALSE(AIEngine::ObservationQueries::roomForBuilding(world,40,40,type,0));
+    CHECK(AIEngine::ObservationQueries::roomForBuilding(world,8,8,type,2));
+    CHECK(AIEngine::ObservationQueries::roomForBuilding(world,12,12,type,0));
 }
 TEST_CASE("shared runtime exact anchors support rectangular attractors across the torus")
 {
@@ -720,7 +747,7 @@ TEST_CASE("Castor projects only its strategic demands and preserves mixed staffi
         }
     }
 }
-TEST_CASE("Warrush staffing preserves intent priority slot order and current stage limits")
+TEST_CASE("Warrush staffing preserves intent priority population order and current stage limits")
 {
     glob2test::HeadlessGlobals globals;
     CatalogWorld fixture(AI::WARRUSH,false,false,true,[](nlohmann::json& snapshot) {
@@ -827,8 +854,17 @@ TEST_CASE("Castor bulk wheat reads preserve weighted distance rounding and senti
     for(bool swimming:{false,true}) {
         CAPTURE(swimming);
         ai.canSwim=swimming;
-        auto* gradient=game.map.getMaterialGradientSlot(0,WHEAT,swimming ? Map::SWIM_CLASS_EVEN : 0);
+        // Synthetic complete publication for the conversion-only fixture.
+        // Drain and discard tickets before replacing storage; readers never
+        // mutate an existing published generation.
+        game.map.resetGradientPipeline();
+        auto gradient=std::make_unique<Uint16[]>(copied.size());
         for(std::size_t i=0;i<copied.size();++i)gradient[i]=raw[i%raw.size()];
+        auto& slot=game.map.materialGradients[0][WHEAT][swimming ? Map::SWIM_CLASS_EVEN : 0];
+        delete[] slot;
+        slot=gradient.release(); // The map owns and eventually frees this array.
+        game.map.publishPlane(&slot);
+        game.snapshotStore().invalidateBoundary();
         withCastorObservation(ai,game,[&] {
             ai.copyWheatGradient(copied.data());
             for(std::size_t i=0;i<copied.size();++i) {
@@ -969,7 +1005,7 @@ TEST_CASE("keyed worker courses retain qualification grants and exclude unrelate
     auto* worker=world.addUnit(WORKER,10,10);worker->constructionLevel=0;
     auto* custom=world.addUnit(3,11,10);custom->constructionLevel=0;
     auto* carrier=world.addUnit(4,12,10);carrier->constructionLevel=0;
-    auto* inactive=world.addUnit(WORKER,13,10);inactive->performance[HARVEST]=0;
+    auto* inactive=world.addUnit(WORKER,13,10);inactive->setPerformance(HARVEST,0);
     auto* defender=world.addUnit(3,14,10);defender->jobPurpose=UnitJobPurpose::Defend;
     const auto view=AIEngine::AIWorldView::capture(game,AIEngine::AIWorldView::captureCatalog(game));
     const auto projection=AIEngine::ObservationQueries::workerTrainingProjection(*view,false);
@@ -986,7 +1022,7 @@ TEST_CASE("keyed worker courses retain qualification grants and exclude unrelate
     CHECK(labour.workers==3); // worker, keyed builder, courier; defense owns its hybrid.
     CHECK(labour.idle==3);CHECK(labour.trainable==1);
     CHECK(labour.trainingSlots==game.buildingsTypes.get(school)->maxUnitInside);
-    custom->canLearn[ARMOR]=false;
+    custom->setCanLearn(ARMOR,false);
     const auto blocked=maxima.observe_labour(maxima.context);
     CHECK(blocked.trainingSlots==labour.trainingSlots);CHECK(blocked.trainable==0);
     auto* clearing=world.addBuilding("clearingflag",20,4);REQUIRE(clearing);
@@ -1023,12 +1059,12 @@ TEST_CASE("Castor swimming workforce excludes inactive carriers")
     auto* worker=world.addUnit(WORKER,10,10);
     for(int i=0;i<3;++i) {
         auto* inactive=world.addUnit(WORKER,11+i,10);
-        inactive->performance[SWIM]=10;inactive->performance[HARVEST]=0;
+        inactive->setPerformance(SWIM,10);inactive->setPerformance(HARVEST,0);
     }
     AICastor ai(world.game.players[0]);
     withCastorObservation(ai,world.game,[&]{ai.computeCanSwim();});
     CHECK_FALSE(ai.canSwim);
-    worker->performance[SWIM]=10;
+    worker->setPerformance(SWIM,10);
     withCastorObservation(ai,world.game,[&]{ai.computeCanSwim();});
     CHECK(ai.canSwim);
 }
@@ -1063,7 +1099,7 @@ TEST_CASE("independent nonmonotonic worker clocks retain keyed course eligibilit
     game.buildingsTypes.loadSnapshotJson(buildings.dump());game.configureBuildingCatalog();
     auto* provider=world.addBuilding("school",4,4);REQUIRE(provider);
     auto* custom=world.addUnit(3,11,10);REQUIRE(custom);
-    REQUIRE(custom->canLearn[HARVEST]);
+    REQUIRE(custom->canLearn(HARVEST));
     REQUIRE(custom->performance[BUILD]==9);REQUIRE(custom->performance[HARVEST]==0);
     const auto& apprenticeship=provider->type->semantics.training[HARVEST];
     REQUIRE(custom->needsTraining(apprenticeship,HARVEST));
@@ -1071,7 +1107,7 @@ TEST_CASE("independent nonmonotonic worker clocks retain keyed course eligibilit
     CHECK(custom->level[BUILD]==0);CHECK(custom->level[HARVEST]==1);
     CHECK(custom->performance[BUILD]==9);CHECK(custom->performance[HARVEST]==11);
     const auto view=AIEngine::AIWorldView::capture(game,AIEngine::AIWorldView::captureCatalog(game));
-    const auto* captured=view->unitSlots(0)[Unit::GIDtoID(custom->gid)];REQUIRE(captured);
+    const auto* captured=view->unitAtSlot(Unit::GIDfrom(Unit::GIDtoID(custom->gid), 0));REQUIRE(captured);
     CHECK(AIEngine::ObservationQueries::matchesStrategyUnitRole(*view,*captured,WORKER));
     // No equal-level probe can represent this effective, independently trained unit.
     for(const auto& level:game.unitCatalog().levels(3)) {
@@ -1088,7 +1124,7 @@ TEST_CASE("independent nonmonotonic worker clocks retain keyed course eligibilit
     AIMaxima::Maxima maxima(game.players[0]);const auto labour=maxima.observe_labour(maxima.context);
     CHECK(labour.workers==1);CHECK(labour.idle==1);CHECK(labour.trainable==1);
     CHECK(labour.trainingSlots==game.buildingsTypes.get(school)->maxUnitInside);
-    custom->canLearn[WALK]=false;
+    custom->setCanLearn(WALK,false);
     CHECK(maxima.observe_labour(maxima.context).trainable==0);
 }
 
@@ -1135,10 +1171,10 @@ TEST_CASE("always airborne carriers retain keyed flight course planning and inde
     const auto labour=maxima.observe_labour(maxima.context);
     CHECK(labour.workers==1);CHECK(labour.idle==1);CHECK(labour.trainable==1);
     CHECK(labour.trainingSlots==provider->maxUnitInside);
-    carrier->canLearn[FLY]=false;
+    carrier->setCanLearn(FLY,false);
     CHECK_FALSE(carrier->needsTraining(course,FLY));
     CHECK(maxima.observe_labour(maxima.context).trainable==0);
-    carrier->canLearn[FLY]=true;
+    carrier->setCanLearn(FLY,true);
     carrier->applyTraining(course,FLY);
     CHECK(carrier->level[FLY]==1);CHECK(carrier->performance[FLY]==16);
     CHECK(carrier->level[BUILD]==0);CHECK(carrier->level[HARVEST]==0);

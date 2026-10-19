@@ -22,6 +22,7 @@
 
 #include "EngineFixtures.h"
 #include "GeneratorPackage.h"
+#include <ThreadSupport.h>
 #include "GenerationService.h"
 
 #include <chrono>
@@ -37,6 +38,7 @@
 #include "ConnectionOverlay.h"
 #include "EndGameScreen.h"
 #include "Engine.h"
+#include "sim/snapshot/SnapshotChecksum.h"
 #include "FileFormatVersions.h"
 #include "render/ColonySkinPreview.h"
 #include "Game.h"
@@ -351,7 +353,19 @@ public:
 		REQUIRE(lockstep);
 		lockstep->onChecksum = [this](std::uint32_t tick, Uint32 checksum) {
 			if (tick == 0 && !lives.back().empty())
+			{
+				// Delayed reports can retire just before the next capture. The
+				// established observation must belong to the replacement world,
+				// at most one completed boundary behind the live simulation.
+				const auto& game = engine->gui.game;
+				const auto& world = game.observation();
+				CHECK(world.tick <= game.stepCounter);
+				CHECK(game.stepCounter-world.tick <= 1);
+				CHECK(world.worldIdentity == game.map.identity());
+				CHECK(world.observationRevision == game.snapshots().revision());
+				++observedReloads;
 				lives.emplace_back(); // reloaded in place: a new run from tick 0
+			}
 			lives.back()[tick] = checksum;
 		};
 		lockstep->turn().onSubmitted = [this](std::uint32_t sequence) {
@@ -522,6 +536,7 @@ public:
 	std::uint32_t tamperAtTick = UINT32_MAX;
 	bool tampered = false;
 	int reloads = 0;
+	int observedReloads = 0;
 	int ordersQueued = 0;
 	std::int64_t catchUpNs = 0;
 	std::uint32_t catchUpTicks = 0;
@@ -608,10 +623,10 @@ struct EngineMatch
 		for (auto& c : clients)
 			if (!c->stopped)
 				REQUIRE(c->session().executedTick() == end);
-		// A little longer: each client takes the checksum before tick `end` at its next
-		// step, as the verifier does.
-		run(200 * MS);
-		return end;
+        // Drain terminal checksum work without executing further orders.
+        for (auto& c:clients) if (!c->stopped) { RngScope scope(c->rng); c->engine->flushChecksums(); }
+        run(200 * MS); // Deliver final reports through the simulated links.
+        return end;
 	}
 
 	Turn::MatchRecord record(const std::string& id) const
@@ -880,6 +895,62 @@ DragResult dragAndHold(const Turn::TurnSessionConfig& config, const fs::path& ve
 
 TEST_SUITE("TurnEngineHarness")
 {
+    GLOB2_TEST_CASE("map checksum coverage survives the last human quitting", "[network-sim]")
+    {
+        glob2test::HeadlessGlobals globals(harnessGlobals());
+        const auto map = mapPath("FourSquares1");
+        const auto setup = makeSetup(map, 1, {"nicowar", "nicowar", "nicowar"}, 2026);
+        Turn::MatchRecord record;
+        record.humanSeatMask = setup.humanSeatMask();
+        Engine engine;
+        Engine::TurnMatchStart start;
+        start.setup = setup;
+        start.mapFile = map;
+        start.localSeat = -1;
+        start.transport = std::make_shared<Turn::RecordTransport>(record, 0);
+        REQUIRE(engine.initTurnMatch(start) == Engine::EE_NO_ERROR);
+        CHECK(engine.routineMapChecksums());
+        REQUIRE(engine.gui.game.executePlayerQuitGame(PlayerQuitsGameOrder(0)));
+        CHECK_FALSE(SimulationChecksum::mapChecksumsFor(engine.gui.game.gameHeader));
+        CHECK(engine.routineMapChecksums());
+    }
+
+    GLOB2_TEST_CASE("AI-only turn recordings replay through their terminal checksum",
+                    "[network-sim][artifacts]")
+    {
+        glob2test::HeadlessGlobals globals(harnessGlobals());
+        globals->automaticEndingGame = false;
+        const auto map = mapPath("FourSquares1");
+        const auto setup = makeSetup(map, 0, {"nicowar", "nicowar", "nicowar", "nicowar"}, 2026);
+        Turn::MatchRecord record;
+        record.matchId = "ai-only-checksum-policy";
+        record.simVersion = setup.simVersion.key();
+        record.setupJson = setup.toJson().dump();
+        record.humanSeatMask = setup.humanSeatMask();
+        record.endTick = 256;
+        const auto directory = glob2test::artifactDir();
+        REQUIRE(record.humanSeatMask == 0);
+        const auto verdict = MatchVerifier::verify(record, setup, map, directory);
+        // A report-free record is unverifiable, but its generated replay is valid.
+        REQUIRE(verdict.verdict == "unverifiable");
+
+        Engine playback;
+        REQUIRE(playback.loadReplayTask((directory / "match.replay").string()).run());
+        auto& reader = *globalContainer->replayReader;
+        REQUIRE(reader.getNumStepsTotal() == record.endTick);
+        playback.beginSession(0);
+        for (Uint32 tick = 0; tick <= record.endTick; ++tick)
+        {
+            // Include the terminator: it carries the final sampled map boundary.
+            playback.stepSession(Uint64(tick) * 40, {});
+            REQUIRE(reader.isValid());
+        }
+        REQUIRE(reader.isFinished());
+        CHECK_NOTHROW(reader.finishChecksumValidation());
+        playback.gui.isRunning = false;
+        playback.finishSession();
+    }
+
 	GLOB2_TEST_CASE("embedded terrain definitions travel with shared matches and verifier replays",
 					"[network-sim][artifacts]")
 	{
@@ -1117,7 +1188,17 @@ TEST_SUITE("TurnEngineHarness")
 	                "[network-sim][artifacts]")
 	{
 		glob2test::HeadlessGlobals globals(harnessGlobals());
+        globals->computeThreads = 2;
 		EngineMatch m("FourSquares1", {{20 * MS}, {40 * MS, 20 * MS}, {30 * MS, 10 * MS, 0.01}}, {"castor"});
+        const auto setupParticipants = globals->resourcePlan.computeParticipants;
+        REQUIRE(globals->resourcePlan.requestedComputeThreads == 2);
+        REQUIRE(setupParticipants == (GAGCore::ThreadSupport::available ? 2u : 1u));
+        REQUIRE(m.clients[1]->engine->gui.game.map.computeExecutor().threadCount() == setupParticipants);
+        std::ostringstream setupProvenance;
+        writeApplicationResourcePlanJson(setupProvenance, globals->resourcePlan);
+        // A preference for the next session must not resize the current session
+        // when rejoin reloads its map and reconstructs the compute executor.
+        globals->computeThreads = 1;
         // Model a verified view-owned color already installed before rejoin.
         m.clients[1]->engine->gui.view.render.skinPreview().colors[1] = 0x123456;
 		m.clients[1]->tamperAtTick = 400;
@@ -1125,6 +1206,12 @@ TEST_SUITE("TurnEngineHarness")
 		const std::uint32_t end = m.finish();
 		CHECK(m.clients[1]->tampered);
 		CHECK(m.clients[1]->reloads == 1);
+		CHECK(m.clients[1]->observedReloads == 1);
+        CHECK(globals->computeThreads == 1);
+        CHECK(m.clients[1]->engine->gui.game.map.computeExecutor().threadCount() == setupParticipants);
+        std::ostringstream reloadedProvenance;
+        writeApplicationResourcePlanJson(reloadedProvenance, globals->resourcePlan);
+        CHECK(reloadedProvenance.str() == setupProvenance.str());
         CHECK(m.clients[1]->engine->gui.view.render.skinPreview().buildingColor(1)==0x123456);
 		REQUIRE(m.clients[1]->lives.size() == 2);
 		// The first run diverged right after the tampered tick and was replaced.
@@ -1776,13 +1863,15 @@ TEST_SUITE("TurnEngineHarness")
 		m.run(2 * SECOND);
 		const std::uint32_t end = m.finish();
 		CHECK(m.requireIdenticalChecksums() == end + 1);
-		// The game skipped exactly the paused ticks, the same on both clients.
+		// Each resume holds its boundary for due AI delivery before the next
+		// advancement: one manual resume and two pause-budget forced resumes.
+		constexpr std::uint32_t resumeBoundaries = 3;
 		const std::uint32_t pausedTicks = lock0.pauseTicksUsed(0) + lock0.pauseTicksUsed(1);
 		for (auto& c : m.clients)
 		{
 			INFO("client " << c->index);
 			CHECK(c->engine->turnLockstep()->pauseTicksUsed(0) == lock0.pauseTicksUsed(0));
-			CHECK(c->engine->gui.game.stepCounter + pausedTicks == end);
+			CHECK(c->engine->gui.game.stepCounter + pausedTicks + resumeBoundaries == end);
 			requireSameAudit(c->engine->turnLockstep()->orderAudit(), lock0.orderAudit());
 		}
 		std::sort(notices.begin(), notices.end());

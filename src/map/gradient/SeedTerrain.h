@@ -2,20 +2,19 @@
 #pragma once
 #include "MapStateView.h"
 #include "field/GradientConstants.h"
-#include <array>
+#include <stdexcept>
 
 namespace gradient_preparation
 {
-// A compact per-rule lookup for live and frozen cells.
+// Select one compiled CPU column outside the cell loop. Indexing the 40-byte
+// accelerator record and interpreting its mask in every cell costs more than
+// loading a prepared 16-bit seed, even when the rule table fits in cache.
 template<class Function>
 void withOpenTerrain(const MapState::View& view, int swim, Function fn)
 {
-    std::vector<Uint16> table(view.rules->size());
-    for (size_t r=0;r<table.size();++r)
-    {
-        const auto& p=view.rules->properties(std::uint16_t(r));
-        table[r]=Uint16(gradient_kernel::terrainAllowsGround(p,swim) ? GRADIENT_UNREACHABLE : GRADIENT_FORBIDDEN);
-    }
+    if(swim<0 || unsigned(swim)>=MOVEMENT_CLASS_COUNT)
+        throw std::invalid_argument("Unknown gradient movement class");
+    const auto& table=view.rules->openTerrainSeeds(swimAccessVariant(swim));
     fn([&](size_t i) { return table[view.cellRules[i]]; });
 }
 }

@@ -16,12 +16,6 @@ namespace ResourceGrowth
 static_assert(ComputeExecutor::GrowthHorizon >= 16);
 namespace
 {
-Uint64 now()
-{
-	return std::chrono::duration_cast<std::chrono::nanoseconds>(
-			   std::chrono::steady_clock::now().time_since_epoch())
-		.count();
-}
 bool emptyAllowed(const MapState::OccupancyCell &o, const ResourceProperties &p)
 {
 	return (!p.blocksBuilding || o.building == 0xffff) &&
@@ -40,7 +34,7 @@ void recordDelta(Map &map, const Proposal &p, bool newTile, int delta)
 		auto *team = map.game->teams[t];
 		if (!team)
 			continue;
-		auto &m = team->stats.measurements;
+		auto &m = team->stats.events();
 		m.growthGlobal[0][p.material] += newTile;
 		m.growthGlobal[1][p.material] += std::max(0, delta);
 		m.growthGlobal[2][p.material] += std::max(0, -delta);
@@ -143,12 +137,10 @@ void calculate(const MapState::View &v, MersenneTwister &rng, Batch &out)
 
 void apply(Map &map, const Batch &batch, Metrics &metrics)
 {
-	const auto start = now();
 	metrics.publishedProposals += batch.proposals.size();
 	if (map.game->gameHeader.isResourceGrowthDisabled())
 	{
 		metrics.rejected += batch.proposals.size();
-		metrics.publicationNs += now() - start;
 		return;
 	}
 	if (batch.proposals.empty()) return;
@@ -233,15 +225,8 @@ void apply(Map &map, const Batch &batch, Metrics &metrics)
 			metrics.clamped += attempted && op.delta > 0;
 		}
 	}
-	metrics.publicationNs += now() - start;
 }
 
-SimulationSnapshot::Requirements Pipeline::requirements()
-{
-	using namespace SimulationSnapshot;
-	return bit(Component::Resources) | bit(Component::Terrain) | bit(Component::Growth) |
-		   bit(Component::Catalogs) | bit(Component::Rules) | bit(Component::Occupancy);
-}
 void Pipeline::stage(Uint32 tick, Uint32 seed)
 {
 	if (reservation)
@@ -253,8 +238,6 @@ void Pipeline::stage(Uint32 tick, Uint32 seed)
 void Pipeline::run(void *context, std::size_t)
 {
 	auto &j = *static_cast<Job *>(context);
-	const auto start = now();
-	j.queueNs = start - j.submittedNs;
 	try
 	{
 		MersenneTwister rng(j.seed);
@@ -265,7 +248,6 @@ void Pipeline::run(void *context, std::size_t)
 		j.error = std::current_exception();
 	}
 	j.snapshot.reset();
-	j.computeNs = now() - start;
 }
 void Pipeline::prepare(const SimulationSnapshot::Handle &snapshot, ComputeExecutor &target)
 {
@@ -301,11 +283,10 @@ void Pipeline::prepare(const SimulationSnapshot::Handle &snapshot, ComputeExecut
 	j->seed = reservation->second;
 	j->catalog = snapshot.catalogs->resources->checksum();
 	j->world = snapshot.worldIdentity;
-	j->snapshot = snapshot.project(requirements());
+	j->snapshot = snapshot.growthView();
 	j->error = {};
 	j->collected = false;
 	j->work = {};
-	j->submittedNs = now();
 	auto *job = j.get();
 	pending.push_back(std::move(j));
 	Uint64 bytes = 0;
@@ -315,11 +296,12 @@ void Pipeline::prepare(const SimulationSnapshot::Handle &snapshot, ComputeExecut
 		bytes += p->reservedCapacity * sizeof(Proposal);
 	metrics.maxProposalBytes = std::max(metrics.maxProposalBytes, bytes);
 	reservation.reset();
-	const ComputeExecutor::Group group{1, {run, job}, ComputeExecutor::NoLane};
+	const auto callback = &run;
+	const ComputeExecutor::Group group{1, {callback, job}, ComputeExecutor::NoLane};
 	try
 	{
 		job->work = executor->submit(std::span(&group, 1),
-			ComputeExecutor::advanceDue(job->output.dueTick));
+			ComputeExecutor::advanceDue(job->output.dueTick), {ComputeProducer::ResourceGrowth, job->output.sourceTick, job->output.dueTick});
 	}
 	catch (...)
 	{
@@ -330,21 +312,17 @@ void Pipeline::prepare(const SimulationSnapshot::Handle &snapshot, ComputeExecut
 	++metrics.submitted;
 	metrics.maxPending = std::max<Uint64>(metrics.maxPending, pending.size());
 }
-void Pipeline::join(Job &j)
+void Pipeline::join(Job &j, JoinContext context)
 {
 	if (!j.work.empty())
 	{
-		const auto start = now();
-		executor->join(j.work);
+		executor->join(j.work, context);
 		j.work = {};
-		metrics.waitNs += now() - start;
 	}
 	if (j.error)
 		std::rethrow_exception(j.error);
 	if (!j.collected)
 	{
-		metrics.computeNs += j.computeNs;
-		metrics.queueNs += j.queueNs;
 		metrics.sampled += j.output.sampled;
 		metrics.capacityGrowthBatches += j.output.capacityGrew;
 		metrics.maxProposals = std::max<Uint64>(metrics.maxProposals, j.output.proposals.size());
@@ -366,7 +344,7 @@ void Pipeline::publish(Map &map, Uint32 tick)
 	while (!pending.empty() && Sint32(tick - pending.front()->output.dueTick) >= 0)
 	{
 		auto &j = *pending.front();
-		join(j);
+		join(j, {JoinReason::TickDeadline, tick});
 		if (j.world == map.identity() && j.catalog == map.resourceRegistry().checksum())
 			apply(map, j.output, metrics);
 		else
@@ -379,10 +357,10 @@ void Pipeline::publish(Map &map, Uint32 tick)
 		pending.pop_front();
 	}
 }
-void Pipeline::finish()
+void Pipeline::finish(JoinContext context)
 {
 	for (auto &j : pending)
-		join(*j);
+		join(*j, context);
 }
 void Pipeline::reset() noexcept
 {
@@ -391,7 +369,7 @@ void Pipeline::reset() noexcept
 		{
 			try
 			{
-				executor->join(j->work);
+				executor->join(j->work, {JoinReason::Teardown, ComputeTelemetry::NoTick});
 			}
 			catch (...)
 			{
@@ -415,7 +393,7 @@ void Pipeline::save(GAGCore::OutputStream *s, Uint32 tick)
 {
 	if (reservation)
 		throw std::logic_error("Saving unprepared growth");
-	finish();
+	finish({JoinReason::Save, ComputeTelemetry::NoTick});
 	s->writeEnterSection("resourceGrowth");
 	s->writeUint8(delay, "delay");
 	s->writeUint8(pending.size(), "count");
@@ -574,36 +552,34 @@ Uint32 Pipeline::checksum(bool heavy)
 } // namespace ResourceGrowth
 
 
-SimulationSnapshot::Requirements Map::pendingWorldRequirements() const
+void Map::publishWorldResultsDue()
 {
-	return pendingGradientRequirements() |
-		   (gradientRuntime->growth.needsPreparation() ? ResourceGrowth::Pipeline::requirements()
-													   : 0);
+    const auto tick = game->stepCounter;
+    if (gradientRuntime->worldResultsPublishedTick == tick) return;
+    if (!gradientPipelineEnabled()) configureGradientPipeline(2, 8);
+    advanceGradientPipeline();
+    gradientRuntime->growth.publish(*this, tick);
+    gradientRuntime->worldResultsPublishedTick = tick;
 }
-void Map::preparePendingWorld()
+void Map::submitWorldWork(const SimulationSnapshot::Handle &snapshot)
 {
-	if (const auto requirements = pendingWorldRequirements())
-	{
-		auto &store = game->snapshotStore();
-		store.invalidateBoundary();
-		preparePendingWorld(store.captureBoundary(*game, requirements));
-	}
-}
-void Map::preparePendingWorld(const SimulationSnapshot::Handle &snapshot)
-{
-	if (hasPendingGradientPreparation())
-		preparePendingGradient(snapshot);
-	gradientRuntime->growth.prepare(snapshot, compute);
+    if (snapshot.tick != game->stepCounter || snapshot.worldIdentity != identity())
+        throw std::invalid_argument("World work requires the current observation");
+    if (gradientRuntime->worldWorkSubmittedTick == snapshot.tick) return;
+    stagePeriodicGradientPreparation();
+    stageResourceGrowth();
+    preparePendingGradient(snapshot);
+    gradientRuntime->growth.prepare(snapshot, compute);
+    gradientRuntime->worldWorkSubmittedTick = snapshot.tick;
 }
 void Map::stageResourceGrowth()
 {
 	if (!game->gameHeader.isResourceGrowthDisabled())
 		gradientRuntime->growth.stage(game->stepCounter, privateRandom(RandomDomain::GrowthJobs).nextU32());
 }
-void Map::finishResourceGrowth()
+void Map::finishResourceGrowth(JoinContext context)
 {
-	preparePendingWorld();
-	gradientRuntime->growth.finish();
+	gradientRuntime->growth.finish(context);
 }
 void Map::setResourceGrowthDelay(unsigned delay)
 {

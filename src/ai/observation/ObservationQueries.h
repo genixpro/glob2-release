@@ -116,14 +116,14 @@ inline bool definitionCanServeStrategyRole(const AIEngine::AIWorldView& world,un
     const auto& traits=world.unitTraits(id);
     AIEngine::UnitView probe;
     probe.typeNum=id;probe.capabilityFlags=traits.flags;probe.experienceLevel=0;
-    std::fill(std::begin(probe.performance),std::end(probe.performance),0);
+    for(int ability=0;ability<NB_ABILITY;++ability)probe.setPerformance(ability,0);
     for(const auto& level:world.unitCatalog().levels(id))
         for(const int ability:{WALK,SWIM,FLY,BUILD,HARVEST,ATTACK_SPEED,ATTACK_STRENGTH})
-            probe.performance[ability]=std::max(probe.performance[ability],level.performance[ability]);
+            probe.setPerformance(ability,std::max(int(probe.performance[ability]),level.performance[ability]));
     if(!traits.has(UnitRuntimeTraits::LegacyPerformancePolicies)) {
-        if(!traits.has(UnitRuntimeTraits::Walk))probe.performance[WALK]=0;
-        if(!traits.has(UnitRuntimeTraits::Swim))probe.performance[SWIM]=0;
-        if(!traits.has(UnitRuntimeTraits::Fly))probe.performance[FLY]=0;
+        if(!traits.has(UnitRuntimeTraits::Walk))probe.setPerformance(WALK,0);
+        if(!traits.has(UnitRuntimeTraits::Swim))probe.setPerformance(SWIM,0);
+        if(!traits.has(UnitRuntimeTraits::Fly))probe.setPerformance(FLY,0);
     }
     return matchesStrategyUnitRole(world,probe,role);
 }
@@ -363,9 +363,11 @@ inline bool roomForBuilding(const AIEngine::AIWorldView& world,int x,int y,const
 {
     if(!type.semantics.occupiesGround) {
         const int normalizedX=world.normalizeX(x), normalizedY=world.normalizeY(y);
-        for(const auto* building:world.buildingSlots(team))
-            if(building && !buildingType(world,*building).semantics.occupiesGround
-                && building->posX==normalizedX && building->posY==normalizedY) return false;
+        // Snapshot records are already compact and grouped by team. Borrow that
+        // range instead of sweeping every empty legacy slot for each map tile.
+        for(const auto* building:world.buildingsForTeam(team))
+            if(building->posX==normalizedX && building->posY==normalizedY
+                && !buildingType(world,*building).semantics.occupiesGround) return false;
         return true;
     }
     bool discovered=false;
@@ -396,7 +398,7 @@ inline std::shared_ptr<Order> missingProductionOrder(const AIEngine::AIWorldView
         if(descriptor.site) type=descriptor.next;
         provided|=unsigned(index.intentMask(type))&((1u<<NB_UNIT_TYPE)-1);
     };
-    for(const auto* building:world.buildingSlots(team)) {
+    for(const auto* building:world.buildingsForTeam(team)) {
         if(!building || building->buildingState!=::Building::ALIVE) continue;
         includeProvider(buildingType(world,*building).isBuildingSite ? constructionCompletionType(world,*building) : building->typeNum);
         if(!anchor || (index.intentMask(building->typeNum)&((1u<<NB_UNIT_TYPE)-1))) anchor=building;

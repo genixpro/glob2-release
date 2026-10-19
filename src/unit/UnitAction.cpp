@@ -27,8 +27,11 @@ void Unit::wrapPosition()
 	if (!performance[FLY] && !performance[WALK] && (dx || dy) && (!performance[SWIM] || !owner->map->terrainPropertiesAt(posX+dx,posY+dy).swimmable)) {
 		dx=dy=0; direction=UNIT_DIRECTION_NONE;
 	}
+    const int oldX=posX,oldY=posY;
 	posX=(posX+dx)&(owner->map->getMaskW());
 	posY=(posY+dy)&(owner->map->getMaskH());
+    if((posX!=oldX || posY!=oldY) && !isDead && displacement!=DIS_INSIDE && hasCapability(UnitRuntimeTraits::GuardIdle))
+        owner->map->gradientGuardCostsChanged(owner->teamNumber);
 }
 
 void Unit::clearOccupiedMapSlot()
@@ -58,7 +61,7 @@ void Unit::handleActionRandomGround()
 	assert(!performance[FLY]);
 	if (!performance[WALK] && !performance[SWIM]) {
 		dx=dy=0; direction=UNIT_DIRECTION_NONE; action=STOP_WALK;
-		speed=std::max(1,performance[STOP_WALK]); return;
+		speed=std::max(1,int(performance[STOP_WALK])); return;
 	}
 	clearOccupiedMapSlot();
 	owner->map->pathfindRandom(this);
@@ -102,16 +105,18 @@ void Unit::handleActionRandomFly()
 
 void Unit::handleActionGoingTarget()
 {
-	assert(!performance[FLY]);
 	clearOccupiedMapSlot();
-	owner->map->pathfindPointToPoint(posX, posY, targetX, targetY, &dx, &dy, swimClass(), owner->me, GOING_TARGET_MAX_PATH_LENGTH);
+    if (performance[FLY] && !owner->map->hasAirRoutingConstraints())
+        flyToTarget();
+    else
+        findDisplacement([&](int* pathDx, int* pathDy) { return owner->map->pathfindPointToPoint(posX, posY, targetX, targetY, pathDx, pathDy, movementClass(), owner->me, performance[FLY] ? Map::GRADIENT_COST_LIMIT/GRADIENT_STEP : GOING_TARGET_MAX_PATH_LENGTH); });
 	directionFromDxDy();
 	wrapPosition();
 
 	if(dx == 0 && dy == 0)
 		if (!performance[FLY]) owner->map->markImmobileUnit(posX, posY, owner->teamNumber);
 
-	selectPreferredGroundMovement();
+	selectPreferredMovement();
 	speed=unitTerrainMovementSpeed(performance[action], action == FLY
         ? owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8
         : owner->map->terrainPropertiesAt(posX,posY).groundSpeedQ8, dx != 0 || dy != 0);
@@ -120,19 +125,8 @@ void Unit::handleActionGoingTarget()
 
 void Unit::handleActionFlyingTarget()
 {
-	// No assert(getAirUnit==NOGUID) on the final claim — two flyers can
-	// converge on the same target tile, so the destination slot may be
-	// non-empty. Direct setAirUnit calls preserve that, unlike claimOccupiedMapSlot().
-	owner->map->setAirUnit(posX, posY, NOGUID);
-
-	flyToTarget();
-
-	wrapPosition();
-
-	action=FLY;
-	speed=unitTerrainMovementSpeed(performance[FLY], owner->map->terrainPropertiesAt(posX,posY).airSpeedQ8, dx != 0 || dy != 0);
-
-	owner->map->setAirUnit(posX, posY, gid);
+    // Durable save action value; choose direct steering or the shared router.
+    handleActionGoingTarget();
 }
 
 void Unit::handleActionGoingDxDy()

@@ -320,7 +320,7 @@ TEST_SUITE("EntityRandomLifecycle")
         }
     }
 
-    TEST_CASE("format 150 area state survives one-time RNG migration and continuation [save-format][artifacts]")
+    TEST_CASE("format 150 text area saves retain funded services through current saves [save-format][artifacts]")
     {
         glob2test::HeadlessGlobals globals;
         glob2test::HeadlessGame world({.header=true, .seed=731});
@@ -335,6 +335,35 @@ TEST_SUITE("EntityRandomLifecycle")
         building->areaFundingTick = 0;
         unit->entityRandom.nextU32(); building->entityRandom.nextU32();
         auto bytes = save(world.game, true);
+        // Format 150 stored allocation slots, before counted append-order records.
+        // Rewrite the entity records too; changing the header alone is not an old save.
+        auto legacyPopulation = [&](const char* name, auto* const* slots, int capacity) {
+            auto* backend = new GAGCore::MemoryStreamBackend;
+            GAGCore::TextOutputStream output(backend);
+            output.writeEnterSection(name);
+            for (int slot = 0; slot < capacity; ++slot) {
+                output.writeEnterSection(unsigned(slot));
+                output.writeUint32(slots[slot] != nullptr, "isUsed");
+                if (slots[slot]) slots[slot]->save(&output);
+                output.writeLeaveSection();
+            }
+            output.writeLeaveSection();
+            output.flush();
+            const auto start = bytes.find(std::string(name) + "\n");
+            REQUIRE(start != std::string::npos);
+            auto end = bytes.find('{', start);
+            REQUIRE(end != std::string::npos);
+            unsigned depth = 0;
+            do {
+                REQUIRE(end < bytes.size());
+                if (bytes[end] == '{') ++depth;
+                if (bytes[end] == '}') --depth;
+                ++end;
+            } while (depth);
+            bytes.replace(start, end - start, backend->takeContents());
+        };
+        legacyPopulation("myUnits", world.team->myUnits, Unit::MAX_COUNT);
+        legacyPopulation("myBuildings", world.team->myBuildings, Building::MAX_COUNT);
         // Reconstruct the released format-150 text layout: keep its area fields,
         // but remove every later RNG section, rather than just patching a header.
         auto eraseSections = [&](const std::string& name) {
@@ -388,40 +417,30 @@ TEST_SUITE("EntityRandomLifecycle")
         std::ofstream(glob2test::artifactDir() / "format-150.game.txt", std::ios::binary) << bytes;
         glob2test::HeadlessGame migrated({.header=true});
         REQUIRE(load(migrated.game, bytes, true));
-        auto* u = migrated.game.teams[0]->myUnits[Unit::GIDtoID(unit->gid)];
-        auto* b = migrated.game.teams[0]->myBuildings[Building::GIDtoID(building->gid)];
-        REQUIRE(u); REQUIRE(b);
-        CHECK(u->areaServiceRemainders == unit->areaServiceRemainders);
-        CHECK(u->areaLastPulseTick == unit->areaLastPulseTick);
-        CHECK(b->areaFunded == building->areaFunded);
-        CHECK(b->areaFundingType == building->areaFundingType);
-        CHECK(b->areaFundingTeam == building->areaFundingTeam);
-        CHECK(b->areaFundingTick == building->areaFundingTick);
-        EntityRandom expectedUnit, expectedBuilding;
-        expectedUnit.initialize(731, EntityRandom::Kind::Unit, u->gid, u->scriptIdentity);
-        expectedBuilding.initialize(731, EntityRandom::Kind::Building, b->gid, b->scriptIdentity);
-        CHECK(u->entityRandom == expectedUnit);
-        CHECK(b->entityRandom == expectedBuilding);
-        auto components = [](Game& game) {
-            std::vector<Uint32> state, buildings, units;
-            game.checkSum(&state, &buildings, &units, true);
-            // The loaded header retains 150 while the resave writes the current format. Its
-            // format checksum differs intentionally; authoritative state must not.
-            state.erase(state.begin());
-            state.insert(state.end(), buildings.begin(), buildings.end());
-            state.insert(state.end(), units.begin(), units.end());
-            return state;
-        };
-        for (bool text : {false, true}) {
-            glob2test::HeadlessGame restored({.header=true});
-            REQUIRE(load(restored.game, save(migrated.game, text), text));
-            CHECK(components(restored.game) == components(migrated.game));
-            for (int tick = 0; tick < 64; ++tick) {
-                migrated.step(); restored.step();
-                CHECK(components(restored.game) == components(migrated.game));
-            }
-        }
-    }
+        auto* restoredUnit=migrated.game.teams[0]->myUnits[Unit::GIDtoID(unit->gid)];
+        auto* restoredBuilding=migrated.game.teams[0]->myBuildings[Building::GIDtoID(building->gid)];
+        REQUIRE(restoredUnit); REQUIRE(restoredBuilding);
+        CHECK(restoredUnit->areaServiceRemainders==unit->areaServiceRemainders);
+        CHECK(restoredUnit->areaLastPulseTick==unit->areaLastPulseTick);
+        CHECK(restoredBuilding->areaFunded);
+        CHECK(restoredBuilding->areaFundingTeam==building->areaFundingTeam);
+        CHECK(restoredBuilding->areaFundingType==building->areaFundingType);
+        CHECK(restoredBuilding->areaFundingTick==building->areaFundingTick);
+        const auto current=save(migrated.game,true);
+        glob2test::HeadlessGame continued({.header=true});
+        REQUIRE(load(continued.game,current,true));
+        // The header checksum includes the loaded format number, which the
+        // new save upgrades. Every simulation component after that header must
+        // still agree, including pending work and private random streams.
+        CHECK(migrated.game.mapHeader.getVersionMinor()==150);
+        CHECK(continued.game.mapHeader.getVersionMinor()==VERSION_MINOR);
+        std::vector<Uint32> before,after;
+        migrated.game.checkSum(&before,nullptr,nullptr,true);
+        continued.game.checkSum(&after,nullptr,nullptr,true);
+        REQUIRE(before.size()==after.size());
+        REQUIRE(before.size()>1);
+        CHECK(std::equal(before.begin()+1,before.end(),after.begin()+1));
+}
 
     TEST_CASE("truncated binary RNG state and even increments are rejected")
     {

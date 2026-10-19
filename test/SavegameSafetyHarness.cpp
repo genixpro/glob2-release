@@ -691,7 +691,7 @@ static void checkRandomContinuation(bool text, bool ai)
 			order->sender=0;
 			game.executeOrder(order,0);
 		}
-		game.syncStep(0);
+		game.step(0);
 	};
 	for (int i=0; i<100; ++i) step(gui.game);
 	const auto savedRandom = gui.game.syncRandom;
@@ -701,7 +701,7 @@ static void checkRandomContinuation(bool text, bool ai)
 	public:
 		size_t runtimeStart=0, runtimeEnd=0, pipelineStart=0;
 		explicit CheckpointOutput(StreamBackend *backend) : BinaryOutputStream(backend) {}
-		void writeEnterSection(const std::string name) override
+		void writeEnterSection(std::string_view name) override
 		{
 			if (name=="mapRuntime") runtimeStart=getPosition();
 			if (name=="GameGUI") runtimeEnd=getPosition();
@@ -745,7 +745,7 @@ static void checkRandomContinuation(bool text, bool ai)
 		step(gui.game);
 		continuation.push_back(simulationState(gui.game));
 		std::vector<GameplayMeasurements> measurements;
-		for (int t=0; t<gui.game.teamsCount(); ++t) measurements.push_back(gui.game.teams[t]->stats.measurements);
+		for (int t=0; t<gui.game.teamsCount(); ++t) measurements.push_back(gui.game.teams[t]->stats.measurements());
 		measurementContinuation.push_back(measurements);
 	}
 	// Unrelated draws from the process stream must not affect the restored game.
@@ -765,10 +765,14 @@ static void checkRandomContinuation(bool text, bool ai)
 		REQUIRE(output.pipelineStart>output.runtimeStart);
 		// Reject invalid queue sizes, deadlines, destinations and cancellation flags.
 		const auto pipeline=output.pipelineStart;
-		REQUIRE(static_cast<unsigned char>(bytes[pipeline+1])>0);
+		// Format 174 batches pending fields: uint16 count, uint32 destination.
+		REQUIRE((static_cast<unsigned char>(bytes[pipeline+1])<<8 |
+		         static_cast<unsigned char>(bytes[pipeline+2]))>0);
+		const auto destination=pipeline+3;
+		const auto remaining=destination+sizeof(Uint32);
 		for (const auto [offset,value] : std::vector<std::pair<size_t,unsigned char>>{
-			{pipeline,0}, {pipeline,17}, {pipeline+1,17},
-			{pipeline+2,255}, {pipeline+4,0}, {pipeline+4,17}, {pipeline+5,2}}) {
+			{pipeline,0}, {pipeline,17}, {pipeline+1,255},
+			{destination,255}, {remaining,0}, {remaining,17}, {remaining+1,2}}) {
 			auto malformed=bytes; malformed[offset]=value;
 			auto bad=input(malformed,true); bool rejected=false;
 			try { rejected=!restored.load(bad.get()); } catch(const std::exception &) { rejected=true; }
@@ -802,7 +806,7 @@ static void checkRandomContinuation(bool text, bool ai)
 		const auto actual = simulationState(restored.game);
 
 		for (int t=0; t<restored.game.teamsCount(); ++t)
-			REQUIRE(restored.game.teams[t]->stats.measurements == measurementContinuation[i][t]);
+			REQUIRE(restored.game.teams[t]->stats.measurements() == measurementContinuation[i][t]);
 		if (actual != continuation[i])
 		{
 			std::cerr << "Continuation mismatch at step " << i << " sizes " << actual.size() << '/' << continuation[i].size() << std::endl;
@@ -1278,7 +1282,7 @@ TEST_SUITE("SavegameSafety")
             {
                 using BinaryOutputStream::BinaryOutputStream;
                 size_t depth=0,cellDepth=0,start=0,end=0;
-                void writeEnterSection(const std::string name) override {
+                void writeEnterSection(std::string_view name) override {
                     ++depth;if(name=="cases") {start=getPosition();cellDepth=depth;}
                 }
                 void writeEnterSection(unsigned) override {++depth;}

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <algorithm>
 #include "MainMenuScreen.h"
+#include "HandPreferenceScreen.h"
 #include "CampaignMainMenu.h"
 #include "CampaignSelectorScreen.h"
 #include "CampaignMenuScreen.h"
@@ -302,6 +303,7 @@ struct MobileGallerySetup
 		stack.push(std::move(main));
 		frame(stack);
 		stackShot(stack, "main-menu");
+		screenShot(stack, "hand-preference", std::make_unique<HandPreferenceScreen>());
 		if (mainScreen->host().find("menu/more"))
 			press(stack, *mainScreen, "menu/more");
 		press(stack, *mainScreen, "menu/discord");
@@ -706,7 +708,7 @@ class MobileGalleryGameplay
 		globalContainer->replayWriter->init("", gui);
 		for (int tick = 0; tick < 4096; ++tick)
 		{
-			gui.game.syncStep(0);
+			gui.game.step(0);
 			globalContainer->replayWriter->advanceStep();
 		}
 		globalContainer->replayWriter->finish();
@@ -979,7 +981,7 @@ class MobileGalleryGameplay
 				gui.localTeam, &gui.game.buildingsTypes, 1, 1);
 			if (std::string(family) == "clearingflag")
 				for (int material = 0; material < MaterialCount; ++material)
-					fixture->clearingMaterials[material] = material % 2 == 0;
+					fixture->setClearsMaterial(material, material % 2 == 0);
 			gui.localTeam->myBuildings[inspectorSlot] = fixture.get();
 			gui.localTeam->attachBuilding(inspectorSlot);
 			inspect(std::string("game-inspector-") + family, fixture.get());

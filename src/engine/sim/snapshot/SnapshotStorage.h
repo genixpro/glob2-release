@@ -25,6 +25,7 @@ struct Storage
 	BufferPool<Session> session;
 	BufferPool<Effects> effects;
 	BufferPool<Statistics> statistics;
+	BufferPool<StatisticsInputs> statisticsInputs;
 	BufferPool<History> history;
 	BufferPool<Telemetry> telemetry;
 	BufferPool<EntityDiagnostics> entityDiagnostics;
@@ -42,9 +43,14 @@ struct Storage
 	// Every live plane of every retained capture may be distinct.
 	BufferPool<std::vector<Uint16>, std::size_t(17) * MapState::PlaneCount> resourcePlanes;
 	Uint64 allocations = 0;
-	Uint64 preparationNs = 0;
 	//! Bytes of map arrays actually copied (changed chunks and full fills).
 	Uint64 bytesCopied = 0;
+	//! Actual entity extraction passes, including passes over an empty world.
+	Uint64 coreMaterializations = 0;
+	//! Bulk authoritative records read from live objects; excludes view metadata.
+	Uint64 entityBytesCopied = 0;
+	//! Logical entity sidecar payload copied, excluding allocator/capacity overhead.
+	Uint64 entitySidecarBytesCopied = 0;
 	//! After each capture, compare every captured map array and entity list
 	//! with the live state and throw on a mismatch (an unmarked write).
 	bool verify = false;

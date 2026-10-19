@@ -32,10 +32,7 @@ void GameAnimations::resize(int) {}
 #include <cstdlib>
 void Map::updateForbiddenGradient(int, int) { std::abort(); }
 
-// Supplier discovery is exercised by the real-engine catalog fixtures. Unit map
-// fixtures have no teams/buildings and must not accidentally test a fake balance.
 #include "Building.h"
-Sint32 Building::availableMaterial(int) const { std::abort(); }
 // Real automatic building routes belong to engine fixtures. Diagnostic calls
 // in the lightweight map harness only use already-concrete route slots.
 BuildingRoute Building::resolveRoute(BuildingRoute) const { std::abort(); }
@@ -47,11 +44,8 @@ bool Map::stockSupplierEligibleSlot(const Building*, const Building*, int, unsig
 // completed-job draining for terrain import, and fail if an engine reservation
 // reaches this test double; that lifecycle is covered by engine harnesses.
 #include "gradient/GradientRuntime.h"
-void Map::preparePendingGradient() {
-    if (gradientRuntime->preparation.job) std::abort();
-}
-void Map::finishGradientPipeline() {
-    preparePendingGradient();
+void Map::finishGradientPipeline(JoinContext) {
+    if (!gradientRuntime->preparations.empty()) std::abort();
     gradientRuntime->pipeline.finish();
 }
 // Unit fixtures never schedule building fields; clearing only drops storage.
@@ -64,7 +58,7 @@ void Map::resetBuildingGradientPipeline() noexcept {
 
 // Growth scheduling belongs to engine fixtures. Lightweight maps never submit
 // jobs; reject accidental use rather than silently simulating a fake pipeline.
-void Map::finishResourceGrowth() {
+void Map::finishResourceGrowth(JoinContext) {
     if (gradientRuntime->growth.count() || gradientRuntime->growth.needsPreparation()) std::abort();
 }
 void ResourceGrowth::Pipeline::reset() noexcept {

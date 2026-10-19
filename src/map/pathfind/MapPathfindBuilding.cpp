@@ -9,8 +9,9 @@
 #include "Utilities.h"
 #include "Unit.h"
 #include "MapInternal.h"
+#include "gradient/GradientRuntime.h"
 #include "BuildingGradientSearch.h"
-#include "gradient/BuildingGradientStats.h"
+#include "SharedBuildingGradient.h"
 
 
 
@@ -24,70 +25,83 @@ constexpr Uint32 STUCK_REBUILD_TICKS = 128;
 
 } // namespace
 
-bool Map::prepareBuildingGradient(Building *building, int swimClass, BuildingRoute route)
+FieldReadiness Map::requestBuildingField(Building* building,int swimClass,BuildingRoute route)
 {
-	const int slot = building->routeSlot(swimClass, route);
-	assert(building);
-	Uint16 *&gradient=building->globalGradient[slot];
-	Uint32 lastUpdate=building->lastGlobalGradientUpdateStepCounter[slot];
-	Uint32 now=game->stepCounter;
-	building->globalGradientUsedStep[slot]=now;
-	bool rebuild=false, cold=false;
-	using Reason = BuildingGradientStats::Reason;
-	Reason reason = Reason::Other;
-	if (gradient==NULL)
-	{
-		gradient=acquireBuildingGradientBuffer();
-		rebuild=cold=true;
-		reason=Reason::Null;
-	}
-	else if ((building->dirtyGradient[slot] || building->gradientGeneration[slot]!=topologyGeneration)
-		&& lastUpdate+GRADIENT_DIRTY_REBUILD_TICKS<=now)
-	{
-		rebuild=true;
-		reason=building->dirtyGradient[slot] ? Reason::Dirty : Reason::Generation;
-	}
-	// A clearing flag's goals are resources, which grow and get cleared.
-	else if (building->resolveRoute(route) == BuildingRoute::Clearing && lastUpdate+CLEARING_FLAG_REFRESH_TICKS<=now)
-	{
-		rebuild=true;
-		reason=Reason::Clearing;
-	}
-	// With scheduled building gradients a refresh is requested and the old
-	// field keeps serving until its publication; a cold field has none.
-	if (rebuild && (cold || !requestBuildingRefresh(building, slot)))
-	{
-		using Sync = BuildingSyncReason;
-		if (cold)
-			switch (building->gradientDrop[slot])
-			{
-			case Building::GradientDrop::New: noteBuildingSyncReason(Sync::ColdNew); break;
-			case Building::GradientDrop::Idle: noteBuildingSyncReason(Sync::ColdIdle); break;
-			case Building::GradientDrop::Own: noteBuildingSyncReason(Sync::ColdOwn); break;
-			case Building::GradientDrop::Team: noteBuildingSyncReason(Sync::ColdTeam); break;
-			case Building::GradientDrop::Area: noteBuildingSyncReason(Sync::ColdArea); break;
-			}
-		else noteBuildingSyncReason(Sync::Other);
-		if (gradientStats) gradientStats->setPendingReason(reason);
-		updateGlobalGradient(building, swimClass, route);
-	}
-	return !building->locked[building->routeAccess(swimClass, route)];
+    assert(building);
+    ensureBuildingGradientPipeline();
+    const int slot=building->routeSlot(swimClass,route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
+    const Uint32 now=game->stepCounter;
+    building->globalGradientUsedStep[slot]=now;
+    const bool cold=!building->globalGradient[slot];
+    const auto last=building->lastGlobalGradientUpdateStepCounter[slot];
+    const bool dirty=(building->dirtyGradient[slot] || building->gradientGeneration[slot]!=topologyGeneration)
+        && last+GRADIENT_DIRTY_REBUILD_TICKS<=now;
+    const bool clearing=building->resolveRoute(route)==BuildingRoute::Clearing && last+CLEARING_FLAG_REFRESH_TICKS<=now;
+    if (cold || dirty || clearing) {
+        if (!requestBuildingRefresh(building,slot)) {
+            if (cold) building->globalGradient[slot]=acquireBuildingGradientBuffer();
+            updateGlobalGradient(building,swimClass,route);
+        }
+    }
+    return building->globalGradient[slot] ? FieldReadiness::Ready : FieldReadiness::Pending;
+}
+bool Map::prepareBuildingGradient(Building* building,int swimClass,BuildingRoute route)
+{
+    return requestBuildingField(building,swimClass,route)==FieldReadiness::Ready
+        && !building->isLocked(building->routeAccess(swimClass,route));
+}
+const Uint16* Map::lookupBuildingField(const Building* building,int swim,BuildingRoute route) const
+{
+    return building->globalGradient[building->routeSlot(swim,route)];
+}
+RouteResult Map::queryBuildingDistance(Building* building,int swim,int x,int y,int* distance,BuildingRoute route)
+{
+    if (requestBuildingField(building,swim,route)==FieldReadiness::Pending) return RouteResult::Pending;
+    return buildingAvailable(building,swim,x,y,distance,route) ? RouteResult::Reachable : RouteResult::Unreachable;
+}
+StepResult Map::queryBuildingStep(EntityRandom& random,Building* building,int swim,int x,int y,int* dx,int* dy,BuildingRoute route)
+{
+    if (requestBuildingField(building,swim,route)==FieldReadiness::Pending) return StepResult::Pending;
+    return pathfindBuilding(random,building,swim,x,y,dx,dy,route) ? StepResult::Step : StepResult::Blocked;
 }
 
 const Uint16 *Map::buildingGradient(Building *building, int swimClass, BuildingRoute route)
 {
 	const int slot = building->routeSlot(swimClass, route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
 	if (!prepareBuildingGradient(building, swimClass, route)) return NULL;
 	finishBuildingGradient(building, swimClass, route);
 	return building->globalGradient[slot];
 }
 
+std::shared_ptr<SharedBuildingGradient> Map::leaseBuildingRoute(Building *building, int swimClass, BuildingRoute route)
+{
+	const int slot = building->routeSlot(swimClass, route);
+	// Observation borrows a usable generation without enrolling, allocating,
+	// seeding or refreshing a field. Live admission owns normal preparation.
+	if (!building->globalGradient[slot] || building->dirtyGradient[slot] ||
+		building->gradientGeneration[slot] != topologyGeneration ||
+		(building->resolveRoute(route) == BuildingRoute::Clearing &&
+		 building->lastGlobalGradientUpdateStepCounter[slot] + CLEARING_FLAG_REFRESH_TICKS <= game->stepCounter))
+		return {};
+	return building->leaseGradient(slot);
+}
+
 Uint16 Map::buildingGradientValue(Building *building, int swimClass, size_t cell, BuildingRoute route) const
 {
 	const int slot = building->routeSlot(swimClass, route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
 	assert(building->globalGradient[slot]);
 	assert(cell < size);
-	if (auto &search = building->globalGradientSearch[slot]) search->resolve(cell);
+    if(auto& search=building->globalGradientSearch[slot]) {
+        if(auto& stats=gradientRuntime->workStats) {
+            const auto before=search->settledCost();const bool complete=search->complete();
+            search->resolve(cell);
+            if(before!=search->settledCost() || complete!=search->complete())
+                stats->partial(GradientWorkStats::buildingKey(building->owner->teamNumber,swimClass,Building::GIDtoID(building->gid),building->scriptIdentity,unsigned(building->resolveRoute(route))),game->stepCounter,before,search->settledCost());
+        } else search->resolve(cell);
+    }
 	return building->globalGradient[slot][cell];
 }
 
@@ -95,6 +109,7 @@ bool Map::buildingGradientDirection(EntityRandom& random, Building *building, in
 	int *dx, int *dy, bool strict, BuildingRoute route) const
 {
 	const int slot = building->routeSlot(swimClass, route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
 	// Settling this layer also settles all equal/better neighbors the generic
 	// direction picker can select. Keep partial-array access inside this adapter.
 	buildingGradientValue(building, swimClass, coordToIndex(x, y), route);
@@ -105,6 +120,7 @@ bool Map::buildingGradientDirection(EntityRandom& random, Building *building, in
 bool Map::buildingAvailable(Building *building, int swimClass, int x, int y, int *dist, BuildingRoute route)
 {
 	const int slot = building->routeSlot(swimClass, route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
 	PERF_SCOPE_TIME(PathBuilding);
 	if (!prepareBuildingGradient(building, swimClass, route))
 		return false;
@@ -124,11 +140,13 @@ bool Map::buildingAvailable(Building *building, int swimClass, int x, int y, int
 bool Map::pathfindBuilding(EntityRandom& random, Building *building, int swimClass, int x, int y, int *dx, int *dy, BuildingRoute route)
 {
 	const int slot = building->routeSlot(swimClass, route);
+    auto guard=SharedBuildingGradient::lock(building->sharedGradient[slot]);
 	PERF_SCOPE_TIME(PathBuilding);
 	assert(building);
 	assert(x>=0);
 	assert(y>=0);
-	if (((areaCells[coordToIndex(x, y)].forbidden) & building->owner->me)!=0)
+	if (requestBuildingField(building,swimClass,route)==FieldReadiness::Pending) return false;
+	if (swimClass!=AIR_MOVEMENT_CLASS && ((areaCells[coordToIndex(x, y)].forbidden) & building->owner->me)!=0)
 	{
 		// This escape path reads the cached field directly as a tie-breaker.
 		// Preserve its old age (do not call buildingGradient here).
@@ -143,7 +161,6 @@ bool Map::pathfindBuilding(EntityRandom& random, Building *building, int swimCla
 	{
 		// Standing where one of the flag's resources was: it is gone, the gradient is stale.
 		building->dirtyGradient[slot]=true;
-		if (gradientStats) gradientStats->clearingGoalGone();
 		return false;
 	}
 	if (buildingGradientDirection(random, building, swimClass, x, y, dx, dy, true, route))
@@ -156,9 +173,8 @@ bool Map::pathfindBuilding(EntityRandom& random, Building *building, int swimCla
 	if (requestBuildingRefresh(building, slot))
 		return buildingGradientDirection(random, building, swimClass, x, y, dx, dy, false, route);
 	noteBuildingSyncReason(BuildingSyncReason::Other);
-	if (gradientStats) gradientStats->setPendingReason(BuildingGradientStats::Reason::Stuck);
 	updateGlobalGradient(building, swimClass, route);
-	if (building->locked[building->routeAccess(swimClass, route)])
+	if (building->isLocked(building->routeAccess(swimClass, route)))
 		return false;
 	if (buildingGradientDirection(random, building, swimClass, x, y, dx, dy, true, route))
 		return true;

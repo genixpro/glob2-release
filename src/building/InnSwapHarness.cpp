@@ -45,8 +45,6 @@ struct World
         }
 		game.addTeam(0);
 		team = game.teams[0];
-		// The gradient scheduler expects an in-use field; allocation is lazy (#243 lifts this).
-		game.map.getMaterialGradientSlot(0, WOOD, 0);
 	}
 
 	// An inn with `meals` wheat: it takes bookings while it has more wheat than guests.
@@ -57,7 +55,7 @@ struct World
 		Building* b = game.addBuilding(x, y, typeNum, 0);
 		require(b != nullptr, "inn placed");
 		game.map.setBuilding(x, y, b->type->width, b->type->height, b->gid);
-		b->materials[WHEAT] = meals;
+		b->setMaterial(WHEAT, meals);
 		b->update();
 		return b;
 	}
@@ -69,7 +67,7 @@ struct World
 		require(u != nullptr, "worker placed");
 		u->hungry = 0;
 		u->medical = Unit::MED_HUNGRY;
-		u->needToRecheckMedical = true;
+		u->setNeedToRecheckMedical(true);
 		return u;
 	}
 
@@ -96,7 +94,7 @@ static void theLaterBookerTradesWithTheOneItWouldCross(unsigned unitType = WORKE
 
 	// Units look for food at the end of their current action.
 	for (int i = 0; i < 100 && !(farWorker->attachedBuilding && nearWorker->attachedBuilding); ++i)
-		world.game.syncStep(0);
+		world.game.step(0);
 
 	require(farWorker->activity == Unit::ACT_UPGRADING && farWorker->destinationPurpose == FEED, "the far unit goes to eat");
 	require(nearWorker->activity == Unit::ACT_UPGRADING && nearWorker->destinationPurpose == FEED, "the near unit goes to eat");
@@ -106,12 +104,18 @@ static void theLaterBookerTradesWithTheOneItWouldCross(unsigned unitType = WORKE
 	require(World::booked(b, farWorker) && !World::booked(b, nearWorker), "inn B's guest list follows");
 	require(a->unitsInside.size() == 1 && b->unitsInside.size() == 1, "each inn keeps one booking");
 	require(world.game.integrity(), "integrity after the swap");
+    if (unitType==EXPLORER) {
+        REQUIRE_FALSE(world.game.map.hasAirRoutingConstraints());
+        for (auto* inn : {a,b})
+            CHECK(inn->globalGradient[inn->routeSlot(AIR_MOVEMENT_CLASS,BuildingRoute::Footprint)]==nullptr);
+    }
+
 
 	// Both walk to their inn (a tile takes a couple of dozen ticks) and eat.
 	bool nearAte = false, farAte = false;
 	for (int i = 0; i < 3000 && !(nearAte && farAte); ++i)
 	{
-		world.game.syncStep(0);
+		world.game.step(0);
 		nearAte |= nearWorker->displacement == Unit::DIS_INSIDE && nearWorker->attachedBuilding == a;
 		farAte |= farWorker->displacement == Unit::DIS_INSIDE && farWorker->attachedBuilding == b;
 	}
@@ -134,7 +138,7 @@ static void aGoodBookingStays()
 	Unit* east = world.addHungryWorker(40, 9);
 
 	for (int i = 0; i < 100 && !(west->attachedBuilding && east->attachedBuilding); ++i)
-		world.game.syncStep(0);
+		world.game.step(0);
 
 	require(west->attachedBuilding == a && east->attachedBuilding == b, "each unit keeps its nearest inn");
 	require(World::booked(a, west) && World::booked(b, east), "the guest lists match");
@@ -155,6 +159,11 @@ TEST_SUITE("InnSwap")
 		glob2test::HeadlessGlobals globals;
         for(unsigned id:{35u,275u}) theLaterBookerTradesWithTheOneItWouldCross(id);
 	}
+	TEST_CASE("flying guests exchange reservations without allocating air fields")
+    {
+        glob2test::HeadlessGlobals globals;
+        theLaterBookerTradesWithTheOneItWouldCross(EXPLORER);
+    }
 	TEST_CASE("a good booking stays")
 	{
 		glob2test::HeadlessGlobals globals;

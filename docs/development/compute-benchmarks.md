@@ -5,8 +5,9 @@ Measure scheduled AI, gradients, growth and scene preparation using retained inp
 ## Scheduled AI decisions and shared computation
 
 All shipped controllers borrow immutable engine snapshots for decisions. The simulation
-owner captures the required component union once per poll tick; unchanged components are
-shared, and mutable component buffers are reused only after their consumer leases end.
+owner captures the complete simulation preset at each read boundary; all polled
+controllers share one AI view of it. Unchanged components are shared, and mutable
+component buffers are reused only after their consumer leases end.
 Map arrays are tracked per 16x16 chunk, and a reused buffer copies only the chunks that
 changed since it was last filled. `GLOB2_SNAPSHOT_VERIFY=1` makes every capture byte-compare
 its arrays and entity lists with the live game and throw on a mismatch; use it in test runs
@@ -43,8 +44,27 @@ changing only worker count must preserve execution at the same delay.
 
 All sessions use `--compute-threads auto|N`, where N is a positive unsigned
 integer counting total executor participants, including the simulation owner.
-`auto` (the default) uses all reported logical CPU threads, falling back to one
-if detection returns zero. There is no separate limit of 64 for explicit counts.
+`auto` (the default) prefers physical cores on native platforms. Linux/Android
+count distinct sysfs sibling groups within the creating thread's CPU affinity;
+Windows counts core topology records intersecting process affinity on single
+processor-group systems. Windows multi-group eligibility is currently unknown
+and uses the logical fallback. macOS/iOS query enabled physical cores with sysctl.
+A system-wide physical count is bounded by logical eligibility when available;
+this bound is not an observed eligible-core count.
+
+When physical topology is unavailable or incomplete, auto falls back to eligible
+logical CPUs, then the hardware thread hint, then one participant. Browser auto
+continues to use the logical hardware hint capped at eight. Explicit counts are
+preserved, including values above observed CPU eligibility; there is no separate
+limit of 64. Discovery samples once at session setup, changes no affinity, and
+does not interpret CPU-time quotas. Both performance and efficiency cores count;
+no threads are pinned to cores. Auxiliary asset/preview pools are independent.
+When the selected CPU count is one, two or three, auto adds one participant
+for the owner so every available core can have a background worker. At four or
+more, the total participant count equals the selected CPU count, leaving one
+core for the owner. This rule also applies to logical-count fallbacks and browser
+auto; an unknown count still gives one participant. The OS schedules these
+threads without pinning them.
 The background pool has N−1 workers. AI, periodic/building gradients, resource
 growth and presentation share this pool. `--compute-threads 1` is the serial
 compute control. Thread creation failure and platforms without threads also leave
@@ -55,6 +75,10 @@ use `--compute-threads auto|N`. The optional area, initialization and hiring com
 paths and their environment selector have also been removed. Structural area
 refreshes and live field initialization retain their serial production order.
 
+Hiring plans on the executor from the shared completed-tick snapshot; see
+[simulation hiring](../architecture/simulation.md#hiring). Use shared executor diagnostics for scheduling waits and external process CPU
+measurements for performance. Separate hiring phase timers are retired.
+
 Structured `game run` accepts `--ai-order-delay D` for a new match (default 8
 ticks). Delays are simulation rules, separate from local thread configuration.
 A loaded match's configured AI delay cannot be overridden.
@@ -64,6 +88,25 @@ explicit count), `compute_resolved_threads` records the resolved participant cou
 `compute_threads` records the actual count including serial fallback, and
 `compute_workers` records actual background workers. Automatic sizing should be
 measured separately from fixed counts; using every logical CPU is not a speedup claim.
+
+`resource_plan` records the session's setup decision: requested/resolved participant
+counts, CPU eligibility and hardware hints, nullable `physical_cores`,
+`physical_core_source`, and `physical_cores_are_eligible`, whether resolved participants exceed
+observed eligibility, thread support and initial compute-GPU permission/backend.
+`cpu_availability_source` retains logical-affinity provenance; physical topology
+has its own source field.
+`participant_source` distinguishes `physical-cores`, `physical-core-bound`,
+`eligible-logical-fallback`, `hardware-hint`, `serial-fallback`, explicit overrides
+and unavailable threading. A one-participant result retains the existing rule
+that compute GPU work is not permitted. It does not rediscover CPU availability
+when writing results. `compute_threads` and `compute_workers`
+still report actual execution after thread-creation fallback; GPU permission does
+not mean a device accepted or executed work. Reload keeps the setup allocation,
+and live gradient-menu changes retain their existing tick-boundary lifecycle.
+
+`OpenCLStatus::hostEventWaits` counts successful OpenCL host synchronization calls
+after an event reports completion. The focused OpenCL acquisition tests report
+this counter separately from committed GPU fields.
 
 `result.json` retains the map executor's `compute_threads`,
 `compute_batches`, `compute_jobs`, `compute_parallel_batches`, `compute_batch_ns`,
@@ -89,17 +132,20 @@ of dropping them. `building_gradient_synchronous_by_reason` splits that count:
 (a map without a game, as in the editor) and `other`.
 `setup_ns` ends before `Engine::run`; `run_ns` includes that call's finalization.
 
-The nested `ai_pipeline` object reports session counters:
+The nested `ai_pipeline` object reports session counters. Separate snapshot,
+statistics, hiring, AI callback and growth phase timings are retired; removed
+measurements are omitted. Use the shared executor's optional diagnostics and
+whole-process CPU measurements. The delay-zero AI placement threshold retains
+its existing work measurement. Copy counts follow the accounting policy below:
 
 | Metric | Meaning |
 | --- | --- |
 | `captures` | Distinct snapshot capture boundaries. |
-| `extraction_ns` | Owner elapsed extraction time, excluding the separately measured preparation subset. |
-| `preparation_ns` | Owner elapsed time deriving building checks and preparing the growth field. |
-| `bytes_copied` | Component payload actually copied across captures: for map arrays only the 16x16 chunks changed since the reused buffer was last filled, plus whole entity, team and published resource-plane payloads. |
-| `component_reuses` | Unchanged component or resource-plane reuse events. |
+| `map_bytes_copied` | Always-on count of bytes copied into map and area-fertility buffers, including dirty 16x16 chunks and full fills. Shared immutable payloads do not count as copies. |
+| `detailed_captures` | Captures with detailed byte/reuse accounting enabled by compute telemetry (`waits` or `trace`), or explicitly by a snapshot harness. |
+| `bytes_copied` | Estimated component payload traffic for `detailed_captures`: exact map copies plus sizes of entity, team and other refreshed payloads. Zero when detailed accounting is disabled. |
+| `component_reuses` | Unchanged component or resource-plane reuse events during `detailed_captures`. Zero when detailed accounting is disabled. |
 | `allocations` | Instrumented component/payload pool-object, vector-growth and resource-plane allocation events. |
-| `computation_ns` | Summed elapsed time executing decision callbacks, across inline or worker execution. |
 | `submitted`, `delivered` | Admitted polls and deadline publications, including null outputs. |
 | `deadline_misses` | Due batches that were not finished when the owner reached their deadline; the owner then executes or waits for the remainder. |
 | `deadline_wait_ns` | Elapsed time the owner spent completing those missed batches, including jobs it ran itself. |
@@ -111,9 +157,9 @@ The nested `ai_pipeline` object reports session counters:
 | `controller_query_vector_bytes`, `controller_query_vector_peak_bytes` | Current sum of published controller query-vector capacities and its session high-water value. |
 | `controller_query_vector_samples` | Controllers with an available published capacity sample; unavailable controllers contribute no value. |
 
-Elapsed work across threads is not process CPU time. Preparation and extraction partition
-owner capture work; decision and deadline-wait durations can overlap other work, so do not
-sum all counters into a total. `bytes_copied` is cumulative traffic, and `allocations` is
+Elapsed work across threads is not process CPU time. Deadline-wait durations can
+overlap other work, so do not sum counters into a total. `bytes_copied` is cumulative estimated traffic for
+the measured captures, and `allocations` is
 not an exhaustive allocator trace. Use process user-plus-system CPU and peak RSS alongside
 the explicit metrics. Worker-local implicit scopes are not merged into owner totals.
 
@@ -191,13 +237,13 @@ determinism and timing control for each delay. Different delays may produce
 different games. A loaded game's delay cannot change while jobs are pending.
 
 The owner reserves one allocated material, market, guard or clear field at the
-completed-tick round-robin boundary. AI and gradients capture the union of their
-required immutable components once; each job leases only its own projection. A
-shared-executor job seeds and propagates the field in private storage. It never
+completed-tick round-robin boundary. AI and gradients share the standard simulation
+capture; periodic jobs retain its `gradientView()`. A shared-executor job seeds and
+propagates the field in private storage. It never
 reads live map arrays, supplier stock or mutable seed caches. Market observations
-include material availability after reservations, and guard jobs capture alliances
-and, when crowd balancing is enabled, units. Publication stays before the teams
-step at the existing fixed deadline. Immediate on-demand and forbidden/building
+include material availability after reservations, and guard jobs read captured
+alliances and use units when crowd balancing is enabled. Publication stays before
+the teams step at the existing fixed deadline. Immediate on-demand and forbidden/building
 fields keep their synchronous paths.
 
 The mutable material seed cache remains on synchronous paths. Periodic material
@@ -230,11 +276,11 @@ threads use the same delayed serial schedule. Routing decisions may use periodic
 fields eight ticks older than before; synchronous refreshes still take effect
 immediately.
 
-`result.json` includes actual worker count, delay, jobs, published/discarded jobs,
-maximum pending buffers, deadline wait nanoseconds, and summed seeding-plus-propagation elapsed
-nanoseconds. `gradient_preparation_ns` records worker seed time collected at joins;
-snapshot capture remains part of the snapshot metrics. The latter is **not CPU time**. Whole-process user+system CPU must be
-measured externally. Timed runs drain outstanding work before stopping the timer;
+`result.json` includes actual worker count, delay, jobs, published/discarded jobs
+and maximum pending buffers. Shared executor diagnostics report deadline waits;
+per-pipeline seeding and propagation timers are retired. Whole-process user+system
+CPU must be measured externally. Timed runs drain outstanding work before stopping
+the timer;
 finishing work does not publish it early.
 
 `test/benchmark_gradient_pipeline.py` accepts the same scenario manifests as
@@ -324,3 +370,58 @@ speedup even when the seed kernel uses less thread CPU time.
 
 
 See [resource benchmarks](resource-benchmarks.md) for corpus preparation, measurement isolation and growth pipeline comparisons.
+
+## Cached turret targeting
+
+Normal games use three-entry lists, a two-tick refresh interval, one-tick
+publication delay and a one-tile guard margin. One pure ranking kernel has a frozen
+adapter for jobs and a live adapter used by tests as the reference.
+
+At completed boundary t, teams with `t % R == team % R` are admitted once from the
+shared standard snapshot. Cooling turrets skip refresh only when the cooldown
+recurrence proves they cannot become ready through t+K+R-1. One executor job per
+due team ranks its turrets; index preparation reuses the previous observation's
+unchanged occupied chunks. Results publish before team stepping at t+K.
+
+The owner starts at entry zero on each ready attempt, revalidates identity, team,
+damage, occupancy, footprint, range, clearance and arrival against live state, and
+fires the first valid entry through the normal bullet machinery. Because of this
+recheck, lists are matched only by turret incarnation: type changes and edits need
+no invalidation, and lists stay out of the game checksum. Saves drain computation
+without publishing early and keep published and pending lists with their deadlines.
+Format 163 stores only identities and entries; formats 159–162 load by discarding
+their source signatures and digests.
+
+## Executor wait diagnostics and tracing
+
+Use `--compute-telemetry waits` to attribute unfinished required batches to AI,
+periodic/building gradients, resource growth, hiring, presentation, other or mixed work.
+Use `trace` for scheduling events. Collection defaults to off; legacy compute timing
+fields are unavailable (`null`) unless the selected mode collects them. Benchmark readers
+must check availability rather than treating null as zero. The gradient pipeline benchmark
+accepts `--compute-telemetry off|waits|trace`, defaulting to off; timing and tracing variants
+must be compared separately. See [the telemetry contract](performance-telemetry.md#optional-compute-executor-diagnostics).
+
+For overhead validation, use release compilation, retained games and paired repetitions
+with an instrumentation-free control built with the same compiler and flags. Include empty
+batches, tiny and substantial callbacks. Rotate execution order and retain every sample,
+wall time, process CPU, memory, tick latency, and lost-event counts. Inspect optimized disabled
+worker/callback specializations for diagnostic clocks, stores, allocations, event writes and
+mode tests. A successful code inspection or fast-development build does not establish that
+disabled overhead is unmeasurable. Report uncertainty and incomplete platform coverage.
+
+Resource-growth benchmark cases accept `GLOB2_COMPUTE_TELEMETRY=off|waits|trace`
+(default off). Their JSON records include the selected mode and use null for
+uncollected pipeline timing. Direct calculation/publication timing remains measured
+by the benchmark's own clock.
+
+### Lean execution boundaries
+
+AI and gradient producers use the shared executor's serial fallback; they have no
+separate inline/shared mode. CPU-only periodic jobs seed and propagate directly on
+their executor slot. Backend selection is applied at the owner configuration
+boundary, after draining private work without changing publication deadlines.
+GPU services and sessions are created only for GPU configurations with workers;
+CPU-only maps retain neither and register no GPU idle-maintenance predicate.
+Per-pipeline preparation, CPU attribution and active-time measurements have been
+retired. Use process user+system CPU, elapsed time and shared executor diagnostics.

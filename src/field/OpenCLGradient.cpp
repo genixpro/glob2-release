@@ -4,7 +4,6 @@
 #include "OpenCLTransferProof.h"
 #include "OpenCLLaneRegistry.h"
 #include "GradientBackend.h"
-#include "ThreadCpuClock.h"
 #include <SDL3/SDL_loadso.h>
 #include <SDL3/SDL_platform_defines.h>
 #include <array>
@@ -43,6 +42,7 @@ struct MemoryBudget {
     }
 };
 MemoryBudget hostBudget{OpenCLHostBudget};
+MemoryBudget globalDeviceBudget{OpenCLDeviceBudget};
 struct BudgetExceeded : std::runtime_error { BudgetExceeded():std::runtime_error("OpenCL payload budget exceeded") {} };
 struct RequiredCanceled : std::exception {const char* what() const noexcept override{return "Required OpenCL execution canceled";}};
 } // namespace
@@ -79,10 +79,6 @@ template<class T> void resizeStaging(std::vector<T>& values,std::size_t count,Bu
         lease.resize(values.capacity()*sizeof(T));
     } else values.resize(count);
 }
-std::uint64_t threadCPUClock() noexcept {
-    return glob2::threadCpuNs();
-}
-thread_local unsigned backendCPUDepth=0;
 unsigned numericOverride(const char* name,unsigned fallback,unsigned maximum) {
     const auto* value=std::getenv(name);
     if(!value) return fallback;
@@ -111,7 +107,6 @@ struct API
     SDL_SharedObject *library = nullptr;
 #define CL_FUNCTION(name, result, ...) result(CL_CALL *name)(__VA_ARGS__) = nullptr
     CL_FUNCTION(GetPlatformIDs, Int, UInt, Handle *, UInt *);
-    CL_FUNCTION(GetPlatformInfo, Int, Handle, UInt, std::size_t, void *, std::size_t *);
     CL_FUNCTION(GetDeviceIDs, Int, Handle, Bits, UInt, Handle *, UInt *);
     CL_FUNCTION(GetDeviceInfo, Int, Handle, UInt, std::size_t, void *, std::size_t *);
     CL_FUNCTION(CreateContext, Handle, const std::intptr_t *, UInt, const Handle *,
@@ -135,6 +130,7 @@ struct API
                 const std::size_t *, UInt, const Handle *, Handle *);
     CL_FUNCTION(Flush, Int, Handle);
     CL_FUNCTION(GetEventInfo, Int, Handle, UInt, std::size_t, void*, std::size_t*);
+    CL_FUNCTION(WaitForEvents, Int, UInt, const Handle*);
     CL_FUNCTION(ReleaseEvent, Int, Handle);
     CL_FUNCTION(ReleaseMemObject, Int, Handle);
     CL_FUNCTION(ReleaseKernel, Int, Handle);
@@ -163,7 +159,6 @@ struct API
     if (!name)                                                                                               \
     throw std::runtime_error("Missing OpenCL function: cl" #name)
         LOAD(GetPlatformIDs);
-        LOAD(GetPlatformInfo);
         LOAD(GetDeviceIDs);
         LOAD(GetDeviceInfo);
         LOAD(CreateContext);
@@ -181,6 +176,7 @@ struct API
         LOAD(EnqueueNDRangeKernel);
         LOAD(Flush);
         LOAD(GetEventInfo);
+        LOAD(WaitForEvents);
         LOAD(ReleaseEvent);
         LOAD(ReleaseMemObject);
         LOAD(ReleaseKernel);
@@ -308,12 +304,12 @@ struct KernelVariant : ExecutionPlan
 {
     Handle program = nullptr, kernel = nullptr;
 };
-static_assert(PLANS.size()==2 && PLANS[1].id==Plan::Frozen8 && PLANS[1].steps==8 &&
+static_assert(PLANS[1].id==Plan::Frozen8 && PLANS[1].steps==8 &&
     PLANS[1].threads==128 && PLANS[1].tileWidth==16 && PLANS[1].tileHeight==16 &&
     PLANS[1].colored && PLANS[1].frozen);
 constexpr auto kernelVariants()
 {
-    std::array<KernelVariant, PLANS.size() - 1> variants{};
+    std::array<KernelVariant, 1> variants{};
     for (std::size_t i = 0; i < variants.size(); ++i)
         static_cast<ExecutionPlan&>(variants[i]) = PLANS[i + 1];
     return variants;
@@ -329,13 +325,15 @@ struct Device
     API api;
     std::mutex initialization, cacheMutex, lanesMutex, failureMutex;
     bool probed = false;
+#ifdef GLOB2_TEST_DEVICE_FAILURES
+    bool waitFailureDiagnostics=false, requiredQueryFailureDiagnostics=false;
+#endif
     std::atomic<bool> failed{false};
     OpenCLRequiredLifetimePool requiredLifetime;
-    bool requiredQueryFailureDiagnostics=false;
-    MemoryBudget deviceBudget{OpenCLDeviceBudget};
+    MemoryBudget& deviceBudget=globalDeviceBudget;
     Handle device = nullptr, context = nullptr;
     OpenCLStatus status;
-    std::array<KernelVariant, PLANS.size() - 1> variants = kernelVariants();
+    std::array<KernelVariant, 1> variants = kernelVariants();
     std::size_t selectedVariant = 0;
     Handle kernel = nullptr;
     struct Plane
@@ -405,9 +403,8 @@ struct Device
     OpenCLStatus retired;
     std::uint64_t retiredSequence = 0;
     std::atomic<std::uint64_t> sequence{0}, active{0}, maximumActive{0};
-    std::atomic<std::uint64_t> noopFields{0}, threadCPUNs{0},threadCPUInvalidMeasurements{0},laneBudgetDeclines{0};
+    std::atomic<std::uint64_t> noopFields{0}, laneBudgetDeclines{0};
     std::atomic<std::uint64_t> requiredQuarantines{0},requiredProofFailures{0};
-    std::atomic<bool> threadCPUAvailable{false};
     void reapExpiredLanes() noexcept {std::lock_guard lock(lanesMutex);lanes.clearExpired();}
     void evictUnusedPlanes() {
         std::lock_guard lock(cacheMutex);
@@ -423,10 +420,7 @@ struct Device
     void initialize() {
         std::scoped_lock lock(initialization, failureMutex);
         if(probed) return;
-        const auto started=threadCPUClock();probe();
-        const auto end=threadCPUClock();
-        if(started && end>=started){status.threadCPUAvailable=true;status.initializationThreadCPUNs+=end-started;}
-        else ++status.threadCPUInvalidMeasurements;
+        probe();
     }
     void probe()
     {
@@ -435,7 +429,10 @@ struct Device
         probed = true;
         try
         {
+#ifdef GLOB2_TEST_DEVICE_FAILURES
             requiredQueryFailureDiagnostics=numericOverride("GLOB2_TEST_OPENCL_REQUIRED_QUERY_FAILURE",0,1)!=0;
+            waitFailureDiagnostics=numericOverride("GLOB2_TEST_OPENCL_WAIT_FAILURE",0,1)!=0;
+#endif
             api.load();
             const auto requestedDevice=numericOverride("GLOB2_OPENCL_DEVICE",0,std::numeric_limits<unsigned>::max());
             const bool explicitDevice=std::getenv("GLOB2_OPENCL_DEVICE")!=nullptr;
@@ -466,7 +463,6 @@ struct Device
                     if (available && compiler && group >= 256)
                     {
                         device = candidate;
-                        status.deviceOrdinal=candidateOrdinal;status.deviceOrdinalKnown=true;
                         break;
                     }
                 }
@@ -482,9 +478,7 @@ struct Device
             check(api.GetDeviceInfo(device, 0x102B, bytes, name.data(), nullptr));
             if(name[bytes-1]!=0)throw std::runtime_error("Unterminated OpenCL device name");
             status.device.assign(name.data(),bytes-1);
-            // Fingerprints are captured once on the initialization coordinator.
-            // A malformed/unsupported optional query leaves metadata empty and
-            // is diagnostic only; it never changes execution or admission.
+            // Operational driver identity; optional malformed metadata is ignored.
             const auto infoString=[](auto query,Handle object,UInt key) {
                 std::size_t size=0;
                 if(query(object,key,0,nullptr,&size) || !size || size>2048)return std::string{};
@@ -492,25 +486,7 @@ struct Device
                 if(query(object,key,size,value.data(),nullptr) || value[size-1]!=0)return std::string{};
                 return std::string(value.data(),size-1);
             };
-            Handle platform=nullptr;
-            if(!api.GetDeviceInfo(device,0x1031 /* CL_DEVICE_PLATFORM */,sizeof platform,&platform,nullptr) && platform) {
-                status.platform=infoString(api.GetPlatformInfo,platform,0x0902);
-                status.platformVendor=infoString(api.GetPlatformInfo,platform,0x0903);
-                status.platformVersion=infoString(api.GetPlatformInfo,platform,0x0901);
-            }
-            status.deviceVendor=infoString(api.GetDeviceInfo,device,0x102C);
             status.driverVersion=infoString(api.GetDeviceInfo,device,0x102D);
-            status.deviceVersion=infoString(api.GetDeviceInfo,device,0x102F);
-            status.openCLCVersion=infoString(api.GetDeviceInfo,device,0x103D);
-            // cl_khr_device_uuid defines a 16-byte CL_DEVICE_UUID_KHR query.
-            // Unsupported/error results leave this diagnostic identity empty.
-            std::array<unsigned char,16> uuid{};std::size_t uuidBytes=0;
-            if(!api.GetDeviceInfo(device,0x106A,sizeof uuid,uuid.data(),&uuidBytes) && uuidBytes==uuid.size() &&
-                std::any_of(uuid.begin(),uuid.end(),[](auto byte){return byte!=0;})) {
-                constexpr char hex[]="0123456789abcdef";
-                status.deviceUUIDHex.reserve(uuid.size()*2);
-                for(const auto byte:uuid){status.deviceUUIDHex.push_back(hex[byte>>4]);status.deviceUUIDHex.push_back(hex[byte&15]);}
-            }
             Int error = 0;
             context = api.CreateContext(nullptr, 1, &device, nullptr, nullptr, &error);
             check(error);
@@ -614,7 +590,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
     OpenCLStatus status;
     bool probed = false;
     Handle device = nullptr, context = nullptr, queue = nullptr;
-    std::array<KernelVariant, PLANS.size() - 1> variants = kernelVariants();
+    std::array<KernelVariant, 1> variants = kernelVariants();
     std::size_t selectedVariant = 0;
     Handle kernel = nullptr;
     Handle first = nullptr, second = nullptr, changed = nullptr, descriptors = nullptr;
@@ -641,10 +617,14 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         std::shared_ptr<Device::Plane> preparing;
         Handle event=nullptr;
         OpenCLTransferProof proof;
+#ifdef GLOB2_TEST_DEVICE_FAILURES
         unsigned diagnosticQueryFailures=0;
+#endif
         RequiredTransaction(std::shared_ptr<Runtime> owner,BudgetLease& reserved,OpenCLRequiredLifetimePool::Slot& slot):lane(std::move(owner)) {
             admission.parent=lane->shared;admission.slot=&slot;reserved.transferTo(objectLease);
+#ifdef GLOB2_TEST_DEVICE_FAILURES
             diagnosticQueryFailures=lane->shared->requiredQueryFailureDiagnostics ? 2 : 0;
+#endif
         }
         ~RequiredTransaction(){if(event)lane->api.ReleaseEvent(event);}
         void remember(Handle next) noexcept {
@@ -660,7 +640,9 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         static bool terminalProof(void* value) noexcept {
             auto& transaction=*static_cast<RequiredTransaction*>(value);
             if(!transaction.event || !transaction.proof.canPollEvent())return false;
+#ifdef GLOB2_TEST_DEVICE_FAILURES
             if(transaction.diagnosticQueryFailures){--transaction.diagnosticQueryFailures;return false;}
+#endif
             Int state=1;
             if(transaction.lane->api.GetEventInfo(transaction.event,0x11D3,sizeof state,&state,nullptr) || state!=0)return false;
             transaction.proof.eventCompleted();return !transaction.proof.needsProof();
@@ -698,15 +680,11 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         out.fields+=in.fields;out.cpuSelections+=in.cpuSelections;
         out.batches+=in.batches;out.maxBatchFields=std::max(out.maxBatchFields,in.maxBatchFields);
         out.costUploads+=in.costUploads;out.costCacheHits+=in.costCacheHits;out.dispatches+=in.dispatches;
+        out.hostEventWaits+=in.hostEventWaits;
         out.hostChecks+=in.hostChecks;out.costIdentityHits+=in.costIdentityHits;out.retiredFields+=in.retiredFields;
         out.schedulerBatches+=in.schedulerBatches;
-        out.budgetDeclines+=in.budgetDeclines;out.threadCPUNs+=in.threadCPUNs;
-        out.threadCPUAvailable=out.threadCPUAvailable||in.threadCPUAvailable;
-        out.tileMaskInitializations+=in.tileMaskInitializations;out.tileMaskClears+=in.tileMaskClears;
-        out.kernelArgumentUpdates+=in.kernelArgumentUpdates;
+        out.budgetDeclines+=in.budgetDeclines;
         out.deviceObservedFields+=in.deviceObservedFields;out.committedFields+=in.committedFields;
-        out.seedCopiedBytes+=in.seedCopiedBytes;out.seedUploadedBytes+=in.seedUploadedBytes;
-        out.outputCopiedBytes+=in.outputCopiedBytes;
         out.requiredCancellations+=in.requiredCancellations;
     }
     static std::shared_ptr<Runtime> registeredLane(const std::shared_ptr<Device>& device,
@@ -749,14 +727,13 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         out.requiredQuarantinePending=shared->requiredLifetime.quarantined();
         out.hostBytes=hostBudget.current.load();out.peakHostBytes=hostBudget.peak.load();
         out.deviceBytes=shared->deviceBudget.current.load();out.peakDeviceBytes=shared->deviceBudget.peak.load();
-        out.noopFields=shared->noopFields.load();out.threadCPUNs=shared->threadCPUNs.load();
-        out.threadCPUInvalidMeasurements+=shared->threadCPUInvalidMeasurements.load();
-        out.threadCPUAvailable=out.threadCPUAvailable || shared->threadCPUAvailable.load();
+        out.noopFields=shared->noopFields.load();
         out.executionLanes=std::count_if(live.begin(),live.end(),[](const auto& lane){return bool(lane);});out.maxConcurrentBatches=shared->maximumActive.load();
         return out;
     }
     void buffers()
     {
+
         for (auto *buffer : {&first, &second, &changed, &descriptors, &tilesFirst, &tilesSecond})
             if (*buffer)
             {
@@ -771,58 +748,108 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         if(!readyPlans.load(std::memory_order_acquire)) throw std::runtime_error("OpenCL plans not ready");
         if(!shared->status.available || shared->failed.load()) throw std::runtime_error("OpenCL device unavailable");
         context=shared->context;device=shared->device;
-        Int error=0;
-        queue=api.CreateCommandQueue(context,device,0,&error);check(error);
-        for(std::size_t i=0;i<variants.size();++i) if(shared->variants[i].kernel) {
-            variants[i].program=shared->variants[i].program;
-            variants[i].kernel=api.CreateKernel(variants[i].program,"propagate",&error);check(error);
-        }
-        selectedVariant=shared->selectedVariant;selectVariant(selectedVariant);
-        status.available=true;probed=true;
-    }
-    template<class... Args> Int fill(Args... args) {
-        const auto result=api.EnqueueFillBuffer(args...);
-        if(required)required->proof.enqueueUnobserved(result);return result;
-    }
-    template<class... Args> Int enqueueKernel(Args... args) {
-        const auto result=api.EnqueueNDRangeKernel(args...);
-        if(required)required->proof.enqueueUnobserved(result);return result;
-    }
-    template <class T> void argumentTo(Handle target,UInt index,T value)
-    {
-        check(api.SetKernelArg(target,index,sizeof(T),&value));++status.kernelArgumentUpdates;
-    }
-    template <class T> void argument(UInt index,T value) {argumentTo(kernel,index,value);}
-    struct Event {
-        API& api;Handle value=nullptr;bool owns=true;
-        explicit Event(API& api):api(api) {}
-        ~Event(){if(value && owns) api.ReleaseEvent(value);}
-        Event(const Event&)=delete;
-    };
-    void await(Event& event) {
-        if(!event.value || (!required && !shared->status.pollMicros))return;
-        check(api.Flush(queue));
-        for(;;) {
-            if(required && required->canceled())throw RequiredCanceled();
-            Int state=1;
-            if(required && required->diagnosticQueryFailures){--required->diagnosticQueryFailures;throw std::runtime_error("Injected required event query failure");}
-            check(api.GetEventInfo(event.value,0x11D3,sizeof state,&state,nullptr));
-            if(state<0)check(state);
-            if(!state) {if(required)required->proof.eventCompleted();return;}
+		Int error = 0;
+		queue = api.CreateCommandQueue(context, device, 0, &error);
+		check(error);
+		for (std::size_t i = 0; i < variants.size(); ++i)
+			if (shared->variants[i].kernel)
+			{
+				variants[i].program = shared->variants[i].program;
+				variants[i].kernel = api.CreateKernel(variants[i].program, "propagate", &error);
+				check(error);
+			}
+		selectedVariant = shared->selectedVariant;
+		selectVariant(selectedVariant);
+		status.available = true;
+		probed = true;
+	}
+	template <class... Args> Int fill(Args... args)
+	{
+
+		const auto result = api.EnqueueFillBuffer(args...);
+
+		if (required)
+			required->proof.enqueueUnobserved(result);
+		return result;
+	}
+	template <class... Args> Int enqueueKernel(Args... args)
+	{
+
+		const auto result = api.EnqueueNDRangeKernel(args...);
+
+		if (required)
+			required->proof.enqueueUnobserved(result);
+		return result;
+	}
+	template <class T> void argumentTo(Handle target, UInt index, T value)
+	{
+
+		check(api.SetKernelArg(target, index, sizeof(T), &value));
+	}
+	template <class T> void argument(UInt index, T value) { argumentTo(kernel, index, value); }
+	struct Event
+	{
+		API &api;
+		Handle value = nullptr;
+		bool owns = true;
+		explicit Event(API &api) : api(api) {}
+		~Event()
+		{
+			if (value && owns)
+				api.ReleaseEvent(value);
+		}
+		Event(const Event &) = delete;
+	};
+	void await(Event &event)
+	{
+
+		if (!event.value || (!required && !shared->status.pollMicros))
+			return;
+		{
+		check(api.Flush(queue));  }
+		for (;;)
+		{
+			if (required && required->canceled())
+				throw RequiredCanceled();
+			Int state = 1;
+#ifdef GLOB2_TEST_DEVICE_FAILURES
+			if (required && required->diagnosticQueryFailures)
+			{
+				--required->diagnosticQueryFailures;
+				throw std::runtime_error("Injected required event query failure");
+			}
+#endif
+			{
+			check(api.GetEventInfo(event.value, 0x11D3, sizeof state, &state, nullptr)); }
+			if(state<0)check(state);
+            if(!state) {
+                // CL_COMPLETE is not host acquisition. Synchronize this
+                // completed event before using transfer data; required
+                // cancellation still polls interruptibly before completion.
+#ifdef GLOB2_TEST_DEVICE_FAILURES
+                if(shared->waitFailureDiagnostics)throw std::runtime_error("Injected OpenCL host wait failure");
+#endif
+                check(api.WaitForEvents(1,&event.value));
+                ++status.hostEventWaits;
+                if(required)required->proof.eventCompleted();
+                return;
+            }
             // Polling remains interruptible by required publication/save/stop.
             const auto delay=std::chrono::microseconds(shared->status.pollMicros ? shared->status.pollMicros : 100);
             if(required && required->controls[0])required->controls[0]->waitFor(delay);
             else std::this_thread::sleep_for(delay);
-        }
-        // Failure unwinds only into batch's nonblocking proof/quarantine guard.
+		}
+		// Failure unwinds only into batch's nonblocking proof/quarantine guard.
         // All transfer endpoints and retained events already belong to it.
-    }
-    void read(Handle buffer,void* output,std::size_t bytes,bool /*finalOutput*/) {
+	}
+	void read(Handle buffer,void* output,std::size_t bytes,bool finalOutput) {
+
         if(required && required->canceled())throw RequiredCanceled();
         Event event(api);
         const bool asynchronous=required || shared->status.pollMicros!=0;
         const bool capture=asynchronous;
         const auto result=api.EnqueueReadBuffer(queue,buffer,!asynchronous,0,bytes,output,0,nullptr,capture ? &event.value : nullptr);
+
         requiredEnqueue(result,event.value,!asynchronous);
         if(required && event.value)event.owns=false;
         check(result);
@@ -831,11 +858,13 @@ struct Runtime : std::enable_shared_from_this<Runtime>
     }
     void write(Handle buffer, const void *data, std::size_t bytes)
     {
+
         if(required && required->canceled())throw RequiredCanceled();
         Event event(api);
         const bool asynchronous=required || shared->status.pollMicros!=0;
         const bool capture=asynchronous;
         const auto result=api.EnqueueWriteBuffer(queue,buffer,!asynchronous,0,bytes,data,0,nullptr,capture ? &event.value : nullptr);
+
         requiredEnqueue(result,event.value,!asynchronous);
         if(required && event.value)event.owns=false;
         check(result);
@@ -843,6 +872,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         await(event);
     }
     void awaitPlane(const std::shared_ptr<Device::Plane>& p) {
+
         while(p->ready.wait_for(std::chrono::milliseconds(1))!=std::future_status::ready) {
             if(required && required->canceled())throw RequiredCanceled();
             if(shared->failed.load()) throw std::runtime_error("OpenCL cost preparation failed on another lane");
@@ -850,6 +880,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         p->ready.get();
     }
     std::shared_ptr<Device::Plane> costPlane(const BackendRequest& r) {
+
         const auto packed=r.identity.packedUniformCost;
         const bool knownUniform=r.identity.owner && r.identity.allCells &&
             (packed&65535u) && (packed>>16);
@@ -915,7 +946,10 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             const auto bytes=p->data.size()*sizeof(UInt);
             try {p->storage->deviceLease.resize(bytes);}
             catch(const BudgetExceeded&) {shared->evictUnusedPlanes();p->storage->deviceLease.resize(bytes);}
-            Int error=0;p->buffer=p->storage->buffer=api.CreateBuffer(context,1,bytes,nullptr,&error);check(error);
+            Int error=0;
+            {
+                p->buffer=p->storage->buffer=api.CreateBuffer(context,1,bytes,nullptr,&error);check(error);
+                 }
             if(required)required->preparing=p;
             write(p->buffer,p->data.data(),bytes);++status.costUploads;
             if(required)required->preparing.reset();
@@ -933,6 +967,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
     }
     void computeBatch(std::span<const BackendRequest *const> requests,std::span<std::uint16_t> staging)
     {
+
         if(shared->failed.load()) throw std::runtime_error("OpenCL device failed on another lane");
         std::size_t total = 0;
         UInt width = 0, height = 0;
@@ -947,6 +982,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             throw std::runtime_error("Gradient batch exceeds OpenCL index range");
         if (total > capacity)
         {
+
             buffers();
             try {deviceLease.resize(total*2*sizeof(std::uint16_t)+288);}
             catch(const BudgetExceeded&) {shared->evictUnusedPlanes();deviceLease.resize(total*2*sizeof(std::uint16_t)+288);}
@@ -964,6 +1000,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         }
         // Polling failure may outlive this stack frame. Every borrowed endpoint
         // belongs to the pre-admitted transaction, never to these locals.
+
         auto& desc=required->descriptors;desc.fill(0);
         auto& held=required->costs;held.fill({});
         // Even an errored blocking call has ambiguous acceptance. Never borrow
@@ -972,7 +1009,6 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         for(auto* r:requests) {
             const auto n=r->grid.cells();
             std::copy(r->gradient,r->gradient+n,staging.begin()+offset);
-            status.seedCopiedBytes+=n*sizeof(std::uint16_t);
             blocked.clear();
             if(!r->identity.allCells) {
                 resizeStaging(blocked,n,blockedLease);
@@ -992,7 +1028,6 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         // untouched and unborrowed until commit, including failed drain paths.
         const auto seedBytes=total*sizeof(std::uint16_t);
         write(first,staging.data(),seedBytes);
-        status.seedUploadedBytes+=seedBytes;
         write(descriptors, desc.data(), requests.size()*8*sizeof(UInt));
         Handle a = first, b = second;
         const auto &variant = variants[selectedVariant];
@@ -1003,6 +1038,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             throw std::runtime_error("OpenCL tile mask exceeds index range");
         if (tileCount > tileCapacity)
         {
+
             for(auto* mask:{&tilesFirst,&tilesSecond}) {if(*mask) api.ReleaseMemObject(*mask);*mask=nullptr;}
             deviceLease.resize(capacity*2*sizeof(std::uint16_t)+288);
             tileCapacity=0;
@@ -1018,10 +1054,10 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             }
             tileCapacity = tileCount;
         }
+
         UInt one = 1;
         check(fill(queue, tilesFirst, &one, sizeof one, 0, tileCount * sizeof(UInt), 0,
                                     nullptr, nullptr));
-        ++status.tileMaskInitializations;
         Handle active = tilesFirst, nextActive = tilesSecond;
         const std::size_t global[]{std::size_t(pitch) * variant.threads, std::size_t(rows),
                                    requests.size()},
@@ -1047,6 +1083,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             const auto count=std::min<UInt>(checkInterval,65536-round);
             for (unsigned dispatch = 0; dispatch < count; ++dispatch)
             {
+
                 // Only the last dispatch's changes are read by the host. The
                 // in-order queue clears earlier accumulated flags before it.
                 if (dispatch+1 == count)
@@ -1054,7 +1091,6 @@ struct Runtime : std::enable_shared_from_this<Runtime>
                                                 requests.size() * sizeof(UInt), 0, nullptr, nullptr));
                 check(fill(queue,nextActive,zero.data(),sizeof(UInt),0,
                            tileCount*sizeof(UInt),0,nullptr,nullptr));
-                ++status.tileMaskClears;
                 argument(0,a);argument(1,b);
                 argument(12,active);argument(13,nextActive);
                 check(
@@ -1065,6 +1101,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
                 ++status.dispatches;
             }
             round+=count;
+
             read(changed,flags.data(),requests.size()*sizeof(UInt),false);
             if(!deviceObserved) {
                 // This successful in-order read proves completion of every
@@ -1072,8 +1109,10 @@ struct Runtime : std::enable_shared_from_this<Runtime>
                 for(const auto* request:requests)
                     if(request->deviceExecutionObserved)*request->deviceExecutionObserved=true;
                 status.deviceObservedFields+=requests.size();deviceObserved=true;
+
             }
             ++status.hostChecks;
+
             bool retired = false;
             for (std::size_t f = 0; f < requests.size(); ++f)
                 if (desc[f * 8 + 5] && !flags[f])
@@ -1084,7 +1123,9 @@ struct Runtime : std::enable_shared_from_this<Runtime>
                 }
             if (std::none_of(flags.begin(), flags.begin() + requests.size(), [](UInt v) { return v != 0; }))
             {
+
                 read(a,staging.data(),total*sizeof(std::uint16_t),true);
+
                 return;
             }
             // No later kernel consumes descriptors once every field is done.
@@ -1109,22 +1150,13 @@ struct Runtime : std::enable_shared_from_this<Runtime>
     }
     bool batch(std::span<const BackendRequest> input, Plan plan)
     {
-        struct CPUTimer {
-            Device& device;bool outer;std::uint64_t start;
-            explicit CPUTimer(Device& device):device(device),outer(backendCPUDepth++==0),start(outer ? threadCPUClock() : 0) {}
-            ~CPUTimer(){
-                --backendCPUDepth;
-                if(outer){const auto end=threadCPUClock();
-                    if(start && end>=start){device.threadCPUAvailable.store(true);device.threadCPUNs+=end-start;}
-                    else ++device.threadCPUInvalidMeasurements;}
-            }
-        } cpuTimer{*shared};
+
         for(const auto& request:input) {
             if(request.executedOnDevice)*request.executedOnDevice=false;
             if(request.deviceExecutionObserved)*request.deviceExecutionObserved=false;
         }
         if(input.empty()) return true;
-        if(plan==Plan::CPU || unsigned(plan)>=PLANS.size() ||
+        if(plan!=Plan::Frozen8 || unsigned(plan)>=PLANS.size() ||
            !(readyPlans.load(std::memory_order_acquire)&(1u<<unsigned(plan)))) return false;
         if(shared->failed.load()) {
             for(const auto& r:input) r.session.fail();
@@ -1141,6 +1173,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
                 for(const auto& r:input) r.session.fail();
                 return false; }
         }
+
         std::lock_guard lock(mutex);
         struct Active {
             Device& d;
@@ -1155,6 +1188,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         std::shared_ptr<RequiredTransaction> transaction;
         struct CurrentGuard {Runtime& lane;~CurrentGuard(){lane.required=nullptr;}} currentGuard{*this};
         try {
+
             BudgetLease reserved{hostBudget};reserved.resize(sizeof(RequiredTransaction)+256);
             transaction=std::make_shared<RequiredTransaction>(shared_from_this(),reserved,*slot);
             transaction->admission.owns=true;slotGuard.transferred=true;required=transaction.get();
@@ -1173,6 +1207,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             if(total>OpenCLHostBudget/sizeof(std::uint16_t)) throw BudgetExceeded();
             try {resizeStaging(values,total,valuesLease);}
             catch(const BudgetExceeded&) {shared->evictUnusedPlanes();resizeStaging(values,total,valuesLease);}
+
             std::size_t outputOffset=0;
             for(std::size_t begin=0;begin<input.size();begin+=8) {
                 const auto count=std::min<std::size_t>(8,input.size()-begin);
@@ -1187,12 +1222,13 @@ struct Runtime : std::enable_shared_from_this<Runtime>
             if(std::any_of(input.begin(),input.end(),[](const auto& r){return r.requiredControl && r.requiredControl->shouldCancel(monotonicNs());}))throw RequiredCanceled();
             if(shared->failed.load() || std::any_of(input.begin(),input.end(),[](const auto& r){return r.session.failed.load();}))
                 throw std::runtime_error("OpenCL device or session failed on another lane");
+
             outputOffset=0;
             for(const auto& r:input) {
                 std::copy_n(values.data()+outputOffset,r.grid.cells(),r.gradient);
-                status.outputCopiedBytes+=r.grid.cells()*sizeof(std::uint16_t);
                 if(r.executedOnDevice) *r.executedOnDevice=true;
                 ++status.committedFields;
+
                 outputOffset+=r.grid.cells();
             }
             ++status.schedulerBatches;
@@ -1220,6 +1256,7 @@ struct Runtime : std::enable_shared_from_this<Runtime>
         }
     }
     void protectFailedTransaction(const std::shared_ptr<RequiredTransaction>& transaction) noexcept {
+
         // A covered positive event is proof. Failure/absence is never permission
         // to block on Finish or release borrowed endpoints during CPU recovery.
         if(RequiredTransaction::terminalProof(transaction.get()))return;
@@ -1267,25 +1304,28 @@ bool executeBatch(std::span<const BackendRequest> requests, Plan choice)
 }
 void prepare()
 {
+
 #if !defined(SDL_PLATFORM_EMSCRIPTEN) && !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
     auto& device=*runtime().shared;
     device.initialize();
     unsigned mask=0;
     if(device.status.available && !device.failed.load())
         for(std::size_t i=0;i<device.variants.size();++i) if(device.variants[i].kernel) mask|=1u<<unsigned(device.variants[i].id);
-    readyPlans.store(mask,std::memory_order_release);
+    readyPlans.fetch_and(~(1u<<unsigned(Plan::Frozen8)),std::memory_order_release);
+    readyPlans.fetch_or(mask,std::memory_order_release);
 #endif
 }
 struct Register
 {
     Register()
     {
-        prepareAccelerator = &prepare;
         accelerator = &execute;
         batchAccelerator = &executeBatch;
     }
 } registration;
 } // namespace
+bool reserveGradientDeviceBytes(std::size_t bytes) noexcept {return globalDeviceBudget.reserve(bytes);}
+void releaseGradientDeviceBytes(std::size_t bytes) noexcept {globalDeviceBudget.release(bytes);}
 bool reserveOpenCLHostBytes(std::size_t bytes) noexcept {return hostBudget.reserve(bytes);}
 void releaseOpenCLHostBytes(std::size_t bytes) noexcept {hostBudget.release(bytes);}
 std::size_t openCLHostBytes() noexcept {return hostBudget.current.load(std::memory_order_relaxed);}
@@ -1316,6 +1356,7 @@ bool requiredOpenCLQuarantinePending() noexcept {
 #endif
 }
 bool reapOpenCLRequiredQuarantine() noexcept {
+
 #if !defined(SDL_PLATFORM_EMSCRIPTEN) && !defined(SDL_PLATFORM_ANDROID) && !defined(SDL_PLATFORM_IOS)
     try {auto device=runtime().shared;const bool reaped=device->requiredLifetime.tryReap(&Runtime::RequiredTransaction::terminalProof);
         device->reapExpiredLanes();return reaped;}catch(...){return false;}
@@ -1326,9 +1367,9 @@ bool reapOpenCLRequiredQuarantine() noexcept {
 bool initializeOpenCL() {
     unsigned empty=0;
     initializationState.compare_exchange_strong(empty,1);
-    try {prepare();} catch(...) {readyPlans.store(0,std::memory_order_release);}
+    try {prepare();} catch(...) {readyPlans.fetch_and(~(1u<<unsigned(Plan::Frozen8)),std::memory_order_release);}
     initializationState.store(2,std::memory_order_release);
-    return readyPlans.load(std::memory_order_acquire)!=0;
+    return (readyPlans.load(std::memory_order_acquire)&(1u<<unsigned(Plan::Frozen8)))!=0;
 }
 bool executeOpenCLDevice(std::span<const BackendRequest> requests,Plan plan) {
     return executeBatch(requests,plan);
@@ -1342,6 +1383,7 @@ OpenCLStatus openCLStatus()
 #else
     auto status=runtime().status;
     status.hostBytes=hostBudget.current.load();status.peakHostBytes=hostBudget.peak.load();
+    status.deviceBytes=globalDeviceBudget.current.load();status.peakDeviceBytes=globalDeviceBudget.peak.load();
     return status;
 #endif
 }

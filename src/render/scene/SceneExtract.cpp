@@ -83,7 +83,7 @@ void prepareSource(const SceneInputs& input,PresentationFrame& scene)
         const auto& b=*selected;auto& bp=panels.building;
         bp.record=selected;bp.valid=true;bp.ownerRecord=&world.teams->values.at(b.team);
         bp.type=&scene.buildingTypes->at(b.typeNum);
-        bp.materials=b.usesTeamResources ? world.teams->values.at(b.team).materials.data() : b.localMaterials;
+        bp.materials=scene.entities.materials(b);
         int recipe=b.productionUnit;
         if (recipe<0) {
             Sint64 best=std::numeric_limits<Sint64>::max();
@@ -327,7 +327,7 @@ bool SceneExtractor::prepareChunk(const SceneInputs& input, PresentationFrame& s
                 }
                 if (candidateCell < cells) return false;
             }
-            const auto* materials = e.materials(b);
+            const auto materials = e.materials(b);
             for (unsigned m = 0; m < MaterialCount; ++m)
                 if (materials[m]) e.materialPresence |= 1u << m;
             ++candidateBuilding;
@@ -380,21 +380,14 @@ bool SceneExtractor::prepareChunk(const SceneInputs& input, PresentationFrame& s
     return true;
 }
 
-SimulationSnapshot::Requirements SceneExtractor::requirements(const SceneRequest& request)
+SimulationSnapshot::CaptureOptions SceneExtractor::captureOptions(const SceneRequest& request)
 {
-    using namespace SimulationSnapshot;
-    auto required=bit(Component::Catalogs)|bit(Component::Terrain)|bit(Component::Resources)
-        |bit(Component::Occupancy)|bit(Component::Areas)|bit(Component::Visibility)
-        |bit(Component::Entities)|bit(Component::Teams)|bit(Component::Rules)|bit(Component::Session)|bit(Component::Effects);
-    if (request.includePanels) required|=bit(Component::Statistics);
-    if (request.includeHistory) required|=bit(Component::History);
-    if (request.includeTelemetry) required|=bit(Component::Telemetry);
-    if (!request.selectedBuilding.empty() || request.view.debugLayers) required|=bit(Component::EntityDiagnostics);
-    if (request.includeScriptAreas) required|=bit(Component::Annotations);
-    return required;
+    return {.presentation=true, .history=request.includeHistory, .telemetry=request.includeTelemetry,
+        .entityDiagnostics=!request.selectedBuilding.empty() || bool(request.view.debugLayers),
+        .annotations=request.includeScriptAreas};
 }
 
 std::shared_ptr<SceneInputs> SceneExtractor::inputs(const SimulationSnapshot::Handle& world,const SceneRequest& request)
-{ return std::make_shared<SceneInputs>(SceneInputs{world,request}); }
+{ return std::make_shared<SceneInputs>(SceneInputs{world.presentationView(captureOptions(request)),request}); }
 void SceneExtractor::prepare(const SimulationSnapshot::Handle& world,const SceneRequest& request,PresentationFrame& scene)
-{ prepare(SceneInputs{world,request},scene); }
+{ prepare(SceneInputs{world.presentationView(captureOptions(request)),request},scene); }

@@ -35,6 +35,7 @@
 #include "field/GradientDeviceService.h"
 
 #include <ApplicationHost.h>
+#include <algorithm>
 
 
 /**
@@ -124,7 +125,7 @@ GlobalContainer::~GlobalContainer(void)
 	// Games have already drained their executors. Native drivers may register
 	// process exit handlers during background initialization, after the broker's
 	// static destructor; join here before those handlers or SDL teardown run.
-	gradient_kernel::shutdownGradientDeviceCoordinator();
+	if (gradientDeviceShutdown) gradientDeviceShutdown();
 	GAGCore::Recording::recorder().shutdown();
 	// Commands and interrupted loading can finish before a heap-owned style exists.
 	if (!runNoX && Style::style != &defaultStyle)
@@ -187,7 +188,11 @@ void GlobalContainer::updateLoadProgressScreen(int value)
 			}
 		gfx->finishDrawingSprite(terrain, 255);
 	}
-	gfx->drawSurface((gfx->getW()-title->getW())>>1, (gfx->getH()-title->getH())>>1, title.get());
+	// Keep the splash wordmark inside portrait viewports without stretching it.
+	const float titleWidth = std::min(float(title->getW()), gfx->getW() * 0.8f);
+	const float titleHeight = title->getH() * (titleWidth / title->getW());
+	gfx->drawSurface((gfx->getW() - titleWidth) / 2, (gfx->getH() - titleHeight) / 2,
+					 titleWidth, titleHeight, title.get());
 	gfx->nextFrame();
 }
 

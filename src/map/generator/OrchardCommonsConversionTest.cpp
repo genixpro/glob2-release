@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Controlled mechanism test on unmodified generated terrain, not an AI balance test.
 #include "EngineFixtures.h"
+#include "GradientFixture.h"
 #include <utility>
 #include "GlobalContainer.h"
 #include "Game.h"
@@ -252,13 +253,13 @@ void run(const Scenario &scenario, const std::filesystem::path &output, unsigned
 		Building *inn = game.addBuilding(x, siteY + 2, type, team);
 		require(inn != nullptr, "inn fits generated clearing");
 		game.map.setBuilding(x, siteY + 2, inn->type->width, inn->type->height, inn->gid);
-		inn->materials[WHEAT] = wheat ? std::min(10, inn->type->maxMaterial[WHEAT]) : 0;
+		inn->setMaterial(WHEAT, wheat ? std::min(10, inn->type->maxMaterial[WHEAT]) : 0);
 		const int kinds[] = {CHERRY, ORANGE, PRUNE};
 		for (int i = 0; i < 3; ++i)
-			inn->materials[kinds[i]] =
-				i < varieties ? std::min(10, inn->type->maxMaterial[kinds[i]]) : 0;
+			inn->setMaterial(kinds[i],
+				i < varieties ? std::min(10, inn->type->maxMaterial[kinds[i]]) : 0);
 		for (int r = 0; r < MaterialCount; ++r)
-			require(inn->materials[r] <= inn->type->maxMaterial[r], "stock fits inn capacity");
+			require(inn->material(r) <= inn->type->maxMaterial[r], "stock fits inn capacity");
 		// Public building ticks honor its normal conversion cooldown.
 		for (int i = 0; i < 256; ++i)
 			inn->step();
@@ -273,7 +274,20 @@ void run(const Scenario &scenario, const std::filesystem::path &output, unsigned
 	require(worker != nullptr, "hungry worker fits between inns");
 	worker->hungry = worker->trigHungry;
 	worker->medical = Unit::MED_HUNGRY;
-	worker->needToRecheckMedical = true;
+	worker->setNeedToRecheckMedical(true);
+	// This fixture isolates stocked-inn diet/advertising choices, so compare
+	// candidates after their lazily requested walking fields have published.
+	const auto prepareFoodRoutes = [&](Game &match)
+	{
+		for (const auto *original : {friendly, rival})
+		{
+			auto *inn = match.teams[original->owner->teamNumber]
+						->myBuildings[Building::GIDtoID(original->gid)];
+			require(inn != nullptr, "scenario inn exists before routing");
+			glob2test::awaitBuildingGradient(match, inn, worker->swimClass(), BuildingRoute::Footprint);
+		}
+	};
+	prepareFoodRoutes(game);
 	Building *chosen = game.teams[0]->findNearestFood(worker);
 	require(chosen == (scenario.converts ? rival : friendly),
 			"normal food routing selects expected inn");
@@ -298,10 +312,10 @@ void run(const Scenario &scenario, const std::filesystem::path &output, unsigned
 	// Loading rebuilds service lists and restarts the normal feeding cooldown.
 	// Mature those public building ticks before comparing eligible choices.
 	for (int team = 0; team < restored.game.teamsCount(); ++team)
-		for (int b = 0; b < Building::MAX_COUNT; ++b)
-			if (auto *inn = restored.game.teams[team]->myBuildings[b])
+		for (auto *inn : restored.game.teams[team]->liveBuildings.entries())
 				for (int tick = 0; tick < 256; ++tick)
 					inn->step();
+	prepareFoodRoutes(restored.game);
 	chosen = restored.game.teams[0]->findNearestFood(worker);
 	require(chosen && chosen->owner->teamNumber == (scenario.converts ? 1 : 0),
 			"food choice survives save/load");
@@ -309,11 +323,11 @@ void run(const Scenario &scenario, const std::filesystem::path &output, unsigned
 	restored.game.anyPlayerWaited = false;
 	const auto firstStep = restored.game.stepCounter;
 	for (int tick = 0; tick < 64; ++tick)
-		restored.game.syncStep(0);
+		restored.game.step(0);
 	require(restored.game.stepCounter == firstStep + 64, "conversion fixture advances game ticks");
 	require(worker->owner->teamNumber == (scenario.converts ? 1 : 0),
 			"normal game ticks realize expected ownership");
-	require(restored.game.teams[1]->stats.measurements.conversionsIn[WORKER] ==
+	require(restored.game.teams[1]->stats.measurements().conversionsIn[WORKER] ==
 				(scenario.converts ? 1u : 0u),
 			"conversion telemetry records expected result");
 	std::printf("%s seed=%u size=256x256 teams=4 clearing=%d,%d fruit_distance_squared=%d owner=%d "

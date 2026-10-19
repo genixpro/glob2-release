@@ -35,9 +35,8 @@ M::Place referencePlace(Game &game, const Team *team, int x, int y)
 	for (int t = 0; t < game.teamsCount(); ++t)
 	{
 		const Team *other = game.teams[t];
-		for (int i = 0; i < Building::MAX_COUNT; ++i)
+		for (const Building *b : other->liveBuildings.entries())
 		{
-			const Building *b = other->myBuildings[i];
 			if (!b || b->type->isVirtual)
 				continue;
 			for (int by = b->posY; by < b->posY + b->type->height; ++by)
@@ -102,7 +101,7 @@ TEST_SUITE("TeamStatsSave")
 		auto *site = world.game.addBuilding(
 			20, 40, globalContainer->buildingsTypes.getTypeNum("inn", 0, true), 0);
 		REQUIRE(site != nullptr);
-		auto &m = world.team->stats.measurements;
+		auto &m = world.team->stats.editMeasurements();
 
 		auto expect = [&](Uint64 &bucket)
 		{
@@ -255,7 +254,7 @@ TEST_SUITE("TeamStatsSave")
 		auto *clearing = w.flag("clearingflag", 30, 50, 0);
 		auto *exploration = w.flag("explorationflag", 50, 50, 0);
 		sampleAll(w.game());
-		auto &m = w.team(0)->stats.measurements;
+		auto &m = w.team(0)->stats.editMeasurements();
 		struct Case
 		{
 			int type, x, y;
@@ -323,7 +322,7 @@ TEST_SUITE("TeamStatsSave")
 		dead->isDead = true;
 		const Uint32 checksum = w.game().checkSum();
 		w.team(0)->stats.sampleDefence(w.team(0));
-		const auto &m = w.team(0)->stats.measurements;
+		const auto &m = w.team(0)->stats.editMeasurements();
 		CHECK(m.defenceTick == w.game().stepCounter);
 		CHECK(m.warriors[M::HOME] == 2);
 		CHECK(m.warriors[M::AWAY] == 1);
@@ -347,7 +346,7 @@ TEST_SUITE("TeamStatsSave")
 		glob2test::HeadlessGame world(glob2test::GameOptions{
 			.wDec = 6, .hDec = 6, .clearImmobile = true, .loadDefaultRace = true, .header = true});
 		auto *swarm = world.addBuilding("swarm", 10, 10);
-		swarm->materials[WHEAT] = swarm->type->maxMaterial[WHEAT];
+		swarm->setMaterial(WHEAT, swarm->type->maxMaterial[WHEAT]);
 		swarm->update();
 		world.addBuilding("inn", 20, 10);
 		for (int i = 0; i < 6; ++i)
@@ -358,11 +357,12 @@ TEST_SUITE("TeamStatsSave")
 		world.step(1100);
 		const auto &stats = world.team->stats;
 		REQUIRE(stats.measurementHistory.size() >= 2);
-		CHECK(workerTicks(stats.measurements) > 0);
-		CHECK(stats.measurements.defenceTick == 1024);
+		CHECK(workerTicks(stats.measurements()) > 0);
+		CHECK(stats.measurements().defenceTick == 1024);
 
 		auto *backend = new GAGCore::MemoryStreamBackend;
 		GAGCore::BinaryOutputStream out(backend);
+		glob2test::discardPrematureHiringSuggestions(world.game);
 		world.game.save(&out, false, "labour statistics");
 		out.flush();
 		const auto bytes = backend->takeContents();
@@ -373,10 +373,10 @@ TEST_SUITE("TeamStatsSave")
 		const auto &loaded = restored.game.teams[0]->stats;
 		CHECK(loaded.labourCoverageStartTick == stats.labourCoverageStartTick);
 		CHECK(loaded.measurementHistory == stats.measurementHistory);
-		CHECK(std::equal(std::begin(loaded.measurements.labour), std::end(loaded.measurements.labour),
-						 std::begin(stats.measurements.labour)));
-		CHECK(std::equal(&loaded.measurements.filling[0][0], &loaded.measurements.filling[0][0] + 16,
-						 &stats.measurements.filling[0][0]));
+		CHECK(std::equal(std::begin(loaded.measurements().labour), std::end(loaded.measurements().labour),
+						 std::begin(stats.measurements().labour)));
+		CHECK(std::equal(&loaded.measurements().filling[0][0], &loaded.measurements().filling[0][0] + 16,
+						 &stats.measurements().filling[0][0]));
 	}
 
 	TEST_CASE("older saves load with labour coverage starting at the loaded tick [save-format]")
@@ -400,10 +400,10 @@ TEST_SUITE("TeamStatsSave")
 				CHECK(workerTicks(stats.measurementHistory[i]) == 0);
 			}
 			CHECK(stats.measurementHistory[2].harvested[WHEAT] > 0);
-			CHECK(stats.labourCoverageStartTick == stats.measurements.tick);
-			CHECK(workerTicks(stats.measurements) == 0);
+			CHECK(stats.labourCoverageStartTick == stats.measurements().tick);
+			CHECK(workerTicks(stats.measurements()) == 0);
 			// No defence snapshot yet: it is taken at the next sample.
-			CHECK(stats.measurements.defenceTick < stats.labourCoverageStartTick);
+			CHECK(stats.measurements().defenceTick < stats.labourCoverageStartTick);
 		}
 	}
 
@@ -438,9 +438,8 @@ TEST_SUITE("TeamStatsSave")
 		{
 			int own = 1 << 30, enemy = 1 << 30;
 			for (int t = 0; t < game.teamsCount(); ++t)
-				for (int i = 0; i < Building::MAX_COUNT; ++i)
+				for (Building *b : game.teams[t]->liveBuildings.entries())
 				{
-					Building *b = game.teams[t]->myBuildings[i];
 					if (!b || b->type->isVirtual)
 						continue;
 					const int d = game.map.warpDistMax(x, y, b->getMidX(), b->getMidY());
@@ -482,7 +481,7 @@ TEST_SUITE("TeamStatsSave")
         // Exercise the public recruitment clock rather than altering its timer.
         auto recruitmentRound=[&] {
             bool hired=false;
-            for(int i=0;i<33;++i) hired=flag->subscribeForFlagingStep() || hired;
+            for(int i=0;i<33;++i) hired=(glob2test::publishCurrentHiringSuggestions(*flag->owner->game), flag->subscribeForFlagingStep()) || hired;
             return hired;
         };
         flag->maxUnitWorking=flag->desiredMaxUnitWorking=1;

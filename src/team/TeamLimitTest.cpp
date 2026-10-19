@@ -25,6 +25,29 @@
 
 TEST_SUITE("TeamLimit")
 {
+TEST_CASE("entity GIDs round trip every slot in every live team")
+{
+    for (int team = 0; team < Team::MAX_COUNT; ++team)
+    {
+        for (int id = 0; id < UnitUtils::MAX_COUNT; ++id)
+        {
+            const auto gid = UnitUtils::GIDfrom(id, team);
+            CHECK(gid != UINT16_MAX);
+            CHECK(gid == team * UnitUtils::MAX_COUNT + id);
+            CHECK(UnitUtils::GIDtoID(gid) == id);
+            CHECK(UnitUtils::GIDtoTeam(gid) == team);
+        }
+        for (int id = 0; id < BuildingUtils::MAX_COUNT; ++id)
+        {
+            const auto gid = BuildingUtils::GIDfrom(id, team);
+            CHECK(gid != UINT16_MAX);
+            CHECK(gid == team * BuildingUtils::MAX_COUNT + id);
+            CHECK(BuildingUtils::GIDtoID(gid) == id);
+            CHECK(BuildingUtils::GIDtoTeam(gid) == team);
+        }
+    }
+}
+
 TEST_CASE("sixteen controller slots survive binary and text headers [save-format]")
 {
     CHECK(Team::MAX_COUNT == 16);
@@ -154,7 +177,7 @@ TEST_CASE("growth bands attribute overlapping coverage to all sixteen teams")
     }
     for (int t = 0; t < Team::MAX_COUNT; ++t)
     {
-        auto &m = game.teams[t]->stats.measurements;
+        auto &m = game.teams[t]->stats.editMeasurements();
         CHECK(m.growthTiles[0][WHEAT] == 1);
         CHECK(m.growthTiles[1][WHEAT] == 3);
         CHECK(m.growthTiles[2][WHEAT] == 5);
@@ -330,7 +353,7 @@ TEST_CASE("script generation slot counts reject missing capacity and truncated p
     {
         using BinaryOutputStream::BinaryOutputStream;
         size_t slotsOffset = 0;
-        void writeUint32(Uint32 value, const std::string name) override
+        void writeUint32(Uint32 value, std::string_view name) override
         {
             if (name == "teamSlots") slotsOffset = getPosition();
             BinaryOutputStream::writeUint32(value, name);
