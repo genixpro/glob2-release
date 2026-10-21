@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "app/ClientFeatures.h"
 #include "ui/ThemeCatalog.h"
+#include "ui/TutorialText.h"
 #include "EngineFixtures.h"
 #include "ScopedEnvironment.h"
 #include <algorithm>
@@ -12,6 +13,8 @@
 #include "SettingsScreen.h"
 #include "SoundMixer.h"
 #include "FrontendTheme.h"
+#include "UIRecordingCanvas.h"
+#include <set>
 #include "GameGUIKeyActions.h"
 #include "KeyboardManager.h"
 #include "FileManager.h"
@@ -84,13 +87,27 @@ static void run(int width,int height,bool gl,bool expanded)
         FrontendTheme theme;
         FrontendScope frontend;
         NativeSettings screen;
+        screen.rows();
+        if (screen.host().find("nav.0")) {
+            GAGGUI::ui::FixedTextMeasurer text(8,16);
+            std::set<std::string> categoryIcons;
+            for (auto category : screen.visibleCategories()) {
+                const auto key="nav."+std::to_string(int(category));
+                screen.host().scrollIntoView(key);
+                glob2test::RecordingCanvas canvas({width,height},text);
+                screen.host().paint(canvas,0);
+                const auto bounds=screen.host().bounds(key);
+                for (const auto& icon : canvas.icons)
+                    if (bounds.contains(icon.bounds)) categoryIcons.insert(icon.name);
+            }
+            CHECK(categoryIcons.size() == screen.visibleCategories().size());
+            screen.host().scrollIntoView("nav.0");
+        }
         for(auto category:screen.visibleCategories()){
             screen.selectCategory(category);
             for(const auto& r:screen.rows()){
-                if(category==SettingsScreen::Category::Online){
-                    CHECK(r.label.find("[settings ")==std::string::npos);
-                    CHECK(r.help.find("[settings ")==std::string::npos);
-                }
+                CHECK(r.label.find("[settings ")==std::string::npos);
+                CHECK(r.help.find("[settings ")==std::string::npos);
                 if(r.id.empty())continue;
                 if(!(r.control.w>0 && r.control.h>0)){std::cerr<<"row without bounds: "<<r.id<<"\n";
                     std::function<void(GAGGUI::ui::Node&,int)> dump=[&](GAGGUI::ui::Node& n,int d){std::cerr<<std::string(size_t(d)*2,' ')<<n.name()<<" "<<n.key<<" "<<n.bounds.x<<","<<n.bounds.y<<" "<<n.bounds.w<<"x"<<n.bounds.h<<"\n";for(auto& c:n.children)dump(*c,d+1);};
@@ -102,6 +119,8 @@ static void run(int width,int height,bool gl,bool expanded)
             screen.capture(output+"/category-"+std::to_string(int(category))+".bmp");
         }
         screen.selectCategory(SettingsScreen::Category::Display);
+        screen.host().scrollIntoView("graphics.unitmotion");
+        screen.capture(output+"/advanced-graphics.bmp");
         REQUIRE(screen.row("graphics.fps").label.starts_with("Target render FPS"));
         REQUIRE(screen.row("graphics.fps").choices.back() == "Unlimited");
         REQUIRE(screen.row("graphics.fps").value == "60 FPS");
@@ -162,10 +181,10 @@ static void run(int width,int height,bool gl,bool expanded)
         REQUIRE(screen.changeSetting("audio.set", 0));
         screen.finishInteraction();
         REQUIRE(s.musicSet.empty());
-        screen.click("audio.mute");REQUIRE(!s.mute);
+        screen.click("audio.mute");REQUIRE(!s.mute);CHECK(s.audioPreferenceChosen);
         screen.key(SDLK_TAB);screen.key(SDLK_RIGHT);screen.onTimer(SDL_GetTicks()+400);
         REQUIRE(screen.changeSetting("audio.music",123));
-        screen.finishInteraction();Settings loaded;loaded.load();REQUIRE((loaded.musicVolume==123 && !loaded.mute));
+        screen.finishInteraction();Settings loaded;loaded.load();REQUIRE((loaded.musicVolume==123 && !loaded.mute));CHECK(loaded.audioPreferenceChosen);
         screen.selectCategory(SettingsScreen::Category::Controls);
         REQUIRE(screen.row("controls.edgefullscreen").number == 1);
         REQUIRE(screen.row("controls.edgewindowed").number == 0);
@@ -368,6 +387,46 @@ static void run(int width,int height,bool gl,bool expanded)
 // sizes, one software renderer and the expanded English wording.
 TEST_SUITE("Settings")
 {
+    TEST_CASE("all categories with enlarged text in compact portrait [display][artifacts][writes-preferences]")
+    {
+        glob2test::ScopedEnvironment compact("GLOB2_MOBILE_UI", "1");
+        glob2test::GlobalsOptions options{.display=true,.loadStrings=true,.width=480,.height=800};
+        options.beforeLoad=[](GlobalContainer& g){g.settings.language="en";g.settings.setTextSizePercent(150);};
+        glob2test::HeadlessGlobals globals(options);
+        FrontendTheme theme; FrontendScope frontend; NativeSettings screen;
+        screen.rows();
+        screen.activateSetting("nav.current");
+        GAGGUI::ui::FixedTextMeasurer text(8,16);
+        std::set<std::string> categoryIcons;
+        screen.capture((glob2test::artifactDir()/"compact-category-picker.bmp").string());
+        screen.key(SDLK_ESCAPE);
+        for (auto category : screen.visibleCategories()) {
+            screen.selectCategory(category);
+            const auto rows=screen.rows();
+            glob2test::RecordingCanvas canvas({480,800},text);
+            screen.host().paint(canvas,0);
+            const auto picker=screen.host().bounds("nav.current");
+            for (const auto& icon : canvas.icons)
+                if (picker.contains(icon.bounds)) categoryIcons.insert(icon.name);
+            for (const auto& row : rows) {
+                if(row.id.empty()) continue;
+                INFO(row.id);
+                CHECK(row.control.w > 0);
+                CHECK(row.control.h > 0);
+            }
+            const auto stem=glob2test::artifactDir()/("compact-large-category-"+std::to_string(int(category)));
+            screen.capture(stem.string()+".bmp");
+            for (auto it=rows.rbegin(); it!=rows.rend(); ++it)
+                if (!it->id.empty()) {
+                    screen.host().scrollIntoView(it->id);
+                    screen.capture(stem.string()+"-bottom.bmp");
+                    break;
+                }
+        }
+        CHECK(categoryIcons.size() == screen.visibleCategories().size());
+        screen.done();
+    }
+
     TEST_CASE("catalog building defaults in compact layout [display][artifacts][writes-preferences]")
     {
         glob2test::ScopedEnvironment compact("GLOB2_MOBILE_UI","1");
@@ -635,5 +694,70 @@ TEST_CASE("Settings categories follow the resolved client capabilities" * doctes
     if (!ClientFeatures::Commander) {
         screen.selectCategory(SettingsScreen::Category::HiveMind);
         CHECK(screen.category() == SettingsScreen::Category::Display);
+    }
+}
+
+
+TEST_CASE("Legacy tutorial aliases use the selected catalog and preserve unknown text" * doctest::test_suite("TutorialLocalization"))
+{
+    glob2test::GlobalsOptions options{.loadStrings=true};
+    glob2test::HeadlessGlobals globals(options);
+    auto *strings = Toolkit::getStringTable();
+    CHECK_FALSE(Glob2UI::isTutorialSource("show(\"Good...\")"));
+    CHECK(Glob2UI::tutorialText("Good...") == "Good...");
+    CHECK(Glob2UI::tutorialText("Introduction and Basics") == "Introduction and Basics");
+    for (int part = 1; part <= 4; ++part)
+    {
+        const auto source = readFile((glob2test::sourceRoot() / ("scripts/tutorial_part" + std::to_string(part) + ".sgsl")).string());
+        CHECK(Glob2UI::isTutorialSource(source));
+        std::string windowsSource;
+        for (const char byte : source)
+        {
+            if (byte == '\n' && (windowsSource.empty() || windowsSource.back() != '\r')) windowsSource += '\r';
+            windowsSource += byte;
+        }
+        CHECK(Glob2UI::isTutorialSource(windowsSource));
+        CHECK_FALSE(Glob2UI::isTutorialSource(source + "# custom scenario"));
+    }
+    const std::string original = "Let's first have a look at what's going on. You have a Swarm and a worker...";
+    for (int language = 0; language < strings->getNumberOfLanguage(); ++language)
+    {
+        strings->setLang(language);
+        CAPTURE(language);
+        CHECK(Glob2UI::tutorialText(original, true) == strings->getString("[tutorial part1 message 2]"));
+        for (const auto &alias : Glob2UI::tutorialTextAliases)
+            CHECK(Glob2UI::tutorialText(std::string(alias.first), true) == strings->getString(std::string(alias.second)));
+        CHECK(Glob2UI::tutorialText("Tutorial Campaign", true) == strings->getString("[tutorial]"));
+        CHECK(Glob2UI::tutorialText("Introduction and Basics", true) == strings->getString("[tutorial mission basics]"));
+        CHECK(Glob2UI::tutorialText("A player's custom mission") == "A player's custom mission");
+    }
+}
+
+
+TEST_CASE("Controls render translated labels and help in every supported language [display:1400x1000][artifacts]" * doctest::test_suite("SettingsLocalization"))
+{
+    glob2test::ScopedEnvironment desktop("GLOB2_MOBILE_UI", "0");
+    glob2test::GlobalsOptions options{.display=true,.loadStrings=true,.width=1280,.height=900};
+    glob2test::HeadlessGlobals globals(options);
+    FrontendTheme theme;
+    FrontendScope frontend;
+    auto *strings = Toolkit::getStringTable();
+    for (int language = 0; language < strings->getNumberOfLanguage(); ++language)
+    {
+        strings->setLang(language);
+        const auto code = strings->getString("[language-code]");
+        globalContainer->settings.language = code;
+        CAPTURE(code);
+        NativeSettings screen;
+        screen.selectCategory(SettingsScreen::Category::Controls);
+        for (const auto &row : screen.rows())
+        {
+            CHECK(row.label.find("[settings ") == std::string::npos);
+            CHECK(row.help.find("[settings ") == std::string::npos);
+            CHECK(Toolkit::getFont("standard")->hasGlyphsFor(row.label));
+            CHECK(Toolkit::getFont("standard")->hasGlyphsFor(row.help));
+        }
+        CHECK(screen.row("controls.wheel").label == strings->getString("[settings Menu scroll wheel enabled]"));
+        screen.capture((glob2test::artifactDir() / ("controls-" + code + ".bmp")).string());
     }
 }

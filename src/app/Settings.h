@@ -63,6 +63,9 @@ public:
 	std::string musicSet; // Empty selects a random soundtrack at match start.
 	Uint32 voiceVolume;
 	int mute;
+	bool audioPreferenceChosen = false; ///< Explicit first-run audio choice; old volume defaults are not consent.
+	// Call before constructing the mixer, after the host presentation is known.
+	void applyAudioStartupPolicy(bool mobile) { if (mobile && !audioPreferenceChosen) mute = 1; }
 	int version;
 	bool rememberUnit;
 	bool scrollWheelEnabled;
@@ -86,9 +89,9 @@ public:
 	bool translucentPathLines;
 	bool smoothProgressIndicators;
 	bool decorativeAnimations;
-	//! Experimental: draw units moving and animating between simulation ticks.
+	//! Draw units moving and animating between simulation ticks.
 	//! Off draws exactly the simulated positions. Not part of setGraphicsDetail.
-	bool unitInterpolation = false;
+	bool unitInterpolation = true;
 	//! Adapt bars, zones, units and terrain to the zoom instead of scaling them with the map.
 	bool adaptiveZoomDetail = true;
 	//! Fade tiles into and out of the fog of war instead of switching them.

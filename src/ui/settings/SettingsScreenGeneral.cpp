@@ -208,7 +208,7 @@ void SettingsScreen::buildGeneral()
 		effect("graphics.indicators", "Smooth progress indicators", "Smooth the moving edges of progress indicators.", &Settings::smoothProgressIndicators);
 		effect("graphics.animation", "Decorative interface animation", "Animate victory artwork. Reduced motion also disables this animation.", &Settings::decorativeAnimations);
 		effect("graphics.zoomdetail", "Adaptive zoom detail", "Simplify bars, zones, terrain and units as the map zooms out, and keep them small zoomed in.", &Settings::adaptiveZoomDetail);
-		effect("graphics.unitmotion", "Smooth unit motion", "Experimental: move and animate units between game ticks.", &Settings::unitInterpolation);
+		effect("graphics.unitmotion", "Smooth unit motion", "Move and animate units between game ticks.", &Settings::unitInterpolation);
 		effect("graphics.smoothfog", "Smooth fog of war", "Fade the map into and out of the fog of war gradually.", &Settings::smoothFog);
         {
             auto *gfx = globalContainer->gfx;
@@ -218,7 +218,7 @@ void SettingsScreen::buildGeneral()
             for (const auto &entry : availability) {
                 backends.push_back(entry.backend);
                 auto label = std::string(rendererBackendLabel(entry.backend));
-                if (!entry.available) label += " (unavailable)";
+                if (!entry.available) label += " (" + tr("Renderer unavailable") + ")";
                 labels.push_back(std::move(label));
             }
             const auto &status = gfx->backendSwitchStatus();
@@ -229,7 +229,7 @@ void SettingsScreen::buildGeneral()
                         globalContainer->gfx->requestBackendSwitch(backends[v]);
                     invalidate();
                 });
-            info("Active renderer: " + std::string(rendererBackendLabel(status.active)));
+            info(std::string(GAGCore::FormattableString(tr("Active renderer: %0")).arg(rendererBackendLabel(status.active))));
             if (status.phase == RendererSwitchPhase::Queued || status.phase == RendererSwitchPhase::Preparing ||
                 status.phase == RendererSwitchPhase::Presenting) info(tr("Changing renderer…"));
             if (!status.reason.empty()) info(status.reason);
@@ -267,6 +267,7 @@ void SettingsScreen::buildGeneral()
 			   {
 				   auto &s = globalContainer->settings;
 				   s.mute = v;
+				   s.audioPreferenceChosen = true;
 				   globalContainer->mix->setVolume(s.musicVolume, s.voiceVolume, s.mute);
 				   commit();
 			   });

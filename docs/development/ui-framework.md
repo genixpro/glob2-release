@@ -91,6 +91,52 @@ as matches and the editor; see [render pacing](../architecture/rendering.md#targ
     strict validation still rejects other untranslated text and all structural
     errors. Remove pending keys once every catalog has a translation.
 
+## Translation coverage checks
+
+Run `python3 data/check_translations.py --strict` and
+`python3 test/test_translations.py` when changing user-visible text.
+Use `python3 data/check_translations.py --json` for per-language missing,
+untranslated, shared-English and placeholder findings, plus the source coverage
+inventory. The checker reads the catalogs without rewriting them.
+
+Native source checks join adjacent C++ literals, skip comments, and include keys
+stored in arrays or passed through UI wrappers and conditional expressions.
+Registered implicit conventions cover settings labels/help (including category
+names and scroll sliders), `musicText`, `customAIText`, `libraryText`, statistics metrics,
+experiments, shipped theme IDs and ruleset names/descriptions. Add a scanner rule
+and a regression fixture when introducing a new wrapper or computed key family.
+Direct prose passed to common frontend constructors, action tables, choice lists
+and map-overlay text is also rejected. A successful
+catalog check cannot detect every string assembled through variables or new helpers.
+
+The JSON `coverage` field records checked families and remaining review surfaces.
+Tutorial SGSL sources retain their legacy translation blocks, but the desktop
+message overlay, touch tutorial panel and history translate recognized tutorial
+text through the current catalogs. `src/ui/TutorialTextAliases.h` contains exact
+aliases from both authored scripts and the scripts embedded in shipped tutorial
+maps. Regenerate it with `python3 tools/localization/generate_tutorial_aliases.py`
+when those inputs change; `--check` and the translation tests verify freshness.
+Full-source fingerprints identify the four authored and four map-embedded tutorial
+scripts when loading a client session, treating LF and CRLF line endings equally. Generic phrases in custom scenarios are
+left untouched. This display mapping also covers old saved tutorial text without rewriting map
+scripts, execution offsets, campaign IDs or progress. Two legacy Spanish pool
+steps share an alias; keep their current combined English instruction identical.
+Campaign mission titles are localized for display while selection still uses
+original mission IDs. Unrecognized custom text is displayed as authored. Legacy desktop tutorial and
+history messages use the shared UTF-8 wrapper, including unspaced CJK text and
+explicit line breaks.
+
+The JSON tutorial inventory distinguishes legacy language blocks from current
+`display_catalog_gaps`. Generator/building/resource names and keyboard names
+built from runtime data and unregistered wrappers still need contextual review.
+Run `npm run i18n:check` from `platform/` for online catalogs and browser launcher
+bindings, and render representative screens in each language to check font
+coverage, text fitting and layout. `TrueTypeFont` shapes bidirectional text into
+visual order before rasterization, so every SDL_ttf font instance must use an
+explicit left-to-right direction. Allowing SDL_ttf to guess direction reorders
+Arabic and Persian a second time, including embedded Latin words and numbers.
+The FontKerning suite checks this at multiple raster scales and after font reload.
+
 ## Anatomy of a screen
 
 ```cpp
@@ -203,8 +249,11 @@ desktop layouts are unchanged at 100% (`applyTextSize()` holds the rule).
   painted line crosses a control's edge, at 100% and 150%.
 
 Mobile game-event notifications start below the statistics, minimap and selection
-header, inside the safe-area gutters. Their text uses the mobile text scale and
-wraps to the available width over a translucent background. The feed is bounded
+header and building inventory, inside the safe-area gutters. Their text uses the
+same normal font and .8 text role as the building title and inventory, respects
+the player’s text-size preference, and wraps over a translucent background. Each
+card vertically centers its icon and complete text block with equal top and bottom
+padding. The feed is bounded
 above the action bar and to 180 points of height; a final wrapped row is shortened
 with an ellipsis when space runs out. Click-to-jump rectangles follow the scaled,
 wrapped rows. Desktop notifications retain their original placement and sizing.
@@ -267,6 +316,14 @@ framework:
   wrapping grid of large buttons.
 - `pageTitle()` and `hint()`: see Typography.
 - `animation()` and `mapPreview()` (hosts a `MapPreview` in a canvas).
+
+Settings use leading labels and help text with trailing value controls. Checkbox
+rows use `ToggleOptions::trailing` and `help` so the label, help and mark share
+one pointer, touch and keyboard target. Wide rows reserve the same control column
+as other settings fields; narrow rows keep a trailing checkbox beside wrapping
+captions while larger controls stack below their labels. Keep every category's
+sidebar icon distinct: recording uses Play, custom AIs Robot, map generators Map,
+and MCP uses Server.
 
 ### Typography
 
@@ -409,8 +466,8 @@ The main-menu Settings button uses a gear with its label in the desktop utility
 grid, and a gear alone beside the wordmark on touch hosts. Desktop Editor and Load
 game also retain their labels beside icons. Touch main-menu launch choices and
 More-page actions all use icons beside labels, including Back and More. Desktop
-settings-sidebar categories use labelled icons; the compact category dropdown
-and game-specific artwork retain their existing presentation.
+settings-sidebar categories and the compact category dropdown share the same
+labelled icons. Game-specific artwork retains its existing presentation.
 
 Choose icon-only controls for familiar actions in headers and toolbars. Keep
 labels in menu rows and desktop utility grids so neighbouring controls read

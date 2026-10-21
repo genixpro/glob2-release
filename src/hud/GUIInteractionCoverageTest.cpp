@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "ui/TutorialText.h"
+#include <BinaryStream.h>
+#include <FileManager.h>
 #include "EngineFixtures.h"
 #include "GameGUIViewport.h"
 #include "GameGUIInternal.h"
@@ -14,6 +17,10 @@
 #include "MapEditDialog.h"
 #include <SDLGraphicContext.h>
 #include <SDL3/SDL.h>
+#include <ScopedEnvironment.h>
+#include <InterfacePresentation.h>
+#include <algorithm>
+#include <iterator>
 #include <set>
 
 namespace
@@ -38,6 +45,51 @@ Uint64 renderPanel(GameGUI& gui)
 }
 TEST_SUITE("GUIInteractionCoverage")
 {
+    TEST_CASE("in-game music selection uses readable phone popup rows [display][artifacts][writes-preferences]")
+    {
+        glob2test::ScopedEnvironment touch("GLOB2_MOBILE_UI", "1");
+        glob2test::HeadlessGlobals globals(glob2test::GlobalsOptions{.display=true,.loadStrings=true,
+            .width=360,.height=720,.screenFlags=GAGCore::GraphicContext::PORTABLEGPU});
+        struct RestoreText { double old=GAGCore::userTextScale; ~RestoreText(){ GAGCore::userTextScale=old; } } restore;
+        GameGUI gui;
+        globals->settings.mute=0;
+        auto* gfx=globals->gfx;
+        gfx->setTargetRenderFps(0);
+        gfx->setResponsiveViewport(true,800,600);
+        for(const auto [width,height]:{std::pair{360,720},std::pair{720,360}})
+        for(const double text:{1.,1.5})
+        {
+            REQUIRE(SDL_SetWindowSize(SDL_GetWindowFromID(gfx->windowID()),width,height));
+            REQUIRE(SDL_SyncWindow(SDL_GetWindowFromID(gfx->windowID())));
+            SDL_Event resize{}; resize.type=SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
+            GAGCore::GraphicContext::translateMouseEvent(&resize);
+            GAGCore::userTextScale=text;
+            InGameOptionScreen dialog(&gui);
+            dialog.attach(*gfx); dialog.update(0);
+            auto& host=dialog.host();
+            host.scrollIntoView("music-set"); dialog.update(0);
+            const auto control=host.bounds("music-set");
+            REQUIRE_FALSE(control.empty());
+            CHECK(control.w > host.rootBounds().w*.7);
+            auto capture=[&](const char* state)
+            {
+                gfx->beginFrame(GAGCore::GraphicContext::FrameMode::FullRedraw);
+                gfx->setClipRect(); gfx->drawFilledRect(0,0,gfx->getW(),gfx->getH(),GAGCore::Color(60,110,50));
+                dialog.draw(0);
+                const auto name=std::string("music-")+state+"-"+std::to_string(width)+"-"+std::to_string(int(text*100))+".bmp";
+                gfx->printScreen(glob2test::artifactDirFromWorkingDirectory()+"/"+name);
+                gfx->nextFrame();
+            };
+            capture("closed");
+            host.tapAt(control.center()); dialog.update(0);
+            REQUIRE(host.popupOpen());
+            REQUIRE(host.popupRoot());
+            CHECK(host.popupRoot()->bounds.w > host.rootBounds().w*.7);
+            capture("open");
+            host.closePopup();
+        }
+    }
+
     TEST_CASE("service progress horizon covers mixed visits and preserves stock horizons")
     {
         glob2test::HeadlessGlobals globals;
@@ -634,4 +686,93 @@ TEST_CASE("resource inspectors show infinity only for stocked infinite yields [d
     inspect(getMaterialName(materialIndex(MaterialId::Wood))+": 0/5\n"+
         getMaterialName(materialIndex(MaterialId::Food))+": 0/4");
     CHECK(map.getResource(index).type==resourceIndex(*id));
+}
+
+
+TEST_CASE("Tutorial messages wrap unspaced UTF-8 text and continuation indents without changing simulation [display]" * doctest::test_suite("TutorialLocalization"))
+{
+    glob2test::HeadlessGlobals globals({.display=true,.loadStrings=true,.width=640,.height=480});
+    glob2test::HeadlessGame world({.clearImmobile=true,.loadDefaultRace=true,.header=true});
+    std::string text;
+    for (int i = 0; i < 20; ++i) text += "日本語の訓練案内。";
+    const auto checksum = world.checksum();
+    std::vector<std::string> lines;
+    world.gui.setMultiLine(text, &lines, "  ");
+    REQUIRE(lines.size() > 1);
+    std::string joined;
+    for (std::size_t i = 0; i < lines.size(); ++i)
+    {
+        CHECK_FALSE(lines[i].empty());
+        CHECK(globalContainer->standardFont->getStringWidth(lines[i].c_str()) <=
+            globalContainer->gfx->getW() - GAME_GUI_RIGHT_MENU_WIDTH - 64);
+        joined += i ? lines[i].substr(2) : lines[i];
+    }
+    CHECK(joined == text);
+    lines.clear();
+    world.gui.setMultiLine("first\nsecond", &lines, "  ");
+    REQUIRE(lines.size() == 2);
+    CHECK(lines[0] == "first");
+    CHECK(lines[1] == "  second");
+    lines.clear();
+    world.gui.setMultiLine("", &lines);
+    CHECK(lines.empty());
+    CHECK(world.checksum() == checksum);
+    CHECK(world.gui.orderQueue.empty());
+}
+
+
+TEST_CASE("Old tutorial localization preserves script bytes and matches ordinary save-load state [display][artifacts]" * doctest::test_suite("TutorialLocalization"))
+{
+    glob2test::HeadlessGlobals globals({.display=true,.loadStrings=true,.width=640,.height=480});
+    GameGUI original(false);
+    {
+        GAGCore::BinaryInputStream input(glob2OpenMapOrSaveInputStreamBackend(*GAGCore::Toolkit::getFileManager(), "campaigns/tutorial-part1.map.gz"));
+        REQUIRE(original.load(&input));
+    }
+    REQUIRE(original.legacyTutorialScript);
+    const auto source = original.game.sgslScript.sourceCode;
+    const auto checksum = original.game.checkSum();
+    const auto orders = original.orderQueue.snapshot();
+    const auto baselineSave = (glob2test::artifactDir() / "tutorial-localization-baseline.game").string();
+    const auto writeSave = [&](const std::string& path) {
+        GAGCore::BinaryOutputStream output(GAGCore::Toolkit::getFileManager()->openOutputStreamBackend(path));
+        original.save(&output, "Tutorial localization round trip");
+    };
+    writeSave(baselineSave);
+    CHECK(original.game.checkSum() == checksum);
+
+    const auto alias = std::find_if(std::begin(Glob2UI::tutorialTextAliases),
+        std::end(Glob2UI::tutorialTextAliases), [&](const auto& entry) {
+            return source.find(entry.first) != std::string::npos;
+        });
+    REQUIRE(alias != std::end(Glob2UI::tutorialTextAliases));
+    CHECK(Glob2UI::tutorialText(std::string(alias->first), original.legacyTutorialScript) ==
+        GAGCore::Toolkit::getStringTable()->getString(std::string(alias->second)));
+    CHECK(original.game.sgslScript.sourceCode == source);
+    CHECK(original.game.checkSum() == checksum);
+    CHECK(original.orderQueue.snapshot() == orders);
+
+    const auto save = (glob2test::artifactDir() / "tutorial-localization-roundtrip.game").string();
+    writeSave(save);
+    CHECK(original.game.checkSum() == checksum);
+    // Loading a newly saved legacy map can heal old coordinates and rebuild
+    // derived state. Compare against the same ordinary save/load without the
+    // display lookup, rather than requiring legacy migration to be a no-op.
+    GameGUI baselineRestored(false);
+    {
+        GAGCore::BinaryInputStream input(GAGCore::Toolkit::getFileManager()->openInputStreamBackend(baselineSave));
+        REQUIRE(baselineRestored.load(&input));
+    }
+    CHECK(baselineRestored.legacyTutorialScript);
+    CHECK(baselineRestored.game.sgslScript.sourceCode == source);
+    GameGUI restored(false);
+    {
+        GAGCore::BinaryInputStream input(GAGCore::Toolkit::getFileManager()->openInputStreamBackend(save));
+        REQUIRE(restored.load(&input));
+    }
+    CHECK(restored.legacyTutorialScript);
+    CHECK(restored.game.sgslScript.sourceCode == source);
+    CHECK(restored.game.checkSum() == baselineRestored.game.checkSum());
+    restored.init();
+    CHECK_FALSE(restored.legacyTutorialScript);
 }
