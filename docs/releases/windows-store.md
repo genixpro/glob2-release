@@ -105,7 +105,7 @@ product's `Main` branch before submitting for certification:
    submitting; use a manual hold if certification should finish before launch.
 2. **Properties:** Strategy is the primary genre; Simulation is an additional
    genre. Declare PC single-player and online multiplayer. Use
-   `https://glob2online.com/privacy/` for privacy, `https://glob2online.com/` for the
+   `https://glob2.online/privacy/` for privacy, `https://glob2.online/` for the
    website, and the current support contact published in that privacy policy.
    Review the customer-visible contact address and phone: Partner Center can use
    the developer account's contact details when product fields are blank.
@@ -115,7 +115,7 @@ product's `Main` branch before submitting for certification:
    below. Upload genuine desktop screenshots from the release candidate. At least
    one PNG is required; Partner Center recommends four, at 1366 × 768 or larger.
    The current gameplay screenshot at
-   `https://glob2online.com/images/glob2-first-colony.webp` is an approved source;
+   `https://glob2.online/images/glob2-first-colony.webp` is an approved source;
    convert it to PNG without changing its content. Add more screenshots of
    gameplay, colony management, campaigns and the editor when available. Do not reuse
    mobile screenshots or the legacy `data/screenshots/globulation2-gameplay.png`
