@@ -140,7 +140,9 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	// and their original ground shadows.
 	if (detail.unitSprite > 0 &&
 		!view.render.skinPreview().draw(*globalContainer->gfx, meshClass, unit->team,
-			unit->action, dir, delta, px, py, unitSprite->baseFrame(imgid), fogAlpha))
+			unit->action, dir, delta, px, py,
+            {unitSprite->baseFrame(imgid), unsigned(unitSprite->getW(imgid)),
+             unsigned(unitSprite->getH(imgid))}, fogAlpha))
 		globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid, fogAlpha);
 	if (detail.unitMarker > 0)
 	{
