@@ -21,3 +21,115 @@ binding declaration, and the error points at the syntax rather than at the macro
 For unused-include cleanup, generate `compile_commands.json` and use
 `tools/remove-unused-includes.py`; do not apply blind bulk fixes. Rebuild client,
 relay and affected tests, then verify behavior-preserving simulation changes as above.
+
+## Header dependencies
+
+Most rebuild time is spent parsing headers, so a header's includes are part of its
+interface. Keep version constants (`VERSION_MINOR`, `SIM_REVISION`,
+`FILE_FORMAT_VERSION_*`) out of headers: give a function an overload whose
+current-format form is defined in the `.cpp`, and move version-gated bodies there.
+Prefer a forward declaration or a small leaf header over including a wide one, and
+keep simulation headers (`src/map`, `src/unit`, `src/building`, `src/team`,
+`src/game`, `src/engine/sim`, `src/resource`, `src/field`) free of rendering, HUD,
+UI and the full SDL umbrella. Hot per-cell accessors stay inline in their headers
+because release builds do not use LTO.
+
+Team, building and unit code reaches its game through `Team::ctx`
+(`src/engine/sim/SimContext.h`): plain pointers to the game header, map header,
+map, building types, unit cargo, area effects, animations, step counter, teams and
+players, plus `ctx.services` (`sim/SimServices.h`, implemented by `Game`) for the
+few calls such as `allocateScriptIdentity` or `resolveUnit`. Use `owner->ctx.x` and
+the specific header of `x` rather than `owner->game->x` and `Game.h`; the pointer
+read costs the same as the `game` read it replaces. Code that owns a game-wide
+pipeline (hiring, turret targeting, team statistics, area effects) still takes a
+`Game&`.
+
+The game and its widest owners hold their large members by pointer, behind a
+reference of the old name: `Game` holds `std::unique_ptr<Map> mapOwner; Map& map;`
+and the snapshot store the same way, and `GameGUI` and `MapEdit` hold their `Game`
+that way. Call sites read `game.map.x` as before, but `Game.h` includes neither
+`Map.h` nor the team, building, unit or snapshot-store headers. Include the header
+of what a file uses rather than expecting it through `Game.h`. Small leaf headers
+carry the vocabulary that used to need a wide one:
+
+| Need | Header |
+| --- | --- |
+| `NOGUID`, `NOGBID`, `Offset`, `AreaType` | `src/map/MapTypes.h` |
+| `refOf` handles for live buildings and units (inline) | `src/engine/sim/EntityRefOf.h` |
+| `TERRAIN_COUNT` and built-in terrains added after the 64 in `TerrainType.h` | `src/map/TerrainBuiltins.h` |
+| Building IDs (`BuildingUtils::MAX_COUNT`, `GIDtoTeam`) | `src/building/BuildingUtils.h` |
+| Building routes and `BUILDING_GRADIENT_COUNT` | `src/building/BuildingRoute.h` |
+| Building state enums, including `UnitCantWorkReason` | `src/building/BuildingState.h` |
+| Team limits (`TEAM_MAX_COUNT`) | `src/team/TeamCapacity.h` |
+
+Map routing lives in `MapRouting` (`src/map/gradient/MapRouting.h`), owned by the
+map and reached through `map->routing()`: pathfinding (`pathfindBuilding`,
+`pathfindMaterial`, `pathfindArea`, point-to-point A*), building and material field
+requests and queries (`requestBuildingField`, `queryMaterialDistance`,
+`getMaterialGradient`, `materialAvailable`), the per-team material, market,
+forbidden, guard and clear gradients with their stale flags, the material routing
+cache, building gradient leases and the gradient pipeline. `Map.h` only
+forward-declares it, so cell-only code does not rebuild when routing changes;
+include `gradient/MapRouting.h` where a file routes. The routing implementation
+files still include `Map.h` and read cells through its inline accessors, so a
+query pays one pointer load to reach `MapRouting`, never one per cell. Static
+movement helpers (`Map::swimClass`, `Map::SWIM_CLASS_EVEN`,
+`Map::GRADIENT_COST_LIMIT`) and `topologyGeneration` stay on `Map`.
+
+`python3 test/check_header_layering.py` enforces this from the static include
+graph in a few seconds: layer ranks in `test/header_layers.json`, no version
+defaults in headers, no new directory-level include cycles, and fan-in budgets (with
+2% slack, so new source files do not trip them) in
+`test/header_fanin_budget.json`. Existing violations are listed in
+`test/header_layering_allowlist.txt` and `test/header_cycles_allowlist.txt`; after
+removing some, run it with `--write` to drop their lines and lower the budgets.
+Only new violations fail: a stale allowlist line and a header over its fan-in budget
+are warnings (annotations in CI), since neither hides a broken layer.
+It also caps `globalContainer` references in non-test simulation code per directory
+(`test/global_container_budget.json`): simulation code reads the game's own
+registries, so that tests can build a game without the application globals.
+`python3 tools/include_graph.py top|fanin|why` reports which translation units a
+header reaches and through which includers. `include_graph.py cost --days 60
+--attribute 5` ranks headers by what their edits actually cost: edits in the
+window times today's fan-in, with the includers that bring the costliest headers
+to the most translation units. Raw fan-in treats a header nobody edits like one
+edited daily, so start decoupling work from the cost ranking.
+Cut an include only where the includers do not use what it carries: `MapRouting.h`
+brings `Map.h` to 56 translation units, but nearly all of them use `Map` directly,
+so removing it would move the include rather than save a rebuild. `include_graph.py
+why` shows the includers; check that they use the header before cutting it.
+
+Some standard and third-party headers cost far more than the rest: with C++20 on
+GCC, `<chrono>` adds about 0.6 s to every translation unit that reaches it (it
+brings formatting and time zones), `nlohmann/json.hpp` about 0.9 s, and
+`<valarray>` and `<random>` about 0.2 s each. Keep them out of widely included
+headers. For a timestamp or deadline, store integer nanoseconds from
+`GAGCore::steadyClockNanoseconds()` (`SteadyClock.h`) or take a millisecond count,
+and convert to `std::chrono` in the `.cpp`. A header that only names `json` in
+declarations includes `<nlohmann/json_fwd.hpp>`. A header that holds a JSON-bearing
+type only by reference or pointer forward-declares it. An interface that reads a
+buffer takes a `std::span` of its elements (as `drawAlphaMap` does) rather than
+naming the caller's container, and render-side members use `std::vector` rather
+than `std::valarray`. Fan-in budgets in angle brackets (`<chrono>`, `<valarray>`,
+`<nlohmann/json.hpp>`) count the translation units that reach these headers
+through any project file.
+
+Terrain registries and cell rules (`TerrainRegistry.h`, `CellRules.h`) hold
+only layouts: `TerrainPropertiesLayout.h`, `TerrainPresentationLayout.h` and
+`field/EntrySteps.h`. The compile-time built-in tables (`TerrainProperties.h`,
+`TerrainGroupTable.h`, `field/TerrainMovementCosts.h`,
+`field/PreparedTerrainCosts.h`) are included only by code that evaluates them,
+such as the gradient kernels, so retuning a terrain does not rebuild every file
+that reads a cell. Their static checks run once, in `TerrainProperties.cpp`. Movement classes and
+`MovementAccess` live in `src/common/MovementClass.h`, so map and field headers do
+not include the unit tuning constants in `unit/UnitConsts.h`.
+
+Decoupling must not slow the simulation. Keep hot accessors (per-cell map reads,
+`MapStateView.h` queries, entity reference factories, the constexpr terrain cost
+tables) inline; a body may move to another header, never out of line. For a
+change to how simulation headers or their owners are held, build `perf=1 opt=3`
+and run `python3 tools/inline_guard.py --baseline master build/linux/client/perf/o3`.
+It lists hot-directory objects that gained calls into core simulation classes
+(an accessor that stopped being inlined), and exits non-zero if any did. Add a
+`tools/perf_ab.py` table at the perf-confirm tier (see
+[comparing against master](build-options.md#comparing-against-master)).

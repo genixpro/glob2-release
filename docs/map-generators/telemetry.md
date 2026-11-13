@@ -38,7 +38,7 @@ Use a stable generator/helper namespace and a descriptive operation name. Includ
 
 ## What is instrumented
 
-Every built-in generator emits its own observations. Examples include City states' effective home/heart kinds and islet counts; Canals' block-kind histogram and wall/moat fallbacks; Anthill's chambers and room shortfalls; the height-field modes' fitted parameters; Watershed's start-search relaxation; Braided river's clamped channel count, crossings found and riffles by kind (forced, tree, loop), and its short-stretch and relaxed-home-distance fallbacks; and optional island, lake, farm and crossing shortfalls across the catalog. Uniform reports its intentionally empty starting-colony configuration.
+Every built-in generator emits its own observations. Examples include City states' effective home/heart kinds and islet counts; Canals' block-kind histogram, wall/moat fallbacks, grand-canal row, width and bridges, quay vertices, unthickened wall vertices and quarry-face tiles; Old town's climate, block-kind counts, wall breaches, unthickened wall vertices and stone by source (mason's stack, wall faces, rubble); Faulted City's home design and facing, raised and sunken quarters, scarp tiles, ramps (`faulted-city.junction.x`/`.y`), sag ponds, rubble, home and plaza quarry-face tiles, plaza fruit and each colony's walk to the plaza; Anthill's chambers and room shortfalls; the height-field modes' fitted parameters; Watershed's start-search relaxation; Braided river's clamped channel count, crossings found and riffles by kind (forced, tree, loop), and its short-stretch and relaxed-home-distance fallbacks; and optional island, lake, farm and crossing shortfalls across the catalog. Uniform reports its intentionally empty starting-colony configuration.
 
 Shared helpers report reusable decisions:
 
@@ -97,7 +97,7 @@ Temporary debug instrumentation is useful for one hypothesis: every rejected poi
 
 ## Verification
 
-The `MapGeneratorDefaults` suite exercises typed values, bounds, disabled collection and partial failure traces. `test/test_map_report.py` verifies JSON types/escaping, failure output, malformed request serialization, schema rejection, no map-byte changes when JSON is requested, and repeatability. `MapGeneratorGoldenTest <profile> --telemetry` compares enabled/disabled full serialized worlds and RNG state for all generators, checks repeatable traces, and prints separate generation timings. Timing differences are reported rather than asserted against a flaky wall-clock threshold. Existing golden rows still protect pre-change maps; telemetry-only changes should not require generator revision bumps.
+The `MapGeneratorDefaults` suite exercises typed values, bounds, disabled collection and partial failure traces. `test/test_map_report.py` verifies JSON types/escaping, failure output, malformed request serialization, schema rejection, no map-byte changes when JSON is requested, and repeatability. `MapGeneratorGoldenTest <profile> --telemetry` compares enabled/disabled full serialized worlds and RNG state for all generators, checks repeatable traces, and prints separate generation timings. Timing differences are reported rather than asserted against a flaky wall-clock threshold. The sim-diff map fingerprints show any pre-change map that moved; telemetry-only changes should not require generator revision bumps.
 
 ## Fractal generator records
 

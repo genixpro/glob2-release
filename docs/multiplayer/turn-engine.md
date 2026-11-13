@@ -108,7 +108,7 @@ changing the protocol or the record: see [network telemetry](../development/netw
 ### MatchSetup to GameHeader
 
 `src/online/MatchSetup.{h,cpp}` turns the platform's MatchSetup JSON
-(`platform/packages/protocol`, `src/matchSetup.ts`, is the source of truth) into the
+(`services/online/packages/protocol`, `src/matchSetup.ts`, is the source of truth) into the
 `GameHeader` that every client and the verifier run:
 
 1. `MatchSetup::parse` checks the JSON Schema rules (every field required, no unknown
@@ -147,7 +147,7 @@ lost and never stands in the way of the opponents-defeated victory. A `closed` s
 (`{seat, kind: "closed", team}`) says so explicitly. Closed seats are not players and
 create no `BasePlayer`; they are numbered after every human and AI seat so players
 keep the numbers `0..p-1`. Rooms send each empty or locked room seat this way
-(`roomMatchSeats` in `platform/apps/api/src/play/rooms.ts`): the taken room seats become
+(`roomMatchSeats` in `services/online/apps/api/src/play/rooms.ts`): the taken room seats become
 match seats `0..p-1` in room seat order on their own map teams, and the empty ones
 follow as closed seats. A match seat therefore equals its room seat only while no empty
 room seat comes before it. LAN rooms list no seat at all for a team nobody took, which
@@ -210,9 +210,11 @@ record. `glob2 info sim-version --format json` prints the JSON.
   with path `#sim-revision` and the revision in decimal ASCII as its content. The data
   files are those listed in `Online::simDataFiles()`: the Maxima strategies (`data/maxima/*.strategy`), the
   Nicowar tables (`data/nicowar.default.txt`, `data/nicowar.txt`), the default resource
-  registry (`data/resources/registry.json`), the default building
+  registry (`data/resources/registry.json`), the language catalog list (`data/texts.list.txt`:
+  SGSL lexes each installed catalog's code as a language token), the default building
   manifest (`data/buildings/manifest.json`) and every definition it references, and the USL runtime
-  (`data/usl/*/Runtime/*.usl`), in byte-wise sorted path order. For each file the hash
+  (`data/usl/*/Runtime/*.usl`), in byte-wise sorted path order. Paths are the engine's virtual paths, relative to
+  the runtime tree (`content/` in a checkout), not to the repository. For each file the hash
   takes the path bytes, one zero byte, the content length as a big-endian 64-bit number
   and the content, with every CR LF pair replaced by LF so a Windows checkout with
   automatic line-ending conversion hashes the same. A missing file contributes its path,
@@ -249,20 +251,27 @@ pathfinding, AI code and parameters, order validation, map loading, random numbe
 scripting. Without a bump, builds that simulate differently share rooms, queues, AI
 ratings and verifiers, and their matches desync or fail verification. The revision
 only ever increases. A bump also needs a fresh golden record
-(`test/fixtures/multiplayer/FourSquares1.g2mr`, which carries the sim version) and
-its trace: `python3 test/run_tests.py --update-fixtures --filter 'TurnEngineHarness/the committed*'`.
+(`test/fixtures/multiplayer/FourSquares1.g2mr`, which carries the sim version):
+`python3 test/run_tests.py --update-fixtures --filter "TurnEngineHarness/the committed*"`
+records it in the same change. The few remaining `[golden]` cases are compatibility
+fixtures (old saves); when one fails, find out why before
+rewriting it with `--update-fixtures --tag golden`. Map generators and the other
+scenarios have no committed output; sim-diff compares them between merge base and
+pull request.
 
 CI enforces what it can detect:
 
-- `test/check_sim_revision.py` (the change-selection job) fails when the committed
-  record names another sim version than the tree, and when the record or its
-  verification trace changed relative to the base revision while the sim version
-  did not.
-- The browser/native equivalence job fails when Linux, Windows, macOS and the browsers agree
-  on a `match verify` trace that differs from the committed one: the simulation
-  changed.
+- `sim-diff` (see [simulation diff](../development/simulation-verification.md))
+  builds the merge base and the pull request, runs both on the same scenarios, and
+  fails when their output differs while the sim version key did not move. On master
+  pushes it audits each merge against its parent and opens an issue.
+- `test/check_sim_revision.py` (the change-selection job) checks that `SIM_REVISION`
+  is an integer that never goes down.
+- `match verify` of the record must give a `verified` verdict against the checksums
+  its clients reported, in `TurnEngineHarness` and on every platform of the
+  browser/native equivalence job, which also requires their traces to agree.
 
-The golden match covers only what one short Nicowar/Warrush game reaches, so a passing
-check does not prove the simulation is unchanged; bump whenever a change can matter.
+sim-diff's scenarios cover only what they run, so a passing check does not prove
+the simulation is unchanged; bump whenever a change can matter.
 
 [Multiplayer index](README.md) · [Documentation index](../README.md).

@@ -1,12 +1,43 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "OverviewTerrainCache.h"
+#include "TerrainBuiltins.h"
 #include "GlobalContainer.h"
+#include "GraphicContext.h"
 #include "scene/SceneMap.h"
 #include "terrain/TerrainCompositor.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <new>
+#include <limits>
+
+void OverviewTerrainCache::update(const SceneMap &map, int left, int top, int right, int bottom,
+								  int vx, int vy, Uint32 visibleTeams, bool wholeMap,
+								  GAGCore::DrawableSurface &target)
+{
+	Output next{
+		.x = (left + vx) & map.getMaskW(),
+		.y = (top + vy) & map.getMaskH(),
+		.columns = right - left + 1,
+		.rows = bottom - top + 1,
+		.seed = map.terrainSeed(),
+		.visibleTeams = wholeMap ? 0u : visibleTeams,
+		.wholeMap = wholeMap,
+		.terrainRevision = map.terrainRevision(),
+		.resourceRevision = map.resourcePresentationRevision(),
+		.discoveryRevision = wholeMap ? 0 : map.discoveryRevision(),
+		.surfaceIdentity = target.lifetimeIdentity(),
+		.surfaceRevision = target.contentRevision(),
+	};
+	if (output == next && mapIdentity == map.identity() && terrain == map.frozenTerrainRegistry() &&
+		resources == map.frozenResourceRegistry() && assets == map.frozenAssetBundle())
+		return;
+	output.reset();
+	copy(map, left, top, right, bottom, vx, vy, visibleTeams, wholeMap, target.getSDLSurface());
+	target.markPixelsChanged();
+	next.surfaceRevision = target.contentRevision();
+	output = next;
+}
 
 void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int right, int bottom,
 								int vx, int vy, Uint32 visibleTeams, bool wholeMap,
@@ -31,29 +62,22 @@ void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int righ
 		for (int cx = chunkOf(left + vx); cx <= chunkOf(right + vx); ++cx)
 		{
 			const int wx = (cx * Tiles) & map.getMaskW(), wy = (cy * Tiles) & map.getMaskH();
-			Page *page = nullptr;
-			for (auto &candidate : pages)
-				if (candidate->x == wx && candidate->y == wy)
-				{
-					page = candidate.get();
-					break;
-				}
-			if (!page)
+			const auto key = std::size_t(wy) * map.getW() + wx;
+			auto found = pages.find(key);
+			if (found == pages.end())
 			{
 				if ((pages.size() + 1) * PageBytes > Budget)
 					pages.erase(std::min_element(pages.begin(), pages.end(),
 												 [](const auto &a, const auto &b)
-												 { return a->used < b->used; }));
-				auto candidate = std::make_unique<Page>();
-				candidate->x = wx;
-				candidate->y = wy;
-				candidate->pixels.reset(
+												 { return a.second.used < b.second.used; }));
+				Page candidate;
+				candidate.pixels.reset(
 					SDL_CreateSurface(Pixels, Pixels, SDL_PIXELFORMAT_ARGB8888));
-				if (!candidate->pixels)
+				if (!candidate.pixels)
 					throw std::bad_alloc();
-				page = candidate.get();
-				pages.push_back(std::move(candidate));
+				found = pages.emplace(key, std::move(candidate)).first;
 			}
+			auto *page = &found->second;
 			page->used = ++use;
 			std::array<Uint32, (Tiles + 3) * (Tiles + 3)> vertices{};
 			for (int y = -1; y <= Tiles + 1; ++y)
@@ -61,8 +85,16 @@ void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int righ
 					vertices[(y + 1) * (Tiles + 3) + x + 1] = map.vertexTerrainAt(wx + x, wy + y);
 			const bool changed =
 				!page->valid || page->seed != map.terrainSeed() || page->vertices != vertices;
-			for (int y = 0; y < Tiles; ++y)
-				for (int x = 0; x < Tiles; ++x)
+			const int x0 = std::max(left + vx, cx * Tiles),
+					  x1 = std::min(right + vx + 1, (cx + 1) * Tiles);
+			const int y0 = std::max(top + vy, cy * Tiles),
+					  y1 = std::min(bottom + vy + 1, (cy + 1) * Tiles);
+			// Keep unseen cells invalid after an edit. A pan can fill them on demand
+			// without recomposing the already visible portion of this page.
+			if (changed)
+				page->resources.fill(std::numeric_limits<int>::min());
+			for (int y = y0 - cy * Tiles; y < y1 - cy * Tiles; ++y)
+				for (int x = x0 - cx * Tiles; x < x1 - cx * Tiles; ++x)
 				{
 					const int mx = wx + x, my = wy + y, i = y * Tiles + x;
 					const auto &resource = map.getResource(mx, my);
@@ -72,7 +104,7 @@ void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int righ
 																		  my + 1, visibleTeams))
 							? resource.type
 							: NO_RES_TYPE;
-					if (!changed && page->resources[i] == type)
+					if (page->resources[i] == type)
 						continue;
 					const auto corners = map.cellCorners(mx, my);
 					std::array<std::array<unsigned char, 3>, 4> colors{};
@@ -87,7 +119,7 @@ void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int righ
 							anyCustom = true;
 						}
 					auto *pixels = page->pixels.get();
-					compositor.composeOverview(compositor.describe(map, mx, my), pixels,
+					compositor.composeOverview(compositor.describeOverview(map, mx, my), pixels,
 											   x * Samples, y * Samples,
 											   anyCustom ? &custom : nullptr);
 					if (type != NO_RES_TYPE)
@@ -115,10 +147,6 @@ void OverviewTerrainCache::copy(const SceneMap &map, int left, int top, int righ
 			page->vertices = vertices;
 			page->seed = map.terrainSeed();
 			page->valid = true;
-			const int x0 = std::max(left + vx, cx * Tiles),
-					  x1 = std::min(right + vx + 1, (cx + 1) * Tiles);
-			const int y0 = std::max(top + vy, cy * Tiles),
-					  y1 = std::min(bottom + vy + 1, (cy + 1) * Tiles);
 			for (int y = 0; y < (y1 - y0) * Samples; ++y)
 				std::memcpy(static_cast<Uint8 *>(target->pixels) +
 								((y0 - vy - top) * Samples + y) * target->pitch +

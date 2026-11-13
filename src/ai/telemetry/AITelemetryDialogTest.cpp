@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "AI.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
+#include "DrawFixtures.h"
 #include "GameGUIDialog.h"
 #include "UIRecordingCanvas.h"
 #include "ScopedEnvironment.h"
@@ -11,6 +16,7 @@
 #include <algorithm>
 #include <iomanip>
 #include <sstream>
+#include "render/scene/SceneExtract.h"
 
 using namespace GAGGUI::ui;
 using namespace GAGCore;
@@ -121,7 +127,7 @@ TEST_CASE("telemetry layout and painting stay bounded with full schemas" *
 			if (i >= AITelemetry::OrderTypes && i < AITelemetry::Specific)
 				continue;
 			const auto &field = schema[i];
-			maxima.push_back({field.name, "na", field.unit, field.meaning, 128});
+			maxima.push_back({std::string(field.name), "na", std::string(field.unit), std::string(field.meaning), 128});
 		}
 		CHECK(maxima.size() > 600);
 		CHECK(measure(std::move(maxima)) < small * 4);

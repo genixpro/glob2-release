@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "TerrainMaterials.h"
+#include "TerrainBuiltins.h"
+#include "map/TerrainGroupTable.h"
 #include "map/TerrainPresentation.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -97,7 +99,7 @@ Catalog Catalog::parse(const nlohmann::json &j)
 					std::count(c.compiledPack.begin(), c.compiledPack.end(), '/') >= 3,
 				"compiled pack must name atlas.json in its own data subdirectory");
 	}
-	const int version = integerInRange(j.at("version"), 1, 3);
+	const int version = integerInRange(j.at("version"), 1, 4);
 	c.version = version;
 	if (j.contains("boundary_warp_q8"))
 	{
@@ -108,16 +110,57 @@ Catalog Catalog::parse(const nlohmann::json &j)
 		for (int i = 0; i < 3; ++i)
 			c.boundaryWarp[i] = integerInRange(warp[i], 0, limits[i]);
 	}
-	require(j.at("profiles").is_array() && !j.at("profiles").empty(), "missing boundary profiles");
 	std::set<std::string> keys;
+	require(version >= 4 || !j.contains("border_classes"), "border classes require catalog version 4");
+	if (version >= 4)
+	{
+		const auto &classes = j.at("border_classes");
+		require(classes.is_array() && !classes.empty() && classes.size() < 256,
+				"version 4 catalogs need border classes");
+		for (const auto &entry : classes)
+		{
+			BorderClass v{entry.at("key").get<std::string>()};
+			require(!v.key.empty() && keys.insert(v.key).second, "duplicate border class");
+			const auto shoreline = entry.value("shoreline", nlohmann::json(false));
+			require(shoreline.is_boolean(), "border class shoreline must be a boolean");
+			v.shoreline = shoreline.get<bool>();
+			const auto cuts = entry.value("cuts_stones", nlohmann::json(false));
+			require(cuts.is_boolean(), "border class cuts_stones must be a boolean");
+			v.cutsStones = cuts.get<bool>();
+			c.borderClasses.push_back(std::move(v));
+		}
+		keys.clear();
+	}
+	require(j.at("profiles").is_array() && !j.at("profiles").empty(), "missing boundary profiles");
 	for (const auto &p : j.at("profiles"))
 	{
-		Profile v{p.at("key").get<std::string>(), integerInRange(p.at("roughness_q8"), 0, 512)};
-		v.legacyEdges = version == 1;
 		const auto shape = p.value("shape", std::string{"patch"});
-		require(shape == "patch" || shape == "contextual", "unknown boundary shape");
+		require(shape == "patch" || shape == "contextual" || shape == "smooth", "unknown boundary shape");
 		require(version >= 3 || shape == "patch", "contextual shape requires catalog version 3");
-		v.contextual = shape == "contextual";
+		require(version >= 4 || shape != "smooth", "smooth shape requires catalog version 4");
+		const bool smooth = shape == "smooth";
+		// Smooth geometry has no authored roughness or contour tables; patch
+		// fallbacks beside it draw straight, warped edges.
+		Profile v{p.at("key").get<std::string>()};
+		v.roughness = integerInRange(smooth ? p.value("roughness_q8", nlohmann::json(0)) : p.at("roughness_q8"), 0, 512);
+		v.legacyEdges = version == 1;
+		v.shape = shape == "smooth" ? BoundaryShape::Smooth
+			: shape == "contextual" ? BoundaryShape::Contextual : BoundaryShape::Patch;
+		for (const char *field : {"precedence", "coast"})
+			require(version >= 4 || !p.contains(field), "precedence and coast require catalog version 4");
+		v.precedence = integerInRange(p.value("precedence", nlohmann::json(0)), 0, 255);
+		// Version 4 draws every contact with smooth geometry, so any profile may
+		// set its parameters; earlier catalogs reserve them for smooth profiles.
+		for (const char *field : {"wiggle_q8", "wiggle_period", "squareness_q8"})
+			require(smooth || version >= 4 || !p.contains(field), "wiggle requires the smooth shape");
+		for (const char *field : {"detail_q8", "jagged_q8"})
+			require(version >= 4 || !p.contains(field), "detail and jagged require catalog version 4");
+		v.wiggle = integerInRange(p.value("wiggle_q8", nlohmann::json(0)), 0, 2048);
+		v.wigglePeriod = integerInRange(p.value("wiggle_period", nlohmann::json(64)), 32, 256);
+		v.squareness = integerInRange(p.value("squareness_q8", nlohmann::json(0)), 0, 256);
+		v.detail = integerInRange(p.value("detail_q8", nlohmann::json(0)), 0, 1024);
+		v.jagged = integerInRange(p.value("jagged_q8", nlohmann::json(0)), 0, 2048);
+		require((v.wigglePeriod & (v.wigglePeriod - 1)) == 0, "wiggle period must be a power of two");
 		require(version >= 2 || !p.contains("feather_q8"),
 				"boundary feather requires catalog version 2");
 		v.feather = integerInRange(p.value("feather_q8", nlohmann::json(256)), 128, 512);
@@ -127,8 +170,78 @@ Catalog Catalog::parse(const nlohmann::json &j)
 		v.amplitude = integerInRange(p.value("amplitude_q8", nlohmann::json(512)), 0, 1024);
 		v.speckle = integerInRange(p.value("speckle_q8", nlohmann::json(0)), 0, 1024);
 		v.bridge = integerInRange(p.value("bridge_q8", nlohmann::json(0)), 0, 1024);
+		for (const char *field : {"teeth_q8", "teeth_form", "facets", "clasts"})
+			require(version >= 4 || !p.contains(field), "teeth, facets and clasts require catalog version 4");
+		v.teeth = integerInRange(p.value("teeth_q8", nlohmann::json(0)), 0, 2560);
+		const auto form = p.value("teeth_form", std::string{"points"});
+		require(form == "points" || form == "lobes", "teeth form must be points or lobes");
+		v.lobes = form == "lobes";
+		const auto facets = p.value("facets", nlohmann::json(false));
+		require(facets.is_boolean(), "facets must be a boolean");
+		v.facets = facets.get<bool>();
+		const auto clasts = p.value("clasts", std::string{"none"});
+		require(clasts == "none" || clasts == "round" || clasts == "angular", "clasts must be none, round or angular");
+		v.clasts = clasts == "round" ? Profile::Clasts::Round
+			: clasts == "angular" ? Profile::Clasts::Angular : Profile::Clasts::None;
 		v.shearScale = version >= 3 ? 256 : 128;
+		// A version-4 rough profile without smooth parameters takes them from its
+		// contour strength (amplitude times roughness): a quarter as the broad
+		// meander, an eighth as fine detail, and fractal grit that grows with
+		// roughness again, so rock breaks up most and a beach is only pebbly. A profile
+		// without roughness (foliage that hides its own edge) gets square corners.
+		if (version >= 4 && !smooth && !p.contains("wiggle_q8"))
+		{
+			const int strength = v.amplitude * v.roughness / 256;
+			v.wiggle = std::min(2048, strength / 4);
+			if (!p.contains("detail_q8")) v.detail = std::min(1024, strength / 8);
+			if (!p.contains("jagged_q8")) v.jagged = std::min(2048, strength * (v.roughness + 256) / 512);
+			if (!p.contains("squareness_q8") && !v.roughness) v.squareness = 256;
+			// Teeth carry most of a rough edge's shape, at half a tile and below.
+			// Resistant edges (roughness from 320) break into straight facets and
+			// angular chips; softer ones scatter rounded grains.
+			if (!p.contains("teeth_q8")) v.teeth = std::min(2560, strength * 2);
+			if (!p.contains("facets")) v.facets = v.roughness >= 320;
+			if (!p.contains("clasts") && v.speckle)
+				v.clasts = v.facets ? Profile::Clasts::Angular : Profile::Clasts::Round;
+		}
+		// Physical properties: what the edge family is made of decides the shape
+		// of its contacts, so a new terrain names a handful of physical numbers
+		// instead of tuning contour parameters. Explicit parameters still win.
+		for (const char *field : {"resistance_q8", "cohesion_q8", "grain_q8", "spread_q8"})
+		{
+			require(version >= 4 || !p.contains(field), "physical properties require catalog version 4");
+			v.physical |= p.contains(field);
+		}
+		v.resistance = integerInRange(p.value("resistance_q8", nlohmann::json(0)), 0, 256);
+		v.cohesion = integerInRange(p.value("cohesion_q8", nlohmann::json(0)), 0, 256);
+		v.grain = integerInRange(p.value("grain_q8", nlohmann::json(0)), 0, 1024);
+		v.spread = integerInRange(p.value("spread_q8", nlohmann::json(0)), 0, 256);
+		if (v.physical)
+		{
+			// Resistant, cohesive material keeps a rough edge; loose material is
+			// smoothed into arcs. Teeth run from 1.5 to 10.5 pixels.
+			const int rough = (v.resistance + v.cohesion) / 2;
+			const auto unset = [&](const char *field) { return !p.contains(field); };
+			if (unset("teeth_q8")) v.teeth = 384 + 9 * rough;
+			if (unset("teeth_form")) v.lobes = v.spread >= 128; // An advancing flow.
+			if (unset("facets")) v.facets = v.resistance >= 128; // Brittle material breaks straight.
+			if (unset("jagged_q8")) v.jagged = 256 + 6 * v.resistance;
+			if (unset("wiggle_q8")) v.wiggle = v.teeth / 8;
+			if (unset("detail_q8")) v.detail = v.teeth / 16;
+			if (unset("speckle_q8")) v.speckle = v.grain;
+			if (unset("clasts"))
+				v.clasts = !v.grain ? Profile::Clasts::None
+					: v.facets ? Profile::Clasts::Angular : Profile::Clasts::Round;
+			// The more resistant material shapes a contact within its class.
+			if (unset("precedence")) v.precedence = std::min(255, v.resistance);
+		}
 		require(!v.key.empty() && keys.insert(v.key).second, "duplicate boundary profile");
+		if (smooth && !p.contains("contours_q12"))
+		{
+			v.contours.assign(4, std::vector<int>(5, 0));
+			c.profiles.push_back(std::move(v));
+			continue;
+		}
 		const auto &curves = p.at("contours_q12");
 		require(curves.is_array() && (version >= 3 ? curves.size() >= 4 && curves.size() <= 64
 												   : curves.size() == 4),
@@ -156,6 +269,12 @@ Catalog Catalog::parse(const nlohmann::json &j)
 				return i;
 		throw std::runtime_error("Terrain tileset: unknown profile " + key);
 	};
+	for (unsigned i = 0; i < c.profiles.size(); ++i)
+		if (const auto &p = j.at("profiles")[i]; p.contains("coast"))
+		{
+			c.profiles[i].coast = int(findProfile(p.at("coast").get<std::string>()));
+			require(c.profiles[i].coast != int(i), "a profile cannot be its own coast");
+		}
 	keys.clear();
 	require(j.at("materials").is_array() && !j.at("materials").empty() &&
 				j.at("materials").size() < 65536,
@@ -167,7 +286,17 @@ Catalog Catalog::parse(const nlohmann::json &j)
 		v.sprite = dataPath(m.at("sprite"));
 		require(!v.key.empty() && keys.insert(v.key).second, "duplicate material key");
 		v.salt = keyHash(v.key);
+		v.blockSalt = v.salt;
 		v.profile = findProfile(m.at("profile"));
+		require(version >= 4 || !m.contains("class"), "border classes require catalog version 4");
+		if (version >= 4)
+		{
+			const auto key = m.at("class").get<std::string>();
+			const auto found = std::find_if(c.borderClasses.begin(), c.borderClasses.end(),
+				[&](const auto &entry) { return entry.key == key; });
+			require(found != c.borderClasses.end(), "unknown border class");
+			v.borderClass = unsigned(found - c.borderClasses.begin());
+		}
 		// Water is an ordinary (animated) tile material; the scrolling ocean
 		// backdrop and per-material backdrops were retired.
 		require(!m.contains("ocean") && !m.contains("backdrop"),
@@ -182,19 +311,94 @@ Catalog Catalog::parse(const nlohmann::json &j)
 			require((v.variantGrid & (v.variantGrid - 1)) == 0, "variant_grid must be a power of two");
 			require(v.periodicEdges, "variant_grid requires periodic edges");
 		}
+		v.variantBlocks = integerInRange(m.value("variant_blocks", nlohmann::json(1)), 1, 16);
+		require(!m.contains("variant_blocks") || v.variantGrid, "variant_blocks requires variant_grid");
+		if (m.contains("stones"))
+		{
+			// The stone map numbers the stones of one variant block.
+			require(version >= 4 && v.variantGrid, "stones require catalog version 4 and a variant_grid");
+			v.stones = dataPath(m.at("stones"));
+		}
+		if (m.contains("variant_block_group"))
+		{
+			const auto &group = m.at("variant_block_group");
+			require(v.variantGrid && group.is_string() && !group.get<std::string>().empty() &&
+					group.get<std::string>().size() <= 64, "variant_block_group requires a grid and a short nonempty key");
+			v.blockSalt = keyHash(group.get<std::string>());
+		}
 		if (m.contains("decor"))
 		{
 			const auto &d = m.at("decor");
 			require(d.is_object(), "decor must be an object");
 			v.decor.sprite = dataPath(d.at("sprite"));
-			for (const auto *key : {"full", "edge"})
+			for (const auto *key : {"full", "edge", "connected", "connected_interior", "connected_foreign"})
 			{
-				auto &frames = std::string(key) == "full" ? v.decor.full : v.decor.edge;
-				require(d.at(key).is_array() && !d.at(key).empty() && d.at(key).size() <= 256,
+				const std::string name = key;
+				if (name.starts_with("connected") && !d.contains(key)) continue;
+				auto &frames = name == "full" ? v.decor.full : name == "edge" ? v.decor.edge :
+					name == "connected" ? v.decor.connected : name == "connected_interior" ?
+					v.decor.connectedInterior : v.decor.connectedForeign;
+				const std::size_t limit = name == "connected_foreign" ? ForeignCodes * 16 : 256;
+				require(d.at(key).is_array() && !d.at(key).empty() && d.at(key).size() <= limit,
 						"decor frames must be a non-empty array");
 				for (const auto &frame : d.at(key))
 					frames.push_back(integerInRange(frame, 0, 65535));
 			}
+			require(v.decor.connected.empty() || v.decor.connected.size() % 16 == 0,
+				"connected decor needs equal variant counts for all 16 corner masks");
+			if (d.contains("connected_corners"))
+			{
+				require(d.at("connected_corners").is_boolean(), "connected_corners must be a boolean");
+				v.decor.connectedCorners = d.at("connected_corners").get<bool>();
+				require(!v.decor.connectedCorners || v.decor.connected.size() == 16 * 16,
+					"connected_corners needs 16 corner-colour variants per mask");
+			}
+			if (d.contains("connected_open"))
+			{
+				require(d.at("connected_open").is_boolean(), "connected_open must be a boolean");
+				v.decor.connectedOpen = d.at("connected_open").get<bool>();
+				require(!v.decor.connectedOpen || !v.decor.connected.empty(),
+					"connected_open needs connected frames");
+			}
+			if (d.contains("connected_tiers"))
+			{
+				require(d.at("connected_tiers").is_boolean(), "connected_tiers must be a boolean");
+				v.decor.connectedTiers = d.at("connected_tiers").get<bool>();
+				require(!v.decor.connectedTiers || v.decor.connectedOpen, "connected_tiers needs connected_open");
+			}
+			if (d.contains("clear_of_masses"))
+			{
+				v.decor.clearOfMasses = integerInRange(d.at("clear_of_masses"), 0, MaxDecorClearOfMasses);
+				// Connected frames expect their neighbours to continue the surface.
+				require(v.decor.connected.empty(), "clear_of_masses is for object decor");
+			}
+			require(v.decor.connectedForeign.empty() ||
+				(v.decor.connectedCorners && v.decor.connectedOpen && v.decor.connectedForeign.size() == ForeignCodes * 16),
+				"connected_foreign needs connected_corners, connected_open and 16 colours per code");
+			require(v.decor.connectedInterior.empty() ||
+				(v.decor.connectedCorners && v.decor.connectedInterior.size() % 16 == 0),
+				"connected_interior needs connected_corners and equal variants per colour");
+		}
+		if (m.contains("overlay"))
+		{
+			const auto &o = m.at("overlay");
+			require(o.is_object(), "overlay must be an object");
+			v.overlay.sprite = dataPath(o.at("sprite"));
+			const auto &cycles = o.at("cycles");
+			require(cycles.is_array() && !cycles.empty() && cycles.size() <= 64,
+					"overlay cycles must be a non-empty array of at most 64 cycles");
+			for (const auto &cycle : cycles)
+			{
+				require(cycle.is_array() && !cycle.empty() && cycle.size() <= 64,
+						"overlay cycle must be a non-empty array of at most 64 steps");
+				auto &steps = v.overlay.cycles.emplace_back();
+				for (const auto &frame : cycle)
+					steps.push_back(integerInRange(frame, -1, 65535));
+				require(std::any_of(steps.begin(), steps.end(), [](int f) { return f >= 0; }),
+						"overlay cycle must draw at least one frame");
+			}
+			v.overlay.ticks = integerInRange(o.value("ticks", nlohmann::json(1)), 1, 65535);
+			v.overlay.densityQ8 = integerInRange(o.value("density_q8", nlohmann::json(256)), 1, 256);
 		}
 		v.animationFrames = integerInRange(m.value("animation_frames", nlohmann::json(1)), 1, 256);
 		v.animationTicks = integerInRange(m.value("animation_ticks", nlohmann::json(1)), 1,
@@ -203,6 +407,11 @@ Catalog Catalog::parse(const nlohmann::json &j)
 			integerInRange(m.value("animation_stride", nlohmann::json(0)), 0, 65535);
 		require(v.animationFrames == 1 || v.animationStride > 0,
 				"animated material needs a frame stride");
+		if (m.contains("animation_blend_steps"))
+		{
+			require(v.animationFrames > 1, "animation_blend_steps needs an animated material");
+			v.animationBlendSteps = integerInRange(m.at("animation_blend_steps"), 1, v.animationTicks);
+		}
 		v.preview = rgbColor(m.at("preview"));
 		v.minimap = rgbColor(m.value("minimap", m.at("preview")));
 		if (m.contains("seam"))
@@ -219,6 +428,33 @@ Catalog Catalog::parse(const nlohmann::json &j)
 			if (s.contains("fringe"))
 				v.seam.fringeColor = rgbColor(s.at("fringe"));
 		}
+		if (m.contains("shore_wash_q8"))
+		{
+			require(version >= 3, "shore_wash_q8 requires catalog version 3");
+			v.shoreWash = integerInRange(m.at("shore_wash_q8"), 0, 256);
+		}
+		if (m.contains("surf"))
+		{
+			require(version >= 3, "surf requires catalog version 3");
+			const auto &s = m.at("surf");
+			require(s.is_object(), "surf must be an object");
+			auto &surf = v.surf;
+			surf.period = integerInRange(s.at("period"), 1, 65535);
+			surf.ticks = integerInRange(s.value("ticks", nlohmann::json(1)), 1, surf.period);
+			surf.reach = integerInRange(s.value("reach_q8", nlohmann::json(0)), 0, 2048);
+			surf.shallow = integerInRange(s.value("shallow_q8", nlohmann::json(0)), 0, 256);
+			surf.shallowWidth =
+				integerInRange(s.value("shallow_width_q8", nlohmann::json(0)), 0, 2048);
+			surf.wet = integerInRange(s.value("wet_q8", nlohmann::json(0)), 0, 256);
+			surf.wetWidth = integerInRange(s.value("wet_width_q8", nlohmann::json(0)), 0, 2048);
+			surf.foam = integerInRange(s.value("foam_q8", nlohmann::json(0)), 0, 256);
+			surf.foamWidth = integerInRange(s.value("foam_width_q8", nlohmann::json(0)), 0, 2048);
+			require(surf.reach + surf.foamWidth <= 2048, "surf must end within eight pixels");
+			if (s.contains("shallow"))
+				surf.shallowColor = rgbColor(s.at("shallow"));
+			if (s.contains("foam"))
+				surf.foamColor = rgbColor(s.at("foam"));
+		}
 		require(m.at("variants").is_array() && !m.at("variants").empty(),
 				"material needs variants");
 		for (const auto &a : m.at("variants"))
@@ -231,8 +467,8 @@ Catalog Catalog::parse(const nlohmann::json &j)
 			v.variants.push_back({frame, unsigned(w)});
 			v.totalWeight += unsigned(w);
 		}
-		require(!v.variantGrid || v.variants.size() == std::size_t(v.variantGrid * v.variantGrid),
-				"variant_grid needs one variant per block cell");
+		require(!v.variantGrid || v.variants.size() == std::size_t(v.variantGrid * v.variantGrid * v.variantBlocks),
+				"variant_grid needs one variant per cell in every block");
 		c.materials.push_back(std::move(v));
 	}
 	require(j.at("bindings").is_object(), "bindings must be an object");
@@ -256,26 +492,6 @@ Catalog Catalog::parse(const nlohmann::json &j)
 	}
 	return c;
 }
-unsigned Catalog::profileFor(MaterialId a, MaterialId b) const
-{
-	auto lo = std::min(a, b), hi = std::max(a, b);
-	for (const auto &p : treatments)
-		if (p.a == lo && p.b == hi)
-			return p.profile;
-	const auto &aa = materials[a], &bb = materials[b];
-	// Stable under manifest reordering, including equal roughness.
-	return profiles[aa.profile].roughness > profiles[bb.profile].roughness ? aa.profile
-		   : profiles[aa.profile].roughness < profiles[bb.profile].roughness
-			   ? bb.profile
-			   : (aa.key < bb.key ? aa.profile : bb.profile);
-}
-bool Catalog::contextualFor(MaterialId a, MaterialId b) const
-{
-	// Both surfaces must opt in: an organic default must not round a road,
-	// boardwalk or sharp hazard just because it has the greater roughness.
-	return a != b && profiles[materials[a].profile].contextual && profiles[materials[b].profile].contextual &&
-		profiles[profileFor(a, b)].contextual;
-}
 std::uint32_t mapSeedSalt(std::uint32_t seed)
 {
 	// Spread the seed before it meets the material and profile salts, so small
@@ -288,7 +504,12 @@ unsigned Catalog::variantIndex(MaterialId id, int x, int y, std::uint32_t seed) 
 	if (m.variantGrid)
 	{
 		const unsigned mask = unsigned(m.variantGrid) - 1;
-		return (unsigned(y) & mask) * unsigned(m.variantGrid) + (unsigned(x) & mask);
+		const unsigned cell = (unsigned(y) & mask) * unsigned(m.variantGrid) + (unsigned(x) & mask);
+		if (m.variantBlocks == 1) return cell;
+		// Unsigned floor-block coordinates also handle negative presentation coordinates.
+		const unsigned block = hash(unsigned(x) / unsigned(m.variantGrid), unsigned(y) / unsigned(m.variantGrid),
+									m.blockSalt ^ mapSeedSalt(seed) ^ 0xb10c4a7du) % unsigned(m.variantBlocks);
+		return block * unsigned(m.variantGrid * m.variantGrid) + cell;
 	}
 	unsigned n = hash(x, y, m.salt ^ mapSeedSalt(seed)) % m.totalWeight;
 	for (unsigned i = 0; i < m.variants.size(); ++i)
@@ -299,14 +520,171 @@ unsigned Catalog::variantIndex(MaterialId id, int x, int y, std::uint32_t seed) 
 	}
 	return unsigned(m.variants.size() - 1);
 }
-int Catalog::decorFrame(MaterialId id, int x, int y, bool edge, std::uint32_t seed) const
+unsigned cornerColours(int x, int y, unsigned maskW, unsigned maskH, std::uint32_t seed)
+{
+	const auto salt = mapSeedSalt(seed) ^ 0xca70b1u;
+	const auto bit = [&](unsigned vx, unsigned vy) { return hash(vx & maskW, vy & maskH, salt) >> 16 & 1u; };
+	const unsigned ux = unsigned(x), uy = unsigned(y);
+	return bit(ux, uy) | bit(ux + 1, uy) << 1 | bit(ux, uy + 1) << 2 | bit(ux + 1, uy + 1) << 3;
+}
+int Catalog::decorFrame(MaterialId id, int x, int y, bool edge, std::uint32_t seed, unsigned cornerMask,
+	unsigned colours) const
 {
 	const auto &d = materials[id].decor;
+	if (!d.connected.empty())
+	{
+		if (cornerMask == 0 || cornerMask > 15) return -1;
+		if (cornerMask == 15 && !d.connectedInterior.empty())
+		{
+			// Interiors never reach a cell edge, so filled cells choose freely.
+			const unsigned extra = unsigned(d.connectedInterior.size()) / 16;
+			if (const unsigned v = hash(x, y, mapSeedSalt(seed) ^ 0x1e7e10u) % (extra + 1))
+				return d.connectedInterior[(colours & 15u) * extra + v - 1];
+		}
+		const unsigned variants = unsigned(d.connected.size()) / 16;
+		const unsigned variant = d.connectedCorners ? colours & 15u :
+			hash(x, y, materials[id].salt ^ mapSeedSalt(seed) ^ 0x6dec0u) % variants;
+		return d.connected[cornerMask * variants + variant];
+	}
 	const auto &frames = edge ? d.edge : d.full;
 	if (frames.empty())
 		return -1;
 	// A salt distinct from the ground variant's, so the two choices are independent.
 	return frames[hash(x, y, materials[id].salt ^ mapSeedSalt(seed) ^ 0x6dec0u) % frames.size()];
+}
+int foreignCodeIndex(unsigned ownMask, unsigned foreignMask)
+{
+	if (!(ownMask & 15u) || !(foreignMask & 15u) || (ownMask & foreignMask))
+		return -1;
+	unsigned code = 0, scale = 1;
+	for (unsigned k = 0; k < 4; ++k, scale *= 3)
+		code += scale * (ownMask >> k & 1u ? 1u : foreignMask >> k & 1u ? 2u : 0u);
+	// Rank among the codes that have both an own and a foreign corner.
+	int index = 0;
+	for (unsigned c = 0; c < code; ++c)
+	{
+		bool own = false, foreign = false;
+		for (unsigned k = 0, s = 1; k < 4; ++k, s *= 3)
+			own |= c / s % 3 == 1, foreign |= c / s % 3 == 2;
+		index += own && foreign;
+	}
+	return index;
+}
+int Catalog::decorForeignFrame(MaterialId id, unsigned ownMask, unsigned foreignMask, unsigned colours) const
+{
+	const auto &d = materials[id].decor;
+	const int code = foreignCodeIndex(ownMask, foreignMask);
+	if (d.connectedForeign.empty() || code < 0)
+		return -1;
+	return d.connectedForeign[unsigned(code) * 16 + (colours & 15u)];
+}
+int Catalog::overlayFrame(MaterialId id, int x, int y, std::uint32_t time, std::uint32_t seed, bool *animated) const
+{
+	if (animated) *animated = false;
+	const auto &o = materials[id].overlay;
+	if (o.cycles.empty())
+		return -1;
+	// Distinct salts keep the chosen cells, their cycles and their phases independent.
+	const std::uint32_t salt = materials[id].salt ^ mapSeedSalt(seed);
+	if (int(hash(x, y, salt ^ 0x6a1170u) & 255u) >= o.densityQ8)
+		return -1;
+	const auto &cycle = o.cycles[hash(x, y, salt ^ 0x6a1171u) % o.cycles.size()];
+	if (animated) *animated = cycle.size() > 1;
+	const std::uint32_t step = time / std::uint32_t(o.ticks) + hash(x, y, salt ^ 0x6a1172u);
+	return cycle[step % cycle.size()];
+}
+namespace
+{
+// Smooth periodic bump: 0 at u = 0 and 1024, 256 at u = 512.
+int surfBump(int u)
+{
+	const int x = u < 512 ? u : 1024 - u;
+	return x * x * (1536 - 2 * x) / 524288;
+}
+unsigned surfMix(unsigned value, unsigned color, int amount)
+{
+	return (value * unsigned(256 - amount) + color * unsigned(amount)) / 256;
+}
+} // namespace
+unsigned shoreCalmAt(int d2)
+{
+	if (d2 <= 0)
+		return 0;
+	// Q8 distance from the shoreline, halfway to the nearest land vertex.
+	const double shore = std::sqrt(double(d2)) * 256 - 128;
+	if (shore >= ShoreCalmReachQ8)
+		return 0;
+	const double t = std::max(0.0, shore) / ShoreCalmReachQ8;
+	return unsigned(std::lround(255 * (1 - t * t * (3 - 2 * t))));
+}
+unsigned shoreCalm(const std::array<std::uint8_t, 4> &c, unsigned fx, unsigned fy)
+{
+	return (c[0] * (256 - fx) * (256 - fy) + c[1] * fx * (256 - fy) + c[2] * (256 - fx) * fy +
+			c[3] * fx * fy + 32768) >> 16;
+}
+void applyShoreCalm(unsigned calm, unsigned strength, const std::array<unsigned char, 3> &mean,
+					unsigned rgb[3])
+{
+	const unsigned keep = 256 - calm * strength / 255;
+	for (int k = 0; k < 3; ++k)
+		rgb[k] = (rgb[k] * keep + mean[k] * (256 - keep) + 128) / 256;
+}
+void applySurf(const Surf &s, bool surfSide, int margin, int wx, int wy, unsigned time,
+			   unsigned value[3], int land)
+{
+	// Beyond every band (most samples of a mixed cell) surf changes nothing.
+	if (margin >= (surfSide ? std::max(s.shallowWidth, s.foamWidth) : std::max(s.wetWidth, s.reach + s.foamWidth)))
+		return;
+	// A slow world-space field staggers each wash along the shore. Its
+	// wavelengths (256 and 512 pixels) divide every map, so it wraps cleanly.
+	// The wash advances in whole steps of `ticks`, matching its page re-blends.
+	time -= time % unsigned(s.ticks);
+	const int phase = int(time % unsigned(s.period) * 1024 / unsigned(s.period));
+	const int offset = surfBump(wx >> 7 & 1023) + surfBump(wy >> 7 & 1023) +
+					   surfBump((wx + wy) >> 6 & 1023);
+	const int u = (phase + offset) & 1023;
+	// The wash rushes up over the first 30% of its period and drains slowly.
+	constexpr int in = SurfWashInQ10;
+	const int rise = u < in ? u * 512 / in : 512 + (u - in) * 512 / (1024 - in);
+	const int run = s.reach * surfBump(rise) / 256 * land / 256;
+	for (int k = 0; k < 3; ++k)
+		value[k] = std::min(value[k], 255u);
+	int front;
+	if (surfSide)
+	{
+		if (margin < s.shallowWidth)
+		{
+			const int amount = s.shallow * (s.shallowWidth - margin) / s.shallowWidth;
+			for (int k = 0; k < 3; ++k)
+				value[k] = surfMix(value[k], s.shallowColor[k], amount);
+		}
+		front = margin + run;
+	}
+	else
+	{
+		if (margin < s.wetWidth)
+		{
+			const int dark = 256 - s.wet * (s.wetWidth - margin) / s.wetWidth;
+			for (int k = 0; k < 3; ++k)
+				value[k] = value[k] * unsigned(dark) / 256;
+		}
+		// A thin sheet of water covers the land the wash has reached.
+		if (margin < run)
+		{
+			const int amount = s.shallow * (run - margin) / (2 * run);
+			for (int k = 0; k < 3; ++k)
+				value[k] = surfMix(value[k], s.shallowColor[k], amount);
+		}
+		front = margin < run ? run - margin : margin - run;
+	}
+	if (front < s.foamWidth)
+	{
+		const int breakup = 96 + (surfBump(wx * 5 >> 7 & 1023) +
+								  surfBump(((wy * 7 >> 7) + phase) & 1023)) * 160 / 512;
+		const int amount = s.foam * (s.foamWidth - front) / s.foamWidth * breakup / 256;
+		for (int k = 0; k < 3; ++k)
+			value[k] = surfMix(value[k], s.foamColor[k], amount);
+	}
 }
 int Catalog::frame(MaterialId id, int x, int y, int time, std::uint32_t seed) const
 {
@@ -510,16 +888,113 @@ void PreparedCoverage::prepareBorders(const Catalog &c, const Recipe &r)
 		border.ordinate[coordinate] = secondary(p) + t * ds;
 		border.normal[coordinate] = std::abs(dp) / std::sqrt(dp * dp + ds * ds);
 	}
+	if (edgeMetadata)
+		prepareNearestSegments();
 	hasBorder = true;
 }
 
+namespace
+{
+// Squared distance from a sample to one contour segment.
+float segmentDistance(float px, float py, float qx, float qy, float x, float y)
+{
+	const float ex = qx - px, ey = qy - py, length = ex * ex + ey * ey;
+	const float t = length > 0 ? std::clamp(((x - px) * ex + (y - py) * ey) / length, 0.f, 1.f) : 0.f;
+	const float cx = px + t * ex - x, cy = py + t * ey - y;
+	return cx * cx + cy * cy;
+}
+} // namespace
+void PreparedCoverage::prepareNearestSegments()
+{
+	// A lattice point lies within 1.5 pixels of every sample in its squares,
+	// so any segment within eight pixels of a sample is within 9.5 of a corner.
+	constexpr float reach = 9.5f;
+	std::array<float, NearestLattice * NearestLattice> best;
+	best.fill(reach * reach);
+	nearestSegment.fill(0);
+	const auto &points = naturalBorder.points;
+	for (unsigned i = 1; i < points.size(); ++i)
+	{
+		const auto p = points[i - 1], q = points[i];
+		const auto lattice = [](float v, bool up)
+		{ return std::clamp(int(up ? std::ceil((v + 4) / 2) : std::floor((v + 4) / 2)), 0, NearestLattice - 1); };
+		const int x0 = lattice(std::min(p.x, q.x) - reach, false), x1 = lattice(std::max(p.x, q.x) + reach, true);
+		const int y0 = lattice(std::min(p.y, q.y) - reach, false), y1 = lattice(std::max(p.y, q.y) + reach, true);
+		for (int y = y0; y <= y1; ++y)
+			for (int x = x0; x <= x1; ++x)
+			{
+				const int k = y * NearestLattice + x;
+				const float d = segmentDistance(p.x, p.y, q.x, q.y, float(2 * x - 4), float(2 * y - 4));
+				if (d < best[k]) { best[k] = d; nearestSegment[k] = std::uint8_t(i); }
+			}
+	}
+}
+unsigned PreparedCoverage::borderMargin(Point sample) const
+{
+	// Euclidean distance to the contour polyline in Q8 pixels. Every seam and
+	// surf band ends within eight pixels; beyond that the margin is saturated.
+	const int x = std::clamp(int(std::floor((sample.x + 4) / 2)), 0, NearestLattice - 2);
+	const int y = std::clamp(int(std::floor((sample.y + 4) / 2)), 0, NearestLattice - 2);
+	unsigned low = 255, high = 0;
+	for (const int k : {y * NearestLattice + x, y * NearestLattice + x + 1,
+			(y + 1) * NearestLattice + x, (y + 1) * NearestLattice + x + 1})
+		if (nearestSegment[k])
+		{
+			low = std::min<unsigned>(low, nearestSegment[k]);
+			high = std::max<unsigned>(high, nearestSegment[k]);
+		}
+	if (!high) return 65535;
+	const auto &points = naturalBorder.points;
+	float best = 64;
+	for (unsigned i = std::max(1u, low - 1); i <= std::min<unsigned>(points.size() - 1, high + 1); ++i)
+		best = std::min(best, segmentDistance(points[i - 1].x, points[i - 1].y, points[i].x, points[i].y,
+			sample.x, sample.y));
+	return best >= 64 ? 65535u : unsigned(std::sqrt(best) * 256);
+}
 Coverage PreparedCoverage::at(int px, int py) const
 {
+	if (smooth.inactive())
+		return roughCoverage(px, py);
+	if (smooth.complete())
+		return smooth.at(px, py);
+	const int share = smooth.share(px, py);
+	if (share <= 0)
+		return roughCoverage(px, py);
+	if (share >= 4096)
+		return smooth.at(px, py);
+	// Between a smooth region and its rougher surroundings the vertex shares
+	// fade one geometry into the other; both are continuous across tiles.
+	const auto fine = smooth.at(px, py), rough = roughCoverage(px, py);
+	Coverage out;
+	unsigned count = 0;
+	const auto add = [&](MaterialId material, std::uint64_t weight)
+	{
+		unsigned slot = 0;
+		while (slot < count && out.material[slot] != material)
+			++slot;
+		if (slot == count)
+			out.material[count++] = material;
+		out.weight[slot] += unsigned(weight);
+	};
+	for (unsigned i = 0; i < 4; ++i)
+	{
+		if (fine.weight[i]) add(fine.material[i], std::uint64_t(fine.weight[i]) * unsigned(share) / 4096);
+		if (rough.weight[i]) add(rough.material[i], std::uint64_t(rough.weight[i]) * unsigned(4096 - share) / 4096);
+	}
+	unsigned sum = 0, largest = 0;
+	for (unsigned i = 0; i < count; ++i)
+	{
+		sum += out.weight[i];
+		if (out.weight[i] > out.weight[largest]) largest = i;
+	}
+	out.weight[largest] += 65536 - sum;
+	out.margin = (fine.margin * unsigned(share) + rough.margin * unsigned(4096 - share)) / 4096;
+	out.neighbor = share >= 2048 ? fine.neighbor : rough.neighbor;
+	return out;
+}
+Coverage PreparedCoverage::roughCoverage(int px, int py) const
+{
 	if (!hasBorder) return patchCoverage(px, py);
-	// Keep historical crossings and feather weights in a 1px seam band. Blend
-	// to the contextual geometry by 4px; this also joins complex junctions.
-	const int edgeDistance = std::min({px, py, 8192 - px, 8192 - py});
-	if (edgeDistance <= 256) return patchCoverage(px, py);
 	int dx = 0, dy = 0;
 	for (const auto &layer : warp)
 	{
@@ -532,6 +1007,17 @@ Coverage PreparedCoverage::at(int px, int py) const
 	const float warpScale = warpSquared > 1536 * 1536 ? 512 / std::sqrt(warpSquared) : 1.f / 3;
 	const Point sample{float(px) / 256 + dx * warpScale / 256,
 		float(py) / 256 + dy * warpScale / 256};
+	// Keep historical crossings and feather weights in a 1px seam band. Blend
+	// to the contextual geometry by 4px; this also joins complex junctions.
+	// The seam distance always comes from the curve, so seams and surf bands
+	// stay continuous through both.
+	const int edgeDistance = std::min({px, py, 8192 - px, 8192 - py});
+	if (edgeDistance <= 256)
+	{
+		auto band = patchCoverage(px, py);
+		if (edgeMetadata) band.margin = borderMargin(sample);
+		return band;
+	}
 	const auto &border = naturalBorder;
 	const float coordinate = std::clamp(border.vertical ? sample.y : sample.x, 0.f, 32.f);
 	const unsigned index = std::min(unsigned(coordinate), 31u);
@@ -562,7 +1048,7 @@ Coverage PreparedCoverage::at(int px, int py) const
 	result.weight[0] = unsigned(std::clamp(32768.f + signedDistance * borderBlendScale, 0.f, 65536.f));
 	result.weight[1] = 65536 - result.weight[0];
 	result.neighbor = borderMaterials[result.weight[0] >= result.weight[1] ? 1 : 0];
-	result.margin = unsigned(std::min(65535.f, std::abs(signedDistance) * 256));
+	if (edgeMetadata) result.margin = borderMargin(sample);
 	if (edgeDistance < 1024)
 	{
 		const std::array<int, 2> displacement{dx, dy};
@@ -574,14 +1060,15 @@ Coverage PreparedCoverage::at(int px, int py) const
 		blend = int(std::int64_t(blend) * blend * (12288 - 2 * blend) >> 24);
 		result.weight[0] = (std::uint64_t(result.weight[0]) * blend + std::uint64_t(oldA) * (4096 - blend)) / 4096;
 		result.weight[1] = 65536 - result.weight[0];
-		result.margin = (result.margin * blend + old.margin * (4096 - blend)) / 4096;
 		result.neighbor = borderMaterials[result.weight[0] >= result.weight[1] ? 1 : 0];
 	}
 	return result;
 }
 
-PreparedCoverage::PreparedCoverage(const Catalog &c, const Recipe &r)
+PreparedCoverage::PreparedCoverage(const Catalog &c, const Recipe &r, Detail detail)
+	: edgeMetadata(detail == Detail::Surface)
 {
+	smooth.prepare(c, r);
 	prepareBorders(c, r);
 	// A single world-space field bends the complete material partition. Using
 	// different fields per material would pull junctions apart. Hash only grid

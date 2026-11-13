@@ -1,0 +1,381 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+
+namespace GAGCore
+{
+inline constexpr const char *DirectTerrainFragment = R"(
+#ifdef DIRECT_TERRAIN_PACKED
+in vec2 world;
+out vec4 terrainColor;
+#else
+varying vec2 world;
+#define terrainColor gl_FragColor
+#endif
+uniform sampler2D cells, coverageIndex, art, coverage, edges, variants, discovery, shoreCalm;
+uniform vec2 mapSize, artSize, coverageSize, variantSize;
+uniform float animationTime;
+uniform bool wholeMap;
+#ifdef DIRECT_TERRAIN_ANIMATION
+uniform float artTilePixels;
+#endif
+#ifdef DIRECT_TERRAIN_HD_MASKS
+// Visible mixed cells may carry a full-detail mask: hdIndex holds its tile
+// number plus one (zero: use the native 16-texel mask), and each tile is
+// hdTilePixels square, one texel per compositor sample at that density.
+uniform sampler2D hdIndex, hdCoverage, hdEdges;
+uniform vec2 hdCoverageSize;
+uniform float hdTilePixels;
+// The atlas a density change retired (hdPreviousTile zero when there is none):
+// a cell still pending in hdIndex draws its old mask from it.
+uniform sampler2D hdPreviousIndex, hdPreviousCoverage, hdPreviousEdges;
+uniform vec2 hdPreviousSize;
+uniform float hdPreviousTile;
+// A low-density mask of every mixed cell, laid out like the map (hdBaseTile
+// zero when there is none); an unbuilt cell's tile is empty.
+uniform sampler2D hdBaseCoverage, hdBaseEdges;
+uniform vec2 hdBaseSize;
+uniform float hdBaseTile;
+#endif
+
+// The offline generator supplies its own interface above this shared shader.
+#ifndef DIRECT_TERRAIN_SAMPLE
+#ifdef DIRECT_TERRAIN_PACKED
+#define DIRECT_TERRAIN_SAMPLE(image, uv) texture(image, uv)
+#define DIRECT_TERRAIN_FETCH(image, xy) texelFetch(image, xy, 0)
+#else
+#define DIRECT_TERRAIN_SAMPLE(image, uv) texture2D(image, uv)
+#endif
+#endif
+
+#ifndef DIRECT_TERRAIN_ANIMATION
+const float artTilePixels = 32.0;
+#endif
+
+vec2 atlasUV(float index, vec2 pixel, vec2 size) {
+    float columns = size.x / artTilePixels;
+    vec2 base = vec2(mod(index, columns), floor(index / columns)) * artTilePixels;
+    return (base + pixel * (artTilePixels / 32.0)) / size;
+}
+
+vec2 maskAtlasUV(float index, vec2 pixel) {
+    float columns = coverageSize.x / 16.0;
+    vec2 base = vec2(mod(index, columns), floor(index / columns)) * 16.0;
+    vec2 samplePixel = clamp(pixel * 0.5 - 0.25, vec2(0.5), vec2(15.5));
+    return (base + samplePixel) / coverageSize;
+}
+
+#ifdef DIRECT_TERRAIN_PACKED
+vec4 decodeRecord(vec4 low, vec4 high) {
+    return floor(low * 255.0 + 0.5) + floor(high * 255.0 + 0.5) * 256.0;
+}
+#define RECORD_COORD(slot) (ivec2(slot) * ivec2(2, 1))
+#define readRecord(image, slot, size) decodeRecord(DIRECT_TERRAIN_FETCH(image, RECORD_COORD(slot)), DIRECT_TERRAIN_FETCH(image, RECORD_COORD(slot) + ivec2(1, 0)))
+
+float decodeScalar(vec4 packedBytes, int column) {
+    vec4 bytes = floor(packedBytes * 255.0 + 0.5);
+    vec2 value = (column % 2 == 0) ? bytes.rg : bytes.ba;
+    return value.x + value.y * 256.0;
+}
+#define SCALAR_COORD(uv, size) ivec2(floor((uv) * (size)))
+#define readScalar(image, uv, size) decodeScalar(DIRECT_TERRAIN_FETCH(image, SCALAR_COORD(uv, size) / ivec2(2, 1)), SCALAR_COORD(uv, size).x)
+#else
+#define readRecord(image, slot, size) floor(DIRECT_TERRAIN_SAMPLE(image, ((slot) + 0.5) / (size)) * 65535.0 + 0.5)
+#define readScalar(image, uv, size) floor(DIRECT_TERRAIN_SAMPLE(image, uv).r * 65535.0 + 0.5)
+#endif
+
+// Edge records pack a Q8 margin with dominant/neighbor selectors, so they
+// cannot be filtered by the sampler.
+vec3 edgeTexel(float index, vec2 texel) {
+    float columns = coverageSize.x / 16.0;
+    vec2 base = vec2(mod(index, columns), floor(index / columns)) * 16.0;
+    float packedEdge = readScalar(edges, (base + texel + 0.5) / coverageSize, coverageSize);
+    float selectors = floor(packedEdge / 4096.0);
+    return vec3(mod(packedEdge, 4096.0), mod(selectors, 4.0), floor(selectors / 4.0));
+}
+
+// Margin relative to the reference pair: positive on its dominant side,
+// negative where the same two materials meet the other way round.
+float signedMargin(vec3 sampleEdge, vec3 reference) {
+    if (sampleEdge.y == reference.y && sampleEdge.z == reference.z)
+        return sampleEdge.x;
+    if (sampleEdge.y == reference.z && sampleEdge.z == reference.y)
+        return -sampleEdge.x;
+    return reference.x;
+}
+
+// The mask stores every second compositor sample. Nearest edge records
+// would step the surf bands in two-texel blocks, so interpolate the margin
+// bilinearly as a signed distance across the boundary, keeping the nearest
+// record's material pair (swapped where the interpolated side flips). The
+// outer half texel of a tile extrapolates linearly, so margins meet the
+// neighboring cell's instead of flattening into a step at the border.
+vec3 edgeAt(float index, vec2 pixel) {
+    vec2 p = pixel * 0.5 - 0.75;
+    vec2 low = clamp(floor(p), vec2(0.0), vec2(14.0));
+    vec2 f = p - low;
+    vec2 high = low + 1.0;
+    vec3 e00 = edgeTexel(index, low);
+    vec3 e10 = edgeTexel(index, vec2(high.x, low.y));
+    vec3 e01 = edgeTexel(index, vec2(low.x, high.y));
+    vec3 e11 = edgeTexel(index, high);
+    vec3 nearest = f.y < 0.5 ? (f.x < 0.5 ? e00 : e10) : (f.x < 0.5 ? e01 : e11);
+    if (nearest.y == nearest.z)
+        return nearest;
+    float s = mix(mix(signedMargin(e00, nearest), signedMargin(e10, nearest), f.x),
+                  mix(signedMargin(e01, nearest), signedMargin(e11, nearest), f.x), f.y);
+    return s >= 0.0 ? vec3(s, nearest.yz) : vec3(-s, nearest.zy);
+}
+
+#ifdef DIRECT_TERRAIN_HD_MASKS
+// One mask atlas: its size in texels and its tile side.
+vec2 hdTileBase(float index, vec2 size, float tile) {
+    float columns = size.x / tile;
+    return vec2(mod(index, columns), floor(index / columns)) * tile;
+}
+// Texel t of a tile holds the compositor sample centred at (t + 0.5) * 32 / T.
+vec2 hdMaskUV(float index, vec2 pixel, vec2 size, float tile) {
+    vec2 samplePixel = clamp(pixel * (tile / 32.0), vec2(0.5), vec2(tile - 0.5));
+    return (hdTileBase(index, size, tile) + samplePixel) / size;
+}
+vec3 hdEdgeTexel(sampler2D image, float index, vec2 texel, vec2 size, float tile) {
+    float packedEdge = readScalar(image, (hdTileBase(index, size, tile) + texel + 0.5) / size, size);
+    float selectors = floor(packedEdge / 4096.0);
+    return vec3(mod(packedEdge, 4096.0), mod(selectors, 4.0), floor(selectors / 4.0));
+}
+// As edgeAt, at one texel per sample.
+vec3 hdEdgeAt(sampler2D image, float index, vec2 pixel, vec2 size, float tile) {
+    vec2 p = pixel * (tile / 32.0) - 0.5;
+    vec2 low = clamp(floor(p), vec2(0.0), vec2(tile - 2.0));
+    vec2 f = p - low;
+    vec2 high = low + 1.0;
+    vec3 e00 = hdEdgeTexel(image, index, low, size, tile);
+    vec3 e10 = hdEdgeTexel(image, index, vec2(high.x, low.y), size, tile);
+    vec3 e01 = hdEdgeTexel(image, index, vec2(low.x, high.y), size, tile);
+    vec3 e11 = hdEdgeTexel(image, index, high, size, tile);
+    vec3 nearest = f.y < 0.5 ? (f.x < 0.5 ? e00 : e10) : (f.x < 0.5 ? e01 : e11);
+    if (nearest.y == nearest.z)
+        return nearest;
+    float s = mix(mix(signedMargin(e00, nearest), signedMargin(e10, nearest), f.x),
+                  mix(signedMargin(e01, nearest), signedMargin(e11, nearest), f.x), f.y);
+    return s >= 0.0 ? vec3(s, nearest.yz) : vec3(-s, nearest.zy);
+}
+#endif
+
+vec4 variantRecord(float index, float field) {
+    float address = index * 8.0 + field;
+    vec2 slot = vec2(mod(address, variantSize.x), floor(address / variantSize.x));
+    return readRecord(variants, slot, variantSize);
+}
+
+vec4 material(float index, vec2 uv, float calm) {
+    vec4 data = variantRecord(index, 0.0);
+    float stepTime = mod(animationTime, data.z);
+    float phase = mod(floor(animationTime / data.z), data.y);
+    vec4 color = DIRECT_TERRAIN_SAMPLE(art, atlasUV(data.x + phase, uv, artSize));
+    // Blend premultiplied endpoints so transparent artwork cannot tint a fade.
+    color.rgb *= color.a;
+    if (data.w > 0.0) {
+        float blend = floor(stepTime * data.w / data.z) / data.w;
+        vec4 nextColor = DIRECT_TERRAIN_SAMPLE(art, atlasUV(data.x + mod(phase + 1.0, data.y), uv, artSize));
+        nextColor.rgb *= nextColor.a;
+        color = mix(color, nextColor, blend);
+    }
+    if (calm > 0.0) {
+        vec4 quiet = variantRecord(index, 7.0);
+        color.rgb = mix(color.rgb, quiet.rgb * (color.a / 255.0), calm * quiet.w / 256.0);
+    }
+    return color;
+}
+
+#ifdef DIRECT_TERRAIN_HD_MASKS
+// A mixed cell whose mask has not landed: marching squares on its corners, so
+// borders cross each cell edge at its midpoint in straight lines and meet the
+// neighbouring cells. The cell is four triangles around its centre; a
+// material's presence is linear in each, from its corners to the centre,
+// which only a material holding three corners claims. A lone corner is cut
+// off along the diagonal, a pair splits straight through the middle, and
+// diagonal corners keep their quadrants, as the built masks do.
+vec4 cornerSplit(float code, vec2 f, float pixel) {
+    vec4 slots = mod(floor(code / vec4(1.0, 4.0, 16.0, 64.0)), 4.0);
+    const vec4 lanes = vec4(0.0, 1.0, 2.0, 3.0);
+    vec4 tl = vec4(equal(vec4(slots.x), lanes)), tr = vec4(equal(vec4(slots.y), lanes));
+    vec4 bl = vec4(equal(vec4(slots.z), lanes)), br = vec4(equal(vec4(slots.w), lanes));
+    vec4 centre = vec4(greaterThan(tl + tr + bl + br, vec4(2.5)));
+    vec4 b = max(vec4(1.0 - f.x - f.y, f.x - f.y, f.y - f.x, f.x + f.y - 1.0), 0.0);
+    vec4 w = b.x * tl + b.y * tr + b.z * bl + b.w * br + (1.0 - dot(b, vec4(1.0))) * centre;
+    float top = max(max(w.x, w.y), max(w.z, w.w));
+    // Presence changes by up to two per cell across a border: blend over
+    // about a screen pixel.
+    return clamp((w - top) / max(2.0 * pixel, 0.0001) + 1.0, 0.0, 1.0);
+}
+#endif
+
+vec3 contact(vec4 indices, vec3 edge, vec3 color) {
+    int dominant = int(edge.y);
+    int neighbor = int(edge.z);
+    if (dominant == neighbor)
+        return color;
+    vec4 adjacent = variantRecord(indices[neighbor], 5.0);
+    float selfHeight = variantRecord(indices[dominant], 5.0).x;
+    float margin = edge.x;
+    if (adjacent.x > selfHeight && margin < adjacent.z)
+        color *= 1.0 - adjacent.y * (adjacent.z - margin) / (256.0 * adjacent.z);
+    vec4 fringe = variantRecord(indices[neighbor], 6.0);
+    if (margin < fringe.w)
+        color = mix(color, fringe.rgb / 255.0, adjacent.w * (fringe.w - margin) / (256.0 * fringe.w));
+    return color;
+}
+
+// Authored shoreline bands. Coverage supplies the same dominant/neighbor
+// selectors and Q8 margin used by the reference compositor.
+float bump(float u) {
+    float x = min(u, 1024.0 - u);
+    return floor(x * x * (1536.0 - 2.0 * x) / 524288.0);
+}
+
+vec3 surf(vec4 indices, vec2 uv, vec3 edge, vec3 color) {
+    int dominant = int(edge.y);
+    int neighbor = int(edge.z);
+    if (dominant == neighbor)
+        return color;
+    vec4 shape = variantRecord(indices[dominant], 1.0);
+    vec4 other = variantRecord(indices[neighbor], 1.0);
+    bool liquidSide = shape.x > 0.0;
+    if (liquidSide == (other.x > 0.0))
+        return color;
+    float index = liquidSide ? indices[dominant] : indices[neighbor];
+    if (!liquidSide)
+        shape = other;
+    vec4 band = variantRecord(index, 2.0);
+    float margin = edge.x;
+    if (margin >= (liquidSide ? max(band.y, shape.w) : max(band.w, shape.y + shape.w)))
+        return color;
+    vec4 shallow = variantRecord(index, 3.0);
+    vec3 foam = variantRecord(index, 4.0).rgb / 255.0;
+    // Q8 shore wash of the land material across the shoreline, stored as its damping.
+    float land = 256.0 - variantRecord(liquidSide ? indices[neighbor] : indices[dominant], 4.0).w;
+    float time = animationTime - mod(animationTime, shallow.w);
+    float phase = floor(mod(time, shape.x) * 1024.0 / shape.x);
+    vec2 position = mod(floor(world), mapSize) * 8192.0 + floor(uv) * 256.0 + 128.0;
+    float offset = bump(mod(floor(position.x / 128.0), 1024.0)) +
+                   bump(mod(floor(position.y / 128.0), 1024.0)) +
+                   bump(mod(floor((position.x + position.y) / 64.0), 1024.0));
+    float u = mod(phase + offset, 1024.0);
+    float rise = floor(u < 224.0 ? u * 512.0 / 224.0 : 512.0 + (u - 224.0) * 512.0 / 800.0);
+    float run = floor(floor(shape.y * bump(rise) / 256.0) * land / 256.0);
+    float front;
+    if (liquidSide) {
+        if (margin < band.y)
+            color = mix(color, shallow.rgb / 255.0, band.x * (band.y - margin) / (256.0 * band.y));
+        front = margin + run;
+    } else {
+        if (margin < band.w)
+            color *= 1.0 - band.z * (band.w - margin) / (256.0 * band.w);
+        if (margin < run)
+            color = mix(color, shallow.rgb / 255.0, band.x * (run - margin) / (512.0 * run));
+        front = abs(margin - run);
+    }
+    if (front < shape.w) {
+        float breakup = 96.0 + (bump(mod(floor(position.x * 5.0 / 128.0), 1024.0)) +
+            bump(mod(floor(position.y * 7.0 / 128.0) + phase, 1024.0))) * 160.0 / 512.0;
+        color = mix(color, foam, shape.z * (shape.w - front) / shape.w * breakup / 65536.0);
+    }
+    return color;
+}
+
+void main() {
+    vec2 slot = mod(floor(world), mapSize);
+    vec2 cell = (slot + 0.5) / mapSize;
+    if (!wholeMap) {
+#ifdef DIRECT_TERRAIN_PACKED
+        ivec2 pixel = ivec2(slot);
+        if (DIRECT_TERRAIN_FETCH(discovery, pixel / ivec2(4, 1))[pixel.x % 4] < 0.5)
+            discard;
+#else
+        if (DIRECT_TERRAIN_SAMPLE(discovery, cell).r < 0.5)
+            discard;
+#endif
+    }
+    vec4 indices = readRecord(cells, slot, mapSize);
+    float halfTexel = 16.0 / artTilePixels;
+    vec2 uv = clamp(fract(world) * 32.0, vec2(halfTexel), vec2(32.0 - halfTexel));
+#ifdef DIRECT_TERRAIN_HD_MASKS
+    // Legacy GL: one mask atlas at the display density. Zero is a uniform cell;
+    // 65280 and up a mixed cell whose mask is still being built, drawn from
+    // the retired atlas if it has one, else from the whole-map base atlas,
+    // else split straight between its corners, until it lands.
+    float hd = readScalar(hdIndex, cell, mapSize);
+    float pending = hd - 65280.0; // Corner slots, two bits each, when not negative.
+    // Cells per screen pixel, taken here in uniform control flow.
+    float pixel = max(fwidth(world.x), fwidth(world.y));
+    bool mixed = hd > 0.0 && pending < 0.0;
+    vec2 atlasSize = hdCoverageSize;
+    float atlasTile = hdTilePixels;
+    bool retired = false;
+    if (pending >= 0.0 && hdPreviousTile > 0.0) {
+        float old = readScalar(hdPreviousIndex, cell, mapSize);
+        if (old > 0.0 && old < 65280.0) {
+            hd = old;
+            mixed = true;
+            retired = true;
+            atlasSize = hdPreviousSize;
+            atlasTile = hdPreviousTile;
+        }
+    }
+    bool base = false;
+    if (pending >= 0.0 && !retired && hdBaseTile > 0.0) {
+        hd = slot.y * mapSize.x + slot.x + 1.0;
+        mixed = true;
+        base = true;
+        atlasSize = hdBaseSize;
+        atlasTile = hdBaseTile;
+    }
+#else
+    float mask = readScalar(coverageIndex, cell, mapSize);
+    if (mask >= 65535.0) discard;
+    bool mixed = mask > 0.0;
+#endif
+    vec4 quiet = DIRECT_TERRAIN_SAMPLE(shoreCalm, cell);
+    vec2 position = uv / 32.0;
+    float calm = mix(mix(quiet.x, quiet.y, position.x), mix(quiet.z, quiet.w, position.x), position.y);
+    vec4 color = material(indices.x, uv, calm);
+#ifdef DIRECT_TERRAIN_HD_MASKS
+    vec4 weights = vec4(0.0);
+    if (mixed) {
+        vec2 maskUV = hdMaskUV(hd - 1.0, uv, atlasSize, atlasTile);
+        weights = base ? DIRECT_TERRAIN_SAMPLE(hdBaseCoverage, maskUV)
+                : retired ? DIRECT_TERRAIN_SAMPLE(hdPreviousCoverage, maskUV)
+                          : DIRECT_TERRAIN_SAMPLE(hdCoverage, maskUV);
+        // An unbuilt base tile is empty: the cell falls through to its corners.
+        mixed = dot(weights, vec4(1.0)) > 0.5;
+    }
+    bool split = !mixed && pending >= 0.0;
+    if (split) {
+        weights = cornerSplit(pending, uv / 32.0, pixel);
+        mixed = true;
+    }
+#endif
+    if (mixed) {
+#ifndef DIRECT_TERRAIN_HD_MASKS
+        vec4 weights = DIRECT_TERRAIN_SAMPLE(coverage, maskAtlasUV(mask - 1.0, uv));
+#endif
+        weights /= max(dot(weights, vec4(1.0)), 0.00001);
+        color *= weights.x;
+        if (weights.y > 0.0) color += weights.y * material(indices.y, uv, calm);
+        if (weights.z > 0.0) color += weights.z * material(indices.z, uv, calm);
+        if (weights.w > 0.0) color += weights.w * material(indices.w, uv, calm);
+#ifdef DIRECT_TERRAIN_HD_MASKS
+        // The split carries no edge: no contact shading or surf until the mask lands.
+        vec3 edge = split ? vec3(0.0) : base ? hdEdgeAt(hdBaseEdges, hd - 1.0, uv, atlasSize, atlasTile)
+                  : retired ? hdEdgeAt(hdPreviousEdges, hd - 1.0, uv, atlasSize, atlasTile)
+                            : hdEdgeAt(hdEdges, hd - 1.0, uv, atlasSize, atlasTile);
+#else
+        vec3 edge = edgeAt(mask - 1.0, uv);
+#endif
+        if (color.a > 0.0)
+            color.rgb = surf(indices, uv, edge, contact(indices, edge, color.rgb / color.a)) * color.a;
+    }
+    terrainColor = color;
+}
+)";
+}

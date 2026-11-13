@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <PerformanceTelemetry.h>
+#include "Map.h"
 #include <iostream>
 #include <sstream>
 #include <locale>
@@ -9,8 +10,8 @@
 #include <set>
 #include <charconv>
 
-#include "AICastor.h"
-#include "AINicowar.h"
+#include "AIMaximaStrategy.h"
+#include "Player.h"
 
 #include <assert.h>
 #include <string.h>
@@ -49,6 +50,12 @@
 #include "FertilityCalculator.h"
 
 #include "ReplayWriter.h"
+#include "Team.h"
+#include "Building.h"
+#include "SGSL.h"
+#include "MapScript.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
 
 #define BULLET_IMGID 0
 
@@ -193,6 +200,13 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 	if (!tempGameHeader.load(stream, versionMinor, mapHeader.historicalGrowthLayout ? mapHeader.getVersionMinor() : 0))
 		co_return false;
 	gameHeader=tempGameHeader;
+	// The header is resolved by controller constructors, before their own saved
+	// execution state is read. Migrate with the actual source format here so an
+	// old embedded strategy is not mistaken for an incomplete current one.
+	std::string strategyError;
+	if (!AIMaxima::StrategyResolver::upgradeSavedConfigurations(
+			gameHeader, versionMinor, strategyError))
+		throw std::runtime_error("Maxima strategy error: " + strategyError);
 	// Resolve before any entity takes a descriptor pointer. Older files must
 	// never inherit edited repository definitions.
 	if (gameHeader.getBuildingCatalogSnapshot().empty()) buildingsTypes.initLegacy();
@@ -232,7 +246,7 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 	{
 		stream->readEnterSection(i);
         co_await GAGCore::CooperativeTask::checkpoint("[Loading teams]");
-		teams[i]=new Team(this);
+		teams[i]=new Team(this, simContext());
         if (!(co_await teams[i]->loadTask(stream, &buildingsTypes, versionMinor)))
             co_return false;
 		if (teams[i]->teamNumber != i) co_return false;
@@ -273,8 +287,6 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 	if(!(co_await map.loadTask(stream, mapHeader, this)))
 		co_return false;
 
-	if (versionMinor >= FILE_FORMAT_VERSION_TERRAIN_PROPERTIES && map.requiredTerrainExperiments() != mapHeader.requiredTerrainExperiments)
-		co_return false;
 	if (versionMinor >= FILE_FORMAT_VERSION_RUNTIME_RESOURCES &&
 		(map.requiredResourceExperiments() != mapHeader.requiredResourceExperiments ||
 		 map.resourceRegistry().experiments() != mapHeader.resourceExperimentDefinitions ||
@@ -285,12 +297,6 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 		if (mapHeader.getIsSavedGame() && !gameHeader.getExperiments().has(key)) co_return false;
 		gameHeader.getExperiments().set(key, true, gameHeader.catalogExperimentKeys());
 	}
-	for (const auto& definition : experimentDefinitions())
-		if (mapHeader.requiredTerrainExperiments.has(definition.id))
-		{
-			if (mapHeader.getIsSavedGame() && !gameHeader.hasExperiment(definition.id)) co_return false;
-			gameHeader.getExperiments().set(definition.id);
-		}
 
 	if (!readMatchingSignature(stream, FILE_SIG_GAME_MAP, "signatureAfterMap"))
 		co_return false;
@@ -411,10 +417,15 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 		}
 	std::set<std::pair<int, Uint32>> diagnosticIdentities;
 	for (int t = 0; t < mapHeader.getNumberOfTeams(); ++t)
+	{
+		const auto &probability = teams[t]->stats.getWinProbabilityHistory();
+		if (!probability.empty() && probability.back().tick > stepCounter)
+			throw std::runtime_error("Invalid win probability game tick");
 		for (const auto &record : teams[t]->stats.aiTelemetry)
 			if (record->current.tick > stepCounter || record->coverage > stepCounter ||
 				!diagnosticIdentities.emplace(record->player, record->generation).second)
 				throw std::runtime_error("Invalid AI telemetry identity or game tick");
+	}
 	for (int p = 0; p < gameHeader.getNumberOfPlayers(); ++p)
 		if (players[p] && players[p]->ai)
 			players[p]->ai->bindTelemetry();
@@ -478,6 +489,11 @@ GAGCore::CooperativeTask Game::loadTask(GAGCore::InputStream *stream,SaveLoadPro
 
 	}
 	gameSection.commit();
+    // Every game started from a map uses resource claims; saved games restore
+    // their own setting (none before format 213). Conversions keep the map as is.
+    if (!mapHeader.getIsSavedGame() && initialization==MapLoadInitialization::Normal)
+        map.enableResourceClaims();
+    map.rebuildActiveMaterialClaims();
 
 	///versions less than 63 did not have fertility computed with the map, but computed it live.
 	///compute it now
@@ -720,7 +736,6 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	Uint32 mapHeaderOffset = stream->getPosition();
 	mapHeader.setMapName(name);
 	mapHeader.setIsSavedGame(!fileIsAMap);
-	mapHeader.requiredTerrainExperiments = map.requiredTerrainExperiments();
 	mapHeader.requiredResourceExperiments = map.requiredResourceExperiments();
 	mapHeader.resourceExperimentDefinitions = map.resourceRegistry().experiments();
 	gameHeader.setResourceExperiments(map.resourceRegistry().experiments());
@@ -882,14 +897,15 @@ void Game::save(GAGCore::OutputStream *stream, bool fileIsAMap, const std::strin
 	// isSavedGame on scope exit.
 }
 
-Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> *checkSumsVectorForBuildings, std::vector<Uint32> *checkSumsVectorForUnits, bool heavy, bool legacy152)
+Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> *checkSumsVectorForBuildings, std::vector<Uint32> *checkSumsVectorForUnits, bool heavy, ChecksumScheme scheme)
 {
+    const bool legacy152 = scheme == ChecksumScheme::Legacy152;
     // Explicit verification may join future work. Network checksums retain
     // their full live-map coverage without shortening worker deadlines.
     const bool includePending = heavy;
 	Uint32 cs=0;
 
-	Uint32 headerCs=mapHeader.checkSum();
+	Uint32 headerCs=mapHeader.checkSum(scheme);
 	cs^=headerCs;
 	if (checkSumsVector)
 		checkSumsVector->push_back(headerCs);// [0]
@@ -899,7 +915,7 @@ Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 	Uint32 teamsCs=0;
 	for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
 	{
-		teamsCs^=teams[i]->checkSum(checkSumsVector, checkSumsVectorForBuildings, checkSumsVectorForUnits, legacy152);
+		teamsCs^=teams[i]->checkSum(checkSumsVector, checkSumsVectorForBuildings, checkSumsVectorForUnits, scheme);
 		teamsCs=rotr1(teamsCs);
 		cs=rotr1(cs);
 	}
@@ -932,7 +948,7 @@ Uint32 Game::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 			break;
 		}
 	}
-	Uint32 mapCs=map.checkSum(heavy, includePending, legacy152);
+	Uint32 mapCs=map.checkSum(heavy, includePending, scheme);
 	cs^=mapCs;
 	if (checkSumsVector)
 		checkSumsVector->push_back(mapCs);// [3+t*20+p*2]

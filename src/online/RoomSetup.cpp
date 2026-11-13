@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 glob2 contributors
 
+#include "Team.h"
 #include "RoomSetup.h"
 
 #include "CustomGameRules.h"
@@ -46,7 +47,7 @@ bool flag(const Json& value, const char* key, bool fallback)
 const std::vector<std::string>& defaultRoomGenerators()
 {
 	// Fair by construction (exact symmetry, solved fairness or repeated wedges), and
-	// verified at 128×128 with both 2 and 4 colonies (platform/packages/core/src/
+	// verified at 128×128 with both 2 and 4 colonies (services/online/packages/core/src/
 	// queueConfig.ts FAIR_GENERATORS, fourColonies: true).
 	static const std::vector<std::string> ids = {"even-ground", "symmetric-arena", "marchland", "carousel", "amphitheatre"};
 	return ids;

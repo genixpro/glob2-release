@@ -5,6 +5,7 @@
 #include <BinaryStream.h>
 #include "Version.h"
 #include "GameDiagnostics.h"
+#include "GameHeader.h"
 #include <algorithm>
 #include <limits>
 #include <set>
@@ -90,8 +91,8 @@ bool OrderScheduler::liveWork() const
 }
 void OrderScheduler::configure(unsigned delayTicks, ComputeExecutor& target)
 {
-	static_assert(ComputeExecutor::AIHorizon >= 8, "the executor sizes its slots for the AI horizon");
-	if (delayTicks > 8) throw std::invalid_argument("AI order delay must be 0..8 ticks");
+	static_assert(ComputeExecutor::AIHorizon >= GameHeader::MAX_AI_ORDER_DELAY, "the executor sizes its slots for the AI horizon");
+	if (delayTicks > GameHeader::MAX_AI_ORDER_DELAY) throw std::invalid_argument("AI order delay must be 0..16 ticks");
 	if (liveWork()) throw std::logic_error("Cannot reconfigure a live AI pipeline");
 	executor = &target;
 	delay = delayTicks;
@@ -335,7 +336,7 @@ bool OrderScheduler::load(GAGCore::InputStream* stream)
 	struct Rollback { OrderScheduler& owner; bool success = false; ~Rollback() { if (!success) { owner.clear(); owner.delay = 0; } } } rollback{*this};
 	stream->readEnterSection("AIOrderScheduler");
 	delay = stream->readUint32("delay");
-	if (delay > 8) return false;
+	if (delay > GameHeader::MAX_AI_ORDER_DELAY) return false;
 	const auto hasSubmission = stream->readUint8("hasSubmission");
 	if (hasSubmission > 1) return false;
 	if (hasSubmission) submissionTick = stream->readUint32("submissionTick");
@@ -433,7 +434,7 @@ bool OrderScheduler::load(GAGCore::InputStream* stream)
                 command.diagnostics.push_back(std::move(diagnostic));
 			stream->readLeaveSection();
 		}
-		const auto enrollmentCount = stream->readCount("enrollments", 32 * MaterialSlotCount * 7);
+		const auto enrollmentCount = stream->readCount("enrollments", 32 * MaterialSlotCount * MOVEMENT_CLASS_COUNT);
         std::set<Uint16> enrollmentKeys; // plane keys, see MapState::planeKey
 		for (unsigned j = 0; j < enrollmentCount; ++j)
 		{
@@ -442,7 +443,7 @@ bool OrderScheduler::load(GAGCore::InputStream* stream)
 			enrollment.team = stream->readUint32("team"); enrollment.resource = stream->readUint32("resource");
 			enrollment.swim = stream->readUint32("swim"); enrollment.observedTick = stream->readUint32("tick");
 			const auto cells = stream->readCount("cells", 1024 * 1024);
-			if (enrollment.team >= 32 || enrollment.resource >= MaterialSlotCount || enrollment.swim >= 7 || !cells || enrollment.observedTick > entry.request.observedTick
+			if (enrollment.team >= 32 || enrollment.resource >= MaterialSlotCount || enrollment.swim >= MOVEMENT_CLASS_COUNT || !cells || enrollment.observedTick > entry.request.observedTick
                 || !enrollmentKeys.emplace(MapState::planeKey(int(enrollment.team),int(enrollment.resource),int(enrollment.swim),false)).second) return false;
             const PlaneKey planeKey{enrollment.team,enrollment.resource,enrollment.swim,enrollment.observedTick,cells};
             const auto existing=loadedPlanes.find(planeKey);

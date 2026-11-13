@@ -14,14 +14,14 @@ or tournament adjudication is part of the worker or engine.
 
 ## Start locally
 
-Build the production client (`scons -j4 release=1 server=0`), then prepare a directory
-containing `glob2` and `data/`. Include optional symbols and any other runtime files
+Build the production client (`python3 tools/dev_build.py -j4 release=1`), then prepare a directory
+containing `glob2` and `content/data/`. Include optional symbols and any other runtime files
 needed by that build. Bundles must contain regular files, not symlinks. Run from the
 repository root:
 
 ```sh
 mkdir -p /tmp/glob2-supplied
-cp build/src/glob2 /tmp/glob2-supplied/glob2
+cp build/linux/client/release/src/glob2 /tmp/glob2-supplied/glob2
 cp -R data /tmp/glob2-supplied/data
 python3 -m tools.tournaments bundle /tmp/glob2-supplied /tmp/glob2-bundles \
   --revision "$(git rev-parse HEAD)" --dirty-identity YOUR_SOURCE_DIFF_HASH
@@ -89,10 +89,10 @@ Game and generation commands require `--output-dir DIR`; an existing
 Values are separate ordinary arguments, not JSON.
 
 ```sh
-build/src/glob2 map study 15 --seed 42 \
+build/linux/client/release/src/glob2 map study 15 --seed 42 \
   --set teams=2 --set width=7 --set height=7 \
   --write-map --rotations 2 --output-dir /tmp/generated
-build/src/glob2 game run --map-file /tmp/generated/map-r0.map.gz \
+build/linux/client/release/src/glob2 game run --map-file /tmp/generated/map-r0.map.gz \
   --game-seed 19 --player cortex --player cortex \
   --ai-param 0:swarmWorkerCap=4 --ai-param 1:swarmWorkerCap=7 \
   --ticks 4096 --save initial --save every:512 --save final \
@@ -102,7 +102,7 @@ build/src/glob2 game run --map-file /tmp/generated/map-r0.map.gz \
 To exercise a custom profile, append repeatable rule arguments to a new game:
 
 ```sh
-build/src/glob2 game run --map-file maps/SmallForTwo.map.gz \
+build/linux/client/release/src/glob2 game run --map-file content/maps/SmallForTwo.map.gz \
   --game-seed 19 --player cortex --player maxima \
   --rule noUpgrades=1 --rule noHunger=1 --rule peaceful=1 \
   --ticks 30000 --save initial --save final --write-replay \
@@ -143,14 +143,19 @@ Game options:
 | `--player AI` | Repeat once per map team, in team order; required for new games |
 | `--ai-param P:key=value` | Repeatable, zero-based player overrides; duplicate keys and invalid values rejected |
 | `--alliance N` | Repeat once per team, one-based group labels; default separate alliances |
-| `--win-condition NAME` | Repeatable replacement for standard conditions: death, allies, prestige, opponents, script |
+| `--win-condition NAME` | Repeatable replacement for standard conditions: death, allies, prestige, opponents, script; probability early victory is appended unless explicitly disabled |
+| `--win-probability PERMILLE` | New games default to 950 (95%); 0 disables, otherwise 501–1000; saved games retain their conditions |
 | `--experiment KEY` | Repeatable [experimental feature](../features/experimental-features.md) baked into a new game, e.g. `guard-area-balancing`; the profile's settings never apply to structured runs; forbidden when loading a save. Listed in `result.json` under `resolved.experiments` |
+| `--resource-claims default\|off` | New-game [resource claims](#resource-claims); `off` is a claims-off baseline that cannot record a replay; forbidden when loading a save. Tournament game configuration: `resource_claims` |
 | `--rule name=value` | Repeatable custom rules, using the names and ranges in [headless rules](../development/headless-replays.md#glob2_test_rules). New games only; effective values are recorded in `resolved.rules`. Tournament game configurations accept the equivalent `rules` object, e.g. `{"noUpgrades": 1, "peaceful": 1}` |
 | `--ticks N` | Absolute tick limit, default 90000; must exceed saved tick |
+| `--benchmark-warmup N` | Opt in to in-engine CPU counters, excluding the first N simulated ticks; tournament game configuration: `benchmark_warmup_ticks`. Loading a save keeps the absolute `ticks` limit; warmup must leave measured ticks. Whole-process resource usage also includes startup/loading. |
+| `--gradient-backend NAME` | Explicit gradient backend (`cpu`, `scalar`, `sse2`, `neon`, `opencl`, `vulkan`, `webgpu`); tournament game configuration: `gradient_backend`. Record the actual backend from the result when comparing compute costs. |
+| `--claim-route-delay N` | Ticks (1–8, default 8; 1 before SIM 157) from a resource-claim route request to its publication; an engine setting for experiments, so a non-default value cannot record a replay. Applies to new and loaded games; saved pending routes keep their due ticks. Tournament game configuration: `claim_route_delay`, which never records a replay because bundle defaults differ |
 | `--compute-threads auto\|N` | Shared executor participants including the owner; native `auto` prefers eligible physical cores, falling back to logical CPUs then one; browser auto uses logical CPUs capped at eight; explicit N is a positive unsigned integer |
 | `--write-replay` | Boolean switch; absent by default; writes `game.replay` when present |
 | `--save initial/final/every:N` | Repeatable opt-in saves; checkpoints are diagnostics, not automatic recovery |
-| `--telemetry NAME` | Repeatable checksums, team-timeline, maxima; default none |
+| `--telemetry NAME` | Repeatable checksums, team-timeline, maxima, warrior-tactics; default none. See [warrior travel and contact](../ai/telemetry.md#warrior-travel-and-contact) |
 | `--profile NAME` | Optional isolated profile name |
 
 GUI autosaving defaults off for tournament/headless runs, independently of the
@@ -227,7 +232,7 @@ Every job has these fields:
 | `depends_on` | Job IDs; every input dependency must appear; cycles rejected |
 | `seeds` | `{"game":N}` or `{"map":N}`; empty on saved games |
 | `config` | Game: players, ticks, ai_params (player-string to key/value object), alliances, winning_conditions. Generator: generator, params, candidates, rotations. Defaults follow CLI |
-| `outputs` | replay false; saves/telemetry/reports empty lists; log_mode `full` (or `telemetry`, or `win-probability` with game team-timeline telemetry); map false; core/stack false; required empty list of relative output paths; result `full` (or `outcome` for compact rating/adjudication fields only) |
+| `outputs` | replay false; saves/telemetry/reports empty lists; log_mode `full` (or `telemetry`, or `gameplay`/`win-probability` with game team-timeline telemetry); map false; core/stack false; required empty list of relative output paths; result `full` (or `outcome` for compact rating/adjudication fields only) |
 | `limits` | timeout_seconds 3600, memory_mb host default, estimated_seconds 60 (buffer planning only) |
 | `labels` | Opaque JSON object preserved unchanged |
 
@@ -285,7 +290,17 @@ For tactical studies that also need Maxima flags and placement decisions, use
 `log_mode: "telemetry"` with the requested `maxima`/`team-timeline` telemetry.
 It retains `MAXIMA_TELEMETRY`, `GLOB2_WINPROB`, `GLOB2_TL`, `GLOB2_ECON` and
 `GLOB2_TIMELINE` records, while omitting unrelated console/performance chatter.
-Other telemetry families require full capture. Requested CSV outputs are unaffected.
+For delivery and labour studies, `log_mode: "gameplay"` keeps `GLOB2_MEASURE`,
+`GLOB2_MEASURE_HISTORY`, win-probability and team-state records, omitting AI,
+performance and Maxima records. This avoids retaining high-volume AI samples and histories
+when they are outside the study. Saved games may still emit substantial gameplay
+history; calibrate allowances over a full measurement window before dispatch.
+Probability-only capture omits delivery and labour measurements. Jobs that need
+those measurements can set `labels.require_gameplay_telemetry: true`; validation
+requires game `team-timeline` telemetry with full or gameplay capture, and
+collection rejects a completed game without a retained final measurement record.
+Endpoint analysis must still verify team coverage and observation boundaries.
+Requested CSV outputs are unaffected.
 
 `log_mode` controls stdout retention only; stderr remains diagnostic. The engine
 still emits its ordinary timeline internally. Both console streams are compressed
@@ -478,13 +493,13 @@ plausible computation errors from faulty RAM. pharaoh-dev-1 is a normal pilot ho
 
 All experiment modules (`ai_comparison`, `fairness`, `generator_stress`, `ablations`) support `plan CONFIG --bundle DIR --output FILE`,
 `submit CONFIG --bundle DIR --output RESULTS`, and
-`reanalyze RESULTS [--policy prestige|survivor_draw|military] [--seed 1] [--draws 1000]
+`reanalyze RESULTS [--policy win_probability|prestige|survivor_draw|military] [--seed 1] [--draws 1000]
 [--k 32] [--output DIR]`. Reports are JSON, CSV and Markdown; no rerun is required.
 
 Shared design fields: id; builds (all supplied by default); map_build (first build);
 generators [15]; map_seeds [1001]; game_seeds [1]; generator_params {}; candidates 5
 for reusable maps; ticks 90000; timeout_seconds 3600; generation_timeout_seconds
-1800; outputs {}; settings {}; labels {}; win_probability_permille 0 (off). Build
+1800; outputs {}; settings {}; labels {}; win_probability_permille 950 (95%; use 0 to disable). Build
 cohorts use common generated maps
 unless generator variation itself is the experiment. Each build needs an eligible
 host. Generator defaults/ranges are always discoverable in its pinned catalog.
@@ -512,8 +527,9 @@ unsupported combinations remain reported failures rather than being filtered out
   logs and reports are omitted for successful game jobs with no requested outputs;
   failed jobs and map-generation jobs retain their diagnostic artifacts.
   For rating-only runs, set `outputs.result` to `outcome`. The retained payload
-  includes termination, winners, team/player identity, survival, prestige and
-  military totals needed by every supported adjudication policy, while omitting
+  includes termination, winners, team/player identity, survival, prestige,
+  military totals, raw probability summaries and the versioned log integral
+  needed by adjusted trajectory scoring, while omitting
   per-tick histories and other bulky result details. Installed bundles are fully
   hashed before atomic publication and then treated as immutable; workers do not
   rehash the complete bundle before every queued game.
@@ -543,6 +559,22 @@ unsupported combinations remain reported failures rather than being filtered out
   `{"52": {"slant": 0}}` for Rice Terraces at 128x128). Never silently replace a
   failed generator with another one. A single-generator cohort is a specialized experiment and must not
   be presented as general AI strength.
+
+  Sampled studies can set `ffa_colonies: [4, 8, 16]` to draw the FFA colony
+  count independently (integers 2–16; the default remains four). Duels and 2v2
+  retain two and four colonies. Set `seat_sampling: "with_replacement"` for
+  independent AI draws, allowing repeated AI implementations even when the pool
+  contains enough distinct entries. The default `"distinct"` samples without
+  replacement when possible and falls back to replacement for smaller pools.
+  In 2v2, the two team AIs are sampled, preserving homogeneous pairs. These two
+  controls require `sample_games` and cannot be combined with `balanced_duels`.
+  Explicit `ffa_colonies` requires an `ffa` entry in `formats`. Counts above four
+  need the same generator/size preflight as any other nonstandard cohort.
+
+  New-game designs may provide `experiments: ["farm-areas"]`; each requested
+  key must exist in every pinned build's `experiments` catalog. The job adapter
+  forwards one `--experiment KEY` per entry. Saved games retain their embedded
+  experiment set and reject overrides, including an explicit empty list.
 
   Set `balanced_duels: true` for a balanced 1v1 sample: `sample_games` must be
   even, with one map size and at least two AIs. Each block plays the same map and
@@ -575,11 +607,15 @@ unsupported combinations remain reported failures rather than being filtered out
   alliances is optional. Paired effects, raw pairs, intervals, configurations and
   failure rates are exported. No automatic best-variant selection occurs.
 
-Engine-declared winners are authoritative under every policy. Capped games rank
-survivors by prestige, unit count, then finished buildings; exact ties stay tied.
-Alternatives draw all survivors or rank warrior attack strength, HP, count.
-Eliminated colonies rank by elimination tick. 2v2 aggregates surviving roster
-statistics. Reports record policy name/version/options and engine/adjudicated status.
+Engine-declared winners are authoritative under every policy. The default
+`win_probability` policy ranks unresolved survivors at the tick cap by their final
+model probability; exact ties stay tied. Eliminated colonies still rank by
+elimination tick. Allies share one probability, counted once in 2v2. Alternatives
+are `prestige` (prestige, population, finished buildings), `survivor_draw` (tie all
+survivors), and `military` (warrior attack, HP, count). Historical results without
+probability statistics require an explicit legacy policy; missing predictions are
+never silently replaced with economic scores. Reports record policy name/version,
+raw termination, and engine/adjudicated status.
 Standard 1v1 ratings fit all observed outcomes at once with the Bradley–Terry
 logistic model: each game has equal weight, ties score 0.5, and input/completion
 order has no effect. Ratings are centred on 1500 with 400 points per tenfold odds;
@@ -628,7 +664,7 @@ planning/statistics, not SSH, process pools, retries or transfers.
 python3 test/test_tournaments.py
 python3 test/test_tournament_pipeline.py
 python3 test/test_map_fairness_tournament.py
-scons -j4 release=1 server=0 engine-tests
+python3 tools/dev_build.py -j4 release=1 engine-tests
 python3 test/run_tests.py --filter 'TournamentCompatibility/*'
 python3 test/tournament_cli_integration.py --output artifacts/tournament-cli
 ```
@@ -642,6 +678,34 @@ Engine compatibility requires actual identical initial states/seeds/orders and
 per-tick checksums across platforms; passing transport tests or builds is insufficient.
 Keep measured coverage, command output and other run-specific evidence in the
 ignored `artifacts/` workspace or in pull-request attachments.
+
+## Resource claims
+
+Every new game (single player, LAN, online, campaign, replay playback and
+`game run`) starts with material destination planes and resource claims, using
+the `contention-v2` policy described in
+[resource claims](../architecture/units.md#resource-claims). Saved games keep what
+they stored: saves from before format 213 have no claims and continue without
+them, and later saves continue with their claim state. Loading a save rejects
+`--resource-claims`.
+
+`game run --resource-claims off` starts a new game without claims or destination
+planes, as a baseline for measuring the feature; it cannot record a replay.
+`result.json` reports `resolved.resource_claims` (`default` or `off`) and, for
+`default`, `resolved.resource_claims_policy_name`. Bundles advertise the
+capabilities `resource_claims_default` (the policy name) and
+`resource_claims_switch_version: 1` (the `--resource-claims` switch).
+
+A game job without claim keys uses its pinned engine's default: claims off for
+bundles built before claims, claims on after. Set `resource_claims: "off"` for a
+claims-off baseline (forwarded only to bundles that advertise the switch) or
+`resource_claims: "default"` to require a bundle with claims. Claims-off jobs
+cannot record replays, and collectors reject results whose attested mode differs
+from the request.
+
+Compare claims on and off with paired seeds and seat rotations, using the ordinary
+delivery and labour measurements (`log_mode: "gameplay"` with `team-timeline`
+telemetry) alongside outcomes and CPU.
 
 ## Map-generation telemetry
 
@@ -666,15 +730,116 @@ Native `map generate NAME --report-file FILE` uses tile dimensions; the structur
 `map study GENERATOR --output-dir DIR` interface uses exponent dimensions as documented
 above. Both use the same production report serializer.
 
+## Whole-game probability scores
+
+**Use the adjusted win-probability trajectory score as the standard continuous
+AI effectiveness score alongside wins, losses and draws**, including custom
+assessments. Its identity is `log_time_outcome_v1`, with log curvature `c=2`.
+It replaces the previous linear AUC divided by observed game duration.
+Standard reanalysis, experiment entry points and pooled leaderboards use it.
+This is a trajectory/utility score from 0 to 1, not a calibrated win probability.
+
+Let `H` be the absolute game tick limit, `T` its observed end, and `p(t)` the
+piecewise-linear retained model curve. The normalized clock is
+`g(t) = ln(1 + 2*t/H) / ln(3)`. Equivalently, `tau=H/2`; changing the log base
+has no effect after normalization. The first half of the horizon receives
+about 63.1% of the weight. Each game is weighted equally in aggregate reports.
+
+The score is `integral_0^T p(t) dg(t) + u * (1 - g(T))`:
+
+- On an `engine_end`, `u=1` for every declared winner, including shared winners,
+  and `u=0` for a loss. Terminal utility is a scoring convention; it does not
+  replace the recorded probability samples with invented 100% predictions.
+- On a `win_probability` early stop, apply the same 1/0 credit using its declared
+  predicted winners/losers. Reports label the source `probability_stop`, separately
+  from actual `engine` endings. The default threshold remains 950 permille.
+- At a `tick_cap`, `T=H`, so there is no terminal tail. The usual final-probability
+  adjudication still determines W/L/D and ratings; it does not invent a score tail.
+- An alliance shares one trace and is counted once. Never add allied probabilities.
+  A winning alliance receives one full group credit, not a sum over its members.
+
+Raw engine results still contain `win_probability_history` (`[tick, permille]`)
+and the original `win_probability` summary (`model`, `final_model`, `permille`,
+`start_tick`, `end_tick`, `area_twice_permille_ticks`, `mean`). The latter remains
+linear/trapezoidal: area divided by 2000 gives probability × ticks; dividing by
+observed duration gives the **legacy** mean. Neither field is the new score.
+The fixed model identity fingerprints the coefficients and feature transforms.
+
+Workers with `outputs.result: outcome` calculate a per-team
+`win_probability_log_integral` before discarding the large curve. This sufficient
+statistic retains metric/coefficient, resolved horizon, model, coverage, weighted
+area and availability. Final group credit is derived from retained outcomes on
+analysis. Compact results therefore score identically to full results without
+verbose logs. Old full results with complete histories can be rescored. Old
+compact records containing only linear area cannot recover the log integral;
+they are unavailable for the new metric, with an explicit reason. Never treat
+missing or partial history as zero, reconstruct it from the final probability,
+or silently fall back to the old mean.
+
+Analysis report schema 2 exports `probability_scores` in JSON/CSV and Markdown.
+The aggregate `mean` is now the adjusted score, identified by `metric`,
+`coefficient` and `horizon_ticks`. Groups retain format, build, variant, subject
+or opponent role, model and stopping threshold; different horizons are never
+pooled. Each entry includes W/L/D, scored/total games, unavailable reasons,
+`outcome_credit_sources`, cap/early-stop counts and deterministic 95% seed-block
+intervals. `legacy_linear_mean`, `legacy_linear_scored_games` and
+`legacy_linear_mean_area_probability_ticks` preserve the old diagnostic.
+
+Paired ablations export `paired_effects` with metric `log_time_outcome_v1`:
+candidate minus baseline for the configured subject, raw differences and
+seed-block intervals that keep correlated rotations together. Pairing requires
+matching format, build, score definition, horizon, model and stopping rule.
+Elo and placements remain outcome-based; changing this continuous score does
+not rewrite wins, adjudication policies or previously published reports.
+
+Custom scripts should use the shared reader rather than reimplementing the score:
+
+```python
+from tools.tournaments.probability import group_score
+
+side = group_score(
+    [t for t in result["teams"] if t["alliance"] == alliance],
+    result,
+    config=job["config"],
+)
+if not side["available"]:
+    raise ValueError(side["unavailable_reason"])
+score = side["score"]  # 0..1, higher is better
+```
+
+The resolved `tick_limit` takes precedence over the job request; compact records
+retain that horizon in their integral. For a standalone full result, pass its
+resolved metadata or the game job configuration. The configured horizon is fixed,
+not inferred from how quickly a game ended. Zero elapsed time, missing opening or terminal coverage, inconsistent alliance
+traces, or mixed model identities make the adjusted score unavailable. Missing terminal outcomes also remain explicit.
+Cap adjudication can still use a fresh final prediction when history is partial.
+
+Use matched models, horizons, stopping rules, maps and opponents. A probability
+stop credited as a win is still the same model's prediction, not independent
+confirmation of victory; disable early victory when testing natural conversion
+or validating that model. Retain actual outcomes, completion times and held-out
+maps alongside this score. Choosing `c=2` fixes a weighting preference; it does
+not make every actual win rank above every unresolved game.
+
 ## Ending decided games early
 
-`"win_probability_permille": 970` in an experiment design turns on the optional
-[win probability](../ai/architecture/win-probability-model.md) winning condition for its games, so a
-match that is already decided is not played out. It is off by default, because it
-changes the outcome that gets measured and so must be asked for.
+Standard experiment planners enable the
+[win probability](../ai/architecture/win-probability-model.md) winning condition at
+95% (`"win_probability_permille": 950`), so strongly decided end games stop sooner.
+Structured `game run` also defaults to 950; `--win-probability 0` disables it.
+The engine still waits until tick 5,120 and evaluates every 512 ticks. Set
+`"win_probability_permille": 0` to disable it, or specify another threshold.
+The planner freezes this choice in every game job, so its identity and retained
+design distinguish cohorts. An explicit `rules.winProbabilityPermille` also sets
+the threshold; conflicting explicit settings are rejected. Low-level new-game jobs that
+bypass the planners also use the CLI default of 950 unless they specify the rule.
 
 Calibration and its limits are described in the model guide. Evaluate the model
 against the AI and game rules in the cohort you intend to measure. The threshold accepts 0 (off) or 501–1000.
+For validation or refitting of the probability model itself, disable probability
+victory and use independent labels, such as the historical `prestige` cap policy.
+The fitting helpers reject probability-called games and `win_probability` labels
+to prevent training or evaluating the model against its own predictions.
 Experiment `rules` also pass through the shared `--rule` interface. Games it ended report a `termination`
 of `win_probability` rather than `engine_end`, and `observations()` carries the
 raw termination through, so analysis can pool, exclude or compare them but can
@@ -699,11 +864,11 @@ schemas/current/history/final values, and engine performance samples/final total
 Collection remains automatic; export remains opt-in. No extra worker service,
 transport option or result-schema migration is needed. The catalog advertises
 `gameplay_telemetry_version`, `ai_telemetry_version`, and
-`performance_telemetry_version` (gameplay 2, AI 1, performance 1). The typed
+`performance_telemetry_version` (gameplay 2, AI 1, performance 2). The typed
 reader also covers the per-team `GLOB2_ECON`/`GLOB2_TL` timeline and the
-`GLOB2_WINPROB` trace as a `team_state` family; unlike the gameplay measurements
-these come straight off `TeamStat`, which is what makes them usable as model
-inputs for something the simulation itself reads. Old bundles can still run and their
+`GLOB2_WINPROB` trace as a `team_state` family, read straight off `TeamStat`.
+The win probability model is fitted on these and on the periodic gameplay
+measurements; AI and performance records are never model inputs. Old bundles can still run and their
 missing new record families are reported as unavailable.
 
 Workers already retain `stdout.log`, compress it, checksum it and transfer it with
@@ -753,15 +918,16 @@ observed totals, inclusive times and unavailable self times remain distinct.
 Population standard deviations require sample counts and a parallel-variance
 merge, not averaging standard deviations. A headless run has no render budget
 and cannot measure interactive frame quality. Structured final saves are included
-before the performance final record. Ambient `GLOB2_PERF_DISABLE` and build-label
-overrides are isolated like the existing headless tuning environment.
+before the performance final record. Ambient build-label overrides are isolated like the existing headless tuning
+environment. Performance collection is mandatory; the retired disable variable has
+no effect. Version 2 adds wall-time distributions, permanent executor
+wait/dependency summaries and renderer/GPU records to the same stream. GPU raw results
+overlap interval/final aggregates; select one population when analyzing them.
 
 See [gameplay metric definitions](../ai/gameplay-statistics.md),
 [AI schema/extension contract](../ai/telemetry.md), and
 [performance scope definitions](../development/performance-telemetry.md).
-The rebased save formats are 105 (gameplay) and 106 (AI), above master's 104;
-released save support still starts at 58. Master's network/YOG gate 33 and replay
-floor 99 are preserved. Existing exported logs need no conversion.
+Existing exported telemetry logs need no conversion.
 
 
 ## Pipeline throughput benchmark

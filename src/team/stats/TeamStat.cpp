@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include <GraphicContext.h>
 #include <PerformanceTelemetry.h>
 #include <sstream>
 #include <iostream>
@@ -17,10 +18,14 @@
 #include <algorithm>
 #include <tuple>
 #include <type_traits>
+#include <cstring>
 #include <limits>
 
-#include "Game.h"
+#include "MapHeader.h"
+#include "BuildingType.h"
+#include "UnitCargo.h"
 #include "GlobalContainer.h"
+#include "Building.h"
 #include "Team.h"
 #include "TeamStat.h"
 #include "SaveLoadProfile.h"
@@ -28,6 +33,7 @@
 #include "Version.h"
 #include "StatsChecksum.h"
 #include "TeamStatsChecksum.h"
+#include "WinProbability.h"
 #include <ChecksumStream.h>
 #include <WordChecksum.h>
 #include "Unit.h"
@@ -380,10 +386,10 @@ EndOfGameStat::EndOfGameStat(int units, int buildings, int prestige, int hp, int
 	value[TYPE_DEFENSE]=defense;
 }
 
-TeamStat::TeamStat()
-{
-	reset();
-}
+// Default member initializers zero every field, which is what reset() of a
+// fresh record produces, without its per-field loops (frozen display and
+// history copies construct STATS_SIZE records each).
+TeamStat::TeamStat() = default;
 
 
 void TeamStat::reset()
@@ -477,21 +483,21 @@ const GameplayMeasurements& TeamStats::measurements() const
 
 void TeamStats::step(Team *team, bool reloaded)
 {
-    sourceTick=publishedTick=team->game->stepCounter;
+    sourceTick=publishedTick=team->ctx.tick();
     configureUnits(team->race.unitTypeCount());
 	PERF_SCOPE_TIME(Stats);
 	if (!reloaded && needsMeasurementInitialization)
-		initializeMeasurements(team->game->stepCounter);
+		initializeMeasurements(team->ctx.tick());
 	if (reloaded) rebuildMeasurementCountReset();
 	beginMeasurementSnapshot(team);
 	// handle end of game stat step
-	if (((team->game->stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) == 0) && !reloaded)
+	if (((team->ctx.tick() & END_OF_GAME_STAT_INTERVAL_MASK) == 0) && !reloaded)
 	{
 		historySnapshot.reset();
 		endOfGameStats.push_back(EndOfGameStat(stats[statsIndex].totalUnit, stats[statsIndex].totalBuilding, team->prestige,
 			stats[statsIndex].totalHP, stats[statsIndex].totalAttackPower, stats[statsIndex].totalDefensePower));
 
-		printEconomy(team, team->game->stepCounter);
+		printEconomy(team, team->ctx.tick());
 	}
 	
 	// handle in game stat step
@@ -570,7 +576,7 @@ void TeamStats::step(Team *team, bool reloaded)
 	TeamStat &stat=stats[statsIndex];
 
 	stat.reset();
-	stat.buildingCountByVariant.resize(team->game->buildingsTypes.size(),0);
+	stat.buildingCountByVariant.resize(team->ctx.buildingsTypes->size(),0);
     auto& eligible=samplingEligibility;
     eligible.clear();
 
@@ -697,6 +703,7 @@ size_t TeamStats::displayCapacityBytes() const
     size_t bytes=0;
     for (const auto& sample:stats) bytes+=sample.buildingCountByVariant.capacity()*sizeof(int)+sample.numberUnitPerType.extraCapacityBytes()+sample.isFree.extraCapacityBytes()+sample.upgradeStatePerType.extraCapacityBytes();
     bytes += endOfGameStats.capacity() * sizeof(EndOfGameStat);
+    bytes += winProbabilityHistory.capacity() * sizeof(WinProbabilitySample);
     bytes += measurementHistory.capacity() * sizeof(GameplayMeasurements);
     for (const auto& sample : measurementHistory) bytes += sample.variants.capacity() * sizeof(sample.variants[0])+sample.unitCapacityBytes();
     bytes+=measurements().unitCapacityBytes();
@@ -711,6 +718,8 @@ std::shared_ptr<const TeamStats> TeamStats::frozenHistory() const
     auto result = std::make_shared<TeamStats>();
     result->sourceTick=sourceTick;result->publishedTick=publishedTick;
     result->endOfGameStats = endOfGameStats;
+    result->winProbabilityHistory = winProbabilityHistory;
+    result->winProbabilityModel = winProbabilityModel;
     result->measurementHistory = measurementHistory;
     result->coverageStartTick = coverageStartTick;
     result->extendedCoverageStartTick = extendedCoverageStartTick;
@@ -965,6 +974,8 @@ int TeamStats::getStarvingUnits() const
 
 bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor,bool privateAdaptive174)
 {
+    winProbabilityHistory.clear();
+    winProbabilityModel.clear();
     publishedMeasurements.reset();
     displaySnapshot.reset();
     historySnapshot.reset();
@@ -1126,6 +1137,27 @@ bool TeamStats::load(GAGCore::InputStream *stream, Sint32 versionMinor,bool priv
         sourceTick=stream->readUint32("sourceTick");publishedTick=stream->readUint32("publishedTick");
         if(sourceTick>publishedTick) throw std::runtime_error("Invalid published statistics tick");
     } else {collectionEnabled=false;sourceTick=publishedTick=editMeasurements().tick;}
+    if (versionMinor >= FILE_FORMAT_VERSION_WIN_PROBABILITY_HISTORY)
+    {
+        GAGCore::BinaryInputStream::CheckedReads checked(stream);
+        stream->readEnterSection("winProbability");
+        winProbabilityModel = stream->readText("model");
+        const auto count = stream->readCount("size");
+        if (count && winProbabilityModel.empty())
+            throw std::runtime_error("Missing win probability model identity");
+        for (unsigned i = 0; i < count; ++i)
+        {
+            stream->readEnterSection(i);
+            const auto tick = stream->readUint32("tick");
+            const auto chance = stream->readSint32("permille");
+            if (chance < 0 || chance > 1000 ||
+                (!winProbabilityHistory.empty() && tick <= winProbabilityHistory.back().tick))
+                throw std::runtime_error("Invalid win probability history");
+            winProbabilityHistory.push_back({tick, chance});
+            stream->readLeaveSection();
+        }
+        stream->readLeaveSection();
+    }
 	stream->readLeaveSection();
     if (versionMinor < FILE_FORMAT_VERSION_BUILDING_CATALOG)
     {
@@ -1250,7 +1282,41 @@ void TeamStats::save(GAGCore::OutputStream *stream)
     stream->writeUint8(collectionEnabled,"collectionEnabled");
     stream->writeEnterSection("collector");measurementFields(stream,collectedMeasurements);stream->writeLeaveSection();
     stream->writeUint32(sourceTick,"sourceTick");stream->writeUint32(publishedTick,"publishedTick");
+	stream->writeEnterSection("winProbability");
+    stream->writeText(winProbabilityModel, "model");
+    stream->writeUint32(winProbabilityHistory.size(), "size");
+    for (unsigned i = 0; i < winProbabilityHistory.size(); ++i)
+    {
+        stream->writeEnterSection(i);
+        stream->writeUint32(winProbabilityHistory[i].tick, "tick");
+        stream->writeSint32(winProbabilityHistory[i].permille, "permille");
+        stream->writeLeaveSection();
+    }
+    stream->writeLeaveSection();
 	stream->writeLeaveSection();
+}
+
+void TeamStats::recordWinProbability(Uint32 tick, int permille, const std::string &model)
+{
+    if (model.empty() || permille < 0 || permille > 1000 ||
+        (!winProbabilityHistory.empty() && tick < winProbabilityHistory.back().tick))
+        throw std::logic_error("Invalid win probability sample");
+    // Repeated reporting of the same boundary is idempotent.
+    if (!winProbabilityHistory.empty() && tick == winProbabilityHistory.back().tick)
+        return;
+    historySnapshot.reset();
+    if (winProbabilityHistory.empty()) winProbabilityModel = model;
+    else if (winProbabilityModel != model) winProbabilityModel = "mixed";
+    winProbabilityHistory.push_back({tick, permille});
+}
+
+Uint64 TeamStats::winProbabilityAreaTwice() const
+{
+    Uint64 area = 0;
+    for (size_t i = 1; i < winProbabilityHistory.size(); ++i)
+        area += Uint64(winProbabilityHistory[i].tick - winProbabilityHistory[i-1].tick) *
+                (winProbabilityHistory[i].permille + winProbabilityHistory[i-1].permille);
+    return area;
 }
 
 void TeamStats::initializeMeasurements(Uint32 tick)
@@ -1397,8 +1463,8 @@ void TeamStats::beginMeasurementSnapshot(Team *team)
     configureUnits(team->race.unitTypeCount());
     editMeasurements().movementClassesKnown=true;
     editMeasurements().groundUnitsByMovementClass.fill(0);
-	editMeasurements().tick = team->game->stepCounter;
-	editMeasurements().variants.resize(team->game->buildingsTypes.size());
+	editMeasurements().tick = team->ctx.tick();
+	editMeasurements().variants.resize(team->ctx.buildingsTypes->size());
 	if (measurementCountCatalogSize != editMeasurements().variants.size())
 		rebuildMeasurementCountReset();
 	for (const auto id : measurementCountTouched) editMeasurements().variants[id].count=0;
@@ -1416,12 +1482,12 @@ void TeamStats::observeMeasurementUnit(Unit *u)
 	if (u && !u->isDead)
 	{
         if (!u->performance[FLY] && (u->performance[WALK] || u->performance[SWIM])) {
-            ++editMeasurements().groundUnitsByMovementClass[u->swimClass()];
+            ++editMeasurements().groundUnitsByMovementClass[Map::swimClass(u->performance[WALK],u->performance[SWIM])];
         }
 		if (!u->widePrimaryCargo() && u->carriedMaterial >= 0 && u->carriedMaterial < MaterialSlotCount)
 			++editMeasurements().carried[u->carriedMaterial];
         if (u->hasCapability(UnitRuntimeTraits::ExtendedCargo) || u->widePrimaryCargo())
-            if (const auto* cargo=u->owner->game->unitCargo.find(u->gid))
+            if (const auto* cargo=u->owner->ctx.unitCargo->find(u->gid))
                 for (const auto& packet:*cargo) ++editMeasurements().carried[packet.material];
 		if (u->isUnitHungry())
 		{
@@ -1560,7 +1626,7 @@ void TeamStats::recordCombatDeath(Unit *u)
 void TeamStats::sampleDefence(Team *team)
 {
 	auto &m = editMeasurements();
-	m.defenceTick = team->game->stepCounter;
+	m.defenceTick = team->ctx.tick();
 	team->map->rebuildGrowthCoverage();
 	std::fill(std::begin(m.warriors), std::end(m.warriors), 0);
 	std::fill(std::begin(m.warriorLevels), std::end(m.warriorLevels), 0);
@@ -1578,9 +1644,9 @@ void TeamStats::sampleDefence(Team *team)
 			u->activity == Unit::ACT_FLAG && u->jobPurpose==UnitJobPurpose::Defend;
 		m.warriorsInside += u->displacement == Unit::DIS_INSIDE;
 	}
-	for (int t = 0; t < team->game->teamsCount(); ++t)
+	for (int t = 0; t < team->ctx.mapHeader->getNumberOfTeams(); ++t)
 	{
-		const Team *other = team->game->teams[t];
+		const Team *other = team->ctx.teams[t];
 		if (!other || !(team->enemies & other->me))
 			continue;
 		for (const Unit *u : other->liveUnits.entries())
@@ -1611,8 +1677,8 @@ void TeamStats::refreshMeasurements(Team *team)
 void TeamStats::sampleTraps(Team *team)
 {
 	auto &m = editMeasurements();
-	m.trappedTick = team->game->stepCounter;
-	m.variants.resize(team->game->buildingsTypes.size());
+	m.trappedTick = team->ctx.tick();
+	m.variants.resize(team->ctx.buildingsTypes->size());
 	for (auto& variant : m.variants) for (auto& row : variant.trapped) std::fill(std::begin(row),std::end(row),0);
 	for (auto &row : m.trappedUnits) std::fill(std::begin(row), std::end(row), 0);
 	for (auto &row : m.trappedBuildings)
@@ -1822,7 +1888,12 @@ void visitEventFields(Visitor&& visit, Destination& destination, Source& source)
 }
 template<class T> void copyEventField(T& destination, const T& source) { destination = source; }
 template<class T, size_t N> void copyEventField(T (&destination)[N], const T (&source)[N])
-{ for (size_t i=0;i<N;++i) copyEventField(destination[i],source[i]); }
+{
+    // Counter tables are plain integers; GCC -O2 copies the recursive loop one
+    // 8-byte element at a time.
+    if constexpr (std::is_trivially_copyable_v<T>) std::memcpy(destination, source, sizeof(destination));
+    else for (size_t i=0;i<N;++i) copyEventField(destination[i],source[i]);
+}
 }
 void TeamStats::completeMeasurements(TeamStatsSample& sample, const GameplayMeasurements& previous)
 {
@@ -2003,6 +2074,8 @@ void TeamStats::saveSample(GAGCore::OutputStream *stream, const TeamStatsSample 
         stream->writeLeaveSection();
 	}
 }
+TeamStatsSample TeamStats::loadSample(GAGCore::InputStream *stream) { return loadSample(stream, VERSION_MINOR); }
+
 TeamStatsSample TeamStats::loadSample(GAGCore::InputStream *stream, int versionMinor,bool privateAdaptive174)
 {
 	TeamStatsSample sample;
@@ -2058,6 +2131,24 @@ Uint32 teamStatsCoreChecksum(const TeamStats &stats, std::span<const TeamSmoothe
 	for (const auto &b : stats.coverageBuildings) {
 		stream.addUint32(Uint32(b.x)); stream.addUint32(Uint32(b.y));
 		stream.addUint32(Uint32(b.width)); stream.addUint32(Uint32(b.height));
+	}
+	// The win-probability model reads these measurement fields, and a winning
+	// condition can act on it, so they are simulation-driving and covered here.
+	const auto add64 = [&](Uint64 value) {
+		stream.addUint32(Uint32(value));
+		stream.addUint32(Uint32(value >> 32));
+	};
+	const WinProbability::InputSamples samples = WinProbability::inputSamples(stats);
+	for (const GameplayMeasurements *sample : {samples.now, samples.then})
+	{
+		stream.addUint32(sample ? sample->tick + 1 : 0);
+		if (!sample)
+			continue;
+		add64(sample->feeding);
+		add64(sample->eatWalkDistance);
+		for (Uint64 value : sample->delivered) add64(value);
+		for (Uint64 value : sample->filling[GameplayMeasurements::SWARM_JOB]) add64(value);
+		for (const BuildingMeasurement &variant : sample->variants) add64(variant.count);
 	}
 	return stream.value();
 }
@@ -2133,8 +2224,8 @@ void TeamStats::printEconomy(const Team *team, Uint32 tick) const
 		const int count = s.buildingCountByVariant[id];
 		if (!count)
 			continue;
-		const auto &type = ModelBuildingProjection::completed(team->game->buildingsTypes,
-															  *team->game->buildingsTypes.get(id));
+		const auto &type = ModelBuildingProjection::completed(*team->ctx.buildingsTypes,
+															  *team->ctx.buildingsTypes->get(id));
 		const auto &spec = type.semantics;
 		auto trains = [&](int ability)
 		{ return type.maxUnitInside > 0 && (type.runtimeTrainingAbilities & (1u << ability)); };

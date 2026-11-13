@@ -25,6 +25,7 @@
 #include "AIMaximaFeedingDemand.h"
 #include "AIMaximaFruit.h"
 #include "AIMaximaPlacement.h"
+#include "AIMaximaPrestige.h"
 #include "AIMaximaRecon.h"
 #include "AIMaximaForceModel.h"
 #include "AIMaximaLabour.h"
@@ -198,6 +199,11 @@ private:
 		int upgrade_level2_racetrack_weight;
 		int upgrade_level2_pool_weight;
 		int upgrade_level2_barracks_weight;
+		int prestige_priority=0;
+		int prestige_building_type=-1;
+		int prestige_target_level=0;
+        int prestige_desired_buildings=0;
+		bool prestige_completion_allowed=false;
 		int first_prestige_trained_workers;
 		int second_prestige_trained_workers;
 		int second_prestige_population_min;
@@ -264,6 +270,8 @@ private:
 		int preemptive_effective_zone_max;
 		int target_switch_margin;
 		int preemptive_recompute_ticks;
+		// Least ticks between recomputes triggered by building changes alone.
+		int preemptive_min_gap_ticks=0;
 		int preemptive_inner_distance;
 		int preemptive_band_width;
 		int preemptive_path_slack;
@@ -338,6 +346,7 @@ private:
 		PolicyTechnology,
 		PolicyDefense,
 		PolicyOffense,
+		PolicyPrestige,
 		PolicyCount
 	};
 
@@ -476,6 +485,8 @@ private:
 		int clusterCandidates;
 		int viableClusters;
 		int bestScore;
+		int flagProximityDistance;
+		int flagProximityPenalty;
 		std::map<std::string, int> rejections;
 	};
 
@@ -508,7 +519,18 @@ private:
 	void score_demands();
 	void score_postures();
 	void select_posture();
-	void allocate_resources();
+	void allocate_resources(AIMaximaRuntime::Context& runtime);
+    void assess_prestige(AIMaximaRuntime::Context& runtime);
+    std::vector<Prestige::Standing> prestige_standings(const AIMaximaRuntime::Context& runtime) const;
+    bool prestige_enabled(const AIMaximaRuntime::Context& runtime) const;
+    int prestige_pipeline_allowance(const AIMaximaPlacement::BuildingProfile& profile,
+        Prestige::PipelineCapacity* capacity=nullptr) const;
+    int prestige_gain(int buildingType,int fromLevel,int targetLevel) const;
+    bool prestige_action_allowed(AIMaximaRuntime::Context& runtime,int root,int from,int to,int excludedAction=-1) const;
+    void guard_prestige_completions(AIMaximaRuntime::Context& runtime);
+    Prestige::Race prestige_race;
+    std::map<int,Prestige::Cancellation> prestige_cancellations;
+    bool prestige_migration_pending=false;
 	void build_policy_bids();
 	void arbitrate_policy_bids();
 	const char* policy_name(PolicyKind policy) const;
@@ -541,7 +563,7 @@ private:
 	EnvironmentModel environment;
 	StrategicDemands demands;
 	PolicyBid policy_bids[PolicyCount];
-	OpponentAssessment opponents[Team::MAX_COUNT];
+	OpponentAssessment opponents[TEAM_MAX_COUNT];
 	Recon::Program reconnaissance;
 	std::map<int, ForceModel::State> force_beliefs;
 	void apply_force_beliefs();
@@ -649,7 +671,12 @@ private:
 	AIMaximaPlacement::DevelopmentLimits collect_development_limits(
 		AIMaximaRuntime::Context& runtime, int excludedAction=-1) const;
 	bool issue_development_action(AIMaximaRuntime::Context& runtime,
-		AIMaximaPlacement::DevelopmentAction& action);
+		AIMaximaPlacement::DevelopmentAction& action,
+        const AIMaximaPlacement::WorldState* placementWorld=nullptr);
+    bool forward_support_authorized(AIMaximaRuntime::Context& runtime,
+        const AIMaximaPlacement::DevelopmentAction& action) const;
+    void forward_support_constraints(const AIMaximaRuntime::Context& runtime,
+        AIMaximaPlacement::DevelopmentIntent& intent) const;
 	void emit_placement_diagnostics(AIMaximaRuntime::Context& runtime,
 		const char* outcome,
 		const AIMaximaPlacement::DevelopmentAction* action) const;
@@ -721,6 +748,9 @@ private:
 	int food_supported_swarms;
     int food_birth_crop_rate=0; // recurring wheat packets/tick, FoodLedger RateScale
 	bool food_ledger_valid;
+	void update_worker_priorities(AIMaximaRuntime::Context& runtime,
+		const AIMaximaPlacement::WorldState& world,
+		const AIMaximaFoodLedger::Result& ledger);
 	void update_food_retirement(AIMaximaRuntime::Context& runtime,
 		const AIMaximaPlacement::WorldState& world);
 	///Neighbouring cells a protected stack's growth can actually spread into.
@@ -834,10 +864,21 @@ private:
 		// 1: live protected seed, 2: unprotected growing/harvesting cell.
 		std::vector<Uint8> cells;
 		int seeds;
+		// Offspring potential with the common eight-direction denominator retained.
+		Uint64 wheatCapacity=0, woodCapacity=0, targetWoodCapacity=0;
 		explicit WoodReserve(int size): cells(size,0), seeds(0) {}
 	};
+	struct FarmTerrainInputs;
+	/// Read-only query shared by placement, clearing and farming.
+	WoodReserve select_wood_reserve(AIMaximaRuntime::Context& runtime) const;
+	/// The reserve chosen by the latest farming update, or a fresh selection
+	/// before the first one. Placement and clearing read it between farming
+	/// updates rather than rebuilding the wheat plan and worker reachability.
+	WoodReserve current_wood_reserve(AIMaximaRuntime::Context& runtime) const;
+	WoodReserve farming_wood_reserve=WoodReserve(0);
+	bool farming_wood_reserve_valid=false;
 	WoodReserve select_wood_reserve(AIMaximaRuntime::Context& runtime,
-        const std::vector<Uint8>* seedEligibility=nullptr) const;
+		const std::vector<Uint8>& protectedWheat, const FarmTerrainInputs& terrain) const;
 	bool wheat_invasion_clearing_required(AIMaximaRuntime::Context& runtime,
 		int index, const std::vector<Uint8>& protected_wheat,
 		const WoodReserve& wood_reserve) const;
@@ -845,8 +886,9 @@ private:
 	void resolve_wheat_invasion_clearing(AIMaximaRuntime::Context& runtime,
 		FarmProtectionPlan& plan);
 	void release_farming_protection(AIMaximaRuntime::Context& runtime);
-	FarmProtectionPlan build_farming_protection_plan(
-		AIMaximaRuntime::Context& runtime);
+	FarmProtectionPlan build_wheat_protection_plan(AIMaximaRuntime::Context& runtime,
+		const FarmTerrainInputs& terrain) const;
+	FarmProtectionPlan build_farming_protection_plan(AIMaximaRuntime::Context& runtime) const;
 	void apply_farming_protection(AIMaximaRuntime::Context& runtime,
 		const FarmProtectionPlan& plan, int& added, int& removed);
 	Farming::ExactFertilityCache fertility_cache;
@@ -867,6 +909,10 @@ private:
 	///them. Pending work is serialized to retain exact order timing.
 	bool land_clearing_pending;
 	bool maintenance_clearing_pending;
+	// A farming update requested the pending plan: it runs without waiting for
+	// scheduling.maintenance_clearing_min_gap_ticks after last_maintenance_clearing_tick.
+	bool maintenance_clearing_requested_by_farming=false;
+	int last_maintenance_clearing_tick=-1000000;
 	bool development_cycle_pending;
 	bool preemptive_defense_pending;
 	bool reactive_defense_pending;

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ChecksumScheme.h"
 #include "Material.h"
 #include <algorithm>
 #include <bitset>
@@ -12,6 +13,7 @@
 #include <memory>
 #include <vector>
 
+#include "BuildingRoute.h"
 #include "BuildingUtils.h"
 #include "BuildingState.h"
 #include "MapInternal.h"
@@ -20,7 +22,6 @@
 #include "UnitConsts.h"
 #include "BuildingCatalog.h"
 #include "BuildingType.h"
-#include "Team.h"
 
 namespace GAGCore
 {
@@ -32,6 +33,7 @@ namespace GAGCore
 struct WideMaterialPacket;
 struct WideMaterialDeliveryResult;
 class Unit;
+class Team;
 class Map;
 class BuildingGradientSearch;
 struct SharedBuildingGradient;
@@ -61,9 +63,7 @@ static constexpr int SWIM_VARIANT_COUNT = 4;
 /// once the can-swim path is reachable).
 static constexpr int SWIM_VARIANT_CAN_SWIM = 1;
 
-enum class BuildingRoute : unsigned char { Footprint, Clearing, Combat, Automatic };
-inline constexpr int BUILDING_ROUTE_COUNT = 3;
-inline constexpr int BUILDING_GRADIENT_COUNT = BUILDING_ROUTE_COUNT * MOVEMENT_CLASS_COUNT;
+// BUILDING_GRADIENT_COUNT: BuildingRoute.h.
 inline constexpr int BUILDING_ACCESS_COUNT = BUILDING_ROUTE_COUNT * SWIM_VARIANT_COUNT;
 static_assert(BUILDING_ACCESS_COUNT == BuildingStateRecord::LockCount);
 
@@ -198,8 +198,10 @@ class Building : public BuildingUtils, public BuildingStateRecord
 	///Updates the construction state when undergoing construction. If the construction materials are fully funded,
 	///construction has completed.
 	void updateBuildingSite(void);
-	///This function updates the units working at this building. If there are too many units, it
-	///fires some.
+	///Whether material-demand reductions wait until a courier finishes unloading.
+	bool finishesDeliveryTrips() const;
+
+	///Releases excess workers immediately for staffing limits and finite construction demand.
 	void updateUnitsWorking(void);
 
 	///This function is called after important events in order to update the building
@@ -260,7 +262,7 @@ class Building : public BuildingUtils, public BuildingStateRecord
 	// Keep stock and demand queries header-defined for the per-material hot loops.
 	Sint32 availableMaterial(int resource) const
 	{
-		const auto reserved = type->useTeamMaterials ? owner->reservedTeamMaterials[resource] : reservedMaterials[resource];
+		const auto reserved = type->useTeamMaterials ? ownerReservedTeamMaterials[resource] : reservedMaterials[resource];
 		return std::max(0, material(resource) - reserved);
 	}
 	bool reserveMaterials(const BuildingMaterialCost& cost);
@@ -335,7 +337,7 @@ class Building : public BuildingUtils, public BuildingStateRecord
 		{
 			// Construction can use unreserved stock already here. Repairs consume
 			// new deliveries directly, so existing inventory cannot satisfy them.
-			const int reserved = type->useTeamMaterials ? owner->reservedTeamMaterials[r] : reservedMaterials[r];
+			const int reserved = type->useTeamMaterials ? ownerReservedTeamMaterials[r] : reservedMaterials[r];
 			const int uncommitted = constructionResultState == REPAIR ? 0 : std::max(0, stock-reserved);
 			return Sint32(std::min<Sint64>(room, std::max(0, constructionMaterialNeed(r)-uncommitted)));
 		}
@@ -418,9 +420,9 @@ class Building : public BuildingUtils, public BuildingStateRecord
 	bool hasClearShotTo(int targetX, int targetY) const;
 
 	bool integrity();
-	Uint32 checkSum(std::vector<Uint32> *checkSumsVector, bool legacy152=false);
+	Uint32 checkSum(std::vector<Uint32> *checkSumsVector, ChecksumScheme scheme=ChecksumScheme::Current);
 private:
-	template<bool Diagnostic> Uint32 checkSumImpl(std::vector<Uint32> *checkSumsVector, bool legacy152);
+	template<bool Diagnostic> Uint32 checkSumImpl(std::vector<Uint32> *checkSumsVector, ChecksumScheme scheme);
 public:
 
 private:
@@ -587,6 +589,11 @@ public:
 	// Pointer-free authoritative values are inherited from BuildingStateRecord.
 	BuildingType *type;
 	Team *owner;
+	// owner->reservedTeamMaterials, cached so the inline material accessors need no
+	// Team definition and one load fewer. setOwner() keeps it in step with owner.
+	// Teams outlive their buildings; it is neither saved nor checksummed.
+	const Sint32 *ownerReservedTeamMaterials = nullptr;
+	void setOwner(Team *team);
 	/// Borrowed shared pool, or null when the compact private stock is active.
 	/// Changing the binding does not overwrite inactive private inventory.
 	Sint32* sharedMaterials = nullptr;
@@ -652,18 +659,7 @@ public:
 
 
 
-	enum UnitCantWorkReason
-	{
-		UnitNotAvailable=0,
-		UnitTooLowLevel=1,
-		UnitCantAccessBuilding=2,
-		UnitTooFarFromBuilding=3,
-		UnitCantAccessResource=4,
-		UnitCantAccessFruit=5,
-		UnitTooFarFromResource=6,
-		UnitTooFarFromFruit=7,
-		UnitCantWorkReasonSize,
-	};
+	// UnitCantWorkReason: BuildingStateRecord (BuildingState.h).
 
 	/// Display only. While the local player has this building selected, the
 	/// units behind each tally are kept by gid so the map view can mark them.

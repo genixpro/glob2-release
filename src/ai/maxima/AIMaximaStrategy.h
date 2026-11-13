@@ -316,9 +316,17 @@ struct MaximaStrategy
 		int recovery_inn_weight;
 	} upgrades;
 
+	struct PrestigePolicy
+	{
+		bool enabled;
+		int investment_floor, urgency_weight, finish_priority, max_pipelines;
+	} prestige;
+
 	struct Repairs
 	{
 		bool enabled;
+		int tower_health_percent;
+		int tower_enemy_radius;
 	} repairs;
 
 	struct Construction
@@ -509,6 +517,13 @@ struct MaximaStrategy
 		int tower_spacing_weight;
 		int tower_threat_target;
 		int tower_threat_weight;
+		int tower_border_percent;
+		int tower_interior_percent;
+		int tower_border_enemy_ratio;
+		int tower_role_distance_falloff;
+		int tower_spread_saturation_tiles;
+		int tower_spread_percent;
+		int food_upgrade_retry_ticks;
 		int labor_scale;
 		int downtime_worker_scale;
 		int artery_length_scale;
@@ -560,6 +575,9 @@ struct MaximaStrategy
 		int flag_minimum_level;
 		int min_force;
 		int retarget_margin;
+		int enemy_commitment;
+		int arrival_grace_ticks;
+		int flag_proximity_weight;
 		int dwell_ticks;
 		int stall_ticks;
 		int target_swarm_value;
@@ -573,6 +591,14 @@ struct MaximaStrategy
 		int route_distance_weight;
 		int failed_target_quarantine_ticks;
 	} tactics;
+
+    struct ForwardSupport
+    {
+        bool inns_enabled;
+        bool hospitals_enabled;
+        int distance_tiles;
+        int coverage_distance_tiles;
+    } forward_support;
 
 	struct Assault
 	{
@@ -770,6 +796,9 @@ struct MaximaStrategy
 		int explorer_attack_interval_ticks;
 		int explorer_attack_phase_offset_ticks;
 		int placement_interval_ticks;
+		int strategy_review_min_gap_ticks;
+		int maintenance_clearing_min_gap_ticks;
+		int preemptive_defense_min_gap_ticks;
 		int explorer_warning_duration_ticks;
 		int explorer_colony_warning_duration_ticks;
 	} scheduling;
@@ -839,6 +868,10 @@ public:
 	/// True when GLOB2_MAXIMA_TELEMETRY is set to anything but "0". Telemetry
 	/// only prints; it never changes a decision.
 	static bool telemetryEnabled();
+	/// Upgrade embedded configurations before constructing controllers from an
+	/// older save. Newly written headers then contain the current complete schema.
+	static bool upgradeSavedConfigurations(GameHeader& gameHeader, int versionMinor,
+		std::string& error);
 	/// Resolves the strategy for one player of `gameHeader`, adding that player's
 	/// GLOB2_MAXIMA_TEAM_OVERRIDES and GLOB2_MAXIMA_PLAYER_OVERRIDES entries
 	/// ("<number>:<assignments>|<number>:<assignments>") to environmentOptions().

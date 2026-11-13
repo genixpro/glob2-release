@@ -2,6 +2,8 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <Stream.h>
+#include "Building.h"
+#include "Map.h"
 #include <algorithm>
 #include <bit>
 
@@ -13,6 +15,7 @@
 #include "Player.h"
 #include "Unit.h"
 #include "Utilities.h"
+#include "Team.h"
 
 #define AI_FILE_MIN_VERSION 1
 #define AI_FILE_VERSION 7
@@ -685,7 +688,7 @@ bool AICastor::load(GAGCore::InputStream *stream, Player *player, Sint32 version
   }
   stream->readLeaveSection();
  }
-	if(aiFileVersion>=6 && !AIEngine::loadResourceInitializations(stream,resourceInitializations,teamNumber,size_t(map->getW())*map->getH())) {stream->readLeaveSection();return false;}
+	if(aiFileVersion>=6 && !AIEngine::loadResourceInitializations(stream,resourceInitializations,teamNumber,size_t(map->getW())*map->getH(),versionMinor)) {stream->readLeaveSection();return false;}
 	stream->readLeaveSection();
 	if (versionMinor<FILE_FORMAT_VERSION_TERRAIN_PROPERTIES
 		&& computeBoot>AI_CASTOR_BOOT_IDLE_TICKS+1)

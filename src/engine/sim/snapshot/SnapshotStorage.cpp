@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SnapshotStorage.h"
 #include "TeamStat.h"
+#include <unordered_map>
 namespace SimulationSnapshot
 {
 MemoryMetrics Storage::memoryMetrics() const
@@ -34,7 +35,7 @@ MemoryMetrics Storage::memoryMetrics() const
     account(session, [&](const Session& value, bool) { return vectorBytes(value.players); });
     account(effects, [&](const Effects& value, bool) {
         Uint64 bytes=vectorBytes(value.sectors);
-        for (const auto& sector:value.sectors) bytes+=vectorBytes(sector.bullets)+vectorBytes(sector.explosions)+vectorBytes(sector.deaths);
+        for (const auto& sector:value.sectors) bytes+=vectorBytes(sector.bullets)+vectorBytes(sector.explosions)+vectorBytes(sector.deaths)+vectorBytes(sector.unitEffects);
         return bytes;
     });
     account(statistics, [&](const Statistics& value, bool leased) {
@@ -50,7 +51,7 @@ MemoryMetrics Storage::memoryMetrics() const
     });
     account(telemetry, [&](const Telemetry& value, bool) {
         Uint64 bytes = vectorBytes(value.rows);
-        for (const auto& row : value.rows) bytes += vectorBytes(row.fields) + vectorBytes(row.values) + vectorBytes(row.named);
+        for (const auto& row : value.rows) bytes += (row.fields ? vectorBytes(*row.fields) : 0) + vectorBytes(row.values) + vectorBytes(row.named);
         return bytes;
     });
     account(history, [&](const History& value, bool leased) {
@@ -81,18 +82,31 @@ MemoryMetrics Storage::memoryMetrics() const
 		return bytes;
 	});
 	account(rules, [&](const Rules& value, bool) { return vectorBytes(value.named) + vectorBytes(value.experiments); });
-	account(resourceFields, [&](const ResourceFields& value, bool) { return vectorBytes(value.planes); });
+    std::unordered_map<const void*,SharedPayload> destinationPayloads;
+	account(resourceFields, [&](const ResourceFields& value, bool leased) {
+        for (const auto& plane:value.planes) if (plane.destinations) {
+            auto [entry,inserted]=destinationPayloads.try_emplace(plane.destinations.get(),
+                SharedPayload{plane.destinations.get(),sizeof(*plane.destinations),plane.destinations->bytes(),leased});
+            if (!inserted) entry->second.leased|=leased;
+        }
+        return vectorBytes(value.planes);
+    });
 	account(growth, [](const Fertility::GrowthCache& value, bool) {
 		const auto capacities = value.storageCapacities();
 		return Uint64(capacities[0] + capacities[1]) * sizeof(Uint32) + Uint64(capacities[2]) * sizeof(Uint16);
 	});
 	account(areaFertility, [&](const BuildingAreaEffects::FertilitySnapshot& value, bool) { return vectorBytes(value.values)+vectorBytes(value.stamps); });
-	account(resourcePlanes, [&](const std::vector<Uint16>& value, bool) { return vectorBytes(value); });
+	account(buildingSeeds, [&](const MapState::BuildingSeedSnapshot& value, bool) { return Uint64(value.planes.capacityBytes()) + vectorBytes(value.stamps); });
 	for (std::size_t i = 0; i < sharedCount; ++i) {
 		result.capacityBytes += shared[i].capacity;
 		result.retainedBytes += shared[i].object + shared[i].capacity;
 		if (shared[i].leased) result.leasedBytes += shared[i].object + shared[i].capacity;
 	}
+    for (const auto& [identity,payload]:destinationPayloads) {
+        result.capacityBytes+=payload.capacity;
+        result.retainedBytes+=payload.object+payload.capacity;
+        if (payload.leased) result.leasedBytes+=payload.object+payload.capacity;
+    }
 	return result;
 }
 } // namespace SimulationSnapshot

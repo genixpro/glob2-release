@@ -5,8 +5,10 @@ from pathlib import Path
 import tempfile
 import unittest
 from terrain_tileset import (ROOT, BINDINGS, LEGACY_BINDINGS, validate, compile_tileset, pixel_fingerprint,
-                             seamless_sources, data_path, required_bindings, material_provenance)
+                             seamless_sources, data_path, required_bindings, material_provenance,
+                             border_profile, border_table)
 from PIL import Image
+import terrain_catalog
 
 
 def catalog_frame_count(document):
@@ -21,7 +23,7 @@ def catalog_frame_count(document):
 
 class TerrainTileset(unittest.TestCase):
     def setUp(self):
-        self.document = json.loads((ROOT / "data/terrain/tileset.json").read_text())
+        self.document = terrain_catalog.load(ROOT / "content")
 
     def test_boundary_shapes_are_explicit_and_version_gated(self):
         validate(self.document)
@@ -34,16 +36,124 @@ class TerrainTileset(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate(self.document)
 
+    def test_border_classes_choose_contacts_without_pair_overrides(self):
+        self.assertEqual(self.document["version"], 4)
+        self.assertNotIn("pair_treatments", self.document)
+        expected = {
+            ("water", "deep_water"): "still", ("water", "grass"): "shore", ("water", "sand"): "beach",
+            ("lava", "boulders"): "molten", ("lava", "water"): "molten", ("road", "boulders"): "paved",
+            ("road", "lava"): "paved", ("boardwalk", "water"): "crisp", ("hedge", "void_hole"): "canopy",
+            ("dirt", "grass"): "soil", ("boulders", "mud"): "rock", ("ice", "water"): "frozen",
+        }
+        for (a, b), profile in expected.items():
+            with self.subTest(pair=(a, b)):
+                self.assertEqual(border_profile(self.document, a, b), profile)
+                self.assertEqual(border_profile(self.document, b, a), profile)
+        table = border_table(self.document)
+        count = len(self.document["bindings"])
+        self.assertEqual(len(table), count * (count - 1) // 2)
+        # An explicit pair treatment remains an escape hatch.
+        self.document["pair_treatments"] = [{"a": "water", "b": "grass", "profile": "beach"}]
+        self.assertEqual(border_profile(self.document, "grass", "water"), "beach")
+
+    def test_border_class_schema_is_version_gated(self):
+        mutations = [
+            lambda d: d.update(version=3),
+            lambda d: d.pop("border_classes"),
+            lambda d: d.update(border_classes=[]),
+            lambda d: d["border_classes"].append({"key": "cover"}),
+            lambda d: d["border_classes"][0].update(shoreline=1),
+            lambda d: d["border_classes"][0].update(unknown=True),
+            lambda d: d["bundle_profiles"]["soft"].update({"class": "absent"}),
+            lambda d: d["bundle_profiles"]["soft"].update(profile="soft"),
+            lambda d: d["materials"][0].update({"class": "absent"}),
+            lambda d: d["materials"][0].pop("class"),
+            lambda d: d["profiles"][0].update(coast="absent"),
+            lambda d: d["profiles"][0].update(coast=d["profiles"][0]["key"]),
+            lambda d: d["profiles"][0].update(precedence=256),
+            # Version 4 draws every profile smoothly: any profile may set these,
+            # within their ranges.
+            lambda d: d["profiles"][0].update(wiggle_q8=2049),
+            lambda d: d["profiles"][0].update(detail_q8=1025),
+            lambda d: next(p for p in d["profiles"] if p.get("shape") == "smooth").update(wiggle_period=48),
+            lambda d: next(p for p in d["profiles"] if p.get("shape") == "smooth").update(wiggle_q8=2049),
+            lambda d: next(p for p in d["profiles"] if p.get("shape") == "smooth").update(squareness_q8=257),
+            lambda d: d["profiles"][0].update(squareness_q8=257),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                d = copy.deepcopy(self.document)
+                mutate(d)
+                with self.assertRaises(ValueError):
+                    validate(d)
+
     def test_registered_materials_and_scalability(self):
         expected = catalog_frame_count(self.document)
         self.assertGreaterEqual(expected, 80)
         self.assertEqual(len(validate(self.document)), expected)
-        for i in range(64 - len(self.document["materials"])):
+        for i in range(96 - len(self.document["materials"])):
             m = copy.deepcopy(self.document["materials"][2])
             m["key"] = f"fixture-{i}"
             self.document["materials"].append(m)
-        self.assertEqual(len(self.document["materials"]), 64)
+        self.assertEqual(len(self.document["materials"]), 96)
         self.assertEqual(len(validate(self.document)), expected)
+
+    def test_interchangeable_blocks_require_complete_periodic_grids(self):
+        # Only the animated waters (which share one wave animation) stay on one
+        # 4x4 layout; the lava group's animated materials have four 8x8 layouts
+        # like the static ones.
+        blocked = [m for m in self.document["materials"] if "variant_blocks" in m]
+        self.assertEqual({m["key"] for m in self.document["materials"] if "variant_blocks" not in m},
+                         {"water", "deep_water", "dark_water"})
+        for material in blocked:
+            self.assertEqual(material["variant_blocks"], 4)
+            self.assertEqual(material["variant_grid"], 8)
+            self.assertEqual(len(material["variants"]), 256)
+            for value in (0, 2, 17, "4", True):
+                invalid = copy.deepcopy(self.document)
+                next(m for m in invalid["materials"] if m["key"] == material["key"])["variant_blocks"] = value
+                with self.assertRaises(ValueError):
+                    validate(invalid)
+            invalid = copy.deepcopy(self.document)
+            next(m for m in invalid["materials"] if m["key"] == material["key"]).pop("variant_grid")
+            with self.assertRaises(ValueError):
+                validate(invalid)
+
+    def test_animation_blend_steps_are_optional_and_bounded_by_the_phase(self):
+        lava = next(m for m in self.document["materials"] if m["key"] == "lava")
+        for steps in (1, lava["animation_ticks"]):
+            lava["animation_blend_steps"] = steps
+            validate(self.document)
+        for steps in (0, lava["animation_ticks"] + 1, "4", 2.0, True):
+            lava["animation_blend_steps"] = steps
+            with self.assertRaises(ValueError):
+                validate(self.document)
+        lava.pop("animation_blend_steps")
+        still = next(m for m in self.document["materials"] if "animation_frames" not in m)
+        still["animation_blend_steps"] = 1
+        with self.assertRaises(ValueError):
+            validate(self.document)
+
+    def test_variant_block_groups_use_nonempty_utf8_keys_of_at_most_64_bytes(self):
+        # Reduce to one material so each schema boundary checks only its frames.
+        document = copy.deepcopy(self.document)
+        document["materials"] = [document["materials"][0]]
+        key = document["materials"][0]["key"]
+        document["bindings"] = {name: key for name in document["bindings"]}
+        document["pair_treatments"] = []
+        for value in ("waves", "a" * 64, "é" * 32):
+            document["materials"][0]["variant_block_group"] = value
+            with self.subTest(valid=value):
+                validate(document)
+        for value in ("", "a" * 65, "é" * 33, True, 4, [], {}):
+            document["materials"][0]["variant_block_group"] = value
+            with self.subTest(invalid=value):
+                with self.assertRaisesRegex(ValueError, "variant_block_group"):
+                    validate(document)
+        document["materials"][0]["variant_block_group"] = "waves"
+        document["materials"][0].pop("variant_grid")
+        with self.assertRaisesRegex(ValueError, "variant_block_group"):
+            validate(document)
 
     def test_required_bindings_cover_legacy_and_builtin_names(self):
         names = json.loads((ROOT / "tools/terrain_builtin_names.json").read_text())
@@ -62,12 +172,67 @@ class TerrainTileset(unittest.TestCase):
     def test_material_provenance_is_per_material(self):
         provenance = material_provenance(self.document)
         self.assertEqual(set(provenance), {m["key"] for m in self.document["materials"]})
-        self.assertEqual(provenance["grass"]["method"], "existing")
+        self.assertEqual(provenance["grass"]["method"], "procedural")
         for key, record in provenance.items():
-            if key in LEGACY_BINDINGS:
-                continue
             self.assertIn(record["method"], ("procedural", "image-generator", "hybrid"), key)
             self.assertTrue((ROOT / record["source"]).is_file(), key)
+
+    def test_connected_decor_requires_complete_corner_groups(self):
+        hedge = next(m for m in self.document["materials"] if m["key"] == "hedge")
+        original = hedge["decor"]["connected"]
+        for frames in ([], [0], [0] * 15, [0] * 17, [0] * 272, [True] * 16):
+            hedge["decor"]["connected"] = frames
+            with self.assertRaises(ValueError):
+                validate(self.document)
+        hedge["decor"]["connected"] = original
+        hedge["decor"]["connected_corners"] = 1
+        with self.assertRaises(ValueError):
+            validate(self.document)
+        hedge["decor"]["connected"] = original[:128]
+        hedge["decor"]["connected_corners"] = True
+        with self.assertRaises(ValueError):
+            validate(self.document)
+        hedge["decor"]["connected"] = original
+        validate(self.document)
+
+    def test_open_edged_decor_is_a_flag_on_connected_frames(self):
+        cliffs = next(m for m in self.document["materials"] if m["key"] == "cliffs")
+        hedge = next(m for m in self.document["materials"] if m["key"] == "hedge")
+        glacier = next(m for m in self.document["materials"] if m["key"] == "glacier")
+        # Cliffs and glacier stand on open ground; foliage keeps a clear border.
+        self.assertIs(cliffs["decor"]["connected_open"], True)
+        self.assertIs(glacier["decor"]["connected_open"], True)
+        self.assertNotIn("connected_open", hedge["decor"])
+        cliffs["decor"]["connected_open"] = 1
+        with self.assertRaises(ValueError):
+            validate(self.document)
+        boulders = next(m for m in self.document["materials"] if m["key"] == "boulders")
+        boulders["decor"]["connected_open"] = True
+        cliffs["decor"]["connected_open"] = True
+        with self.assertRaises(ValueError):
+            validate(self.document)
+        del boulders["decor"]["connected_open"]
+        validate(self.document)
+
+    def test_clear_of_masses_is_a_small_object_decor_distance(self):
+        boulders = next(m for m in self.document["materials"] if m["key"] == "boulders")
+        self.assertEqual(boulders["decor"]["clear_of_masses"], 0)
+        for value in (0, 1):
+            boulders["decor"]["clear_of_masses"] = value
+            validate(self.document)
+        for value in (-1, 2, True, "1", 1.0):
+            boulders["decor"]["clear_of_masses"] = value
+            with self.assertRaises(ValueError):
+                validate(self.document)
+        boulders["decor"]["clear_of_masses"] = 0
+        # Connected frames (masses and foliage) tile across cells.
+        for key in ("cliffs", "hedge"):
+            material = next(m for m in self.document["materials"] if m["key"] == key)
+            material["decor"]["clear_of_masses"] = 1
+            with self.assertRaises(ValueError):
+                validate(self.document)
+            del material["decor"]["clear_of_masses"]
+        validate(self.document)
 
     def test_invalid_catalogs(self):
         mutations = [
@@ -115,6 +280,13 @@ class TerrainTileset(unittest.TestCase):
             lambda d: d["materials"][3]["seam"].update(height=-1),
             lambda d: d["materials"][3]["seam"].update(fringe=[0, 0]),
             lambda d: d["materials"][3]["seam"].update(fringe_width_q8=2049),
+            lambda d: d["materials"][3].update(surf=[]),
+            lambda d: d["materials"][3].update(surf={"period": 0}),
+            lambda d: d["materials"][3].update(surf={"period": 60, "wet_q8": 257}),
+            lambda d: d["materials"][3].update(surf={"period": 60, "ticks": 0}),
+            lambda d: d["materials"][3].update(surf={"period": 60, "ticks": 61}),
+            lambda d: d["materials"][3].update(surf={"period": 60, "reach_q8": 1800, "foam_width_q8": 300}),
+            lambda d: d["materials"][3].update(surf={"period": 60, "shallow": [0, 0]}),
             lambda d: d["profiles"][0].update(feather_q8=True),
             lambda d: d["profiles"][0].update(feather_q8=127),
             lambda d: d["profiles"][0].update(feather_q8=513),
@@ -149,12 +321,22 @@ class TerrainTileset(unittest.TestCase):
     def test_version_one_catalog_remains_supported(self):
         self.document["version"] = 1
         self.document.pop("boundary_warp_q8")
+        self.document.pop("border_classes")
+        self.document.pop("bundle_profiles", None)
         for profile in self.document["profiles"]:
-            for field in ("feather_q8", "amplitude_q8", "speckle_q8", "bridge_q8", "shape"):
+            for field in ("feather_q8", "amplitude_q8", "speckle_q8", "bridge_q8", "shape",
+                          "precedence", "coast", "wiggle_q8", "wiggle_period", "squareness_q8",
+                          "teeth_q8", "teeth_form", "facets", "clasts", "resistance_q8",
+                          "cohesion_q8", "grain_q8", "spread_q8"):
                 profile.pop(field, None)
+            profile.setdefault("roughness_q8", 0)
             profile["contours_q12"] = [[0, 128, -128, 64, 0]] * 4
         for material in self.document["materials"]:
             material.pop("seam", None)
+            material.pop("surf", None)
+            material.pop("class", None)
+            material.pop("stones", None)
+            material.pop("shore_wash_q8", None)
         self.assertEqual(len(validate(self.document)), catalog_frame_count(self.document))
         self.document["profiles"][0]["contours_q12"][0][1] = 257
         with self.assertRaises(ValueError):
@@ -163,9 +345,9 @@ class TerrainTileset(unittest.TestCase):
     def test_variant_borders_preserve_premultiplied_alpha_continuity(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            (root / "data").mkdir()
-            Image.new("RGBA", (32, 32), (40, 80, 120, 128)).save(root / "data/tile0.png")
-            Image.new("RGBA", (32, 32), (250, 0, 0, 0)).save(root / "data/tile1.png")
+            (root / "content/data").mkdir(parents=True)
+            Image.new("RGBA", (32, 32), (40, 80, 120, 128)).save(root / "content/data/tile0.png")
+            Image.new("RGBA", (32, 32), (250, 0, 0, 0)).save(root / "content/data/tile1.png")
             document = {"materials": [{"sprite": "data/tile", "variants": [{"frame": 0}, {"frame": 1}]}]}
             frames = seamless_sources(document, root)
             first, second = frames["data/tile0.png"], frames["data/tile1.png"]
@@ -175,22 +357,45 @@ class TerrainTileset(unittest.TestCase):
             self.assertEqual(second.getpixel((1, 16)), (40, 80, 120, 96))
             self.assertEqual(second.getpixel((16, 16)), (250, 0, 0, 0))
 
+    def blended(self):
+        """The catalog with its first material's shared borders blended, not periodic."""
+        document = copy.deepcopy(self.document)
+        for field in ("edges", "variant_grid", "variant_blocks", "variant_block_group"):
+            document["materials"][0].pop(field, None)
+        return document, catalog_frame_count(dict(materials=document["materials"][:1]))
+
+    def test_only_blended_frames_are_packed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            periodic = [m for m in self.document["materials"] if m.get("edges") == "periodic"]
+            packed = compile_tileset(dict(self.document, materials=periodic), Path(tmp) / "a")
+            self.assertEqual((packed["pages"], packed["frames"], packed["sources"]), ([], [], {}))
+            document, count = self.blended()
+            packed = compile_tileset(document, Path(tmp) / "b")
+            prefix = document["materials"][0]["sprite"]
+            self.assertEqual(len(packed["frames"]), count)
+            self.assertTrue(all(f["source"].startswith(prefix) for f in packed["frames"]))
+            self.assertEqual(sorted(packed["sources"]), sorted(f["source"] for f in packed["frames"]))
+            self.assertTrue(all(len(page["levels"]) == 1 for page in packed["pages"]))
+
     def test_source_fingerprints_follow_exported_pixels(self):
         native = Image.new("RGBA", (32, 32), (23, 57, 91, 255))
         # Shared fixture value also asserted by the C++ pack loader regression.
         self.assertEqual(pixel_fingerprint(native), "422c101433645325")
+        document, count = self.blended()
         with tempfile.TemporaryDirectory() as tmp:
-            fingerprints = {name: pixel_fingerprint(native) for name in validate(self.document)}
-            packed = compile_tileset(self.document, Path(tmp), runtime_fingerprints=fingerprints)
+            fingerprints = {name: pixel_fingerprint(native) for name in validate(document)}
+            packed = compile_tileset(document, Path(tmp), runtime_fingerprints=fingerprints)
+            self.assertEqual(len(packed["frames"]), count)
             self.assertTrue(all(frame["native_rgba_fnv1a64"] == fingerprints[frame["source"]]
                                 for frame in packed["frames"]))
 
     def test_pages_and_mips_are_reproducible(self):
+        document, _ = self.blended()
         with tempfile.TemporaryDirectory() as tmp:
             a, b = Path(tmp) / "a", Path(tmp) / "b"
-            first = compile_tileset(self.document, a, page_size=128)
+            first = compile_tileset(document, a, page_size=128)
             self.assertGreater(len(first["pages"]), 1)
-            second = compile_tileset(self.document, b, page_size=128)
+            second = compile_tileset(document, b, page_size=128)
             self.assertEqual(first, second)
             for p in a.iterdir():
                 self.assertEqual(p.read_bytes(), (b / p.name).read_bytes())

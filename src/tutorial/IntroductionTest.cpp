@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
 #include "TutorialModel.h"
 #include "scripting/javascript/ScriptValue.h"
 #include "scripting/javascript/ScriptOrders.h"
@@ -9,6 +12,7 @@
 #include "Player.h"
 #include "WinningConditions.h"
 #include "ReplayWriter.h"
+#include "Version.h"
 #include "Brush.h"
 #include "FertilityCalculator.h"
 #include <BinaryStream.h>
@@ -17,24 +21,31 @@
 #include <sstream>
 #include <iomanip>
 #include <zlib.h>
+#include "Unit.h"
+#include "Building.h"
+#include "SGSL.h"
+#include "MapScript.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
+#include "sim/snapshot/WorldSnapshot.h"
 
 namespace
 {
 std::string source(const std::string &name="introduction")
 {
-    std::ifstream catalogFile(glob2test::sourceRoot()/"scripts/tutorials/catalog.json");
+    std::ifstream catalogFile(glob2test::contentRoot()/"scripts/tutorials/catalog.json");
     const auto catalog=Tutorial::contentJson({std::istreambuf_iterator<char>(catalogFile),{}});
     std::string path;
     for(const auto &entry:catalog.items)
         if(std::filesystem::path(entry.string("definition")).stem()==name) path=entry.string("script");
     REQUIRE_FALSE(path.empty());
-    std::ifstream file(glob2test::sourceRoot()/path);
+    std::ifstream file(glob2test::contentRoot()/path);
     REQUIRE(file.good());
     return {std::istreambuf_iterator<char>(file),{}};
 }
 void setup(glob2test::HeadlessGame &w,const std::string &name="introduction")
 {
-    const auto path=glob2test::sourceRoot()/("campaigns/"+name+".map.gz");
+    const auto path=glob2test::contentRoot()/("campaigns/"+name+".map.gz");
     gzFile file=gzopen(path.string().c_str(),"rb"); REQUIRE(file);
     std::string bytes;char buffer[4096];int count;
     while((count=gzread(file,buffer,sizeof(buffer)))>0) bytes.append(buffer,count);
@@ -62,8 +73,18 @@ void create(Game &g,const char *name,int x,int y,int workers,bool site=false)
 {
     const int type=g.buildingsTypes.getTypeNum(name,0,site);
     REQUIRE(type>=0);
+    CAPTURE(std::string(name));CAPTURE(x);CAPTURE(y);
     REQUIRE(g.checkRoomForBuilding(x,y,g.buildingsTypes.get(type),0,false));
     order(g,std::make_shared<OrderCreate>(0,x,y,type,workers,site ? 0 : workers, site ? std::nullopt : std::optional<Sint32>(4)));
+}
+std::vector<Uint32> continuationState(Game &game)
+{
+    std::vector<Uint32> state, buildings, units;
+    game.checkSum(&state,&buildings,&units);
+    REQUIRE_FALSE(state.empty());
+    state.insert(state.end(),buildings.begin(),buildings.end());
+    state.insert(state.end(),units.begin(),units.end());
+    return state;
 }
 void continuation(glob2test::HeadlessGame &w)
 {
@@ -71,17 +92,21 @@ void continuation(glob2test::HeadlessGame &w)
     GAGCore::BinaryOutputStream output(memory);
     w.game.save(&output,false,w.game.mapHeader.getMapName()); output.flush();
     const std::string bytes(memory->getBuffer(),memory->getPosition());
-    std::vector<Uint32> trace;
+    std::vector<std::vector<Uint32>> trace;
     std::ofstream log(glob2test::artifactDir()/"introduction.trace",std::ios::app);
-    for (int i=0;i<96;++i) { w.step(); trace.push_back(w.game.checkSum()); log << w.game.stepCounter << " " << trace.back() << "\n"; }
+    for (int i=0;i<96;++i) {
+        w.step();trace.push_back(continuationState(w.game));
+        log << w.game.stepCounter << " " << w.game.checkSum() << "\n";
+    }
     GameGUI restored(false);
     GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));
     input.seekFromStart(0);
     REQUIRE(restored.game.load(&input));
+    CHECK(restored.game.mapHeader.getVersionMinor()==VERSION_MINOR);
     restored.game.setWaitingOnMask(0);
     for (int i=0;i<96;++i) {
         restored.game.step(0);
-        REQUIRE(restored.game.checkSum()==trace[i]);
+        REQUIRE(continuationState(restored.game)==trace[i]);
     }
 }
 void until(glob2test::HeadlessGame &w,const std::function<bool()> &done,int limit=24000)
@@ -113,7 +138,7 @@ void until(glob2test::HeadlessGame &w,const std::function<bool()> &done,int limi
 TEST_CASE("packaged lesson maps embed their source and share geography" * doctest::test_suite("Introduction"))
 {
     glob2test::HeadlessGlobals globals;
-    std::ifstream catalogFile(glob2test::sourceRoot()/"scripts/tutorials/catalog.json");
+    std::ifstream catalogFile(glob2test::contentRoot()/"scripts/tutorials/catalog.json");
     const auto catalog=Tutorial::contentJson({std::istreambuf_iterator<char>(catalogFile),{}});
     std::vector<Uint16> reference;
     for(const auto &entry:catalog.items) {
@@ -452,7 +477,10 @@ TEST_CASE("expanded lessons complete through player orders and saved continuatio
         }
         if(name=="fortifications") {
             create(w.game,"defencetower",96,96,3,true);done(0);
-            create(w.game,"stonewall",99,95,2,true);create(w.game,"stonewall",99,98,2,true);done(1);
+            // A worker may be passing over a wall site; a player waits for it to move on.
+            const auto roomFor=[&](int x,int y){return w.game.checkRoomForBuilding(x,y,w.game.buildingsTypes.get(w.game.buildingsTypes.getTypeNum("stonewall",0,true)),0,false);};
+            until(w,[&]{return roomFor(99,95);},2000);create(w.game,"stonewall",99,95,2,true);
+            until(w,[&]{return roomFor(99,98);},2000);create(w.game,"stonewall",99,98,2,true);done(1);
             CHECK(w.game.teams[1]->liveBuildings.size()==3);
             auto *tower=find(w.game,IntBuildingType::DEFENSE_BUILDING);REQUIRE(tower);
             order(w.game,std::make_shared<OrderModifyBuilding>(tower->gid,2));done(2);
@@ -474,7 +502,7 @@ TEST_CASE("zone observations and scenario orders preserve map callback validatio
     glob2test::HeadlessGame w({.wDec=6,.hDec=6,.teams=2,.loadDefaultRace=true,.header=true,.seed=20261026});
     setup(w,"fortifications");
     globalContainer->replayWriter=std::make_unique<ReplayWriter>();
-    globalContainer->replayWriter->init("",w.gui);
+    w.gui.startReplay(*globalContainer->replayWriter, "");
     struct RecordingScope { ~RecordingScope(){globalContainer->replayWriter.reset();} } recordingScope;
     const auto recordedBefore=globalContainer->replayWriter->getOrderCount();
     const std::string spawn="const t=ctx.game.buildingTypes().find(t=>t.name==='warflag'&&!t.site&&t.level===0);const e={type:'scenarioOrder',team:1,order:{type:'create',buildingType:t.id,x:97,y:98,workers:1,futureWorkers:1,range:3}};";
@@ -581,6 +609,9 @@ TEST_CASE("archived SGSL save retains embedded source and continuation" * doctes
         REQUIRE(baseline.game.checkSum()==restored.game.checkSum());
         trace<<baseline.game.stepCounter<<" "<<baseline.game.checkSum()<<"\n";
     }
+    // Windows requires the writer to release the file before it can be renamed.
+    trace.close();
+    REQUIRE(trace.good());
     std::filesystem::rename(glob2test::artifactDir()/"introduction.trace",glob2test::artifactDir()/"legacy-campaign.trace");
 }
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "PowerOfTwo.h"
+#include "Map.h"
 #include "Unit.h"
 #include "Building.h"
 #include "BuildingType.h"
@@ -15,14 +16,19 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include "Game.h"
+#include "Team.h"
 
 namespace MapGeneration::JavaScript
 {
 JSClassID Binding::nativeClass = 0;
 Binding::Binding(const Package &p, const GenerationRequest &r, Game *g, GenerationContext *c,
 				 bool ro, bool inspect)
-	: package(p), request(r), game(g), generation(c), readonly(ro), inspecting(inspect)
+	: package(p), request(r), game(g), world(nullptr), generation(c), readonly(ro),
+	  inspecting(inspect)
 {
+	if (game)
+		world = &ownedWorld.emplace(*game);
 	if (std::fegetround() != FE_TONEAREST)
 		throw ScriptError("Unsupported floating-point rounding mode");
 	runtime = JS_NewRuntime();
@@ -269,7 +275,7 @@ void Binding::allocate(size_t n)
 	JS_SetMemoryLimit(runtime, limit - nativeBytes);
 }
 Binding::CallbackScope::CallbackScope(Binding &binding)
-	: e(binding), previousGame(e.game), previousGeneration(e.generation),
+	: e(binding), previousGame(e.game), previousWorld(e.world), previousGeneration(e.generation),
 	  previousReadonly(e.readonly), previousGenerationLease(e.generationLease)
 {
 	if (e.callbackDepth >= 64)
@@ -285,6 +291,7 @@ Binding::CallbackScope::~CallbackScope()
 	e.leases.pop_back();
 	--e.callbackDepth;
 	e.game = previousGame;
+	e.world = previousWorld;
 	e.generation = previousGeneration;
 	e.readonly = previousReadonly;
 	e.generationLease = std::move(previousGenerationLease);

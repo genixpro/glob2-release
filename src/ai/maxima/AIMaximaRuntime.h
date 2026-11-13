@@ -9,9 +9,10 @@
 #define AI_MAXIMA_RUNTIME_H
 
 #include "field/Frontier.h"
-#include "field/TerrainTravel.h"
+#include "field/TerrainTravelMode.h"
 #include "AIImplementation.h"
-#include "Map.h"
+#include "MapTypes.h"
+class Map;
 #include "Order.h"
 #include "ai/observation/OrderSelection.h"
 #include "Player.h"
@@ -21,6 +22,7 @@
 #include "ai/engine/AIDecision.h"
 
 #include <memory>
+#include <functional>
 #include <limits>
 #include <list>
 #include <locale>
@@ -451,6 +453,9 @@ namespace Construction
 		void remove_building(int id);
 		void set_upgrading(int id, bool awaitingExecution=false);
 		void order_execution_completed(int gid, bool accepted, std::optional<Uint32> generation={});
+		// A rejected or canceled create forgets its issued placement, so the
+		// one-at-a-time placement gate does not wait for the pending timeout.
+		void placement_rejected(int x, int y, int type);
 		void tick();
 		bool is_building_pending(unsigned id) const;
 		bool is_building_found(unsigned id) const;
@@ -721,6 +726,7 @@ class Context
 	void add_material_tracker(Management::MaterialTracker*, int id);
 	std::shared_ptr<Management::MaterialTracker> get_material_tracker(int id);
 	Construction::BuildingRegister& get_building_register() { return buildings; }
+	const Construction::BuildingRegister& get_building_register() const { return buildings; }
 	Gradients::GradientManager& get_gradient_manager() { return gradients; }
     const Gradients::GradientManager& get_gradient_manager() const { return gradients; }
 	const TeamStat& get_team_stats();
@@ -731,6 +737,9 @@ class Context
         }
         orders.push_back(order);
     }
+    // Revoke stale queued commands before dispatch, preserving registry receipts.
+    void reject_queued_orders(const std::function<bool(const Order&)>& reject);
+    void push_urgent_order(std::shared_ptr<Order> order);
 	bool is_fruit_on_map() const { return fruitOnMap; }
 	void dispatch_event(const RuntimeEvent& event);
 	void save(GAGCore::OutputStream*) const;

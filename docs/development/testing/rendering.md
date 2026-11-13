@@ -58,7 +58,7 @@ For AddressSanitizer and UndefinedBehaviorSanitizer on macOS or Linux, build the
 engine tests into a separate directory with the sanitizer flags and run the same filter:
 
 ```sh
-scons -j8 release=0 server=0 --build=build/tests-asan engine-tests \
+python3 tools/dev_build.py -j8 --build=build/tests-asan engine-tests \
   CXXFLAGS='-g -fsanitize=address,undefined -fno-omit-frame-pointer' \
   LINKFLAGS='-g -fsanitize=address,undefined'
 python3 test/run_tests.py --build-dir build/tests-asan --filter 'GameGUISelection/*'
@@ -67,12 +67,12 @@ python3 test/run_tests.py --build-dir build/tests-asan --filter 'GameGUISelectio
 Use `GLOB2_SDL3_PREFIX` when building against the pinned SDL3 dependency prefix.
 The native build records its library directory in the runtime search path.
 
-SCons caches compiler/linker flags; pass `CXXFLAGS=-g LINKFLAGS=-g` to return to a
-normal build. This is a direct method regression, not an interactive replay test.
+The build directory keeps these flags until a later build of it omits
+`CXXFLAGS=` and `LINKFLAGS=`, which restores the default `-g`. This is a direct method regression, not an interactive replay test.
 
 ## Aspect-ratio and screen-capture regression
 
-The `FullscreenAspect` suite (`libgag/src/FullscreenAspectHarness.cpp`) opens a real SDL
+The `FullscreenAspect` suite (`libs/gag/src/FullscreenAspectHarness.cpp`) opens a real SDL
 window and checks native presentation pixels, clipping, logical screen captures,
 and translated mouse motion/button events and polling at equal, wide, tall and odd
 window sizes, accepting actual OS constraints. Desktop fullscreen follows the same
@@ -87,7 +87,7 @@ python3 test/run_tests.py --filter 'FullscreenAspect/*'
 Both cases are tagged `[display:1600x1400]`: the runner opens that Xvfb screen on
 Linux without a `DISPLAY` and uses Mesa software OpenGL (`LIBGL_ALWAYS_SOFTWARE=1`)
 in CI. The OpenGL case is skipped in `opengl=0` builds. The same goes for the
-`WindowResize` suite (`libgag/src/WindowResizeHarness.cpp`), which resizes the window
+`WindowResize` suite (`libs/gag/src/WindowResizeHarness.cpp`), which resizes the window
 through the cache, callbacks, reflow, context recreation and minimum-size paths and
 checks live scale/fullscreen transitions, F11, preserved window dimensions and
 context identity. `TextRaster` checks glyph pixels against an independent native
@@ -100,8 +100,8 @@ Run `python3 test/run_tests.py --filter 'EnteringUnitDraw/*'`; the case is tagge
 
 A unit on its final step into a building keeps its map slot on the tile it is
 leaving (`Unit::handleActionEnteringBuilding`) while `posX`/`posY` already name
-the building tile, so `Game::drawMapGroundUnits` visits it one square behind
-itself. Nothing in `Game::drawUnit` reads `displacement`, so at equal `delta`
+the building tile, so `MapDrawer::drawMapGroundUnits` visits it one square behind
+itself. Nothing in `MapDrawer::drawUnit` reads `displacement`, so at equal `delta`
 that state must render pixel-for-pixel like the same step expressed as an
 ordinary walk onto the destination tile. The harness renders both and compares
 framebuffers over five points of one step; a mismatch is reported in pixels
@@ -192,7 +192,12 @@ speed, through pause and hard pause, and plays the recorded replay back at 1x,
 maximum and fast-forward. The last case captures the engine's per-run checksums
 and requires the first four (speed and pause) and the last three (playback) to
 agree. `python3 test/run_tests.py --filter 'GameSpeed/settings*'` runs the settings
-case alone. That case also clicks the top bar's speed chevrons. The `GameSpeedControl`
+case alone. That case also clicks the top bar's speed chevrons. The desktop
+statistics case captures the bar at 640 and 1280 pixels with zero and five-digit
+prestige/conversion values, checks the clear gutter before speed, and clicks the
+relocated chevrons. Desktop uses measured icon/value groups with common gutters;
+prestige shares touch's school book, colony value and conditional match-progress bar,
+and the win chance shares its trophy and two-digit local value. The `GameSpeedControl`
 suite (`src/hud/GameSpeedControlTest.cpp`, unit binary) covers the chevron presets and
 the tick-rate readout's window, one-second refresh, stall decay and formatting with
 explicit times.

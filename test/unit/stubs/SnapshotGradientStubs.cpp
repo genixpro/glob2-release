@@ -2,6 +2,7 @@
 // Copyright (C) 2026 glob2 contributors
 
 #include "gradient/SnapshotGradient.h"
+#include "Map.h"
 #include "Game.h"
 #include "gradient/ResourceGradientProbe.h"
 
@@ -32,3 +33,10 @@ void ResourceGradientProbe::stageEpisodes(Map&) { throw std::logic_error("Resour
 
 void ResourceGradientProbe::finishStudy(unsigned) {}
 void ResourceGradientProbe::writeMovementTotals() {}
+
+// Active pursuit lives in the real engine; isolated Map fixtures have no units.
+void Map::invalidateMaterialClaimsAt(size_t,bool,bool,Uint32) {}
+std::vector<ResourceClaims::Owner> Map::farmMaterialClaimOwners(size_t,Uint32,MaterialMask) { return {}; }
+void Map::revalidateMaterialClaimOwners(std::vector<ResourceClaims::Owner>,bool) {}
+void Map::invalidateAllActiveMaterialClaims() {}
+void Map::checkActiveClaimRules() {}

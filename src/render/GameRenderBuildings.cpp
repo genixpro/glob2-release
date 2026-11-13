@@ -7,7 +7,6 @@
 #include <PerformanceTelemetry.h>
 #include <iostream>
 
-#include "AICastor.h"
 
 #include <assert.h>
 
@@ -21,6 +20,7 @@
 #include "building/hud/BuildingPresentation.h"
 #include "DatasetWriter.h"
 #include "Game.h"
+#include "MapDrawer.h"
 #include "GameUtilities.h"
 #include "GlobalContainer.h"
 #include "Order.h"
@@ -31,7 +31,9 @@
 
 
 #include "Brush.h"
+#include "UnitEffectArt.h"
 #include "IntBuildingType.h"
+#include "Building.h"
 
 
 // Building rendering. Split from Game_render.cpp.
@@ -49,7 +51,7 @@ struct BuildingPosComp
 };
 
 
-void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view)
+void MapDrawer::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view)
 {
 	const SceneEntities &entities = scene.entities;
 	const SceneMap &map = scene.map; // the extracted map, not Game::map
@@ -79,11 +81,26 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 	const Uint8 spriteAlpha = Uint8(std::lround(255 * spriteOpacity));
 	if (spriteOpacity > 0)
 	{
+		// A swarm that has just produced a unit glows in its team colour (UnitEffects.h).
+		float glowOpacity = 0;
+		if (view)
+			if (const auto found = view->render.swarmGlows.find(Uint16(gid)); found != view->render.swarmGlows.end())
+				glowOpacity = found->second;
+		const GAGCore::Color glow = glowOpacity > 0 ? UnitEffectArt::tint(UnitEffectArt::hueOf(color)) : GAGCore::Color();
+		const Uint8 glowAlpha = Uint8(std::lround(255 * glowOpacity * spriteOpacity));
 		const bool skinned = view && type->presentation.skinSlot == "swarm"
 			&& !type->isBuildingSite && view->render.skinPreview().drawSwarm(
 				*globalContainer->gfx, team->number, x+dx, y+dy,
-				buildingSprite->getW(imgid), buildingSprite->getH(imgid), spriteAlpha);
-		if (!skinned) globalContainer->gfx->drawSprite(x+dx, y+dy, buildingSprite, imgid, spriteAlpha);
+				buildingSprite->getW(imgid), buildingSprite->getH(imgid), spriteAlpha,
+				Uint32(glow.r) << 16 | Uint32(glow.g) << 8 | glow.b, glowAlpha);
+		if (!skinned)
+		{
+			globalContainer->gfx->drawSprite(x+dx, y+dy, buildingSprite, imgid, spriteAlpha);
+			if (glowAlpha)
+				if (DrawableSurface *shape = buildingSprite->silhouette(imgid, glow, true))
+					globalContainer->gfx->drawSurfaceAdditive(float(x+dx), float(y+dy), float(buildingSprite->getW(imgid)),
+						float(buildingSprite->getH(imgid)), shape, glowAlpha);
+		}
 	}
 	if (detail && detail->buildingIcon > 0)
 	{
@@ -98,7 +115,7 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 	}
 	globalContainer->gfx->finishDrawingSprite(buildingSprite, 255);
 
-	if ((drawOptions & DRAW_BUILDING_RECT) != 0)
+	if ((drawOptions & Game::DRAW_BUILDING_RECT) != 0)
 	{
 		int rectW=(type->width )<<5;
 		int rectH=(type->height)<<5;
@@ -116,7 +133,7 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 	Uint32 visibleTeams = entities.teams[localTeam].mask;
 	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
 
-	if (((drawOptions & DRAW_HEALTH_FOOD_BAR) != 0) && (team->otherVision & visibleTeams))
+	if (((drawOptions & Game::DRAW_HEALTH_FOOD_BAR) != 0) && (team->otherVision & visibleTeams))
 	{
 		// TODO : find better color for this
 		if (type->hpMax)
@@ -143,8 +160,8 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 				drawHealthBar(x+healDecx, y+decy-4, maxWidth, actWidth, hpRatio, drawnRender);
 		}
 
-		// Attention outlasts the bars when zoomed out, as a status pip: damage, a building
-		// with under half its workers, an inn without food, a tower without ammunition.
+		// Attention outlasts the bars when zoomed out, as a status badge: damage, a tower
+		// without ammunition, an inn without food, a building with under half its workers.
 		const bool damaged = type->hpMax && building->hp!=building->maxHp;
 		const bool understaffed = building->maxUnitWorking>0 && building->working.count*2<building->maxUnitWorking;
 		const bool unfed = buildingFeedingUnfunded(*type, entities.materials(*building));
@@ -164,12 +181,16 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 		if (type->maxBullets)
 			drawBuildingResourceBar(x+1, y+1, type, type->maxBullets, building->bullets, 200, 200, 200, drawnRender);
 		if (damaged)
-			drawStatusPip(x+type->width*32-4, y+4, 255, 0, 0, drawnRender);
-		else if (understaffed || unfed || unarmed)
-			drawStatusPip(x+type->width*32-4, y+4, 255, 176, 0, drawnRender);
+			drawStatusPip(x+type->width*32-4, y+4, MapOverlayQueue::Damaged, drawnRender);
+		else if (unarmed)
+			drawStatusPip(x+type->width*32-4, y+4, MapOverlayQueue::Unarmed, drawnRender);
+		else if (unfed)
+			drawStatusPip(x+type->width*32-4, y+4, MapOverlayQueue::Hungry, drawnRender);
+		else if (understaffed)
+			drawStatusPip(x+type->width*32-4, y+4, MapOverlayQueue::Understaffed, drawnRender);
 	}
 
-	if (drawOptions & DRAW_ACCESSIBILITY)
+	if (drawOptions & Game::DRAW_ACCESSIBILITY)
 	{
 		std::ostringstream oss;
 		oss << team->number;
@@ -189,7 +210,7 @@ void Game::drawMapBuilding(int x, int y, int gid, int viewportX, int viewportY, 
 }
 
 
-void Game::drawMapGroundBuildings(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, std::set<Uint16> *visibleBuildings, const BuildingGuiStateMap* buildingGuiState, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view)
+void MapDrawer::drawMapGroundBuildings(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, std::set<Uint16> *visibleBuildings, const BuildingGuiStateMap* buildingGuiState, const PresentationFrame& scene, MapRenderState* drawnRender, ViewState* view)
 {
 	PERF_SCOPE_TIME(GroundBuildings);
 	const SceneEntities &entities = scene.entities;
@@ -217,7 +238,7 @@ void Game::drawMapGroundBuildings(int left, int top, int right, int bot, int sw,
 				const auto copy = std::make_tuple(gid, originX, originY);
 				if(drawnCopies.find(copy) == drawnCopies.end())
 				{
-					if (((drawOptions & DRAW_WHOLE_MAP) != 0)
+					if (((drawOptions & Game::DRAW_WHOLE_MAP) != 0)
 						|| Building::GIDtoTeam(gid)==localTeam
 						|| (building->seenByMask & visibleTeams)
 						|| map.isFOWDiscovered(x+viewportX, y+viewportY, visibleTeams))

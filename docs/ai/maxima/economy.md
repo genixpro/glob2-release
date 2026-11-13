@@ -51,6 +51,82 @@ replace those planning gates: an impossible bid would otherwise consume labour
 and suppress feasible development. New rules should be represented in these same
 stages rather than stored as a separate persistent strategy profile.
 
+## Prestige race
+
+With normal prestige victory active and `prestige.enabled=true`, the policy
+competes for the same construction and training budget as ordinary technology. It
+prepares a prestige-producing building, invests in its upgrade chain, prioritizes
+a winning
+finish, or holds when prerequisites are missing, survival needs intervene, or
+it cannot catch the surviving leader before crossing the shared threshold.
+Victory enablement, the threshold and alliance-sharing precedence come from
+primitive snapshot metadata; the copied configuration omits victory objects.
+Catalog prestige values determine the increments; the policy does not assume a
+fixed school score. Dedicated investment uses upgrade chains whose prerequisite
+buildings and construction sites have zero prestige, so cancelling an upgrade
+cannot itself add prestige. A catalog without such a route leaves this policy
+on hold. It credits
+completed buildings and pending construction, including prestige due from a new
+building's first completion,
+requests one to four unfinished pipelines according to spare qualified builders,
+and keeps ordinary school demand when that is larger. `prestige.max_pipelines`
+defaults to four; set it to one for the conservative comparison policy.
+Each allocation assesses prestige after initializing
+the director budget, so only completed prestige-producing levels retire a pipeline;
+basic schools, prerequisite upgrades and pending sites continue to supply it.
+Healthy idle workers qualified for the final upgrade, plus qualified builders
+already working on that building lineage, supply the parallel allowance.
+Existing training reserves and unmet ordinary construction requests are deducted;
+capacity above the base pipeline needs full configured construction/upgrade crews.
+The base request still passes ordinary workforce and funding checks. Counting builders
+already on the pipeline prevents its own staffing from shrinking its allowance.
+The allowance also stops at the number of remaining prestige increments needed,
+and an immediate winning finish uses one pipeline. Private materials in an
+existing school cannot justify extra new pipelines without supply for their full
+upgrade chains. Population, qualified-builder, service continuity, placement and
+construction limits still apply. The requested stock is capped at the engine's
+per-team building limit.
+New matches enable this policy by default when normal prestige victory is active.
+It can increase spending on schools and qualified builders when prestige is viable;
+set `prestige.enabled=false` to opt out.
+
+The threshold counts all teams' prestige, including defeated colonies. Leadership
+considers surviving teams individually. Tied leaders win; an ally's individual
+lead is sufficient only with mutual alliance and the alliance victory condition
+ordered before prestige victory. Private stock funds only its own building’s next
+upgrade; unrelated private stores do not establish a construction supply route.
+Completion projections include fresh individual scores between the engine's
+32-tick global-total refreshes. A larger cached total remains conservative until
+the next refresh after a prestige building is lost.
+Before starting a prestige-producing action, Maxima rejects a completion that
+would cross the threshold and award it no victory. Only one such completion is
+committed at once. Fresh observations also recheck queued orders and active
+upgrades. An unsafe active upgrade is cancelled with the ordinary construction
+cancel order when restoring its previous building is safe; cancellation waits
+for execution and the observed result before releasing its planner commitment.
+Custom first-level prestige sites still block additional prestige commitments
+and receive the start check, but the engine cannot undo them with an upgrade
+cancel order. The policy does not demolish them. It also rejects a cancellation
+that would restore enough prestige to trigger a loss in a custom catalog.
+
+The policy changes economic investment, not combat targets, defense placement
+or reconnaissance objectives. Timed prestige finishes alone do not activate it.
+Turning off normal prestige victory or `prestige.enabled` removes both the
+investment policy and its completion guards. Race telemetry reports numeric
+state/reason, standings, remaining threshold, pending gain and investment priority.
+Director snapshots also expose the selected target level, prestige pipeline request
+and ordinary school request after allocation.
+
+Save format 192 persists race budgets and cancellation identities/receipts.
+Format 193 adds the adaptive pipeline setting. Saves predating that setting
+restore `prestige.max_pipelines=1`, preserving the conservative execution policy.
+Supported older Maxima saves gain the new policy when their match enables prestige
+victory. Missing prestige configuration explicitly receives `enabled=true` and
+the documented weights. The new policy reassesses pending work before development
+execution resumes. Other saved execution work is retained. This intentional
+behavior change requires the
+new simulation/network version; it does not drop older save support.
+
 ## Local staffing
 
 Every completed inn and swarm samples corn stock as a share of its capacity
@@ -69,6 +145,14 @@ with `staffing.new_inn_workers` or `staffing.new_swarm_workers`, then follow
 the same loop. Swarm allowances remain bounded by the colony labour plan.
 Controller state belongs to the building's lifetime and is saved with Maxima.
 
+At each food-ledger review, completed inns and swarms are ranked separately by
+existing wheat-route quality (average supply distance, including the penalty for
+unreachable wheat). The worst half, rounded down, receive low worker priority;
+the rest receive normal priority. Equal scores are ordered by building ID.
+Construction sites and upgrades are excluded from this ranking. Ordinary inn
+construction receives high priority during a food emergency and normal priority
+otherwise. These priority reviews require the food ledger to be enabled.
+
 ## Development
 
 Schools retain their early population and technology gates. Once the higher
@@ -82,6 +166,21 @@ food backing, health, reserved space and construction quotas constrain both.
 Positive-scoring upgrades receive a preference when no viable emergency
 construction candidate is present. An active upgrade receives high worker
 priority until completion.
+
+The scan prunes by branch and bound. Each candidate is first scored optimistically,
+before routing: no artery, no farm-loss penalty and, for inns and swarms, the best
+possible food quality. Its true score can only be lower, so a candidate whose bound
+cannot beat the best already found in its water tier is skipped without routing,
+food walk or full scoring. The scan visits origins nearest Maxima's completed
+buildings first, so a strong site is found early and the bound prunes most of the
+map; once a strict water-tier site exists, fallback-tier sites are skipped outright.
+A colony site's food is bounded by the unclaimed food inside the window its supply
+search can reach (a summed-area table), so hopeless colony sites skip the flood
+fill. Inn and swarm upgrades likewise compete on that bound,
+and their food-ledger check (which rebuilds the ledger without the building) runs
+only for the upgrade that would win. The chosen site is the one a full evaluation
+would pick from the same snapshot. An upgrade that fails its food check is not
+checked again for `placement.food_upgrade_retry_ticks` (512).
 
 For every building category, repairs and upgrades share an allowance that leaves
 at least half the existing buildings operational, rounded up: two or three
@@ -110,6 +209,27 @@ demand is covered, spare workers beyond the training reserve can fund another
 tower. Viable ordinary builds, repairs and upgrades take precedence. Normal
 quotas, siting and farm protection still apply; a committed tower site remains
 ordinary construction when other demand appears.
+
+Each new tower takes a siting role from a deterministic golden-ratio sequence
+over the colony's tower count, so the shares hold even across a few towers:
+`placement.tower_border_percent` border towers, `placement.tower_interior_percent`
+interior towers and fruit towers for the remainder (50/25/25 by default). A
+border tower prefers the point between Maxima's nearest non-tower building and
+the nearest seen enemy non-tower building that is `placement.tower_border_enemy_ratio`
+times as far from the enemy (a third of the way out by default). An interior
+tower prefers Maxima's own buildings and a fruit tower prefers known fruit; both
+border and fruit towers fall back to interior siting when no enemy building or
+fruit is known. Every role also prefers distance from existing towers, which
+takes `placement.tower_spread_percent` of the location score and saturates at
+`placement.tower_spread_saturation_tiles`. Stone distance, threat and
+defendedness play no part in tower siting.
+
+A repair turns a building back into a site, and a tower site cannot shoot. A
+tower is therefore repaired only once its hit points fall below
+`repairs.tower_health_percent` of maximum, and never while a visible enemy
+warrior or ground-attacking explorer is within `repairs.tower_enemy_radius`
+tiles; a selected repair that becomes contested before it is issued is dropped.
+Other buildings are repaired at any damage.
 
 Economic recovery restricts growth and development, while military activity
 continues to follow defence needs, eligible forces, reachability, target safety

@@ -194,7 +194,8 @@ static constexpr int FILE_FORMAT_VERSION_CUSTOM_AI = 129;
 static constexpr int FILE_FORMAT_VERSION_FARM_AREA = 130;
 
 //! Worker time use, combat-death place and assignment, and the defence snapshot in
-//! gameplay measurements (diagnostic only; older saves start them at load).
+//! gameplay measurements (older saves start them at load). Swarm-filling time is a
+//! win probability model input; the rest is diagnostic.
 static constexpr int FILE_FORMAT_VERSION_LABOUR_STATS = 133;
 
 //! Canonical terrain identities, terrain experiment requirements and exposure state.
@@ -331,3 +332,117 @@ static constexpr int FILE_FORMAT_VERSION_PROACTIVE_BUILDINGS = 174;
 
 // Per-team building admission widens pending counts from 8 to 16 bits.
 static constexpr int FILE_FORMAT_VERSION_TEAM_BUILDING_GRADIENT_QUOTA = 186;
+
+// Terrain authoring requirements are retired; new headers omit their old slot.
+static constexpr int FILE_FORMAT_VERSION_MAINLINE_TERRAINS = 187;
+
+// Dedicated Maxima forward-service intent coordinates and preferred distance.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_FORWARD_SUPPORT = 188;
+
+// Saved Maxima strategies include the bounded current-flag proximity preference.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_FLAG_PROXIMITY = 189;
+
+// Automatic timestamped alliance win-probability history.
+static constexpr int FILE_FORMAT_VERSION_WIN_PROBABILITY_HISTORY = 190;
+
+//! Built-in looks of grass and sand: TERRAIN_COUNT grew from 29 to 33, so earlier
+//! files carry custom terrain IDs starting at 29 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_GROUND_LOOKS = 191;
+
+// Economic prestige director and acknowledged upgrade cancellation.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_PRESTIGE = 192;
+
+// Adaptive prestige preparation; older strategies retain a single pipeline.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_PRESTIGE_PARALLEL = 193;
+
+//! Built-in sandstone tiles, pumice field, frozen lake and windy sand dune:
+//! TERRAIN_COUNT grew from 33 to 37, so earlier files carry custom terrain IDs
+//! starting at 33 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_SANDSTONE_PUMICE = 195;
+
+//! Built-in wind-swept snow: TERRAIN_COUNT grew from 36 to 37, so earlier files carry
+//! custom terrain IDs starting at 36 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_WIND_SWEPT_SNOW = 196;
+
+//! Built-in weathered sandstone: TERRAIN_COUNT grew from 37 to 38, so earlier files
+//! carry custom terrain IDs starting at 37 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_WEATHERED_SANDSTONE = 197;
+
+//! Built-in windy sand dune: TERRAIN_COUNT grew from 38 to 39, so earlier files carry
+//! custom terrain IDs starting at 38 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_WINDY_SAND_DUNE = 198;
+
+//! Built-in hardpan: TERRAIN_COUNT grew from 39 to 40, so earlier files carry custom
+//! terrain IDs starting at 39 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_HARDPAN = 199;
+
+//! Built-in tundra: TERRAIN_COUNT grew from 40 to 41, so earlier files carry custom
+//! terrain IDs starting at 40 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_TUNDRA = 200;
+
+//! Built-in volcanic ash: TERRAIN_COUNT grew from 41 to 42, so earlier files carry
+//! custom terrain IDs starting at 41 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_VOLCANIC_ASH = 201;
+
+//! Built-in glacier ice: TERRAIN_COUNT grew from 42 to 43, so earlier files carry
+//! custom terrain IDs starting at 42 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_GLACIER_ICE = 202;
+
+//! Built-in overgrown road: TERRAIN_COUNT grew from 43 to 44, so earlier files carry
+//! custom terrain IDs starting at 43 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_OVERGROWN_ROAD = 203;
+
+//! Built-in laterite: TERRAIN_COUNT grew from 44 to 45, so earlier files carry custom
+//! terrain IDs starting at 44 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_LATERITE = 204;
+
+//! Stable access fields retain published and in-flight preparation costs.
+static constexpr int FILE_FORMAT_VERSION_ROUTING_RATIO_POLICY = 205;
+
+//! Built-in cliffs: TERRAIN_COUNT grew from 45 to 46, so earlier files carry custom
+//! terrain IDs starting at 45 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_CLIFFS = 206;
+
+//! Built-in molten lava pool: TERRAIN_COUNT grew from 46 to 47, so earlier files carry
+//! custom terrain IDs starting at 46 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_MOLTEN_LAVA_POOL = 207;
+
+//! Built-in rock paths (slate ashlar, basalt causeway, scoria blocks): TERRAIN_COUNT grew
+//! from 47 to 50, so earlier files carry custom terrain IDs starting at 47 that the loader
+//! renumbers.
+static constexpr int FILE_FORMAT_VERSION_ROCK_PATHS = 208;
+
+//! Built-in ice paths (rime ashlar, moonstone lozenge, frost pinwheel): TERRAIN_COUNT grew
+//! from 50 to 53, so earlier files carry custom terrain IDs starting at 50 that the loader
+//! renumbers.
+static constexpr int FILE_FORMAT_VERSION_ICE_PATHS = 209;
+
+//! Built-in arctic tundra: TERRAIN_COUNT grew from 53 to 54, so earlier files carry custom
+//! terrain IDs starting at 53 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_ARCTIC_TUNDRA = 210;
+
+//! Built-in glacier: TERRAIN_COUNT grew from 54 to 55, so earlier files carry custom
+//! terrain IDs starting at 54 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_GLACIER = 211;
+
+//! Built-in icefall, sandstone benches, obsidian ridge, granite tors and travertine
+//! terraces (Barriers) and penitentes, termite mounds, hoodoos and petrified stumps
+//! (Outcrops): TERRAIN_COUNT grew from 55 to 64, so earlier files carry custom terrain
+//! IDs starting at 55 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_ICEFALL = 212;
+
+//! Resource claims: material destination planes on gradient fields, active claims, pending
+//! unit routes, claim policy cadence and bounded claim recovery are saved.
+static constexpr int FILE_FORMAT_VERSION_RESOURCE_CLAIMS = 213;
+
+//! Maxima role-sited towers: the placement world snapshot carries remembered enemy
+//! building positions, and older strategies restore the previous tower siting.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_TOWER_ROLES = 214;
+
+//! Maxima coalesces strategy reviews and maintenance-clearing plans: the last
+//! clearing tick and whether a farming update requested one are saved.
+static constexpr int FILE_FORMAT_VERSION_MAXIMA_COALESCED_REVIEWS = 215;
+
+//! Built-in steppe grass and moor grass (Grass): TERRAIN_COUNT grew from 64 to 66, so
+//! earlier files carry custom terrain IDs starting at 64 that the loader renumbers.
+static constexpr int FILE_FORMAT_VERSION_STEPPE_GRASS = 216;

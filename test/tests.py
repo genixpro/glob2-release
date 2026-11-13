@@ -1,14 +1,20 @@
 """Registry of every native test and test-adjacent program.
 
-test/SConscript builds two doctest binaries from these tables and scons/mobile_build.py
-cross-compiles the same lists. Paths are relative to test/ unless they start with '#',
-which is the repository root: a domain's tests sit beside the code they test.
+CMakeLists.txt builds four doctest binaries from these tables and cmake/mobile.cmake
+cross-compiles the same lists (portable_engine_tests() and portable_unit_tests() fold
+the module binaries back into the two the mobile and browser builds produce). Paths
+are relative to test/ unless they start with '#', which is the repository root: a
+domain's tests sit beside the code they test.
 
 Placement rule: a test joins UNIT_TESTS if it needs neither GlobalContainer nor any
-client object; otherwise it joins ENGINE_TESTS. Entry options:
+client object; MAP_TESTS if it needs only the map layer (buildsys/sources.py
+MAP_SOURCES); SIM_TESTS if it needs the simulation but no GameGUI, window or menu;
+otherwise ENGINE_TESTS. Entry options:
   cxxflags  extra compiler flags for that translation unit only
   defines   extra preprocessor defines for that translation unit only
-  require   build features the entry needs: 'wss', 'not-mingw', 'opengl'
+  require   build features the entry needs: 'wss', 'not-mingw', 'opengl', and the
+            optional source groups of buildsys/sources.py ('generators', 'editor',
+            'ai:castor', ...) that compile_profile=core leaves out
 """
 
 # Linked into both test binaries.
@@ -17,10 +23,20 @@ SUPPORT = [
     'support/Glob2Test.cpp',
     'support/GlobalContainerSlot.cpp',
 ]
+# Native macOS test binaries also link this: Foundation's scoped activity keeps
+# App Nap from throttling background test processes.
+MAC_SUPPORT = [
+    ('support/TestActivity_mac.mm', dict(require={'mac'})),
+]
 
 # Linked into glob2-engine-tests only.
 ENGINE_SUPPORT = [
-    'support/EngineFixtures.cpp',
+    'support/HeadlessGlobals.cpp',
+    'support/HeadlessGame.cpp',
+    'support/GameFixtures.cpp',
+    'support/Continuation.cpp',
+    'support/SimulationInvariants.cpp',
+    'support/DrawFixtures.cpp',
     'support/LegacyResourceTypes.cpp',
 ]
 
@@ -50,15 +66,15 @@ ENGINE_TESTS = [
     ('#src/ui/screens/MusicScreensTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/ai/numbi/NumbiObservationTest.cpp',
     ('#src/ai/warrush/WarrushObservationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/ai/engine/AIOrderSchedulerTest.cpp',
     '#src/ai/engine/AIPipelineTest.cpp',
     '#src/engine/sim/snapshot/SnapshotChecksumTest.cpp',
     ('#src/engine/sim/snapshot/WorldSnapshotTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/LegacyAIStateTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/LegacyAIStateTest.cpp', dict(require={'ai:cabino', 'ai:cortex'}, cxxflags=['-fno-access-control'])),
     '#src/ai/AIStateContinuationTest.cpp',
+    '#src/ai/AIOrderValidityTest.cpp',
+    '#src/ai/AIRegistryProfileTest.cpp',
     '#src/ai/BuildingCapabilitiesTest.cpp',
-    '#src/ai/shared_runtime/RuntimeBuildingOrderSaveLoadTest.cpp',
-    ('#src/ai/AICustomCatalogTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/AICustomCatalogTest.cpp', dict(require={'ai:cabino', 'ai:castor', 'ai:cortex'}, cxxflags=['-fno-access-control'])),
     '#src/building/types/BuildingCatalogTest.cpp',
     '#src/building/BuildingProductionCombatTest.cpp',
     ('#src/building/BuildingStockTest.cpp', dict(cxxflags=['-fno-access-control'])),
@@ -73,38 +89,39 @@ ENGINE_TESTS = [
     ('#src/map/ResourceGrowthTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/resource/ResourceRuntimeBenchmark.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/map/gradient/BuildingGradientBenchmark.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/map/gradient/BuildingSeedTemplatesBenchmark.cpp',
     '#src/building/BuildingServicesTest.cpp',
+    '#src/unit/ServiceEffectRecordTest.cpp',
+    '#src/render/UnitEffectDeterminismTest.cpp',
     # This fixture selects SDL's dummy driver; isolate its client context from display cases.
-    '#libgag/src/ScreenExecutionHarness.cpp',
-    ('#libgag/src/MacScrollMonitorTest.mm', dict(require={'mac'})),
-    ('#libgag/src/MacScrollVisualHarness.cpp', dict(require={'mac'})),
-    ('#src/ai/AIRecoveryCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#libs/gag/src/ScreenExecutionHarness.cpp',
+    ('#libs/gag/src/MacScrollMonitorTest.mm', dict(require={'mac'})),
+    ('#libs/gag/src/MacScrollVisualHarness.cpp', dict(require={'mac'})),
+    ('#src/ai/AIRecoveryCoverageTest.cpp', dict(require={'ai:cabino', 'ai:castor', 'ai:cortex'}, cxxflags=['-fno-access-control'])),
 
     ('GameplayRecordingIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/hud/GUIInteractionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/hud/GUIInteractionCoverageTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
     ('#src/hud/GUIOrderCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/EditorActionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/BrushCatalogTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/EditorTerrainPaintTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/EditorFlowsTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/EditorDockLayoutTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/map/editor/EditorPresentationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/EditorActionCoverageTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/BrushCatalogTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/EditorTerrainPaintTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/EditorFlowsTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/EditorDockLayoutTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/editor/EditorPresentationTest.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
     '#src/scripting/sgsl/LegacyAreaWaitTest.cpp',
     ('#src/scripting/sgsl/LegacyScriptCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/ai/AIDecisionCoverageTest.cpp',
-    ('#src/ai/AIRulesTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/AIRulesTest.cpp', dict(require={'ai:cabino', 'ai:cortex'}, cxxflags=['-fno-access-control'])),
     # Calls Cortex's and Numbi's private helpers to drive single offense decisions.
-    ('#src/ai/telemetry/AITargetTelemetryTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/castor/CastorContinuationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/ai/cortex/CortexNetCoverageTest.cpp',
-    ('#src/ai/cortex/CortexActionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/cortex/CortexPolicyCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/telemetry/AITargetTelemetryTest.cpp', dict(require={'ai:cortex'}, cxxflags=['-fno-access-control'])),
+    ('#src/ai/castor/CastorContinuationTest.cpp', dict(require={'ai:castor'}, cxxflags=['-fno-access-control'])),
+    ('#src/ai/cortex/CortexActionCoverageTest.cpp', dict(require={'ai:cortex'}, cxxflags=['-fno-access-control'])),
     ('#src/scripting/javascript/ScriptCompatibilityTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/scripting/javascript/ScriptIntegrationTest.cpp',
+    ('#src/scripting/javascript/ScriptIntegrationTest.cpp', dict(require={'editor'})),
     '#src/ai/telemetry/AITelemetryDialogTest.cpp',
     '#src/hive/HiveIntegrationTest.cpp',
     '#src/scripting/javascript/ScriptPresentationTest.cpp',
-    '#src/scripting/map/ScriptEditorTest.cpp',
+    ('#src/scripting/map/ScriptEditorTest.cpp', dict(require={'editor'})),
     '#src/scripting/javascript/ScriptRealisticTest.cpp',
     ('#src/scripting/javascript/ScriptSessionTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/scripting/javascript/ScriptSimulationTest.cpp', dict(cxxflags=['-fno-access-control'])),
@@ -116,6 +133,7 @@ ENGINE_TESTS = [
     '#src/render/scene/SceneExtractTest.cpp',
     '#src/game/diagnostics/GameDiagnosticsTest.cpp',
     ('#src/team/stats/WinProbabilityTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/team/stats/MaterialLedgerTest.cpp',
     ('#src/engine/sim/ClientChannelsTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/building/HiringBucketHarness.cpp',
     '#src/building/HiringPlannerTest.cpp',
@@ -124,7 +142,13 @@ ENGINE_TESTS = [
     '#src/map/gradient/ImmobileUnitGradientHarness.cpp',
     '#src/building/InnSwapHarness.cpp',
     '#src/building/LevelGateHarness.cpp',
-    '#src/unit/ResourceFetchTargetHarness.cpp',
+    ('#src/unit/ResourceFetchTargetHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/unit/ClaimContinuationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/claims/ClaimGPUContinuationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/claims/ClaimRecoveryAdversarialHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/map/claims/ClaimRoutePipelineTest.cpp',
+    '#src/map/claims/ActiveClaimRoutesHarness.cpp',
+    '#src/map/claims/ClaimInvalidationHarness.cpp',
     '#src/unit/MarketFetchHarness.cpp',
     ('#src/unit/MarketsV2Test.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/unit/FetchHiringScoreHarness.cpp',
@@ -140,31 +164,30 @@ ENGINE_TESTS = [
     ('#src/net/turn/TurnEngineHarness.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/net/LanIdentityTest.cpp', dict(require={'wss'})),
     ('#src/net/lan/LanMatchHarness.cpp', dict(require={'wss'}, cxxflags=['-fno-access-control'])),
-    ('#src/ai/AISavePortabilityHarness.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/building/BuildingFootprintHarness.cpp',
     '#src/map/MapTilingHarness.cpp',
     ('#src/map/gradient/ClearingFlagGradientTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/ai/cortex/CortexGeometryHarness.cpp',
+    ('#src/ai/cortex/CortexGeometryHarness.cpp', dict(require={'ai:cortex'})),
     '#src/unit/EnteringUnitSaveHarness.cpp',
     ('#src/map/gradient/MapGradientInvalidationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/map/gradient/DelayedGradientPublicationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/map/gradient/GradientPreparationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/nicowar/NicowarFarmingHarness.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/ai/shared_runtime/RuntimeContinuationTest.cpp',
     '#src/game/SharedWorkerLifecycleTest.cpp',
+    ('#src/game/ChecksumSchemeTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/unit/TrappedUnitLifecycleTest.cpp',
     '#src/unit/UnitContinuationHarness.cpp',
     'SavegameSafetyHarness.cpp',
-    ('UntrustedFilesTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('TournamentCompatibilityTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/maxima/MaximaRelocationIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/map/generator/CombGeneratorTest.cpp',
-    '#src/map/generator/OrchardCommonsConversionTest.cpp',
+    ('UntrustedFilesTest.cpp', dict(require={'ai:cabino'}, cxxflags=['-fno-access-control'])),
+    ('TournamentCompatibilityTest.cpp', dict(require={'ai:cortex'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/generator/CombGeneratorTest.cpp', dict(require={'generators'})),
+    ('#src/map/generator/OrchardCommonsConversionTest.cpp', dict(require={'generators'})),
     'PortableGameHarness.cpp',
     ('#src/team/stats/TeamStatsPipelineTest.cpp', {}),
+    '#src/team/RoutingRatioPolicyTest.cpp',
     ('#src/team/stats/TeamStatsSaveHarness.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/team/stats/TeamLabourStatsTest.cpp',
-    ('#src/engine/EngineSessionHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/engine/EngineSessionHarness.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
     '#src/net/turn/TurnNetConnectionTest.cpp',
     '#src/online/RelayTransportTest.cpp',
     '#src/online/OnlineResultTest.cpp',
@@ -172,36 +195,38 @@ ENGINE_TESTS = [
     '#src/online/PlatformRoomTest.cpp',
     '#src/online/OnlineServicesTest.cpp',
     ('#src/net/WssBackpressureTest.cpp', dict(require={'wss'})),
-    ('#src/render/MapRenderResizeHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/render/MapRenderResizeHarness.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
     ('#src/render/PointBarRenderTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/ai/maxima/MaximaCombatIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/ai/maxima/MaximaDiagnosticsTest.cpp',
     ('#src/ai/maxima/MaximaDirectorRegressionTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/ai/maxima/MaximaEconomyRegressionTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#src/ai/maxima/MaximaFarmingIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/ai/maxima/MaximaImplementationIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/ai/maxima/MaximaLifecycleTest.cpp',
-    '#src/ai/maxima/MaximaStrategyTest.cpp',
     # Rendering and window harnesses: most cases need a display ([display]); entries that
     # call OpenGL outside HAVE_OPENGL guards are left out of opengl=0 builds.
-    '#libgag/src/DrawableSurfaceBlendTest.cpp',
-    '#libgag/src/FontKerningTest.cpp',
+    '#libs/gag/src/DrawableSurfaceBlendTest.cpp',
+    '#libs/gag/src/FontKerningTest.cpp',
     '#src/ui/OnlineWordingTest.cpp',
     ('#src/render/EnteringUnitDrawHarness.cpp', dict(require={'opengl'})),
+    ('#src/render/UnitEffectDrawHarness.cpp', dict(require={'opengl'})),
     ('#src/render/FailingUnitMarkersHarness.cpp', dict(require={'opengl'})),
-    '#libgag/src/FullscreenAspectHarness.cpp',
-    ('#src/render/HighResolutionIntegrationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#libgag/src/PortableRendererHarness.cpp',
+    ('#src/render/SwimmingUnitDrawHarness.cpp', dict(require={'opengl'}, cxxflags=['-fno-access-control'])),
+    '#libs/gag/src/FullscreenAspectHarness.cpp',
+    ('#src/render/HighResolutionIntegrationHarness.cpp', dict(require={'editor'}, cxxflags=['-fno-access-control'])),
+    '#libs/gag/src/PortableRendererHarness.cpp',
     '#src/render/SoftwareRendererTest.cpp',
     '#src/render/terrain/TerrainMaterialsTest.cpp',
+    '#src/render/terrain/TerrainStonesTest.cpp',
+    '#src/render/terrain/TerrainContinuityTest.cpp',
     ('#src/render/TerrainPresentationTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#libgag/src/RuntimePackCheck.cpp', dict(require={'opengl'})),
-    ('#libgag/src/TextRasterHarness.cpp', dict(require={'opengl'})),
+    ('#libs/gag/src/RuntimePackCheck.cpp', dict(require={'opengl'})),
+    ('#libs/gag/src/TextRasterHarness.cpp', dict(require={'opengl'})),
     ('#src/render/torus/TorusRenderIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
     ('#src/unit/render/UnitHighResolutionCacheTest.cpp', dict(require={'opengl'})),
     ('#src/unit/render/UnitTeamColorCacheTest.cpp', dict(require={'opengl'})),
     ('#src/unit/render/UnitTeamShaderTest.cpp', dict(require={'opengl'})),
-    '#libgag/src/WindowResizeHarness.cpp',
+    '#libs/gag/src/WindowResizeHarness.cpp',
     '#src/ui/settings/SettingsScreenTest.cpp',
     '#src/render/RendererSwitchIntegrationTest.cpp',
     '#src/ui/settings/SettingsGraphicsTest.cpp',
@@ -212,77 +237,68 @@ ENGINE_TESTS = [
     '#src/app/SystemLanguageTest.cpp',
     '#src/game/orders/GuardAreaBalanceTest.cpp',
     ('#src/game/orders/FarmAreaTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    '#src/game/GameSpeedTest.cpp',
-    '#src/ui/UIPresentationHarness.cpp',
+    # The pacing check steps Engine on an injected clock and reads its GUI's tick.
+    ('#src/game/GameSpeedTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ui/UIPresentationHarness.cpp', dict(require={'editor'})),
     '#src/ui/UIIconsTest.cpp',
-    '#src/hud/touch/GameGUITouchHarness.cpp',
+    ('#src/hud/touch/GameGUITouchHarness.cpp', dict(require={'editor'})),
     # Command-line harnesses whose modes became cases.
     '#src/game/screens/CustomGameSetupHarness.cpp',
     '#src/team/TeamLimitTest.cpp',
     '#src/team/IntrusiveEntityListTest.cpp',
     ('#src/team/IntrusivePopulationSaveTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/map/preview/MapPreviewHarness.cpp',
-    ('#src/map/generator/MapGeneratorDefaultsTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/generator/MapGeneratorDefaultsTest.cpp', dict(require={'editor', 'generators'}, cxxflags=['-fno-access-control'])),
+    ('#src/map/generator/MapGeneratorPropertyTest.cpp', dict(require={'generators'})),
 ]
 
 # glob2-unit-tests: libgag, libusl, the production sources below and stubs.
 UNIT_TESTS = [
-    '#src/map/gradient/LegacyResourceGradientStateTest.cpp',
-    '#src/map/gradient/ResourceGradientExplorationTest.cpp',
-    '#src/map/gradient/GradientMarketTargetsTest.cpp',
-    '#src/map/gradient/GradientTargetCellTest.cpp',
-    '#src/map/gradient/AdaptiveGradientStateTest.cpp',
+    '#platforms/mobile/AssetIndexTest.cpp',
     '#src/building/HiringRankingTest.cpp',
-    '#src/map/TerrainRegistryTest.cpp',
-    '#libgag/src/TextStreamTest.cpp',
-    '#libgag/src/AssetLoaderTest.cpp',
-    '#libgag/src/SpriteLoadTest.cpp',
-    '#libgag/src/SpriteRenderAtlasTest.cpp',
-    '#libgag/src/RenderFramePacerTest.cpp',
-    '#libgag/src/RenderDeviceTest.cpp',
-    '#libgag/src/ProgrammableGLDeviceTest.cpp',
-    '#libgag/src/SDLGPUDeviceTest.cpp',
-    '#libgag/src/RendererSelectionTest.cpp',
-    '#libgag/src/GraphicContextDeviceSkinsTest.cpp',
-    '#libgag/src/FontMetricsTest.cpp',
-    '#libgag/src/PackedArrayTest.cpp',
-    '#libgag/src/EventQueueTest.cpp',
-    '#src/map/generator/MapGeneratorGoldenCoverageTest.cpp',
+    '#libs/gag/src/TextStreamTest.cpp',
+    '#libs/gag/src/AssetLoaderTest.cpp',
+    '#libs/gag/src/SpriteLoadTest.cpp',
+    '#libs/gag/src/SpriteRenderAtlasTest.cpp',
+    '#libs/gag/src/RenderFramePacerTest.cpp',
+    '#libs/gag/src/RenderDeviceTest.cpp',
+    '#libs/gag/src/ProgrammableGLDeviceTest.cpp',
+    '#libs/gag/src/SDLGPUDeviceTest.cpp',
+    '#libs/gag/src/RendererSelectionTest.cpp',
+    '#libs/gag/src/GraphicContextDeviceSkinsTest.cpp',
+    '#libs/gag/src/FontMetricsTest.cpp',
+    '#libs/gag/src/PackedArrayTest.cpp',
+    '#libs/gag/src/EventQueueTest.cpp',
 
-    '#libgag/src/GameplayRecordingTest.cpp',
-    '#libgag/src/RecordingSessionTest.cpp',
+    '#libs/gag/src/GameplayRecordingTest.cpp',
+    '#libs/gag/src/RecordingSessionTest.cpp',
     'support/RecordingValidationProcess.cpp',
-    '#libusl/test/USLCoverageTest.cpp',
-    '#libgag/src/SurfaceCoverageTest.cpp',
-    '#libgag/src/SurfaceRasterTest.cpp',
-    '#libgag/src/ImageAssetTest.cpp',
-    '#libgag/src/GpuTexturePreparationTest.cpp',
+    '#libs/usl/test/USLCoverageTest.cpp',
+    '#libs/gag/src/SurfaceCoverageTest.cpp',
+    '#libs/gag/src/SurfaceRasterTest.cpp',
+    '#libs/gag/src/ImageAssetTest.cpp',
+    '#libs/gag/src/GpuTexturePreparationTest.cpp',
     '#src/scripting/javascript/ScriptRuntimeTest.cpp',
     '#src/hive/HiveWorkerTest.cpp',
     '#src/scripting/javascript/ScriptNumericTest.cpp',
-    ('#libgag/src/UnitDrawBatchTest.cpp', dict(require={'opengl'})),
-    ('#libgag/src/MapGeometryCacheTest.cpp', dict(require={'opengl'})),
-    ('#libgag/src/SpriteDrawBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#libgag/src/SpriteSheetTest.cpp', dict(cxxflags=['-fno-access-control'])),
-    ('#libgag/src/OpaqueRectangleBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#libs/gag/src/UnitDrawBatchTest.cpp', dict(require={'opengl'})),
+    ('#libs/gag/src/MapGeometryCacheTest.cpp', dict(require={'opengl'})),
+    ('#libs/gag/src/SpriteDrawBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#libs/gag/src/SpriteSheetTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#libs/gag/src/OpaqueRectangleBatchTest.cpp', dict(cxxflags=['-fno-access-control'])),
     # Former CppUnit suite (TestsRunner).
     '#src/hud/AllyTeamWidgetIndexTest.cpp',
-    '#src/common/BitArrayTest.cpp',
-    '#libgag/src/BidiTextTest.cpp',
+    '#libs/gag/src/BidiTextTest.cpp',
     '#src/render/scene/SceneBufferTest.cpp',
     '#src/map/BrushAccumulatorTest.cpp',
-    '#src/map/BrushCoverageTest.cpp',
     '#src/map/editor/BrushToolHitTest.cpp',
     '#src/building/hud/BuildingFailureDisplayTest.cpp',
     '#src/ai/cortex/CortexUpgradeTest.cpp',
     '#src/map/editor/EditorWidgetLayoutTest.cpp',
-    ('#src/map/FertilityFieldTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/building/FetchApportionmentTest.cpp',
-    '#src/common/FilenameStripTest.cpp',
     '#src/audio/GameMusicControllerTest.cpp',
     '#src/hud/GhostBuildingOverlapTest.cpp',
     '#src/ai/shared_runtime/GradientBFSTest.cpp',
-    '#src/field/FieldTraversalTest.cpp',
     '#src/field/OpenCLGradientTest.cpp',
     '#src/field/RuntimeGradientBackendTest.cpp',
     '#src/field/GradientPreparationContractTest.cpp',
@@ -291,12 +307,12 @@ UNIT_TESTS = [
     '#src/field/OpenCLTransferProofTest.cpp',
     '#src/field/OpenCLRequiredControlTest.cpp',
     '#src/field/OpenCLLaneRegistryTest.cpp',
-    ('#src/map/gradient/GradientTest.cpp', dict(cxxflags=['-fno-access-control'])),
     'HelloWorldTest.cpp',
-    '#libgag/src/Sha1Test.cpp',
+    '#libs/gag/src/Sha1Test.cpp',
     'VendoredJsonTest.cpp',
     '#src/online/HttpFetchUrlTest.cpp',
     '#src/online/PlatformProtocolTest.cpp',
+    '#src/online/ApiErrorTextTest.cpp',
     '#src/online/InstanceConfigTest.cpp',
     '#src/online/InviteLinkTest.cpp',
     '#src/online/MapCacheTest.cpp',
@@ -306,15 +322,15 @@ UNIT_TESTS = [
     '#src/online/ReplayAppearanceTest.cpp',
     '#src/online/PlatformClientTest.cpp',
     '#src/online/OnlineResourcesTest.cpp',
-    '#src/resource/ResourceRegistryTest.cpp',
     '#src/online/QuickMatchTest.cpp',
     '#src/online/MapCatalogTest.cpp',
     '#src/ui/KeyActionLookupTest.cpp',
-    ('#src/map/MapQueryTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/net/message/MessageRecipientsTest.cpp',
     '#src/render/overlay/OverlayFillTest.cpp',
     '#src/render/ZoomDetailTest.cpp',
+    '#src/render/AnimationClockTest.cpp',
     '#src/render/FogFadeTest.cpp',
+    '#src/render/UnitEffectsTest.cpp',
     '#src/team/stats/MetricSeriesTest.cpp',
     '#src/game/rules/TeamLayoutTest.cpp',
     '#src/hud/input/PanelButtonHitTest.cpp',
@@ -322,30 +338,28 @@ UNIT_TESTS = [
     '#src/map/generator/shared/PerlinNoiseTest.cpp',
     '#src/audio/PlayerVoiceDrainTest.cpp',
     '#src/hud/draw/SpriteCenteringTest.cpp',
-    '#libgag/src/SkinMeshTest.cpp',
-    '#libgag/src/SkinModelTest.cpp',
-    '#libgag/src/SkinShapeModelTest.cpp',
-    ('#libgag/src/SkinModelRenderTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#libs/gag/src/SkinMeshTest.cpp',
+    '#libs/gag/src/SkinModelTest.cpp',
+    '#libs/gag/src/SkinShapeModelTest.cpp',
+    ('#libs/gag/src/SkinModelRenderTest.cpp', dict(cxxflags=['-fno-access-control'])),
     '#src/building/TurretScanTileTest.cpp',
     '#src/unit/render/UnitAnimationTest.cpp',
+    '#src/unit/render/SwimmingPresentationTest.cpp',
     '#src/unit/render/UnitDrawGeometryTest.cpp',
     '#src/unit/UnitTimingTest.cpp',
-    '#natsort/NatSortTest.cpp',
-    # Former standalone programs compiled by test/SConstruct or directly in CI.
+    '#third_party/natsort/NatSortTest.cpp',
+    # Former standalone programs once compiled directly in CI.
     '#src/game/player/BasePlayerSaveLoadTest.cpp',
     '#src/team/BaseTeamSaveLoadTest.cpp',
     '#src/game/BulletSaveLoadTest.cpp',
     '#src/render/clouds/CloudFieldTest.cpp',
-    '#src/game/ExperimentalFeaturesTest.cpp',
+    '#src/render/clouds/IntroCoverTest.cpp',
+    '#src/common/ExperimentalFeaturesTest.cpp',
     '#src/game/GameHeaderDefaultAlliancesTest.cpp',
     '#src/game/GameHeaderTextSaveLoadTest.cpp',
     '#src/game/GameHintsTest.cpp',
     '#src/game/GameObjectivesTest.cpp',
-    '#src/map/io/MapExploredAreaSaveLoadTest.cpp',
     '#src/map/preview/MapRenderGeometryTest.cpp',
-    '#src/common/MersenneTwisterTest.cpp',
-    '#src/common/EntityRandomTest.cpp',
-    '#src/common/WordChecksumTest.cpp',
     '#src/render/torus/TorusGeometryTest.cpp',
     '#src/render/torus/TorusPickingTest.cpp',
     '#src/render/torus/TorusTextureTilesTest.cpp',
@@ -365,23 +379,19 @@ UNIT_TESTS = [
     '#src/campaign/CampaignLoadHarness.cpp',
     '#src/campaign/CampaignSelectionHarness.cpp',
     '#src/game/WinningConditionsHarness.cpp',
-    '#libgag/src/BufferedFileStreamHarness.cpp',
-    '#src/common/ComputeExecutorHarness.cpp',
-    '#src/map/gradient/GradientPipelineHarness.cpp',
-    ('#mobile/MobileCertificateHarness.cpp', dict(require={'wss'})),
-    '#mobile/MobileDocumentsHarness.cpp',
-    '#libgag/src/MobileInputHarness.cpp',
-    ('#mobile/MobileTemporaryFilesHarness.cpp', dict(require={'not-mingw'})),
-    '#libgag/src/PerformanceTelemetryHarness.cpp',
-    '#libgag/src/ScrollPhysicsTest.cpp',
-    '#libgag/src/GestureScrollTest.cpp',
+    '#libs/gag/src/BufferedFileStreamHarness.cpp',
+    ('#platforms/mobile/MobileCertificateHarness.cpp', dict(require={'wss'})),
+    '#platforms/mobile/MobileDocumentsHarness.cpp',
+    '#libs/gag/src/MobileInputHarness.cpp',
+    ('#platforms/mobile/MobileTemporaryFilesHarness.cpp', dict(require={'not-mingw'})),
+    '#libs/gag/src/PerformanceTelemetryHarness.cpp',
+    '#libs/gag/src/ScrollPhysicsTest.cpp',
+    '#libs/gag/src/GestureScrollTest.cpp',
     '#src/hud/GameSpeedControlTest.cpp',
     '#src/hud/GameEventFeedTest.cpp',
     '#src/audio/MusicBufferTest.cpp',
     '#src/audio/MusicProducerTest.cpp',
-    '#libgag/src/ui/UILayoutHarness.cpp',
-    '#src/map/gradient/GlobalGradientHarness.cpp',
-    ('#src/map/gradient/PathGradientHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#libs/gag/src/ui/UILayoutHarness.cpp',
     '#src/ai/maxima/MaximaContinuationTest.cpp',
     '#src/ai/maxima/MaximaFoodLedgerStandaloneTest.cpp',
     '#src/ai/maxima/MaximaDefenseStandaloneTest.cpp',
@@ -391,6 +401,7 @@ UNIT_TESTS = [
     '#src/ai/maxima/MaximaPlacementStandaloneTest.cpp',
     '#src/ai/maxima/MaximaReconStandaloneTest.cpp',
     '#src/ai/maxima/MaximaStaffingControlStandaloneTest.cpp',
+    '#src/ai/maxima/MaximaPrestigeStandaloneTest.cpp',
     '#src/ai/maxima/MaximaTacticsStandaloneTest.cpp',
 ]
 
@@ -404,10 +415,13 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/field/WebGPUGradient.cpp',
     '#src/app/cli/CommandLine.cpp',
     '#src/map/TerrainRegistry.cpp',
+    '#src/map/TerrainCatalog.cpp',
     '#src/map/CellRules.cpp',
     '#src/map/MapAssetBundle.cpp',
     '#src/render/terrain/TerrainCatalogIO.cpp',
     '#src/render/terrain/TerrainMaterials.cpp',
+    '#src/render/terrain/TerrainBorderRules.cpp',
+    '#src/render/terrain/TerrainSmoothBorders.cpp',
     '#src/scripting/javascript/ScriptValue.cpp',
     '#src/scripting/javascript/ScriptRuntime.cpp',
     '#src/hive/HiveWorker.cpp',
@@ -440,16 +454,20 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/map/editor/MapEditKeyActions.cpp',
     '#src/map/generator/shared/Noise.cpp',
     '#src/map/gradient/BuildingGradientSearch.cpp',
+    '#src/map/gradient/GradientRuntime.cpp',
+    '#src/map/gradient/MapRouting.cpp',
     '#src/map/gradient/MapGradientDirection.cpp',
     '#src/map/gradient/MapGradientChamfer.cpp',
     '#src/map/gradient/MapGradientPropagation.cpp',
     '#src/map/gradient/ResourceSeedCache.cpp',
+    '#src/map/gradient/BuildingSeedTemplates.cpp',
     '#src/map/gradient/LegacyResourceGradientState.cpp',
     '#src/map/gradient/AdaptiveGradientState.cpp',
     '#src/map/gradient/MapGradientTargets.cpp',
     '#src/map/gradient/MapGradientMarketTargets.cpp',
     '#src/resource/ResourceRegistry.cpp',
     '#src/map/pathfind/MapPathfindPoint.cpp',
+    '#src/map/claims/ClaimRouteCapture.cpp',
     '#src/net/message/MessageRecipients.cpp',
     '#src/render/FogFade.cpp',
     '#src/team/stats/MetricCatalog.cpp',
@@ -458,7 +476,7 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/game/player/BasePlayer.cpp',
     '#src/team/BaseTeam.cpp',
     '#src/game/Bullet.cpp',
-    '#src/game/ExperimentalFeatures.cpp',
+    '#src/common/ExperimentalFeatures.cpp',
     '#src/game/GameHeader.cpp',
     '#src/unit/types/UnitCatalog.cpp',
     '#src/building/BuildingArtwork.cpp',
@@ -471,6 +489,7 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/game/GameHints.cpp',
     '#src/game/GameObjectives.cpp',
     '#src/render/clouds/SimplexNoise.cpp',
+    '#src/render/clouds/IntroCover.cpp',
     '#src/game/WinningConditions.cpp',
     '#src/team/stats/WinProbability.cpp',
     '#src/map/io/MapExploredAreaIO.cpp',
@@ -484,6 +503,7 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/online/MemoryStorage.cpp',
     '#src/online/PlatformClient.cpp',
     '#src/online/PlatformProtocol.cpp',
+    '#src/online/ApiErrorText.cpp',
     '#src/online/QuickMatch.cpp',
     '#src/online/RelayProbe.cpp',
     '#src/online/Sha256.cpp',
@@ -495,9 +515,9 @@ UNIT_PRODUCTION_SOURCES = [
     '#src/online/SimVersion.cpp',
     '#src/campaign/Campaign.cpp',
     '#src/audio/SoundMixer.cpp',
-    '#mobile/Documents.cpp',
-    ('#mobile/CertificateTrust.cpp', dict(require={'wss'})),
-    ('#mobile/TemporaryFiles.cpp', dict(require={'not-mingw'})),
+    '#platforms/mobile/Documents.cpp',
+    ('#platforms/mobile/CertificateTrust.cpp', dict(require={'wss'})),
+    ('#platforms/mobile/TemporaryFiles.cpp', dict(require={'not-mingw'})),
     '#src/net/turn/JitterBuffer.cpp',
     '#src/net/turn/MatchRecord.cpp',
     '#src/net/turn/TurnMessages.cpp',
@@ -519,13 +539,161 @@ UNIT_STUBS = [
     'unit/stubs/SnapshotGradientStubs.cpp',
     'unit/stubs/MapHeaderStubs.cpp',
     'unit/stubs/OrderStubs.cpp',
-    'unit/stubs/GameGUIStubs.cpp',
     'unit/stubs/RaceStubs.cpp',
 ]
 
+# Module test binaries (test/README.md): each links one module library of
+# buildsys/sources.py plus the libraries below it, libgag, libusl and only the stubs
+# and production objects listed here, so a change in that layer rebuilds and links
+# a few hundred objects rather than the whole client. Cases moved here keep their
+# runner policy: map cases came from glob2-unit-tests and share a process, sim cases
+# came from glob2-engine-tests and run one process per case. `run_tests.py --binary
+# unit` includes the map binary and `--binary engine` the sim binary.
+
+# glob2-map-tests: libglob2_map.a. No Game, Team, Unit or GlobalContainer instance.
+MAP_TESTS = [
+    '#src/map/gradient/LegacyResourceGradientStateTest.cpp',
+    '#src/map/gradient/ResourceGradientExplorationTest.cpp',
+    '#src/map/gradient/GradientMarketTargetsTest.cpp',
+    '#src/map/gradient/GradientTargetCellTest.cpp',
+    '#src/map/gradient/AdaptiveGradientStateTest.cpp',
+    '#src/map/TerrainRegistryTest.cpp',
+    '#src/map/TerrainCatalogTest.cpp',
+    '#src/common/BitArrayTest.cpp',
+    '#src/map/BrushCoverageTest.cpp',
+    ('#src/map/FertilityFieldTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/common/FilenameStripTest.cpp',
+    '#src/field/FieldTraversalTest.cpp',
+    '#src/field/astar/AStarTest.cpp',
+    '#src/map/ResourceClaimsTest.cpp',
+    '#src/map/claims/ClaimRecoveryAdversarialTest.cpp',
+    ('#src/map/gradient/GradientTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/resource/ResourceRegistryTest.cpp',
+    ('#src/map/MapQueryTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/map/io/MapExploredAreaSaveLoadTest.cpp',
+    '#src/common/MersenneTwisterTest.cpp',
+    '#src/common/EntityRandomTest.cpp',
+    '#src/common/WordChecksumTest.cpp',
+    '#src/common/ComputeExecutorHarness.cpp',
+    '#src/map/gradient/GradientPipelineHarness.cpp',
+    '#src/map/gradient/GlobalGradientHarness.cpp',
+    ('#src/map/gradient/PathGradientHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+]
+
+# Production objects outside MAP_SOURCES that the map layer still calls (welds):
+# hashing (Online::Sha256), the save-profile predicate MapIO checks, the terrain
+# visual catalog MapAssetBundle loads, and the BaseTeam records a MapHeader holds.
+MAP_PRODUCTION_SOURCES = [
+    '#src/online/Sha256.cpp',
+    '#src/app/SaveLoadProfile.cpp',
+    '#src/render/terrain/TerrainCatalogIO.cpp',
+    '#src/render/terrain/TerrainMaterials.cpp',
+    '#src/render/terrain/TerrainSmoothBorders.cpp',
+    '#src/render/terrain/TerrainBorderRules.cpp',
+    '#src/team/BaseTeam.cpp',
+]
+
+# Replacement definitions for the simulation symbols the map layer references.
+MAP_STUBS = [
+    'map/stubs/SimulationStubs.cpp',
+]
+
+# glob2-sim-tests: libglob2_sim.a and libglob2_map.a, a headless GlobalContainer and
+# no GameGUI. Cases construct Game(nullptr) and step it themselves, and never run
+# GlobalContainer::load() (HeadlessGlobals with loadStrings or display): that loads
+# the client's keyboard, audio, style and sprites, which only glob2-engine-tests links.
+SIM_TESTS = [
+    '#src/ai/engine/AIOrderSchedulerTest.cpp',
+    '#src/ai/shared_runtime/RuntimeBuildingOrderSaveLoadTest.cpp',
+    ('#src/ai/cortex/CortexNetCoverageTest.cpp', dict(require={'ai:cortex'})),
+    ('#src/ai/cortex/CortexPolicyCoverageTest.cpp', dict(require={'ai:cortex'}, cxxflags=['-fno-access-control'])),
+    '#src/game/diagnostics/WarriorTacticsTraceTest.cpp',
+    ('#src/ai/AISavePortabilityHarness.cpp', dict(require={'ai:castor'}, cxxflags=['-fno-access-control'])),
+    ('#src/ai/nicowar/NicowarFarmingHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/maxima/MaximaRelocationIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/maxima/MaximaFarmingIntegrationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/ai/maxima/MaximaStrategyTest.cpp',
+]
+
+SIM_SUPPORT = [
+    'support/HeadlessGlobals.cpp',
+    'support/GameFixtures.cpp',
+    'support/SimulationInvariants.cpp',
+]
+
+# Production objects outside SIM_SOURCES and MAP_SOURCES that the simulation still
+# calls (welds), and the headless GlobalContainer: Game reads buildingsTypes, runNoX,
+# replay and dataset writers, settings.language and fileManager through
+# globalContainer, so HeadlessGlobals constructs a real one.
+SIM_PRODUCTION_SOURCES = MAP_PRODUCTION_SOURCES + [
+    '#src/app/GlobalContainer.cpp',
+    '#src/app/Settings.cpp',
+    '#src/app/SystemLanguage.cpp',
+    '#src/app/CompileProfile.cpp',
+    '#src/online/SimVersion.cpp',
+    '#src/net/message/OrderMessages.cpp',
+    '#src/net/message/MessageRecipients.cpp',
+    '#src/render/GameAnimations.cpp',
+    '#src/render/scene/SceneExtract.cpp',
+    '#src/render/scene/SceneMap.cpp',
+    '#src/render/overlay/OverlayAreas.cpp',
+    '#src/render/overlay/OverlayFill.cpp',
+    '#src/hud/TeamDisplay.cpp',
+    '#src/tutorial/TutorialModel.cpp',
+]
+
+# Replacement definitions for the presentation symbols GlobalContainer references.
+SIM_STUBS = [
+    'sim/stubs/PresentationStubs.cpp',
+]
+
+# Case-count contract (run_tests.py): each module test file must list at least as
+# many cases as it did in the binary it came from. Raise a floor when cases are added;
+# lower one only when a case is deliberately removed.
+MODULE_CASE_FLOORS = {
+    # glob2-map-tests
+    'src/map/gradient/LegacyResourceGradientStateTest.cpp': 7,
+    'src/map/gradient/ResourceGradientExplorationTest.cpp': 1,
+    'src/map/gradient/GradientMarketTargetsTest.cpp': 4,
+    'src/map/gradient/GradientTargetCellTest.cpp': 4,
+    'src/map/gradient/AdaptiveGradientStateTest.cpp': 15,
+    'src/map/TerrainRegistryTest.cpp': 12,
+    'src/map/TerrainCatalogTest.cpp': 1,
+    'src/common/BitArrayTest.cpp': 4,
+    'src/map/BrushCoverageTest.cpp': 6,
+    'src/map/FertilityFieldTest.cpp': 23,
+    'src/common/FilenameStripTest.cpp': 11,
+    'src/field/FieldTraversalTest.cpp': 16,
+    'src/field/astar/AStarTest.cpp': 10,
+    'src/map/ResourceClaimsTest.cpp': 10,
+    'src/map/claims/ClaimRecoveryAdversarialTest.cpp': 7,
+    'src/map/gradient/GradientTest.cpp': 12,
+    'src/resource/ResourceRegistryTest.cpp': 12,
+    'src/map/MapQueryTest.cpp': 42,
+    'src/map/io/MapExploredAreaSaveLoadTest.cpp': 2,
+    'src/common/MersenneTwisterTest.cpp': 1,
+    'src/common/EntityRandomTest.cpp': 5,
+    'src/common/WordChecksumTest.cpp': 4,
+    'src/common/ComputeExecutorHarness.cpp': 57,
+    'src/map/gradient/GradientPipelineHarness.cpp': 31,
+    'src/map/gradient/GlobalGradientHarness.cpp': 3,
+    'src/map/gradient/PathGradientHarness.cpp': 21,
+    # glob2-sim-tests
+    'src/ai/engine/AIOrderSchedulerTest.cpp': 12,
+    'src/ai/shared_runtime/RuntimeBuildingOrderSaveLoadTest.cpp': 3,
+    'src/ai/cortex/CortexNetCoverageTest.cpp': 5,
+    'src/ai/cortex/CortexPolicyCoverageTest.cpp': 7,
+    'src/game/diagnostics/WarriorTacticsTraceTest.cpp': 8,
+    'src/ai/AISavePortabilityHarness.cpp': 1,
+    'src/ai/nicowar/NicowarFarmingHarness.cpp': 3,
+    'src/ai/maxima/MaximaRelocationIntegrationTest.cpp': 8,
+    'src/ai/maxima/MaximaFarmingIntegrationTest.cpp': 23,
+    'src/ai/maxima/MaximaStrategyTest.cpp': 4,
+}
+
 # Standalone programs: (target, source, alias, group). group 'test' programs are run by
 # CI through their own runners; 'tools' are developer utilities and benchmarks. The
-# transport programs the browser tests drive stay in src/SConscript under 'transport-test'.
+# transport programs the browser tests drive are harnesses (buildsys/harness_programs.py) under 'transport-test'.
 PROGRAMS = [
     ('SaveSizeHarness', 'SaveSizeHarness.cpp', 'save-size-harness', 'tools'),
 
@@ -533,15 +701,22 @@ PROGRAMS = [
     ('MapReportHarness', '#src/map/tools/MapReportHarness.cpp', 'map-report-test', 'test'),
     ('MaximaStrategyDump', '#src/ai/maxima/MaximaStrategyDump.cpp', 'maxima-strategy-dump', 'tools'),
     ('MenuColonyHarness', '#tools/MenuColonyHarness.cpp', 'menu-colony-harness', 'test'),
+    ('TranslationPreviewHarness', '#tools/TranslationPreviewHarness.cpp', 'translation-preview-harness', 'tools'),
     ('AssetLoadingBenchmark', '#tools/AssetLoadingBenchmark.cpp', 'asset-loading-benchmark', 'tools'),
     ('SoftwareRenderBenchmark', '#src/render/SoftwareRenderBenchmark.cpp', 'software-render-benchmark', 'tools'),
     ('torus-render-benchmark', '#src/render/torus/TorusRenderBenchmark.cpp', 'torus-render-benchmark', 'tools'),
 ]
 
+# The 'require' option of PROGRAMS entries, by target.
+PROGRAM_REQUIRES = {
+    'MenuColonyHarness': {'editor'},
+    'TranslationPreviewHarness': {'editor'},
+}
+
 # Old per-harness alias -> test binary. Kept for one release so documented commands and
 # shell history keep working; delete after that.
 LEGACY_ALIASES = {
-    'ai-save-portability-test': 'glob2-engine-tests',
+    'ai-save-portability-test': 'glob2-sim-tests',
     'building-expel-test': 'glob2-engine-tests',
     'building-footprint-test': 'glob2-engine-tests',
     'building-gradient-invalidation-test': 'glob2-engine-tests',
@@ -550,7 +725,7 @@ LEGACY_ALIASES = {
     'cortex-geometry-test': 'glob2-engine-tests',
     'entering-unit-save-test': 'glob2-engine-tests',
     'fetch-apportionment-test': 'glob2-engine-tests',
-    'global-gradient-test': 'glob2-unit-tests',
+    'global-gradient-test': 'glob2-map-tests',
     'gradient-invalidation-test': 'glob2-engine-tests',
     'hiring-bucket-test': 'glob2-engine-tests',
     'hungry-defeat-test': 'glob2-engine-tests',
@@ -560,10 +735,10 @@ LEGACY_ALIASES = {
     'map-render-resize-test': 'glob2-engine-tests',
     'maxima-continuation-test': 'glob2-unit-tests',
     'maxima-food-ledger-test': 'glob2-unit-tests',
-    'maxima-relocation-test': 'glob2-engine-tests',
-    'nicowar-farming-test': 'glob2-engine-tests',
+    'maxima-relocation-test': 'glob2-sim-tests',
+    'nicowar-farming-test': 'glob2-sim-tests',
     'orchard-conversion-test': 'glob2-engine-tests',
-    'path-gradient-test': 'glob2-unit-tests',
+    'path-gradient-test': 'glob2-map-tests',
     'point-bar-render-test': 'glob2-engine-tests',
     'portable-game-test': 'glob2-engine-tests',
     'resource-fetch-target-test': 'glob2-engine-tests',
@@ -596,8 +771,8 @@ LEGACY_ALIASES = {
     'map-preview-test': 'glob2-engine-tests',
     'map-generator-defaults-test': 'glob2-engine-tests',
     'buffered-file-test': 'glob2-unit-tests',
-    'compute-executor-test': 'glob2-unit-tests',
-    'gradient-pipeline-test': 'glob2-unit-tests',
+    'compute-executor-test': 'glob2-map-tests',
+    'gradient-pipeline-test': 'glob2-map-tests',
     'mobile-certificate-test': 'glob2-unit-tests',
     'mobile-documents-test': 'glob2-unit-tests',
     'mobile-input-test': 'glob2-unit-tests',
@@ -617,9 +792,72 @@ def scripting_entries():
     """
     selected = {'#src/tutorial/IntroductionTest.cpp', '#src/map/generator/javascript/ScriptGeneratorTest.cpp', '#src/scripting/javascript/ScriptCompatibilityTest.cpp', '#src/scripting/javascript/ScriptIntegrationTest.cpp', '#src/scripting/javascript/ScriptPresentationTest.cpp',
                 '#src/scripting/javascript/ScriptRealisticTest.cpp', '#src/scripting/javascript/ScriptSessionTest.cpp', '#src/scripting/javascript/ScriptSimulationTest.cpp',
-                '#src/team/stats/TeamStatsSaveHarness.cpp', '#src/scripting/javascript/ScriptRuntimeTest.cpp', '#src/scripting/javascript/ScriptNumericTest.cpp', '#libgag/src/ImageAssetTest.cpp'}
-    return [entry for entry in ENGINE_TESTS + UNIT_TESTS
+                '#src/team/stats/TeamStatsSaveHarness.cpp', '#src/scripting/javascript/ScriptRuntimeTest.cpp', '#src/scripting/javascript/ScriptNumericTest.cpp', '#libs/gag/src/ImageAssetTest.cpp'}
+    return [entry for entry in portable_engine_tests() + portable_unit_tests()
             if (entry if isinstance(entry, str) else entry[0]) in selected]
+
+
+# Linked into the browser's script-tests.js beside the scripting corpus (web-tests).
+WEB_TESTS = [
+    '#src/online/ApiErrorTextTest.cpp',
+    '#src/common/EntityRandomTest.cpp',
+    '#src/unit/EntityRandomLifecycleTest.cpp',
+    ('#src/scripting/sgsl/LegacyScriptCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/common/ComputeExecutorHarness.cpp',
+    '#src/field/WebGPUGradientTest.cpp',
+    '#src/app/ApplicationResourcePlanTest.cpp',
+    '#src/replay/ReplayTelemetryTest.cpp',
+    '#src/map/gradient/GradientPipelineHarness.cpp',
+    ('#src/unit/ResourceFetchTargetHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/unit/ClaimContinuationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/claims/ClaimRecoveryAdversarialHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/map/claims/ClaimRecoveryAdversarialTest.cpp',
+    '#src/engine/sim/snapshot/SnapshotChecksumTest.cpp',
+    '#src/map/claims/ActiveClaimRoutesHarness.cpp',
+    '#src/map/claims/ClaimRoutePipelineTest.cpp',
+    '#src/map/claims/ClaimInvalidationHarness.cpp',
+    '#src/game/SharedWorkerLifecycleTest.cpp',
+    ('#src/game/ChecksumSchemeTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/gradient/BuildingGradientInvalidationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/map/gradient/InitialBuildingGradientHarness.cpp',
+    ('#src/map/gradient/DelayedGradientPublicationHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/engine/sim/snapshot/WorldSnapshotTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/render/scene/SceneExtractTest.cpp',
+    '#src/render/scene/SceneBufferTest.cpp',
+    '#src/render/overlay/OverlayFillTest.cpp',
+    ('#src/map/gradient/PathGradientHarness.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/gradient/GradientPreparationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/ai/cortex/CortexActionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/map/MapQueryTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/hud/GUIInteractionCoverageTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/resource/ResourceRegistryTest.cpp',
+    '#src/map/TerrainResourcesHarness.cpp',
+    '#src/unit/types/UnitCatalogTest.cpp',
+    ('#src/unit/UnitCustomizationTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/building/types/BuildingCatalogTest.cpp',
+    '#src/building/BuildingCatalogFixtureHarness.cpp',
+    '#src/building/BuildingServicesTest.cpp',
+    '#src/building/BuildingProductionCombatTest.cpp',
+    ('#src/building/MaterialDemandTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    '#src/ai/shared_runtime/RuntimeContinuationTest.cpp',
+    ('#src/ai/AICustomCatalogTest.cpp', dict(cxxflags=['-fno-access-control'])),
+    ('#src/unit/MarketsV2Test.cpp', dict(cxxflags=['-fno-access-control'])),
+]
+
+
+def web_test_entries():
+    """Every entry the browser's script-tests.js compiles."""
+    return SUPPORT + ENGINE_SUPPORT + scripting_entries() + WEB_TESTS
+
+
+def portable_engine_tests():
+    """ENGINE_TESTS plus the sim cases, for builders that link one whole-client binary."""
+    return ENGINE_TESTS + SIM_TESTS
+
+
+def portable_unit_tests():
+    """UNIT_TESTS plus the map cases, which also link against the unit binary's stubs."""
+    return UNIT_TESTS + MAP_TESTS
 
 
 def source_path(source):

@@ -192,7 +192,7 @@ void SkinSprites::pollManifests(unsigned &active)
 			request.url = origin + "/api/v1/skins/versions/" + team.skin.versionId + "/sprites/" +
 						  team.skin.spriteManifestHash + "/manifest";
 			request.responseLimit = 65536;
-			request.timeout = std::chrono::seconds(15);
+			request.timeoutMilliseconds = 15000;
 			team.fetch = start(std::move(request));
 			if (team.fetch)
 				++active;
@@ -230,7 +230,7 @@ bool SkinSprites::loadPageBytes(Page &page, std::string &bytes, unsigned &active
 		request.url = origin + "/api/v1/skins/versions/" + page.version + "/sprites/" +
 					  page.bundle + "/pages/" + page.info.hash;
 		request.responseLimit = page.info.bytes;
-		request.timeout = std::chrono::seconds(15);
+		request.timeoutMilliseconds = 15000;
 		page.fetch = start(std::move(request));
 		if (page.fetch)
 			++active;
@@ -370,7 +370,7 @@ void SkinSprites::poll()
 
 SkinSprites::Page *SkinSprites::requestPage(int team, unsigned clip, unsigned frame)
 {
-	if (team < 0 || team >= 32 || clip >= 8)
+	if (team < 0 || team >= 32 || clip > 8)
 		return nullptr;
 	const auto &manifest = teams[team].manifest;
 	const auto found = std::find_if(
@@ -407,7 +407,9 @@ bool SkinSprites::draw(GAGCore::GraphicContext &gfx, int team, unsigned clip, un
 	++metrics.hits;
 	if (!alpha)
 		return true;
-	GAGCore::drawSkinShadow(gfx, shadow, x, y, w, h, SkinSpriteLogicalSizes[clip], alpha);
+	GAGCore::drawSkinShadow(gfx, shadow, x, y, w, h,
+							clip == ProneHarvestSpriteClip ? 38 : SkinSpriteLogicalSizes[clip],
+							alpha);
 	x -= w * 0.125f;
 	y -= h * 0.125f;
 	w *= 1.25f;

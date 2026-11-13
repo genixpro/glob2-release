@@ -4,6 +4,8 @@
 // for the map; the Areas section carries the script-area number and name.
 
 #include "BuildingType.h"
+#include "Map.h"
+#include "TerrainBuiltins.h"
 #include "EditorDock.h"
 #include "EditorDockInternal.h"
 #include "ExperimentalFeatures.h"
@@ -18,6 +20,7 @@
 #include <FormatableString.h>
 #include <algorithm>
 #include <cctype>
+#include "Game.h"
 
 namespace fe = Glob2UI;
 using fe::Element;

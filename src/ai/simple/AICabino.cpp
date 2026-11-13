@@ -2,11 +2,13 @@
 // Copyright (C) 2005-2007 Bradley Arsenault
 
 #include "Material.h"
+#include "AITerrainPredicates.h"
 #include "field/UniformTraversal.h"
 #include "AITelemetryFields.h"
 #include <Stream.h>
 
 #include "AICabino.h"
+#include <cmath>
 #include "ai/engine/AIDecision.h"
 #include "ai/observation/OrderSelection.h"
 #include "ai/observation/ObservationAreaOrders.h"
@@ -31,6 +33,7 @@
 #include <fstream>
 #include <sstream>
 #include <iomanip>
+#include "Team.h"
 
 using namespace Cabino;
 
@@ -1174,7 +1177,8 @@ bool Gradient::isSource(unsigned x, unsigned y)
 		if(building!=NOGBID && getBuildingFromGid(map, building)->team==team->number)
 			return true;
 	}
-	if(sources&Water && terrainProvidesFertility(map->terrainPropertiesAt(index)))
+	// Real water only: Fertile ground is farmable land, handled by the Farmer.
+	if(sources&Water && terrainIsIrrigatingWater(map->terrainPropertiesAt(index)))
 		return true;
 	return false;
 }
@@ -1366,6 +1370,15 @@ void SimpleBuildingDefense::save(GAGCore::OutputStream *stream) const
 
 
 
+namespace
+{
+// The zone's half extent, limited to what the flag type allows.
+int defenseFlagRadius(const SimpleBuildingDefense::defenseRecord& record, const BuildingType& type)
+{
+	return std::min<int>(std::max(record.width, record.height)/2, type.maxUnitStayRange);
+}
+}
+
 bool SimpleBuildingDefense::findDefense()
 {
  const int typeNum=selectBuilding(ai,AttractWarriors);
@@ -1417,7 +1430,13 @@ bool SimpleBuildingDefense::findDefense()
 
 					if(AICabino_DEBUG)
 						ai.diagnosticStream<<"AICabino: findDefense: Creating a defense flag at "<<dr.flagx<<", "<<dr.flagy<<", to combat "<<dr.assigned<<" units that are attacking our "<<AIEngine::ObservationQueries::buildingType(*ai.game,*b).key<<" at "<<b->posX<<","<<b->posY<<"."<<std::endl;
-					ai.enqueueOrder(AIEngine::ObservationQueries::createOrder(*ai.game, ai.team->number, dr.flagx, dr.flagy, typeNum, 1, 1));
+					// Create the flag fully staffed and sized. Its record finds the flag a
+					// slice later, which the order delay can push past this pass.
+					auto create=std::static_pointer_cast<OrderCreate>(AIEngine::ObservationQueries::createOrder(
+						*ai.game, ai.team->number, dr.flagx, dr.flagy, typeNum, dr.assigned, dr.assigned));
+					if(ai.game->catalog->at(typeNum).resolvedType.maxUnitStayRange)
+						create->flagRadius=defenseFlagRadius(dr, ai.game->catalog->at(typeNum).resolvedType);
+					ai.enqueueOrder(create);
 				}
 			}
 			++i;
@@ -1510,8 +1529,11 @@ bool SimpleBuildingDefense::findCreatedDefenseFlags()
 						if(AICabino_DEBUG)
 							ai.diagnosticStream<<"AICabino: findCreatedDefenseFlags: Found created flag at "<<i->flagx<<","<<i->flagy<<", adding it to the defense records."<<std::endl;
 						i->flag=b->identity.gid;
-						ai.enqueueOrder(std::shared_ptr<Order>(new OrderModifyFlag(b->identity.gid, std::max(i->width, i->height)/2)));
-						ai.enqueueOrder(std::shared_ptr<Order>(new OrderModifyBuilding(b->identity.gid, i->assigned)));
+						const int radius=defenseFlagRadius(*i, AIEngine::ObservationQueries::buildingType(*ai.game,*b));
+						if(b->unitStayRange!=radius)
+							ai.enqueueOrder(std::shared_ptr<Order>(new OrderModifyFlag(b->identity.gid, radius)));
+						if(b->maxUnitWorking!=static_cast<int>(i->assigned))
+							ai.enqueueOrder(std::shared_ptr<Order>(new OrderModifyBuilding(b->identity.gid, i->assigned)));
 						ai.getUnitModule()->request("SimpleBuildingDefense", WARRIOR, ATTACK_STRENGTH, 1, i->assigned, i->flag);
 						break;
 					}
@@ -3861,17 +3883,21 @@ bool BasicDistributedSwarmManager::moderateSwarms()
 	}
 
 	if (ai.game->configuration->isPeacefulModeEnabled()) ratios[WARRIOR]=0;
-	int max=*std::max_element(ratios, ratios+NB_UNIT_TYPE);
-	int devisor=1;
-	if(max>16)
-		devisor=max/16;
-
-	for(unsigned int i=0; static_cast<int>(i)<NB_UNIT_TYPE; ++i)
+	// Scale the ratios proportionally into the range a swarm accepts (0..16, the
+	// order validator's MAX_RATIO_RANGE), rounding to nearest and keeping every
+	// wanted unit type at least 1. Dividing by an integer max/16 left a largest
+	// ratio of 17..31 unscaled, and the validator rejected the whole order.
+	const int maxRatio=16;
+	const long long max=*std::max_element(ratios, ratios+NB_UNIT_TYPE);
+	if(max>maxRatio)
 	{
-		unsigned int num=ratios[i];
-		ratios[i]=static_cast<int>(std::floor(num/devisor+0.5));
-		if(num>0 && ratios[i]==0)
-			ratios[i]=1;
+		for(unsigned int i=0; static_cast<int>(i)<NB_UNIT_TYPE; ++i)
+		{
+			const long long num=ratios[i];
+			ratios[i]=static_cast<int>((num*maxRatio+max/2)/max);
+			if(num>0 && ratios[i]==0)
+				ratios[i]=1;
+		}
 	}
 
 	unsigned int assigned_per_swarm=MAXIMUM_UNITS_FOR_SWARM;
@@ -4871,6 +4897,13 @@ bool Farmer::updateFarm()
 	// With the farm-areas experiment, wheat near water is farmed with a farm
 	// area on the same pattern; forbidden paint continues to protect wood.
 	const bool farms=ai.map->farmAreasEnabled;
+	// Farm zone: near real water, or on Fertile ground, which is farmable land
+	// in its own right. Maps without Fertile ground keep the water rule alone.
+	const auto inFarmZone=[&](unsigned x,unsigned y)
+	{
+		return water_gradient.getHeight(x, y)<=static_cast<int>(MAX_DISTANCE_FROM_WATER+2)
+			|| terrainIsFertileGround(ai.map->terrainPropertiesAt(ai.map->tileIndex(x,y)));
+	};
 	BrushAccumulator farm_del_acc;
 	BrushAccumulator farm_add_acc;
 	for(unsigned int x=0; static_cast<int>(x)<ai.map->width; ++x)
@@ -4886,7 +4919,7 @@ bool Farmer::updateFarm()
 				const bool wheat_farm=farm_spot && MapState::hasMaterial(ai.map->state(),ai.map->tileIndex(x,y),MaterialId::Food)
 					&& !((ai.map->areasAt(ai.map->tileIndex(x,y)).clear&(ai.team->mask))!=0)
 					&& ai.map->canPaintFarmAt(ai.map->tileIndex(x,y))
-					&& water_gradient.getHeight(x, y)<=static_cast<int>(MAX_DISTANCE_FROM_WATER+2);
+					&& inFarmZone(x, y);
 				const bool farmed=((ai.map->areasAt(ai.map->tileIndex(x,y)).farm&(ai.team->mask))!=0);
 				if(wheat_farm && !farmed)
 					farm_add_acc.applyBrush(BrushApplication(x, y, 0), ai.map->width, ai.map->height);
@@ -4909,7 +4942,7 @@ bool Farmer::updateFarm()
 				}
 				else
 				{
-					if(resources.find(point(x, y))==resources.end() && ((ai.map->visibilityAt(ai.map->tileIndex(x,y)).discovered&(ai.team->mask))!=0) && water_gradient.getHeight(x, y)<=static_cast<int>(MAX_DISTANCE_FROM_WATER+2))
+					if(resources.find(point(x, y))==resources.end() && ((ai.map->visibilityAt(ai.map->tileIndex(x,y)).discovered&(ai.team->mask))!=0) && inFarmZone(x, y))
 					{
 						add_acc.applyBrush(BrushApplication(x, y, 0), ai.map->width, ai.map->height);
 						resources.insert(point(x, y));

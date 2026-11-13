@@ -7,7 +7,6 @@
 #include <PerformanceTelemetry.h>
 #include "MapCopies.h"
 
-#include "AICastor.h"
 
 #include <assert.h>
 
@@ -18,6 +17,7 @@
 #include "BuildingType.h"
 #include "DatasetWriter.h"
 #include "Game.h"
+#include "MapDrawer.h"
 #include "GameUtilities.h"
 #include "GlobalContainer.h"
 #include "Order.h"
@@ -26,7 +26,6 @@
 #include "GameGUI.h"
 #include <SDL3/SDL.h>
 
-#include "MapEdit.h"
 
 #include "Brush.h"
 #include "Bullet.h"
@@ -34,13 +33,16 @@
 #include "ReplayWriter.h"
 
 #include "GameAnimations.h"
+#include "UnitEffectArt.h"
+#include <string>
+#include "unit/render/ColonySkinPreview.h"
 
 #define BULLET_IMGID 0
 
 // Bullets/explosions/death animations, fog of war, and overlay maps. Split from Game_render.cpp.
 
 
-void Game::drawMapBulletsExplosionsDeathAnimations(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene)
+void MapDrawer::drawMapBulletsExplosionsDeathAnimations(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene)
 {
 	const SceneEntities &entities = scene.entities;
 	const SceneMap &map = scene.map; // the extracted map, not Game::map
@@ -131,6 +133,145 @@ void Game::drawMapBulletsExplosionsDeathAnimations(int left, int top, int right,
 	}
 }
 
+void MapDrawer::drawMapUnitEffects(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+{
+	// drawMap indexes effects only for renderers and settings that draw them.
+	if (view.render.unitEffects.empty())
+		return;
+	PERF_SCOPE_TIME(Effects);
+	const SceneEntities &entities = scene.entities;
+	const SceneMap &map = scene.map;
+	Uint32 visibleTeams = entities.teams[localTeam].mask;
+	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
+	const int mapPixW = map.getW() << 5, mapPixH = map.getH() << 5;
+	UnitEffectArt &art = view.render.effectArt();
+	GAGCore::GraphicContext &gfx = *globalContainer->gfx;
+	const float pixelsPerUnit = gfx.mapTransformScale() * gfx.getRasterScale();
+	Sprite::flushBatches(&gfx);
+	// A spawn's dust, a service's icons and a conversion's motes and icon travel
+	// with their unit: they burst around its drawn centre, so their outward
+	// motion adds to its own. The unit pass queued where it drew each unit (one
+	// entry per seam copy).
+	const auto &overlays = view.render.unitOverlays;
+	const auto teamHue = [&](int team) {
+		auto color = presentationColor(entities.teams[team].color);
+		if (const auto chosen = view.render.skinPreview().buildingColor(team))
+			color = GAGCore::Color((*chosen >> 16) & 255, (*chosen >> 8) & 255, *chosen & 255);
+		return UnitEffectArt::hueOf(color);
+	};
+	for (const SceneSectorEffects &sector : entities.sectors)
+		for (const SceneUnitEffect &effect : sector.unitEffects)
+		{
+			const float age = effect.age + view.render.unitMotion;
+			const auto kind = UnitEffect::Kind(effect.kind);
+			const bool spawn = kind == UnitEffect::Kind::Spawn, convert = kind == UnitEffect::Kind::Convert;
+			const float ends = spawn ? UnitEffect::DustTicks : convert ? float(UnitEffect::LifetimeTicks)
+				: UnitEffect::IconDelayTicks + UnitEffect::IconTicks;
+			if (age >= ends ||
+				(!(drawOptions & Game::DRAW_WHOLE_MAP) && !map.isFOWDiscovered(effect.x, effect.y, visibleTeams)))
+				continue;
+			if (convert && (effect.fromTeam < 0 || size_t(effect.fromTeam) >= entities.teams.size()))
+				continue;
+			int glyph = -1;
+			if (!spawn && !convert)
+			{
+				if (!entities.typeDefinitions || effect.buildingType < 0 || size_t(effect.buildingType) >= entities.typeDefinitions->size())
+					continue;
+				glyph = (*entities.typeDefinitions)[effect.buildingType].presentation.iconFrame;
+			}
+			const float hue = teamHue(effect.team);
+			const std::uint32_t seed = UnitEffect::seedOf(effect.x, effect.y, effect.unit);
+			// The team that gained a converted unit sees its colours gather and a
+			// heart rise; the team that lost it sees its own colours fall off and a
+			// heart break; anyone else, replays included, sees both colours.
+			UnitEffect::ConvertView convertView = UnitEffect::ConvertView::Neutral;
+			if (convert && !globalContainer->isViewingGame())
+				convertView = localTeam == effect.team ? UnitEffect::ConvertView::Gained
+					: localTeam == effect.fromTeam ? UnitEffect::ConvertView::Lost : UnitEffect::ConvertView::Neutral;
+			const float fromHue = convert ? teamHue(effect.fromTeam) : hue;
+			const auto drawAt = [&](float cx, float cy, float opacity) {
+				if (spawn)
+				{
+					UnitEffect::forEachDustGlow(age, [&](const UnitEffect::Glow &glow) { art.draw(gfx, hue, cx, cy, glow, 1); });
+					UnitEffect::forEachDustMote(seed, age,
+						[&](const UnitEffect::Sparkle &mote) { art.draw(gfx, hue, cx, cy, mote, 1); });
+				}
+				else if (convert)
+				{
+					if (convertView != UnitEffect::ConvertView::Gained)
+						UnitEffect::forEachShedMote(seed, age,
+							[&](const UnitEffect::Sparkle &mote) { art.draw(gfx, fromHue, cx, cy, mote, opacity); });
+					if (convertView != UnitEffect::ConvertView::Lost)
+					{
+						UnitEffect::forEachGatherGlow(age, [&](const UnitEffect::Glow &glow) { art.draw(gfx, hue, cx, cy, glow, opacity); });
+						UnitEffect::forEachGatherMote(seed, age,
+							[&](const UnitEffect::Sparkle &mote) { art.draw(gfx, hue, cx, cy, mote, opacity); });
+					}
+					// The gainer's heart takes the unit's new colour, the loser's its old one.
+					const bool gained = convertView == UnitEffect::ConvertView::Gained;
+					UnitEffect::forEachConvertHeart(convertView, age, [&](const UnitEffect::Icon &icon, UnitEffect::HeartPart part) {
+						art.drawHeart(gfx, part, gained ? hue : fromHue, gained ? 1.f : 0.8f, cx, cy, icon, opacity);
+					});
+				}
+				else
+					UnitEffect::forEachServiceIcon(seed, age, [&](const UnitEffect::Icon &icon) {
+						art.draw(gfx, *globalContainer->mapIcons, glyph, kind, cx, cy, icon, opacity, pixelsPerUnit);
+					});
+			};
+			bool drawn = false;
+			for (const auto &unit : overlays)
+				if (unit.unit == effect.unit)
+				{
+					// A spawn fades in with its own opacity, which its dust does not
+					// share; a serviced or converted unit's opacity is its fog fade,
+					// which its effect does.
+					drawAt(unit.x + 16, unit.y + 16, spawn ? 1 : unit.opacity);
+					drawn = true;
+				}
+			// A converted unit walks on towards the inn, so its effect follows it
+			// rather than jumping back to the tile it changed sides on.
+			if (drawn || convert)
+				continue;
+			// The unit was not drawn this frame (it died, or is outside the drawn
+			// area): play the effect from the tile it came out on.
+			int x, y;
+			map.mapCaseToDisplayable(effect.x, effect.y, &x, &y, viewportX, viewportY);
+			// A cloud reaches about two tiles; icons a little over one.
+			const int centreX = x + 16, centreY = y + 16, reach = 72;
+			forEachMapCopy(centreX - reach, centreY - reach, centreX + reach, centreY + reach,
+				mapPixW, mapPixH, sw, sh, [&](int dx, int dy) {
+					const float cx = float(centreX + dx), cy = float(centreY + dy);
+					// A service's icons burst once the unit is half out, half a tile short of its exit tile.
+					if (spawn)
+						drawAt(cx, cy, 1);
+					else
+						drawAt(cx - effect.dx * 16.f, cy - effect.dy * 16.f, 1);
+				});
+		}
+	// Over each unit: a spawn's twinkles, and a trained unit's new level rising like
+	// a combat level-up (MapDrawer::drawUnit).
+	for (const auto &unit : view.render.unitOverlays)
+	{
+		if (UnitEffect::Kind(unit.kind) == UnitEffect::Kind::Spawn)
+			UnitEffect::forEachShimmerTwinkle(unit.seed, unit.age, [&](const UnitEffect::Sparkle &twinkle) {
+				art.draw(gfx, unit.hue, unit.x + 16, unit.y + 16, twinkle, unit.opacity);
+			});
+		else if (unit.level)
+		{
+			const auto number = UnitEffect::levelNumber(unit.age);
+			if (number.alpha <= 0)
+				continue;
+			const std::string text = std::to_string(unit.level);
+			globalContainer->standardFont->pushStyle(Font::Style(Font::STYLE_NORMAL, 242, 131, 14));
+			gfx.drawString(int(unit.x) + 16 - (globalContainer->standardFont->getStringWidth(text.c_str()) >> 1),
+				int(unit.y - 16 - number.rise), globalContainer->standardFont, text, 0,
+				Uint8(std::lround(255 * number.alpha * unit.opacity)));
+			globalContainer->standardFont->popStyle();
+		}
+	}
+	view.render.unitOverlays.clear();
+}
+
 namespace
 {
 //! Shade one fog square whose four corners are at different fade levels. The
@@ -167,11 +308,11 @@ void drawFogShadeSquare(int x, int y, const unsigned corner[4], unsigned lowest,
 }
 }
 
-void Game::drawMapFogOfWar(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const MapRenderState& render, const PresentationFrame& scene)
+void MapDrawer::drawMapFogOfWar(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const MapRenderState& render, const PresentationFrame& scene)
 {
 	const SceneMap &sceneMap = scene.map;
 	PERF_SCOPE_TIME(RenderFog);
-	if ((drawOptions & DRAW_WHOLE_MAP) == 0)
+	if ((drawOptions & Game::DRAW_WHOLE_MAP) == 0)
 	{
 		// we have decrease on because we do unaligned lookup
 		Uint32 visibleTeams = scene.entities.teams[localTeam].mask;
@@ -257,12 +398,12 @@ void Game::drawMapFogOfWar(int left, int top, int right, int bot, int sw, int sh
 	}
 }
 
-void Game::drawMapOverlayMaps(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view)
+void MapDrawer::drawMapOverlayMaps(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view)
 {
 	const SceneMap& map = view.drawnScene().map;
-	std::valarray<unsigned char> &overlayAlphas = view.render.overlayAlphas;
+	std::vector<unsigned char> &overlayAlphas = view.render.overlayAlphas;
 	PERF_SCOPE_TIME(Overlay);
-	if(drawOptions & DRAW_OVERLAY)
+	if(drawOptions & Game::DRAW_OVERLAY)
 	{
 		const OverlayArea* overlays = view.drawnScene().overlay.get();
 
@@ -274,7 +415,7 @@ void Game::drawMapOverlayMaps(int left, int top, int right, int bot, int sw, int
 		int width = (right - left) + 2;
 		int height = (bot - top) + 2;
 
-		overlayAlphas.resize(width * height);
+		overlayAlphas.assign(width * height, 0);
 		for (int y=0; y<height; y++)
 		{
 			for (int x=0; x<width; x++)

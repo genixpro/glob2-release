@@ -20,7 +20,10 @@
 // synchronized RNG stream, swapped in while it runs (as MenuColony does), and none
 // writes replays; everything else an Engine touches is its own.
 
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "ProfileNeeds.h"
 #include "GeneratorPackage.h"
 #include <ThreadSupport.h>
 #include "GenerationService.h"
@@ -66,6 +69,8 @@
 #include "TurnTestSupport.h"
 #include "Utilities.h"
 #include "VerifyMatch.h"
+#include "Team.h"
+#include "render/ViewState.h"
 
 namespace fs = std::filesystem;
 using nlohmann::json;
@@ -222,7 +227,7 @@ std::vector<Uint8> hostileOrder(Game& game, int team, int seat, std::mt19937& rn
 
 std::string mapPath(const std::string& name)
 {
-	return (glob2test::sourceRoot() / "maps" / (name + ".map.gz")).string();
+	return (glob2test::contentRoot() / "maps" / (name + ".map.gz")).string();
 }
 
 // Uploaded current files bind their authored catalogs through the production
@@ -668,6 +673,7 @@ struct EngineMatch
 /// verifier's.
 json liveTeams(EngineClient& client)
 {
+	client.engine->gui.game.winProbabilitySyncStep(true);
 	std::ostringstream out;
 	out << '{';
 	Headless::playersAndTeamsJson(out, client.engine->gui.game, client.engine->teamEliminatedTick);
@@ -1184,8 +1190,8 @@ TEST_SUITE("TurnEngineHarness")
 		MESSAGE(summary(m, end));
 	}
 
-	GLOB2_TEST_CASE("a client that executes a tampered order is repaired by an in-place reload and named by the verifier",
-	                "[network-sim][artifacts]")
+	TEST_CASE("a client that executes a tampered order is repaired by an in-place reload and named by the verifier "
+	          "[network-sim][artifacts]" * glob2test::needs({"ai:castor"}))
 	{
 		glob2test::HeadlessGlobals globals(harnessGlobals());
         globals->computeThreads = 2;
@@ -1734,6 +1740,8 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK_FALSE(now.rejected);
 		CHECK(now.flooded == 0);
 		CHECK(now.executedMoves > 100);
+		// The delays below are on the harness's simulated clock (net.now advances one
+		// FRAME per loop), not the wall clock, so a slow machine cannot move them.
 		CHECK(now.maxMove < 300);
 		CHECK(now.dropMs >= 0);
 		CHECK(now.dropMs < 300);
@@ -1950,7 +1958,7 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK(v.verdict.verdict == "verified");
 	}
 
-	GLOB2_TEST_CASE("the committed match record verifies to the committed checksum trace", "[network-sim][golden]")
+	GLOB2_TEST_CASE("the committed match record verifies against its own checksum reports", "[network-sim][sim-trace]")
 	{
 		glob2test::HeadlessGlobals globals(harnessGlobals());
 		const fs::path record = glob2test::fixture("multiplayer/FourSquares1.g2mr");
@@ -1972,7 +1980,88 @@ TEST_SUITE("TurnEngineHarness")
 		CHECK(v.compared == rec.reports.size());
 		for (int seat = 0; seat < Turn::MAX_SEATS; ++seat)
 			CHECK(v.orders.seats[seat].rejected == 0);
-		glob2test::expectGolden("multiplayer/FourSquares1.verify-trace.txt", glob2test::readFile(out.path / "checksums.txt"));
+		// The replayed trace covers every tick and agrees with each checksum the
+		// clients reported during the live match.
+		REQUIRE(v.checksums.size() == size_t(rec.endTick) + 1);
+		REQUIRE(rec.reports.size() > 0);
+		for (const auto &report : rec.reports)
+		{
+			CAPTURE(report.tick);
+			REQUIRE(v.checksums.contains(report.tick));
+			CHECK(report.checksum == v.checksums.at(report.tick));
+		}
+		glob2test::recordSimTrace("multiplayer/FourSquares1.verify-trace.txt", glob2test::readFile(out.path / "checksums.txt"));
+	}
+
+
+	GLOB2_TEST_CASE("match records from earlier sim versions are unverifiable without changing replay file floors",
+					"[network-sim][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(harnessGlobals());
+		// Released sim version keys, each a revision that a language or map
+		// registration retired: a record naming one, or run with one, must not verify.
+		const struct
+		{
+			const char *revision;
+			const char *key;
+		} retired[] = {
+			{"111, before Marathi", "191-73-be0cfb6de27ede2ccf532696a24fe30af46f1f6e825019b75072d91081b3cee9"},
+			{"112, before Thai", "191-73-9ce97439847adc396d7cf42390d2962c382a23f89363df4dd92c53dbc1f6c4d9"},
+			{"113, Telugu, before Filipino and Thai", "191-73-289bec536583fdb3508350732d433c2aab519de883507b9af486b120b1cea81d"},
+			{"114, Thai and Filipino branches", "191-73-cb71317a961766ae7d249e039c3f6ea8fcc6fb3b6d620e1cb69ae0cbae014e7a"},
+			{"115, Thai and Bulgarian branches", "191-73-e09bf9518579c665617212e36e5ff735ad3e3bae85e0d994b836f2ce35babe56"},
+			{"116, Thai and Honeycomb branches", "191-73-073ef28125370208bf905617952c192cff54c21ca8a0d6c38465e5affeae607c"},
+		};
+		const auto current = Online::currentSimVersion();
+		const auto committed = Turn::MatchRecord::readFile(
+			glob2test::fixture("multiplayer/FourSquares1.g2mr").string());
+		REQUIRE(committed.simVersion == current.key());
+		const auto committedSetup = Online::MatchSetup::parse(committed.setupJson);
+		REQUIRE(committedSetup.simVersion == current);
+		// boundary 0: the record as committed; 1: the setup ran an old version;
+		// 2: the record names an old version.
+		const auto verify = [&](const Online::SimVersion *before, int boundary, const std::string &name)
+		{
+			auto record = committed;
+			auto setup = committedSetup;
+			if (boundary == 1)
+			{
+				setup.simVersion = *before;
+				record.setupJson = setup.toJson().dump();
+			}
+			if (boundary == 2)
+				record.simVersion = before->key();
+			const auto output = glob2test::artifactDir() / name;
+			fs::create_directories(output);
+			const auto verdict = MatchVerifier::verify(record, setup, mapPath("FourSquares1"), output);
+			REQUIRE(verdict.checksums.size() == size_t(record.endTick) + 1);
+			CHECK(verdict.compared == record.reports.size());
+			// SIM_REVISION partitions online execution; it does not change the
+			// standalone replay container format. Every actual generated replay
+			// remains readable at the current supported file-format version.
+			ReplayReader reader;
+			CHECK(reader.loadReplay((output / "match.replay").string()));
+			return verdict;
+		};
+		CHECK(verify(nullptr, 0, "current").verdict == "verified");
+		for (size_t i = 0; i < std::size(retired); ++i)
+		{
+			const std::string revision = retired[i].revision;
+			CAPTURE(revision);
+			Online::SimVersion before;
+			REQUIRE(Online::SimVersion::parseKey(retired[i].key, before));
+			REQUIRE(before != current);
+			for (int boundary : {1, 2})
+			{
+				CAPTURE(boundary);
+				const auto verdict =
+					verify(&before, boundary, "retired-" + std::to_string(i) + "-" + std::to_string(boundary));
+				CHECK(verdict.verdict == "unverifiable");
+				CHECK(verdict.reason.find(before.key()) != std::string::npos);
+				CHECK(verdict.reason.find(boundary == 1 ? "match ran sim version" : "record names sim version") !=
+					  std::string::npos);
+			}
+		}
 	}
 
 	GLOB2_TEST_CASE("rejoin fast-forward time grows with game length and AI count", "[network-sim][benchmark][artifacts]")

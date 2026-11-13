@@ -47,7 +47,7 @@ class GpuTerrainPageCache
     std::uint64_t frame=0,maskIdentity=0,contentRevision=0;
     inline static std::atomic_uint64_t nextCacheIdentity{0};
     const std::uint64_t cacheIdentity=++nextCacheIdentity;
-    static constexpr std::size_t PageBudget=128u*1024*1024,MaskBudget=8u*1024*1024;
+    static constexpr std::size_t PageBudget=128u*1024*1024,MaskBudget=8u*1024*1024,MaxSources=1024;
     static constexpr std::size_t MaskLeaseBudgetBytes=40u*1024*1024;
     static PageKey key(const SoftwareTerrainCache::Chunk &chunk) {return {chunk.x,chunk.y,chunk.scale,chunk.downsample};}
     GAGCore::TextureSnapshot material(TerrainVisual::Compositor &compositor,const TerrainVisual::Recipe &recipe,TerrainVisual::MaterialId id) {
@@ -71,9 +71,11 @@ class GpuTerrainPageCache
             if(!resources->update(handle,surface.get(),view.revision,descriptor)) throw std::bad_alloc();
         } else {
             // Source cache is bounded independently of submitted snapshots.
-            if(sources.size()>=256) {
+            // One four-layout material alone has 256 variants; sources this
+            // frame already drew are never evicted, or a view thrashes them.
+            if(sources.size()>=MaxSources) {
                 auto oldest=std::min_element(sources.begin(),sources.end(),[](const auto &a,const auto &b){return a.second.used<b.second.used;});
-                resources->erase(oldest->second.handle);sources.erase(oldest);
+                if(oldest->second.used!=frame) {resources->erase(oldest->second.handle);sources.erase(oldest);}
             }
             handle=resources->create(surface.get(),view.revision,descriptor);
             if(!handle) throw std::bad_alloc();
@@ -193,7 +195,7 @@ class GpuTerrainPageCache
             data->targetRect={x*cellSize,y*cellSize,cellSize,cellSize};
             std::array<TerrainVisual::MaterialId,4> palette{};
             const auto &recipe=tile.recipe;
-            const bool uniform=std::all_of(recipe.corners.begin(),recipe.corners.end(),[&](auto id){return id==recipe.corners[0];});
+            const bool uniform=recipe.uniform();
             if(uniform) {palette[0]=recipe.corners[0];data->paletteCount=1;}
             else {const auto mask=coverage(compositor,recipe,chunk.scale);
                 data->coverage=mask.data;palette=mask.palette;data->paletteCount=mask.colors;}
@@ -201,7 +203,16 @@ class GpuTerrainPageCache
                 data->materials[slot]=material(compositor,recipe,palette[slot]);
                 const auto &seam=compositor.catalog().materials[palette[slot]].seam;
                 data->seams[slot]={seam.height,seam.cast,seam.castWidth,seam.fringe,seam.fringeWidth,seam.fringeColor};
+                const auto &surf=compositor.catalog().materials[palette[slot]].surf;
+                const auto &material=compositor.catalog().materials[palette[slot]];
+                const std::uint32_t calm=material.shoreCalm?
+                    std::uint32_t(256-TerrainVisual::ShoreCalmContrastQ8)<<24|material.calmMean[0]<<16|material.calmMean[1]<<8|material.calmMean[2]:0;
+                data->surfs[slot]={surf.period,surf.reach,surf.foam,surf.foamWidth,surf.shallow,surf.shallowWidth,
+                                   surf.wet,surf.wetWidth,surf.shallowColor,surf.foamColor,surf.ticks,calm,
+                                   material.shoreWash};
             }
+            data->surfOriginX=recipe.x*8192;data->surfOriginY=recipe.y*8192;data->surfTime=compositor.surfTime();
+            for(unsigned k=0;k<4;++k)data->shoreCalm|=std::uint32_t(recipe.calm[k])<<(8*k);
             DrawPacket packet;packet.kind=DrawPacket::Kind::WeightedCompose;packet.blend=DrawPacket::Blend::Opaque;
             packet.weightedCompose=std::move(data);packets.push_back(std::move(packet));
         }
@@ -250,7 +261,8 @@ struct SamplingPlan
 	bool pageFits, viewFits;
 };
 SamplingPlan samplingPlan(const SceneMap &map, int left, int top, int right, int bottom, int vx,
-						  int vy, int preferredResolution, int preferredDownsample = 0)
+						  int vy, int preferredResolution, int preferredDownsample = 0,
+						  bool stableView = false)
 {
 	const bool gpu = globalContainer->gfx->rendererCapabilities().accelerated;
 	const auto budget = gpu ? SoftwareTerrainCache::GPUBudget : SoftwareTerrainCache::Budget;
@@ -258,10 +270,14 @@ SamplingPlan samplingPlan(const SceneMap &map, int left, int top, int right, int
 	const int y0 = chunkOf(top + vy), y1 = chunkOf(bottom + vy);
 	// A map smaller than one page repeats within that canonical page. All map
 	// dimensions are powers of two, so its period divides the page dimensions.
-	const auto visiblePages =
-		std::uint64_t(
-			std::min(x1 - x0 + 1, std::max(1, map.getW() / SoftwareTerrainCache::ChunkTiles))) *
-		std::min(y1 - y0 + 1, std::max(1, map.getH() / SoftwareTerrainCache::ChunkTiles));
+	constexpr int tiles = SoftwareTerrainCache::ChunkTiles;
+	// Size the interactive HD view for its worst alignment on the page grid.
+	// A pan can expose an extra row and column without changing the zoom.
+	const int columns = stableView ? (right - left + tiles - 1) / tiles + 1 : x1 - x0 + 1;
+	const int rows = stableView ? (bottom - top + tiles - 1) / tiles + 1 : y1 - y0 + 1;
+	const auto visiblePages = std::uint64_t(std::min(columns, std::max(1, map.getW() / tiles))) *
+		std::min(rows, std::max(1, map.getH() / tiles));
+	const auto cacheBudget = gpu ? SoftwareTerrainCache::GPUCacheBudget : budget;
 	const int limit = globalContainer->gfx->maximumTextureSize();
 	const auto fitsDevice = [&](int resolution)
 	{ return limit <= 0 || SoftwareTerrainCache::ChunkPixels * resolution <= limit; };
@@ -292,13 +308,14 @@ SamplingPlan samplingPlan(const SceneMap &map, int left, int top, int right, int
 	const bool pageFits =
 		(limit <= 0 || SoftwareTerrainCache::ChunkPixels * resolution / downsample <= limit) &&
 		storage <= budget;
-	// The entire view needs CPU pixels, but its textures can be streamed from
-	// those pixels under the cache budget. Reserve room for at least one upload.
+	// Immediate draws can stream textures from retained CPU pixels. Progressive
+	// draws need the full view to fit eventually or some holes never fill.
 	const auto cpuStorage = pageStorage(resolution, false, downsample);
-	const auto minimumStorage = gpu ? visiblePages * cpuStorage + storage - cpuStorage
+	const auto minimumStorage = gpu && !stableView ? visiblePages * cpuStorage + storage - cpuStorage
 		: visiblePages * storage;
-	const auto cacheBudget = gpu ? SoftwareTerrainCache::GPUCacheBudget : budget;
-	return {resolution, downsample, cacheBudget, pageFits, pageFits && minimumStorage <= cacheBudget};
+	const bool texturesFit = !stableView || !gpu || visiblePages * (storage - cpuStorage) <= budget;
+	return {resolution, downsample, cacheBudget, pageFits,
+		pageFits && texturesFit && minimumStorage <= cacheBudget};
 }
 
 // Box-filter composed coverage in premultiplied space, then retain straight
@@ -360,7 +377,7 @@ void reduceTile(SDL_Surface *source, SDL_Surface *target, int ox, int oy, int di
 }
 SamplingPlan viewSamplingPlan(const SceneMap &map, int left, int top, int right, int bottom, int vx,
 							  int vy, int preferredResolution, bool tiledCapture,
-							  int preferredDownsample = 0)
+							  int preferredDownsample = 0, bool stableView = false)
 {
 	// A narrow atlas edge must not select HD pages after its wider neighbor
 	// selected native pages. That changes seams and repeatedly clears the cache.
@@ -376,7 +393,7 @@ SamplingPlan viewSamplingPlan(const SceneMap &map, int left, int top, int right,
 				NativeTilePixels / SoftwareTerrainCache::capturePixelsPerCell(map.getW(), map.getH()));
 	}
 	return samplingPlan(map, left, top, right, bottom, vx, vy, preferredResolution,
-						preferredDownsample);
+						preferredDownsample, stableView);
 }
 void drawEmergencyTiles(const SceneMap &map, int left, int top, int right, int bottom, int vx,
 						int vy, Uint32 visibleTeams, bool wholeMap, int preferredResolution)
@@ -488,27 +505,42 @@ std::pair<bool, bool> classifyAlpha(const SDL_Surface &surface, SDL_Rect rect)
     if (*first >> 24 == 0) return {false, allAlpha<0>(surface, rect)};
     return {false, false};
 }
+// A reduced page (downsample > 1) composes each cell at native size into a
+// job-local tile and box-filters it into the page, as the serial path does.
 void buildTerrainJob(std::span<TerrainCellResult> results,
                      const TerrainVisual::Compositor::CpuMaterials &materials, int samplingScale,
-                     int pitch, std::size_t cellsPerJob, std::size_t job)
+                     int downsample, int pitch, std::size_t cellsPerJob, std::size_t job)
 {
     TerrainVisual::Compositor::CpuScratch scratch;
+    std::vector<Uint32> native;
+    SDL_Surface nativeTile{};
+    if (downsample > 1)
+    {
+        native.resize(std::size_t(NativeTilePixels) * NativeTilePixels);
+        nativeTile.format = SDL_PIXELFORMAT_ARGB8888;
+        nativeTile.w = nativeTile.h = NativeTilePixels;
+        nativeTile.pitch = NativeTilePixels * 4;
+        nativeTile.pixels = native.data();
+    }
     for (std::size_t k = job * cellsPerJob; k < results.size() && k < (job + 1) * cellsPerJob; ++k)
     {
         auto &result = results[k];
         SDL_Surface output{};
         output.format = SDL_PIXELFORMAT_ARGB8888;
-        output.w = output.h = 32 * samplingScale;
+        output.w = output.h = 32 * samplingScale / downsample;
         output.pitch = pitch;
         output.pixels = result.pixels;
         if (result.input.discovered)
         {
             if (!result.reused && result.keepMask)
                 result.mask = materials.mask(result.input.recipe, samplingScale);
-            materials.compose(result.input.recipe, &output, samplingScale, scratch,
+            materials.compose(result.input.recipe, downsample > 1 ? &nativeTile : &output, samplingScale,
+                              scratch,
                               result.reused ? result.reused
                               : result.mask ? &*result.mask
                                             : nullptr);
+            if (downsample > 1)
+                reduceTile(&nativeTile, &output, 0, 0, downsample);
             std::tie(result.opaque, result.empty) =
                 classifyAlpha(output, {0, 0, output.w, output.h});
         }
@@ -544,15 +576,50 @@ bool SoftwareTerrainCache::prepare(const SceneMap &map, GAGCore::Sprite &sprite,
 								   int right, int bottom, int vx, int vy, Uint32 visibleTeams,
 								   bool wholeMap, int time, bool tiledCapture)
 {
+	const bool fixedDensity = benchmarkDownsample > 0 && !tiledCapture;
 	return prepareAtResolution(map, sprite, left, top, right, bottom, vx, vy, visibleTeams,
-							   wholeMap, time, 0, tiledCapture);
+							   wholeMap, time, fixedDensity ? 1 : 0, tiledCapture,
+							   fixedDensity ? benchmarkDownsample : 0);
+}
+namespace
+{
+// Only a contact between a surf material and a dry material can animate.
+bool hasShoreline(const TerrainVisual::Recipe &recipe, const TerrainVisual::Compositor &compositor)
+{
+    // The palette includes halo materials, so a cell beside the water's edge
+    // whose corners are all land still animates its wash.
+    const auto liquid = [&](auto id) { return compositor.catalog().materials[id].surf.period > 0; };
+    std::array<TerrainVisual::MaterialId, 4> palette;
+    const unsigned count = recipe.palette(palette);
+    const bool first = liquid(palette[0]);
+    return std::any_of(palette.begin() + 1, palette.begin() + count, [&](auto id) { return liquid(id) != first; });
+}
+
+bool surfStepChanged(TerrainVisual::MaterialId id, unsigned previousTime,
+                     const TerrainVisual::Compositor &compositor)
+{
+    const auto &surf = compositor.catalog().materials[id].surf;
+    return surf.period && previousTime / surf.ticks != compositor.surfTime() / surf.ticks;
+}
+
+bool tileSurfChanged(const TerrainVisual::Recipe &recipe, unsigned previousTime,
+                     const TerrainVisual::Compositor &compositor)
+{
+    std::array<TerrainVisual::MaterialId, 4> palette;
+    const unsigned count = recipe.palette(palette);
+    return previousTime != compositor.surfTime() && hasShoreline(recipe, compositor) &&
+        std::any_of(palette.begin(), palette.begin() + count,
+            [&](auto id) { return surfStepChanged(id, previousTime, compositor); });
+}
 }
 bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
                                         const std::array<Tile, ChunkTiles * ChunkTiles> &tiles,
                                         TerrainVisual::Compositor &compositor, SDL_Surface *target,
-                                        bool wasValid, std::size_t budget)
+                                        bool wasValid, std::size_t budget, bool nativeAvailable)
 {
-    if (downsample != 1 || resolution > 4 ||
+    // Reduced pages compose native cells and filter them; a retained native
+    // page is already that input, so the serial path reduces it directly.
+    if ((downsample != 1 && (nativeAvailable || resolution != 1)) || resolution > 4 ||
         GAGCore::renderExecution() == GAGCore::RenderExecution::Immediate ||
         !GAGCore::PresentationWork::current) return false;
     const auto materialChanged = [&](TerrainVisual::MaterialId id)
@@ -560,7 +627,7 @@ bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
         const auto old = std::find_if(page.materialRevisions.begin(), page.materialRevisions.end(),
                                       [id](const auto &revision) { return revision.first == id; });
         return old == page.materialRevisions.end() ||
-               old->second != compositor.materialRevision(id);
+               old->second != compositor.textureRevision(id);
     };
     // Keep oversized HD cells and the optimized reduction path
     // serial. A CPU job covers at most 16K sampled pixels.
@@ -570,42 +637,23 @@ bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
     // admission space for materials used only by unchanged cells in this page.
     std::vector<unsigned> changed;
     changed.reserve(tiles.size());
-    std::vector<TerrainVisual::MaterialId> neededMaterials;
+    bool hasDiscoveredChanges = false;
     for (unsigned i = 0; i < tiles.size(); ++i)
     {
         const auto &tile = tiles[i];
         if (wasValid && page.tiles[i] == tile &&
-            (!tile.discovered || std::none_of(tile.recipe.corners.begin(),
-                                              tile.recipe.corners.end(), materialChanged)))
+            (!tile.discovered || (std::none_of(tile.recipe.corners.begin(),
+                                               tile.recipe.corners.end(), materialChanged) &&
+                                  !tileSurfChanged(tile.recipe, page.surfTime, compositor))))
             continue;
         changed.push_back(i);
-        if (tile.discovered)
-            for (auto id : tile.recipe.corners)
-                if (std::find(neededMaterials.begin(), neededMaterials.end(), id) == neededMaterials.end())
-                    neededMaterials.push_back(id);
+        hasDiscoveredChanges = hasDiscoveredChanges || tile.discovered;
     }
-    if (neededMaterials.empty()) return false;
-    const std::size_t materialBytes = compositor.cpuMaterialBytes(neededMaterials);
+    if (!hasDiscoveredChanges) return false;
     const std::size_t perCell =
         cellPixels * sizeof(TerrainVisual::Compositor::CellMask::Sample) +
         sizeof(TerrainVisual::Compositor::CellMask) + sizeof(Tile) + 256;
-    const std::size_t allowance = bytes() <= budget ? std::min({inFlightLimit, budget - bytes(), GAGCore::RenderWorkReservation::available()}) : 0;
-    const std::size_t fixed = materialBytes * 2 + perCell * 2;
-    // Amortize synchronous tickets across more cells without increasing any
-    // callback's 16K-sample bound or exceeding the reservation/headroom limits.
-    const std::size_t groupCells =
-        allowance > fixed ? std::min(std::size_t(64), (allowance - fixed) / perCell) : 0;
-    const std::size_t reserve = fixed + perCell * groupCells;
-    if (groupCells < 2) return false;
-    GAGCore::RenderWorkReservation workReservation;
-    if (!workReservation.reserve(reserve)) return false;
     PERF_SCOPE_TIME(TerrainPlanning);
-    std::shared_ptr<const TerrainVisual::Compositor::CpuMaterials> materials;
-    {
-        PERF_SCOPE_TIME(TerrainMaterials);
-        materials = compositor.cpuMaterials(neededMaterials);
-    }
-    cpuMaterialLease = materials;
     // The page is unpublished for the whole rebuild. Lock on the owner once;
     // workers receive only disjoint raw cell rectangles and the stable pitch.
     // A failure may leave partial pixels, but the caller keeps the page invalid.
@@ -616,15 +664,42 @@ bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
         ~Unlock() { SDL_UnlockSurface(surface); }
     } unlock{target};
     auto *pixels = static_cast<Uint8 *>(target->pixels);
-    const int pitch = target->pitch, n = 32 * resolution;
+    const int pitch = target->pitch, n = 32 * resolution / downsample;
     // Planning is owner-only. Masks cannot be evicted or
     // replaced until the synchronous group finishes.
-    for (std::size_t first = 0; first < changed.size(); first += groupCells)
+    for (std::size_t first = 0; first < changed.size();)
     {
+        // Snapshot only this bounded group's variants. A whole page can span
+        // several layouts and exceed the in-flight cap before any jobs start.
+        const std::size_t allowance = bytes() <= budget
+            ? std::min({inFlightLimit, budget - bytes(), GAGCore::RenderWorkReservation::available()}) : 0;
+        std::size_t groupCells = std::min(std::size_t(64), std::max(std::size_t(2), changed.size() - first));
+        std::size_t count = 0, reserve = 0;
+        std::vector<TerrainVisual::Recipe> recipes;
+        recipes.reserve(groupCells);
+        for (;;)
+        {
+            count = std::min(groupCells, changed.size() - first);
+            recipes.clear();
+            for (std::size_t k = first; k < first + count; ++k)
+                if (tiles[changed[k]].discovered) recipes.push_back(tiles[changed[k]].recipe);
+            const auto materialBytes = compositor.cpuMaterialBytesForRecipes(recipes);
+            reserve = materialBytes * 2 + perCell * (count + 2);
+            if (reserve <= allowance) break;
+            if (groupCells == 2) return false;
+            groupCells = std::max(std::size_t(2), groupCells / 2);
+        }
+        GAGCore::RenderWorkReservation workReservation;
+        if (!workReservation.reserve(reserve)) return false;
+        std::shared_ptr<const TerrainVisual::Compositor::CpuMaterials> materials;
+        {
+            PERF_SCOPE_TIME(TerrainMaterials);
+            materials = compositor.cpuMaterialsForRecipes(recipes);
+        }
+        cpuMaterialLease = materials;
         std::vector<TerrainCellResult> results;
-        const auto count = std::min(groupCells, changed.size() - first);
         results.reserve(count);
-        for (std::size_t k = first; k < changed.size() && k < first + groupCells; ++k)
+        for (std::size_t k = first; k < first + count; ++k)
         {
             const unsigned i = changed[k];
             TerrainCellResult result{};
@@ -636,21 +711,27 @@ bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
             if (tiles[i].discovered && held && held->mask.recipe == recipe &&
                 held->mask.scale == resolution)
                 result.reused = &held->mask;
-            result.keepMask = tiles[i].discovered &&
-                              std::any_of(recipe.corners.begin(), recipe.corners.end(),
-                                          [&](auto id) { return id != recipe.corners[0]; }) &&
-                              std::any_of(recipe.corners.begin(), recipe.corners.end(),
+            std::array<TerrainVisual::MaterialId, 4> palette;
+            const unsigned paletteCount = recipe.palette(palette);
+            result.keepMask = tiles[i].discovered && !recipe.uniform() &&
+                              std::any_of(palette.begin(), palette.begin() + paletteCount,
                                           [&](auto id) { return compositor.animated(id); });
             results.push_back(std::move(result));
         }
-        const std::size_t cellsPerJob = std::max(std::size_t(1), 16384 / cellPixels);
+        // At most 16K sampled pixels per job, and at least two jobs per participant
+        // so a wide pool is not left idle by a group of a few large jobs.
+        const std::size_t participants = std::max<std::size_t>(1, GAGCore::renderConcurrency());
+        const std::size_t cellsPerJob = std::clamp(
+            (results.size() + 2 * participants - 1) / (2 * participants), std::size_t(1),
+            std::max(std::size_t(1), 16384 / cellPixels));
         const auto started = std::chrono::steady_clock::now();
         {
             PERF_SCOPE_TIME(TerrainBatch);
             GAGCore::executePresentationJobs(
                 (results.size() + cellsPerJob - 1) / cellsPerJob,
-                [&results, materials, samplingScale = resolution, pitch, cellsPerJob](std::size_t job)
-                { buildTerrainJob(results, *materials, samplingScale, pitch, cellsPerJob, job); });
+                [&results, materials, samplingScale = resolution, reduction = downsample, pitch,
+                 cellsPerJob](std::size_t job)
+                { buildTerrainJob(results, *materials, samplingScale, reduction, pitch, cellsPerJob, job); });
         }
         ++workMetrics.batches;
         workMetrics.jobs += (results.size() + cellsPerJob - 1) / cellsPerJob;
@@ -672,6 +753,7 @@ bool SoftwareTerrainCache::tryBuildCpuPage(Chunk &page,
             page.opaque[result.index] = result.opaque;
             page.empty[result.index] = result.empty;
         }
+        first += count;
     }
     return true;
 }
@@ -698,6 +780,7 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 	PERF_SCOPE_TIME(TerrainCache);
 	copies.clear();
 	++frame;
+	if (left > right || top > bottom) return true;
     if (!enabled)
     {
         gpuPages.reset();
@@ -707,10 +790,30 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
     }
 	paintBounds = {left * 32, top * 32, (right - left + 1) * 32, (bottom - top + 1) * 32};
 	auto &compositor = globalContainer->terrainCompositor(map.frozenAssetBundle());
-	const bool nextGPU = globalContainer->gfx->rendererCapabilities().accelerated;
+	auto &gfx = *globalContainer->gfx;
+	const bool nextGPU = gfx.rendererCapabilities().accelerated;
+	// When even native-size pages need reduction, avoid preparing HD
+	// materials for the interactive Legacy OpenGL view.
+	const bool reducedLegacyView = gfx.isLegacyGLScreen() && !tiledCapture && !preferredDownsample &&
+		samplingPlan(map, left, top, right, bottom, vx, vy, 1).downsample > 1;
     {
         PERF_SCOPE_TIME(TerrainMaterials);
-	compositor.prepare(nextGPU, time);
+	// CPU and device composition can rebuild complete pages beyond the
+	// viewport, so prepare every cell in those pages before collecting jobs.
+	const auto prepareMaterials = [&] {
+		compositor.prepareVisible(nextGPU, time, map,
+			chunkOf(left + vx) * ChunkTiles, chunkOf(top + vy) * ChunkTiles,
+			(chunkOf(right + vx) + 1) * ChunkTiles - 1,
+			(chunkOf(bottom + vy) + 1) * ChunkTiles - 1, reducedLegacyView);
+	};
+	prepareMaterials();
+	// A capture is drawn once, so it waits for streamed HD rather than
+	// keeping the native fallback that interactive frames replace later.
+	if (tiledCapture && nextGPU)
+	{
+		GAGCore::Sprite::finishHighResolution();
+		prepareMaterials();
+	}
     }
 	const auto plan =
 		viewSamplingPlan(map, left, top, right, bottom, vx, vy,
@@ -737,7 +840,6 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 	downsample = plan.downsample;
 	const auto storage = pageStorage(resolution, false, downsample);
 	const auto uploadReserve = gpu ? pageStorage(resolution, true, downsample) - storage : 0;
-    auto &gfx = *globalContainer->gfx;
     const auto *device = gfx.renderDevice();
     const auto visiblePages = std::uint64_t(std::min(x1-x0+1,std::max(1,map.getW()/ChunkTiles))) *
         std::min(y1-y0+1,std::max(1,map.getH()/ChunkTiles));
@@ -869,32 +971,55 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 								ox * 4,
 							static_cast<const Uint8 *>(tile->pixels) + y * tile->pitch, n * 4);
 		};
-		for (int cy = y0; cy <= y1; ++cy)
-			for (int cx = x0; cx <= x1; ++cx)
+		const auto terrainRevision = map.terrainRevision();
+		const int columns = x1 - x0 + 1;
+		const auto pageCount = std::size_t(columns) * (y1 - y0 + 1);
+		const auto findPage = [&](int cx, int cy) -> Chunk *
+		{
+			const int wx = (cx * ChunkTiles) & map.getMaskW();
+			const int wy = (cy * ChunkTiles) & map.getMaskH();
+			for (auto &chunk : chunks)
+				if (chunk->x == wx && chunk->y == wy && chunk->scale == resolution &&
+					chunk->downsample == downsample)
+					return chunk.get();
+			return nullptr;
+		};
+		for (std::size_t i = 0; i < pageCount; ++i)
 			{
-				const int wx = (cx * ChunkTiles) & map.getMaskW(),
-						  wy = (cy * ChunkTiles) & map.getMaskH();
-				Chunk *entry = nullptr;
-				for (auto &c : chunks)
-					if (c->x == wx && c->y == wy && c->scale == resolution && c->downsample == downsample)
-					{
-						entry = c.get();
-						break;
-					}
-				// Compare the complete vertex window including the contour halo.
-				std::array<Uint32, (ChunkTiles + 3) * (ChunkTiles + 3)> sources{};
-				const int halo = compositor.contextualBorders() ? 1 : 0;
-				for (int y = -halo; y <= ChunkTiles + halo; ++y)
-					for (int x = -halo; x <= ChunkTiles + halo; ++x)
-						sources[(y + 1) * (ChunkTiles + 3) + x + 1] = map.vertexTerrainAt(wx + x, wy + y);
+				const int cx = x0 + int(i % columns), cy = y0 + int(i / columns);
+				const int wx = (cx * ChunkTiles) & map.getMaskW();
+				const int wy = (cy * ChunkTiles) & map.getMaskH();
+				Chunk *entry = findPage(cx, cy);
+				// Animation and artwork revisions change pixels but keep their
+				// recipes. The terrain revision avoids scanning the vertex
+				// window on ordinary frames.
+				const bool sameTerrain = entry && entry->valid &&
+					entry->recipeTerrainRevision == terrainRevision && entry->seed == map.terrainSeed();
+				// Compare the complete vertex window on edits, including the
+				// halo needed by borders and shore calm.
+				std::array<Uint32, SourceSpan * SourceSpan> sources{};
+				if (!sameTerrain)
+				{
+					for (int y = -SourceHalo; y <= ChunkTiles + SourceHalo; ++y)
+						for (int x = -SourceHalo; x <= ChunkTiles + SourceHalo; ++x)
+							sources[(y + SourceHalo) * SourceSpan + x + SourceHalo] = map.vertexTerrainAt(wx + x, wy + y);
+				}
 				const auto revisionChanged = [&](const auto &revision)
-				{ return compositor.materialRevision(revision.first) != revision.second; };
-				bool unchanged = entry && entry->valid && (!gpuPages || gpuPages->find(*entry)) && entry->sources == sources &&
-								 entry->seed == map.terrainSeed() &&
-								 std::none_of(entry->materialRevisions.begin(),
-											  entry->materialRevisions.end(), revisionChanged);
-				if (unchanged)
-					for (int y = 0; y < ChunkTiles && unchanged; ++y)
+				{ return compositor.textureRevision(revision.first) != revision.second; };
+				const auto pageChanged = [&](const Chunk &page)
+				{
+					return std::any_of(page.materialRevisions.begin(), page.materialRevisions.end(),
+						[&](const auto &revision) {
+							return (revisionChanged(revision) || (page.hasShoreline &&
+								surfStepChanged(revision.first, page.surfTime, compositor)));
+						});
+				};
+				bool sameContent = entry && entry->valid && (!gpuPages || gpuPages->find(*entry)) &&
+								 (sameTerrain || entry->sources == sources) &&
+								 entry->seed == map.terrainSeed();
+				const bool artChanged = sameContent && pageChanged(*entry);
+				if (sameContent && !artChanged)
+					for (int y = 0; y < ChunkTiles && sameContent; ++y)
 						for (int x = 0; x < ChunkTiles; ++x)
 						{
 							const bool discovered =
@@ -903,13 +1028,15 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 															 wy + y + 1, visibleTeams);
 							if (discovered != entry->tiles[y * ChunkTiles + x].discovered)
 							{
-								unchanged = false;
+								sameContent = false;
 								break;
 							}
 						}
+				const bool unchanged = sameContent && !artChanged;
 				if (unchanged)
 				{
 					entry->used = frame;
+					entry->recipeTerrainRevision = terrainRevision;
 					++hits;
 					copies.push_back(
 						{entry, (cx * ChunkTiles - vx) * 32, (cy * ChunkTiles - vy) * 32});
@@ -919,12 +1046,16 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 				for (int y = 0; y < ChunkTiles; ++y)
 					for (int x = 0; x < ChunkTiles; ++x)
 					{
-						auto &t = tiles[y * ChunkTiles + x];
+						const int index = y * ChunkTiles + x;
+						auto &t = tiles[index];
 						t.discovered = wholeMap || map.isMapPartiallyDiscovered(
 													   wx + x - 1, wy + y - 1, wx + x + 1,
 													   wy + y + 1, visibleTeams);
 						if (t.discovered)
-							t.recipe = compositor.describe(map, wx + x, wy + y);
+						{
+							t.recipe = sameTerrain && entry->tiles[index].discovered
+								? entry->tiles[index].recipe : compositor.describe(map, wx + x, wy + y);
+						}
 					}
 				// Reduced pages average native composition. A retained native
 				// page is already that exact input, including coverage and alpha;
@@ -935,7 +1066,7 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 					for (auto &c : chunks)
 						if (c->x == wx && c->y == wy && c->scale == 1 && c->downsample == 1 &&
 							c->valid && c->tiles == tiles &&
-							std::none_of(c->materialRevisions.begin(), c->materialRevisions.end(), revisionChanged))
+							!pageChanged(*c))
 						{
 							native = c.get();
 							nativeUsed = native->used;
@@ -986,9 +1117,7 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 						[id](const auto &revision) { return revision.first == id; });
 					return previous == entry->materialRevisions.end() || revisionChanged(*previous);
 				};
-				const bool sourcesChanged =
-					std::any_of(entry->materialRevisions.begin(), entry->materialRevisions.end(),
-								revisionChanged);
+				const bool sourcesChanged = pageChanged(*entry);
 				if (!entry->valid || sourcesChanged || entry->tiles != tiles || (gpuPages && !gpuPages->find(*entry)))
 				{
 					auto *target = entry->image ? entry->image->getSDLSurface() : entry->parked.get();
@@ -1003,7 +1132,7 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
                             copies.clear();return false;
                         }
                     }
-                    else if (!tryBuildCpuPage(*entry, tiles, compositor, target, wasValid, budget))
+                    else if (!tryBuildCpuPage(*entry, tiles, compositor, target, wasValid, budget, native != nullptr))
                     {
                         ++workMetrics.serialPages;
                         PERF_SCOPE_TIME(TerrainBatch);
@@ -1014,7 +1143,8 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 							if (wasValid && entry->tiles[i] == tiles[i] &&
 								(!tiles[i].discovered ||
 								 std::none_of(tiles[i].recipe.corners.begin(),
-											  tiles[i].recipe.corners.end(), materialChanged)))
+											  tiles[i].recipe.corners.end(), materialChanged) &&
+                                 !tileSurfChanged(tiles[i].recipe, entry->surfTime, compositor)))
 								continue;
 							auto &held = entry->masks[i];
 							const auto &recipe = tiles[i].recipe;
@@ -1025,11 +1155,11 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 							std::optional<TerrainVisual::Compositor::CellMask> passing;
 							const TerrainVisual::Compositor::CellMask *cellMask =
 								held ? &held->mask : nullptr;
-							const auto &corners = recipe.corners;
-							if (tiles[i].discovered && !native && !cellMask &&
-								std::any_of(corners.begin(), corners.end(),
-											[&](auto id) { return id != corners[0]; }) &&
-								std::any_of(corners.begin(), corners.end(),
+							// The palette, as in tryBuildCpuPage: halo surf animates too.
+							std::array<TerrainVisual::MaterialId, 4> palette;
+							const unsigned paletteCount = recipe.palette(palette);
+							if (tiles[i].discovered && !native && !cellMask && !recipe.uniform() &&
+								std::any_of(palette.begin(), palette.begin() + paletteCount,
 											[&](auto id) { return compositor.animated(id); }))
 							{
 								passing = compositor.mask(recipe, maskScale);
@@ -1044,9 +1174,8 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 							}
 							if (tiles[i].discovered)
 							{
-								if (gpu && downsample > 1 && !native &&
-									std::all_of(corners.begin(), corners.end(),
-												[&](auto id) { return id == corners[0]; }))
+								// Calmed shore cells vary within a variant; compose those.
+								if (gpu && downsample > 1 && !native && !recipe.calmed() && recipe.uniform())
 									copyUniform(recipe, target, x * n, y * n, n);
 								else if (downsample > 1)
 								{
@@ -1088,15 +1217,22 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 					if (entry->image && !gpuPages) entry->image->markPixelsChanged();
 					entry->tiles = tiles;
 					entry->materialRevisions.clear();
+					entry->surfTime = compositor.surfTime();
+					entry->hasShoreline = false;
 					for (const auto &tile : tiles)
-						if (tile.discovered)
-							for (auto id : tile.recipe.corners)
-								if (std::none_of(entry->materialRevisions.begin(),
-												 entry->materialRevisions.end(),
-												 [id](const auto &revision)
-												 { return revision.first == id; }))
-									entry->materialRevisions.emplace_back(
-										id, compositor.materialRevision(id));
+					{
+						if (!tile.discovered)
+							continue;
+						entry->hasShoreline |= hasShoreline(tile.recipe, compositor);
+						std::array<TerrainVisual::MaterialId, 4> palette;
+						for (unsigned k = 0, n = tile.recipe.palette(palette); k < n; ++k)
+						{
+							const auto id = palette[k];
+							if (std::none_of(entry->materialRevisions.begin(), entry->materialRevisions.end(),
+										 [id](const auto &revision) { return revision.first == id; }))
+								entry->materialRevisions.emplace_back(id, compositor.textureRevision(id));
+						}
+					}
 					if (!gpu)
 						buildOpaqueRuns(*entry);
 					entry->valid = true;
@@ -1106,13 +1242,16 @@ bool SoftwareTerrainCache::prepareAtResolution(const SceneMap &map, GAGCore::Spr
 				}
 				else
 					++hits;
-				entry->sources = sources;
+				if (!sameTerrain) entry->sources = sources;
 				entry->seed = map.terrainSeed();
+				entry->recipeTerrainRevision = terrainRevision;
 				if (native) native->used = nativeUsed;
 				copies.push_back({entry, (cx * ChunkTiles - vx) * 32, (cy * ChunkTiles - vy) * 32});
 			}
-		if (gpu && !gpuPages && std::any_of(copies.begin(), copies.end(), [](const auto &copy) { return !copy.chunk->image; }) &&
-			!makeRoom(uploadReserve)) throw std::bad_alloc();
+		if (gpu && !gpuPages &&
+			std::any_of(copies.begin(), copies.end(), [](const auto &copy) { return !copy.chunk->image; }) &&
+			!makeRoom(uploadReserve))
+			throw std::bad_alloc();
 	}
 	catch (const std::bad_alloc &)
 	{
@@ -1131,7 +1270,18 @@ void SoftwareTerrainCache::drawUncached(const SceneMap &map, GAGCore::Sprite &sp
 {
 	auto &compositor = globalContainer->terrainCompositor(map.frozenAssetBundle());
 	const bool gpu = globalContainer->gfx->rendererCapabilities().accelerated;
-	compositor.prepare(gpu, time);
+	const auto prepareMaterials = [&] {
+		compositor.prepareVisible(gpu, time, map,
+			chunkOf(left + vx) * ChunkTiles, chunkOf(top + vy) * ChunkTiles,
+			(chunkOf(right + vx) + 1) * ChunkTiles - 1,
+			(chunkOf(bottom + vy) + 1) * ChunkTiles - 1);
+	};
+	prepareMaterials();
+	if (tiledCapture && gpu)
+	{
+		GAGCore::Sprite::finishHighResolution();
+		prepareMaterials();
+	}
 	const auto plan =
 		viewSamplingPlan(map, left, top, right, bottom, vx, vy, compositor.scale(), tiledCapture);
 	if (mode == FallbackMode::EmergencyTiles || !plan.pageFits)
@@ -1205,11 +1355,16 @@ void SoftwareTerrainCache::draw(GAGCore::GraphicContext &target)
 			copy.chunk->textureUsed = ++textureUse;
 			SDL_Rect area{copy.x, copy.y, ChunkPixels, ChunkPixels}, visible;
 			if (SDL_GetRectIntersection(&area, &paintBounds, &visible))
-				target.drawSurface(
-					visible.x, visible.y, visible.w, visible.h, copy.chunk->image.get(),
-					(visible.x - area.x) * resolution / downsample,
-					(visible.y - area.y) * resolution / downsample,
-					visible.w * resolution / downsample, visible.h * resolution / downsample);
+			{
+				const auto draw = [&](SDL_Rect rect)
+				{
+					target.drawSurface(rect.x, rect.y, rect.w, rect.h, copy.chunk->image.get(),
+						(rect.x - area.x) * resolution / downsample,
+						(rect.y - area.y) * resolution / downsample,
+						rect.w * resolution / downsample, rect.h * resolution / downsample);
+				};
+                draw(visible);
+			}
 			continue;
 		}
 		for (const auto &run : copy.chunk->opaqueRuns)

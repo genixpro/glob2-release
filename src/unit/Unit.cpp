@@ -5,7 +5,11 @@
 #include "Race.h"
 #include "Team.h"
 #include "Map.h"
-#include "Game.h"
+#include "gradient/MapRouting.h"
+#include "GameHeader.h"
+#include "UnitCargo.h"
+#include "AreaEffects.h"
+#include "sim/SimServices.h"
 
 #include "Building.h"
 
@@ -30,17 +34,19 @@ Unit::Unit(GAGCore::InputStream *stream, Team *owner, Sint32 versionMinor)
 Unit::Unit(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 {
 	init(x, y, gid, typeNum, team, level);
-	scriptIdentity = owner->game->allocateScriptIdentity(false, gid);
-	entityRandom.initialize(owner->game->gameHeader.getRandomSeed(), EntityRandom::Kind::Unit, gid, scriptIdentity);
+	scriptIdentity = owner->ctx.services->allocateScriptIdentity(false, gid);
+	entityRandom.initialize(owner->ctx.gameHeader->getRandomSeed(), EntityRandom::Kind::Unit, gid, scriptIdentity);
 }
 
 Unit::~Unit()
 {
 	assert(!populationMembership && !populationPrevious && !populationNext);
 	if (owner && owner->game) {
+        owner->map->forgetClaimRecovery(ResourceClaims::unitOwner(gid,scriptIdentity));
+        if (owner->map->activeClaimsEnabled()) releaseActiveMaterialClaim();
 		if (hasCapability(UnitRuntimeTraits::ReleaseClearingClaims) && previousClearingArea && owner->map->getW()>0 && owner->map->isClearingAreaClaimed(previousClearingArea->x,previousClearingArea->y,owner->teamNumber)==gid)
 			owner->map->setClearingAreaUnclaimed(previousClearingArea->x,previousClearingArea->y,owner->teamNumber);
-		owner->game->unitCargo.erase(gid);
+		owner->ctx.unitCargo->erase(gid);
 	}
 }
 
@@ -68,6 +74,7 @@ void Unit::refreshEffectiveAbilities()
 
 void Unit::rebindDefinitionForSetup()
 {
+    const MaterialClaimObservation claimObservation{*this};
 	// Parallel training derives its reservation from the original learnability.
 	// Capture that amount before replacing flags and cached abilities.
 	const auto oldServiceCost=serviceResourcesReserved() && attachedBuilding
@@ -83,7 +90,7 @@ void Unit::rebindDefinitionForSetup()
 	configuredVisionRadius=Uint8(traits.visionRadius);
 	for (int ability=0;ability<NB_ABILITY;++ability) {
         const Sint32 raw=race->getUnitType(typeNum,level[ability])->performance[ability];
-        setPerformance(ability,ability==HP ? std::max(1,raw/owner->game->gameHeader.getGlassCannonScale()) : raw);
+        setPerformance(ability,ability==HP ? std::max(1,raw/owner->ctx.gameHeader->getGlassCannonScale()) : raw);
     }
 	refreshEffectiveAbilities();
 	hp=int(std::clamp<Sint64>(Sint64(hp)*performance[HP]/oldHP,INT_MIN,performance[HP]));
@@ -91,7 +98,7 @@ void Unit::rebindDefinitionForSetup()
 	hungriness=traits.hungerRate;
 	trigHungry=traits.has(UnitRuntimeTraits::LegacyPerformancePolicies) ? (performance[ATTACK_SPEED] ? Sint64(configuredFoodCapacity)*UNIT_HUNGRY_TRIG_NUM_WARRIOR/UNIT_HUNGRY_TRIG_DEN : configuredFoodCapacity/UNIT_HUNGRY_TRIG_DIVISOR_DEFAULT) : Sint64(configuredFoodCapacity)*traits.hungerTriggerNumerator/traits.hungerTriggerDenominator;
 	trigHungryCarrying=Sint64(configuredFoodCapacity)*traits.carryingTriggerNumerator/traits.carryingTriggerDenominator;
-	trigHP=owner->game->gameHeader.isUnitsFearless()?0:Sint64(performance[HP])*traits.medicalTriggerNumerator/traits.medicalTriggerDenominator;
+	trigHP=owner->ctx.gameHeader->isUnitsFearless()?0:Sint64(performance[HP])*traits.medicalTriggerNumerator/traits.medicalTriggerDenominator;
 	// Existing map units may have an assignment authored under the preceding
 	// definition. A disabled work clock cannot complete that action to release
 	// its subscription, so cancel it during setup without spending random draws.
@@ -153,6 +160,7 @@ void Unit::rebindDefinitionForSetup()
 
 void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 {
+    materialClaimPolicyState={};
 	// unit specification
 	this->typeNum = typeNum;
 
@@ -189,7 +197,7 @@ void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 	// Custom-game "glass cannon" rule: cut HP once here, at the source,
 	// rather than at every downstream read. A map's starting units predate
 	// the match's header; Game::applyStartingRules cuts theirs.
-	const int hpDivisor = owner->game->gameHeader.getGlassCannonScale();
+	const int hpDivisor = owner->ctx.gameHeader->getGlassCannonScale();
 
 	// quality parameters
 	for (int i=0; i<NB_ABILITY; i++)
@@ -235,7 +243,7 @@ void Unit::init(int x, int y, Uint16 gid, Sint32 typeNum, Team *team, int level)
 	// Custom-game "fearless" rule: fight to the death instead of retreating
 	// to heal once damaged (reinstates the "warriors fight to death" intent
 	// noted above, which trigHP normally overrides for everyone).
-	trigHP = owner->game->gameHeader.isUnitsFearless() ? 0 : (Sint64(hp)*traits.medicalTriggerNumerator)/traits.medicalTriggerDenominator;
+	trigHP = owner->ctx.gameHeader->isUnitsFearless() ? 0 : (Sint64(hp)*traits.medicalTriggerNumerator)/traits.medicalTriggerDenominator;
 
 	attachedBuilding=NULL;
 	targetBuilding=NULL;
@@ -271,6 +279,12 @@ void Unit::setTargetBuilding(Building * b)
 
 void Unit::subscriptionSuccess(Building* building, bool inside, bool attraction, UnitJobPurpose purpose)
 {
+    if(owner->map->activeClaimsEnabled()) {
+        releaseActiveMaterialClaim();
+        // A new job starts its refresh cadence afresh.
+        materialClaimPolicyState.lastGoalAttempt=0;
+    }
+    const MaterialClaimObservation claimObservation{*this};
 	Building* b=building;
 	if (attraction && !inside) {
 		jobPurpose=purpose;
@@ -393,7 +407,7 @@ void Unit::applyTerrainHealthRate(int rate)
 	terrainHealthRemainder = Sint16(accumulated % 256);
 	if (change < 0) recordLethalDamage(-change, GameplayMeasurements::UNKNOWN);
 	hp = int(std::clamp<Sint64>(Sint64(hp)+change,INT_MIN,performance[HP]));
-	if (hp>=performance[HP] && owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
+	if (hp>=performance[HP] && owner->ctx.areaEffects->enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
 	if (hp >= performance[HP] && terrainHealthRemainder > 0) terrainHealthRemainder = 0;
 	if (change) setNeedToRecheckMedical(true);
 	resolveDeath();
@@ -402,23 +416,24 @@ void Unit::applyTerrainHealthRate(int rate)
 void Unit::applyAreaServices()
 {
 	using namespace BuildingAreaEffects;
-	auto &game = *owner->game;
-	if (!game.areaEffects.enabled() || (game.stepCounter & (PulseTicks - 1)) ||
-		areaLastPulseTick == game.stepCounter || isDead || insideTimeout < 0 ||
+	const auto &effects = *owner->ctx.areaEffects;
+	const Uint32 tick = owner->ctx.tick();
+	if (!effects.enabled() || (tick & (PulseTicks - 1)) ||
+		areaLastPulseTick == tick || isDead || insideTimeout < 0 ||
 		displacement == DIS_INSIDE || displacement == DIS_ENTERING_BUILDING ||
 		(displacement == DIS_EXITING_BUILDING && attachedBuilding))
 		return;
 	const auto tile = owner->map->coordToIndex(posX, posY);
-	if (!game.areaEffects.at(Healing, owner->teamNumber, tile) &&
-		!game.areaEffects.at(Damage, owner->teamNumber, tile) &&
-		!game.areaEffects.at(Feeding, owner->teamNumber, tile))
+	if (!effects.at(Healing, owner->teamNumber, tile) &&
+		!effects.at(Damage, owner->teamNumber, tile) &&
+		!effects.at(Feeding, owner->teamNumber, tile))
 		return;
-	areaLastPulseTick = game.stepCounter;
+	areaLastPulseTick = tick;
 	const int beforeHp = hp, beforeHunger = hungry;
 	const auto amount = [&](Channel channel)
 	{
 		unsigned value =
-			areaServiceRemainders[channel] + game.areaEffects.at(channel, owner->teamNumber, tile);
+			areaServiceRemainders[channel] + effects.at(channel, owner->teamNumber, tile);
 		areaServiceRemainders[channel] = value % 256;
 		return int(value / 256);
 	};
@@ -441,7 +456,7 @@ void Unit::applyAreaServices()
 		if (hp >= performance[HP])
 			areaServiceRemainders[Healing] = 0;
 	}
-	if (game.gameHeader.isHungerDisabled() || hungry >= foodCapacity())
+	if (owner->ctx.gameHeader->isHungerDisabled() || hungry >= foodCapacity())
 		areaServiceRemainders[Feeding] = 0;
 	else
 	{
@@ -455,6 +470,7 @@ void Unit::applyAreaServices()
 
 void Unit::syncStep(void)
 {
+    const MaterialClaimObservation claimObservation{*this};
 	if (owner->map->hasTerrainHealthEffects()) applyTerrainHealth();
 	if (isDead) return;
 	//warrior attacks?
@@ -472,7 +488,7 @@ void Unit::syncStep(void)
 		{
 			int enemyID=GIDtoID(enemyGUID);
 			int enemyTeam=GIDtoTeam(enemyGUID);
-			Unit *enemy=owner->game->teams[enemyTeam]->myUnits[enemyID];
+			Unit *enemy=owner->ctx.teams[enemyTeam]->myUnits[enemyID];
 
 			const int damage=int(std::clamp<Sint64>(Sint64(getRealAttackStrength())-enemy->getRealArmor(false),1,INT_MAX));
 			++owner->stats.events().shots[GameplayMeasurements::MELEE];
@@ -483,7 +499,7 @@ void Unit::syncStep(void)
 
 			enemy->underAttackTimer = UNDER_ATTACK_TIMER_TICKS;
 
-			enemy->owner->pushGameEvent(GameEvent::unitUnderAttack(owner->game->stepCounter, enemy->posX, enemy->posY, enemy->typeNum));
+			enemy->owner->pushGameEvent(GameEvent::unitUnderAttack(owner->ctx.tick(), enemy->posX, enemy->posY, enemy->typeNum));
 
 			incrementExperience(damage);
 		}
@@ -494,7 +510,7 @@ void Unit::syncStep(void)
 			{
 				int enemyID=Building::GIDtoID(enemyGBID);
 				int enemyTeam=Building::GIDtoTeam(enemyGBID);
-				Building *enemy=owner->game->teams[enemyTeam]->myBuildings[enemyID];
+				Building *enemy=owner->ctx.teams[enemyTeam]->myBuildings[enemyID];
 				const int damage=int(std::clamp<Sint64>(Sint64(getRealAttackStrength())-enemy->getEffectiveArmor(),1,INT_MAX));
 				++owner->stats.events().shots[GameplayMeasurements::MELEE];
 				TeamStats::recordDamage(owner, enemy->owner, GameplayMeasurements::MELEE,
@@ -503,7 +519,7 @@ void Unit::syncStep(void)
 
 				enemy->underAttackTimer = UNDER_ATTACK_TIMER_TICKS;
 
-				enemy->owner->pushGameEvent(GameEvent::buildingUnderAttack(owner->game->stepCounter, enemy->posX, enemy->posY, enemy->typeNum));
+				enemy->owner->pushGameEvent(GameEvent::buildingUnderAttack(owner->ctx.tick(), enemy->posX, enemy->posY, enemy->typeNum));
 
 				if (enemy->hp<0)
 					enemy->kill(GameplayMeasurements::DESTROYED);
@@ -547,7 +563,7 @@ void Unit::syncStep(void)
 			: configuredVisionRadius;
 		const int d=2*r+1;
 		owner->map->setMapDiscovered(posX-r,posY-r,d,d,owner->sharedVisionOther);
-		owner->map->setMapBuildingsDiscovered(posX-r,posY-r,d,d,owner->sharedVisionOther,owner->game->teams);
+		owner->map->setMapBuildingsDiscovered(posX-r,posY-r,d,d,owner->sharedVisionOther,owner->ctx.teams);
 		owner->map->setMapExploredByUnit(posX-r,posY-r,d,d,owner->teamNumber);
 	}
 
@@ -560,6 +576,7 @@ void Unit::syncStep(void)
 
 void Unit::resetAtLevel(Sint32 newLevel)
 {
+    if (owner->map->activeClaimsEnabled()) releaseActiveMaterialClaim();
 	// Reset abilities and activity without changing this entity's identity.
 	clearCargo();
 	init(posX, posY, gid, typeNum, owner, newLevel);
@@ -567,6 +584,7 @@ void Unit::resetAtLevel(Sint32 newLevel)
 
 void Unit::setWorkerLevel(Sint32 newLevel)
 {
+    const MaterialClaimObservation claimObservation{*this};
 	constructionLevel = newLevel;
 	for (int ability : {(int)BUILD, (int)HARVEST})
 	{
@@ -619,11 +637,12 @@ bool Unit::applyTraining(const BuildingTrainingSpec& training,int ability)
 
 void Unit::applyTrainingUnchecked(const BuildingTrainingSpec& training, int ability)
 {
+    const MaterialClaimObservation claimObservation{*this};
 	if (level[ability] < training.targetLevel)
 	{
 		level[ability] = training.targetLevel;
 		const Sint32 raw=race->getUnitType(typeNum,training.targetLevel)->performance[ability];
-        setPerformance(ability,ability==HP ? std::max(1,raw/owner->game->gameHeader.getGlassCannonScale()) : raw);
+        setPerformance(ability,ability==HP ? std::max(1,raw/owner->ctx.gameHeader->getGlassCannonScale()) : raw);
 	}
 	if (hasCapability(UnitRuntimeTraits::LearnConstruction)) constructionLevel = std::max(int(constructionLevel), training.constructionLevel);
 	refreshEffectiveAbilities();
@@ -631,14 +650,20 @@ void Unit::applyTrainingUnchecked(const BuildingTrainingSpec& training, int abil
 
 void Unit::recordLethalDamage(int damage, int cause)
 {
-	if (hp >= UNIT_HP_DEATH_THRESHOLD && Sint64(hp) - damage < UNIT_HP_DEATH_THRESHOLD)
+	if (hp >= UNIT_HP_DEATH_THRESHOLD && Sint64(hp) - damage < UNIT_HP_DEATH_THRESHOLD) {
 		diagnosticDeathCause = cause;
+        // Other units and projectiles can hit this unit after its own tick.
+        // Release before the damage write so an end-of-tick save cannot retain
+        // ownership for a worker already unable to finish the pickup.
+        if(owner->map->activeClaimsEnabled())
+            releaseActiveMaterialClaim();
+    }
 }
 
 unsigned Unit::carriedPacketCount() const
 {
 	if (!hasCapability(UnitRuntimeTraits::ExtendedCargo)) return carriedMaterial>=0;
-	const auto* extra=owner->game->unitCargo.find(gid);
+	const auto* extra=owner->ctx.unitCargo->find(gid);
 	return (carriedMaterial>=0)+(extra?extra->size():0)-(widePrimaryCargo()?1:0);
 }
 
@@ -646,7 +671,7 @@ bool Unit::hasCarriedMaterial(int material) const
 {
 	if (carriedMaterial==material) return true;
 	if (!hasCapability(UnitRuntimeTraits::ExtendedCargo)) return false;
-	const auto* extra=owner->game->unitCargo.find(gid);
+	const auto* extra=owner->ctx.unitCargo->find(gid);
 	if (extra) for (const auto& entry:*extra) if (entry.material==material) return true;
 	return false;
 }
@@ -657,7 +682,7 @@ bool Unit::hasDeliverableCargo(const Building& building, int material) const
 	const Uint64 multiplier=building.type->materialMultiplier[material];
 	const auto usable=[&](WideMaterialPacket packet) { return packetCanDeliver(packet,multiplier); };
 	if (carriedMaterial==material && !widePrimaryCargo() && usable({carriedPacket.numerator,carriedPacket.denominator})) return true;
-	if (const auto* extra=owner->game->unitCargo.find(gid))
+	if (const auto* extra=owner->ctx.unitCargo->find(gid))
 		for (const auto& entry:*extra) if (entry.material==material && usable(entry.packet)) return true;
 	return false;
 }
@@ -670,7 +695,7 @@ bool Unit::canCarryMaterial(int material) const
 	if (hasCarriedMaterial(material) || carriedMaterial<0) return true;
 	unsigned kinds=1;
 	MaterialMask mask=MaterialMask(1u<<carriedMaterial);
-	if (const auto* extra=owner->game->unitCargo.find(gid))
+	if (const auto* extra=owner->ctx.unitCargo->find(gid))
 		for (const auto& entry:*extra) if (!(mask&(1u<<entry.material))) { mask|=1u<<entry.material; ++kinds; }
 	return kinds<unsigned(traits.cargoKinds);
 }
@@ -680,7 +705,7 @@ void Unit::clearCargo()
 	carriedMaterial=UNIT_CARRIED_RESOURCE_NONE;
 	carriedPacket={};
 	setWidePrimaryCargo(false);
-	owner->game->unitCargo.erase(gid);
+	owner->ctx.unitCargo->erase(gid);
 }
 
 void Unit::receiveCarriedMaterial(int resource, MaterialPacket packet)
@@ -703,8 +728,8 @@ void Unit::receiveCargoPacket(int resource, WideMaterialPacket packet)
 		carriedMaterial=resource;
 		if (packet.denominator<=1000000 && packet.numerator<=std::numeric_limits<Uint32>::max())
 			carriedPacket={Uint32(packet.numerator),Uint32(packet.denominator)};
-		else { setWidePrimaryCargo(true); carriedPacket={}; owner->game->unitCargo.overflow(gid).push_back({resource,packet}); }
-	} else owner->game->unitCargo.overflow(gid).push_back({resource,packet});
+		else { setWidePrimaryCargo(true); carriedPacket={}; owner->ctx.unitCargo->overflow(gid).push_back({resource,packet}); }
+	} else owner->ctx.unitCargo->overflow(gid).push_back({resource,packet});
 }
 
 bool Unit::deliverCargo(Building& building)
@@ -726,7 +751,7 @@ bool Unit::deliverCargo(Building& building)
 		} else retained.push_back(entry);
 	};
 	if (carriedMaterial>=0 && !widePrimaryCargo()) offer({carriedMaterial,{carriedPacket.numerator,carriedPacket.denominator}});
-	if (const auto* extra=owner->game->unitCargo.find(gid)) for (const auto& entry:*extra) offer(entry);
+	if (const auto* extra=owner->ctx.unitCargo->find(gid)) for (const auto& entry:*extra) offer(entry);
 	clearCargo();
 	for (const auto& entry:retained) receiveCargoPacket(entry.material,entry.packet);
 	return delivered;
@@ -748,7 +773,7 @@ bool Unit::continueExtendedCargoCollection()
 		wished[material]=int(std::max<Sint64>(0,Sint64(wished[material])-std::max(1,stock)));
 	};
 	if (carriedMaterial>=0 && !widePrimaryCargo()) subtract(carriedMaterial,{carriedPacket.numerator,carriedPacket.denominator});
-	if (const auto* extra=owner->game->unitCargo.find(gid)) for (const auto& entry:*extra) subtract(entry.material,entry.packet);
+	if (const auto* extra=owner->ctx.unitCargo->find(gid)) for (const auto& entry:*extra) subtract(entry.material,entry.packet);
 	int selected=-1, pending=-1, best=INT_MAX;
 	for (int material=0;material<MaterialCount;++material) {
 		if (wished[material]<=0 || !canCarryMaterial(material)) continue;
@@ -777,9 +802,10 @@ bool Unit::continueExtendedCargoCollection()
 bool Unit::findMaterialDestination(int material,Sint32* x,Sint32* y,int* distance,bool withMarkets,const Building* consumer)
 {
 	Map& map=*owner->map;
-    if (!x || !y) return distance ? map.materialAvailableSlot(owner->teamNumber,material,movementClass(),posX,posY,distance,withMarkets,consumer)
-        : map.materialAvailableSlot(owner->teamNumber,material,movementClass(),posX,posY,withMarkets,consumer);
-    return map.materialAvailableUpdateSlot(owner->teamNumber,material,movementClass(),posX,posY,x,y,distance,withMarkets,consumer);
+    if (map.routing().queryMaterialDistance(owner->teamNumber,material,movementAccess(),posX,posY,distance,withMarkets,consumer)!=RouteResult::Reachable) return false;
+    if (!x || !y) return true;
+    const auto* field=map.routing().getMaterialGradientSlot(owner->teamNumber,material,movementAccess(),withMarkets,consumer);
+    return map.routing().projectMaterialDestination(field,owner->teamNumber,material,movementAccess(),posX,posY,x,y,withMarkets,consumer);
 
 }
 
@@ -787,8 +813,16 @@ RouteResult Unit::queryMaterialDestination(int material,Sint32* x,Sint32* y,int*
 {
     Map& map=*owner->map;
     if (performance[FLY]) return findMaterialDestination(material,x,y,distance,withMarkets,consumer) ? RouteResult::Reachable : RouteResult::Unreachable;
-    const auto result=map.queryMaterialDistance(owner->teamNumber,material,movementClass(),posX,posY,distance,withMarkets,consumer);
+    const auto result=map.routing().queryMaterialDistance(owner->teamNumber,material,movementAccess(),posX,posY,distance,withMarkets,consumer);
     if (result!=RouteResult::Reachable || !x || !y) return result;
-    return map.materialAvailableUpdateSlot(owner->teamNumber,material,movementClass(),posX,posY,x,y,distance,withMarkets,consumer) ? RouteResult::Reachable : RouteResult::Unreachable;
+    const auto* field=map.routing().getMaterialGradientSlot(owner->teamNumber,material,movementAccess(),withMarkets,consumer);
+    return map.routing().projectMaterialDestination(field,owner->teamNumber,material,movementAccess(),posX,posY,x,y,withMarkets,consumer)
+        ? RouteResult::Reachable : RouteResult::Unreachable;
 
+}
+
+void Unit::reconcileMaterialClaim()
+{
+    if(owner && owner->map && owner->map->activeClaimsEnabled())
+        releaseInvalidActiveMaterialClaim();
 }

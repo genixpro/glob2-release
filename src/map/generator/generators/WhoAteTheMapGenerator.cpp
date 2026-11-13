@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "WhoAteTheMapGenerator.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "Grid.h"
@@ -227,9 +227,7 @@ IslandCapacity islandCapacity(const Layout &L)
 	const Torus &t = L.t;
 	const auto grass = pureTiles(L.terrain, t, GRASS);
 	const auto water = pureTiles(L.terrain, t, WATER);
-	std::vector<unsigned char> open(t.size());
-	for (int i = 0; i < t.size(); ++i)
-		open[i] = !water[i];
+	const auto open = walkableTiles(L.terrain, t);
 	IslandCapacity result;
 	result.labels = connectedRegions(open, t.w, t.h, true, GridNeighbors::Eight);
 	std::vector<int> area(t.size(), 0), inland(t.size(), 0);
@@ -272,10 +270,7 @@ std::vector<int> chooseSites(const Layout &L, GenerationContext &context)
 	const Torus &t = L.t;
 	const auto grass = pureTiles(L.terrain, t, GRASS);
 	const auto room = buildAnchors(t, grass, 13);
-	std::vector<unsigned char> open(t.size(), 0);
-	const auto water = pureTiles(L.terrain, t, WATER);
-	for (int i = 0; i < t.size(); ++i)
-		open[i] = !water[i];
+	const auto open = walkableTiles(L.terrain, t);
 	const auto islands = islandCapacity(L);
 	const auto &labels = islands.labels;
 	std::vector<int> sizes(t.size(), 0);
@@ -382,7 +377,7 @@ std::vector<int> chooseSites(const Layout &L, GenerationContext &context)
 	return sites;
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "bitten island";
 	const auto L = design(context.request, context);
@@ -399,7 +394,7 @@ bool generate(Game &game, GenerationContext &context)
 		context.detail = "The surviving island has too few spacious fertile starts.";
 		return false;
 	}
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	writeVertices(map, L.terrain);
 	const auto grass = pureTiles(L.terrain, t, GRASS);
 	for (int k = 0; k < context.request.nbTeams; ++k)
@@ -492,7 +487,7 @@ bool generate(Game &game, GenerationContext &context)
 	return true;
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const auto L = design(context.request, replay);
@@ -564,7 +559,7 @@ GeneratorDefinition whoAteTheMapDefinition()
 	return {"who-ate-the-map",
 			66,
 			"Who Ate the Map?",
-			2,
+			3,
 			false,
 			{GeneratorControl::choice("appetite", "Appetite",
 									  {"A Little Nibble", "Hungry", "Who Ate the Map?"}, 1)

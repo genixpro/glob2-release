@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SharedBuildingGradient.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "gradient/MapRouting.h"
 #include "GradientExecutionAudit.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
 #include "HiringPipeline.h"
 #include "FileFormatVersions.h"
 #include "LegacyPopulationOutput.h"
@@ -11,6 +15,7 @@
 #include <StreamBackend.h>
 #include <set>
 #include <nlohmann/json.hpp>
+#include "sim/EntityRefOf.h"
 
 namespace
 {
@@ -461,7 +466,7 @@ TEST_SUITE("HiringPlanner")
 				if (list.key == Hiring::Key{Hiring::Job::Delivery, WHEAT})
 				{
 					REQUIRE(list.candidates.size() == 1);
-					CHECK(list.candidates[0].unit == Game::refOf(viable));
+					CHECK(list.candidates[0].unit == refOf(viable));
 					found = true;
 				}
 			CHECK(found);
@@ -492,7 +497,10 @@ TEST_SUITE("HiringGradientPreparation")
 				u->medical = Unit::MED_FREE;
 				u->hungriness = 0;
 				u->carriedMaterial = WHEAT;
-				const auto slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
+                u->performance[WALK]=30;u->performance[SWIM]=10;
+                w.game.teams[0]->updateRoutingRatio();
+                REQUIRE(w.game.teams[0]->routingRatio.selected==6);
+				const auto slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
 				REQUIRE(!b->globalGradient[slot]);
 				GradientExecutionAudit audit;
 				HiringPipeline pipeline(w.game.map.computeExecutor());
@@ -508,13 +516,14 @@ TEST_SUITE("HiringGradientPreparation")
 					w.game.map.bumpTopologyGeneration();
 				else if (invalidate == 2)
 					b->supersedeGradient(slot);
-				pipeline.publishDue(HiringPipeline::Delay);
+				w.game.teams[0]->routingRatio.selected=1;
+                pipeline.publishDue(HiringPipeline::Delay);
 				const auto *lists = pipeline.suggestions(*b);
 				REQUIRE(lists);
 				bool found = false;
 				for (const auto &list : lists->jobs)
 					for (const auto &candidate : list.candidates)
-						if (candidate.unit == Game::refOf(u))
+						if (candidate.unit == refOf(u))
 							found = true;
 				REQUIRE(found);
 				if (invalidate)
@@ -522,6 +531,7 @@ TEST_SUITE("HiringGradientPreparation")
 				else
 				{
 					REQUIRE(b->globalGradient[slot]);
+                    CHECK(w.game.map.routing().publishedCostClass(b->globalGradient[slot])==6);
 					REQUIRE(b->globalGradientSearch[slot]);
 					CHECK(b->globalGradientSearch[slot]->resolved(
 						w.game.map.coordToIndex(u->posX, u->posY)));
@@ -539,9 +549,9 @@ TEST_SUITE("HiringGradientPreparation")
 		glob2test::HeadlessGame w({.discovered = true, .loadDefaultRace = true});
 		auto *b = innWithWorker(w);
 		auto *u = w.game.teams[0]->myUnits[0];
-		const int slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
-		b->globalGradient[slot] = w.game.map.acquireBuildingGradientBuffer();
-		w.game.map.updateGlobalGradient(b, u->swimClass(), BuildingRoute::Footprint);
+		const int slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
+		b->globalGradient[slot] = w.game.map.routing().acquireBuildingGradientBuffer();
+		w.game.map.routing().updateGlobalGradient(b, u->movementAccess(), BuildingRoute::Footprint);
 		auto *data = b->globalGradient[slot];
 		auto *search = b->globalGradientSearch[slot].get();
 		b->dirtyGradient[slot] = true;
@@ -564,8 +574,8 @@ TEST_SUITE("HiringGradientPreparation")
 		glob2test::HeadlessGame w({.discovered = true, .loadDefaultRace = true});
 		auto *b = innWithWorker(w);
 		auto *u = w.game.teams[0]->myUnits[0];
-		const int slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
-		b->globalGradient[slot] = w.game.map.acquireBuildingGradientBuffer();
+		const int slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
+		b->globalGradient[slot] = w.game.map.routing().acquireBuildingGradientBuffer();
 		std::fill_n(b->globalGradient[slot], std::size_t(w.game.map.getW()) * w.game.map.getH(),
 					GRADIENT_FORBIDDEN);
 		b->dirtyGradient[slot] = true;
@@ -578,7 +588,7 @@ TEST_SUITE("HiringGradientPreparation")
 		bool found = false;
 		for (const auto &list : lists->jobs)
 			for (const auto &candidate : list.candidates)
-				if (candidate.unit == Game::refOf(u))
+				if (candidate.unit == refOf(u))
 					found = true;
 		CHECK(found);
 	}
@@ -624,9 +634,9 @@ TEST_SUITE("HiringGradientPreparation")
 				REQUIRE(delivery);
 				REQUIRE(delivery->candidates.size() == count);
 				CHECK(delivery->primaryCount == 1);
-				CHECK(delivery->candidates.front().unit == Game::refOf(units.front()));
+				CHECK(delivery->candidates.front().unit == refOf(units.front()));
 				const auto slot =
-					b->routeSlot(units.front()->swimClass(), BuildingRoute::Footprint);
+					b->routeSlot(accessClass(units.front()->movementAccess()), BuildingRoute::Footprint);
 				REQUIRE(b->globalGradientSearch[slot]);
 				CHECK(b->globalGradientSearch[slot]->resolved(
 					w.game.map.coordToIndex(units.front()->posX, 8)));
@@ -666,8 +676,8 @@ TEST_SUITE("HiringGradientPreparation")
 			u->medical = Unit::MED_FREE;
 			u->hungriness = 0;
 			u->carriedMaterial = WHEAT;
-			const auto ref = Game::refOf(b);
-			const int slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
+			const auto ref = refOf(b);
+			const int slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
 			original.game.observeCompletedWorld();
 			auto *storage = new GAGCore::MemoryStreamBackend;
 			std::unique_ptr<GAGCore::OutputStream> out;
@@ -698,9 +708,19 @@ TEST_SUITE("HiringGradientPreparation")
 			auto *copy = restored.game.resolveBuilding(ref);
 			REQUIRE(copy);
 			CHECK(!copy->globalGradient[slot]);
-			original.game.stepCounter = restored.game.stepCounter = HiringPipeline::Delay;
-			original.game.hiringPipeline->publishDue(HiringPipeline::Delay);
-			restored.game.hiringPipeline->publishDue(HiringPipeline::Delay);
+			// Advance tick by tick: the field stays unpublished until the
+			// boundary the batch is due at, which publishes it.
+			REQUIRE(restored.game.hiringPipeline->rules().delay == HiringPipeline::Delay);
+			while (original.game.stepCounter < HiringPipeline::Delay)
+			{
+				CHECK(!b->globalGradient[slot]);
+				CHECK(!copy->globalGradient[slot]);
+				original.game.step(0);
+				restored.game.step(0);
+				CHECK(original.game.checkSum() == restored.game.checkSum());
+			}
+			original.game.observeCompletedWorld();
+			restored.game.observeCompletedWorld();
 			REQUIRE(b->globalGradient[slot]);
 			REQUIRE(copy->globalGradient[slot]);
 			CHECK(b->globalGradient[slot][original.game.map.coordToIndex(35, 8)] ==
@@ -830,22 +850,22 @@ TEST_SUITE("BuildingGradientInitialization")
 			glob2test::HeadlessGame w(
 				{.wDec = 7, .hDec = 7, .discovered = true, .loadDefaultRace = true});
 			w.game.map.configureCompute(participants);
-			w.game.stepCounter = 1; // Team zero's next shortlist is three ticks away.
+			w.game.stepCounter = 1; // Team zero is outside the hiring cohort.
 			auto *b = w.addBuilding("inn", 8, 8);
 			b->maxUnitWorking = 0;
 			b->updateCallLists();
 			auto *u = w.addUnit(WORKER, 60, 8);
 			u->medical = Unit::MED_HUNGRY;
-			const int slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
+			const int slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
 			GradientExecutionAudit audit;
 			w.game.hiringPipeline = std::make_unique<HiringPipeline>(w.game.map.computeExecutor());
 			auto &pipeline = *w.game.hiringPipeline;
 			pipeline.requestInitialization(*b);
 			pipeline.observe(w.game, observation(w));
 			CHECK(pipeline.preparing(*b, slot));
-			CHECK(w.game.map.requestBuildingField(b, u->swimClass(), BuildingRoute::Footprint) ==
+			CHECK(w.game.map.routing().requestBuildingField(b, u->movementAccess(), BuildingRoute::Footprint) ==
 				  FieldReadiness::Pending);
-			CHECK(w.game.map.buildingGradientPipelineStatus().queued == 0);
+			CHECK(w.game.map.routing().buildingGradientPipelineStatus().queued == 0);
 			pipeline.drain();
 			CHECK(!b->globalGradient[slot]);
 			CHECK(audit.counts(GradientExecutionAudit::Kind::Seed).owner +
@@ -853,7 +873,9 @@ TEST_SUITE("BuildingGradientInitialization")
 				  1);
 			if (participants == 4)
 				CHECK(audit.counts(GradientExecutionAudit::Kind::Seed).owner == 0);
-			pipeline.publishDue(2);
+			pipeline.publishDue(1 + HiringPipeline::Delay - 1);
+			CHECK(!b->globalGradientSearch[slot]);
+			pipeline.publishDue(1 + HiringPipeline::Delay);
 			REQUIRE(b->globalGradientSearch[slot]);
 			CHECK(!b->globalGradientSearch[slot]->resolved(w.game.map.coordToIndex(60, 8)));
 			CHECK(!pipeline.preparing(*b, slot));
@@ -873,7 +895,7 @@ TEST_SUITE("BuildingGradientInitialization")
 			w.game.hiringPipeline->drain();
 			CHECK(!w.game.hiringPipeline->preparing(*b, slot));
 			CHECK(!b->globalGradient[slot]);
-			CHECK(w.game.map.buildingGradientPipelineStatus().queued == 0);
+			CHECK(w.game.map.routing().buildingGradientPipelineStatus().queued == 0);
 		};
 		checkLazy();
 		REQUIRE(b->launchConstruction(1, 1));
@@ -883,18 +905,18 @@ TEST_SUITE("BuildingGradientInitialization")
 		b->cancelConstruction(0);
 		w.game.stepCounter = 3;
 		checkLazy();
-		CHECK(w.game.map.requestBuildingField(b, 0, BuildingRoute::Footprint) ==
+		CHECK(w.game.map.routing().requestBuildingField(b, MovementAccess::Land, BuildingRoute::Footprint) ==
 			  FieldReadiness::Pending);
-		CHECK(w.game.map.buildingGradientPipelineStatus().queued == 1);
+		CHECK(w.game.map.routing().buildingGradientPipelineStatus().queued == 1);
 	}
 	TEST_CASE("legacy preparation and primary hiring seed one shared route")
 	{
 		glob2test::HeadlessGlobals globals;
 		glob2test::HeadlessGame w(
 			{.wDec = 7, .hDec = 7, .discovered = true, .loadDefaultRace = true});
-		w.game.stepCounter = 4;
+		w.game.stepCounter = HiringPipeline::Refresh; // Team zero is in the hiring cohort.
 		auto *b = innWithWorker(w);
-		CHECK(w.game.map.requestBuildingField(b, 0, BuildingRoute::Footprint) ==
+		CHECK(w.game.map.routing().requestBuildingField(b, MovementAccess::Land, BuildingRoute::Footprint) ==
 			  FieldReadiness::Pending);
 		GradientExecutionAudit audit;
 		w.game.hiringPipeline = std::make_unique<HiringPipeline>(w.game.map.computeExecutor());
@@ -907,8 +929,8 @@ TEST_SUITE("BuildingGradientInitialization")
 				  audit.counts(GradientExecutionAudit::Kind::Seed).other ==
 			  1);
 		w.game.map.submitWorldWork(world);
-		CHECK(w.game.map.buildingGradientPipelineStatus().jobs == 0);
-		pipeline.publishDue(5);
+		CHECK(w.game.map.routing().buildingGradientPipelineStatus().jobs == 0);
+		pipeline.publishDue(HiringPipeline::Refresh + HiringPipeline::Delay);
 		REQUIRE(pipeline.suggestions(*b));
 	}
 	TEST_CASE(
@@ -929,8 +951,8 @@ TEST_SUITE("BuildingGradientInitialization")
 				original.game.hiringPipeline =
 					std::make_unique<HiringPipeline>(original.game.map.computeExecutor());
 				original.game.hiringPipeline->requestInitialization(*b);
-				const auto ref = Game::refOf(b);
-				const int slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
+				const auto ref = refOf(b);
+				const int slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
 				if (pending)
 					original.game.observeCompletedWorld();
 				auto *storage = new GAGCore::MemoryStreamBackend;
@@ -964,8 +986,8 @@ TEST_SUITE("BuildingGradientInitialization")
 					restored.game.observeCompletedWorld();
 				}
 				CHECK(restored.game.hiringPipeline->preparing(*copy, slot));
-				original.game.hiringPipeline->publishDue(2);
-				restored.game.hiringPipeline->publishDue(2);
+				original.game.hiringPipeline->publishDue(1 + HiringPipeline::Delay);
+				restored.game.hiringPipeline->publishDue(1 + HiringPipeline::Delay);
 				REQUIRE(b->globalGradient[slot]);
 				REQUIRE(copy->globalGradient[slot]);
 				CHECK(original.game.checkSum() == restored.game.checkSum());

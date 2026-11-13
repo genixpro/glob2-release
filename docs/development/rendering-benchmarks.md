@@ -1,6 +1,6 @@
 # Rendering benchmarks
 
-Use release builds and retained scenarios to measure rendering changes. Timing evidence complements visual review.
+Use perf builds ([build tiers](build-options.md#build-tiers)) and retained scenarios to measure rendering changes. Add `sprite_packing=video optimized_assets=1` when the measurement needs the shipped asset paths. Timing evidence complements visual review.
 
 ## Renderer stress measurements
 
@@ -10,21 +10,25 @@ explorers and warriors in distinct visible cells at the camera's minimum zoom.
 Run from the repository root with an isolated profile:
 
 ```sh
-scons release=1 server=0 torus-render-benchmark
+python3 tools/dev_build.py perf=1 torus-render-benchmark
 mkdir -p artifacts/render-profile
 GLOB2_USER_DATA_DIR="$PWD/artifacts/render-profile/profile" \
 GLOB2_BENCH_FLAT=1 GLOB2_BENCH_SIZE=256x256 GLOB2_BENCH_UNITS=1000 \
 GLOB2_BENCH_FRAMES=300 GLOB2_BENCH_CAPTURE=artifacts/render-profile/frame.ppm \
-build/darwin/client/release/test/torus-render-benchmark --renderer gpu --no-fullscreen --mute --window-size 1280x800
+build/darwin/client/perf/test/torus-render-benchmark --renderer gpu --no-fullscreen --mute --window-size 1280x800
 ```
 
-Use the current host's release directory on Linux/Windows. `GLOB2_BENCH_MODE`
+Use the current host's perf directory on Linux/Windows. `GLOB2_BENCH_MODE`
 selects `2D no clouds` or `2D clouds`; otherwise both run. Run
 each mode in a separate fresh process with identical warmup and camera settings
 when comparing cloud cost: running both shares terrain and device caches, so the
 second mode benefits from the first mode's work. Alternate process order across
 repeated pairs to limit drift from temperature and background activity. Set
-`GLOB2_BENCH_VISIBLE=1` to show and present the completed fixture.
+`GLOB2_BENCH_VISIBLE=1` to show and present the completed fixture; otherwise, on
+macOS, the window is created hidden and never activates the process
+(`GLOB2_TEST_HIDDEN_WINDOWS`, see [test/README.md](../../test/README.md)), so
+repeated captures don't steal focus. `software-render-benchmark` does the same
+unless `PROFILE_VISIBLE` is set.
 `GLOB2_BENCH_NATIVE_CLOUD_DETAIL=1` restores the original dense cloud grid for
 a controlled comparison. `GLOB2_BENCH_BARS=1` adds health/food bars. Unit count
 zero measures the same terrain without units. Retain executable hashes, commands,
@@ -46,9 +50,19 @@ Sweep measurements mix those view sizes; use a fixed camera for paired timings.
 cycles smoothly between the selected zoom and four times that zoom over 120
 frames. It takes precedence over the seam sweep in the ordinary flat pass.
 `GLOB2_BENCH_CAMERA_PAN=1` uses the same scrolling at a fixed zoom.
+`GLOB2_BENCH_CAMERA_ZOOM=1` runs the smooth zoom cycle with a stationary
+map origin. Run it on its own to separate zoom from panning.
+`GLOB2_BENCH_TERRAIN_PIXELS_PER_TILE=32` or `16` requests a constant
+terrain page density in the flat GPU fixture. With the variable unset, the
+fixture uses the normal adaptive page density. Compare both densities with
+and without `GLOB2_BENCH_PAUSE_PRESENTATION=1` using the same camera path.
+Inspect the reported sampling resolution and downsample before attributing a
+result to fixed-density reuse. If the view cannot fit the requested density,
+the renderer can still fall back to its normal streaming path.
 `GLOB2_BENCH_FRAME_TIMES=1` prints each measured and warmup frame; summaries
 include p99 and maximum latency as well as median and p95. Per-frame records
-include process CPU time captured before diagnostic output on platforms where
+include estimated resident terrain texture bytes within the cache accounting.
+They also include process CPU time captured before diagnostic output on platforms where
 `clock()` measures CPU time; Windows omits that field. The benchmark finishes
 deferred HD artwork loading before timing, so density changes compare identical
 source artwork rather than different asset-loader progress. Keep cold frames when
@@ -68,14 +82,106 @@ mixed unit queue, texture arrays and persistent map geometry.
 `GLOB2_BENCH_COMPARE_CAPTURE_PREFIX=artifacts/render-profile/pair` saves the final
 pair as `pair-immediate.ppm` and `pair-optimized.ppm` for visual review.
 
-Timings include GPU completion (`glFinish`) and exclude frame presentation, AI,
+Timings include GPU completion (`glFinish` on legacy GL, synchronous readback on
+device backends) and exclude final frame presentation, AI,
 input, scene extraction and simulation work. Flat passes retain a prepared scene;
 AI comparisons refresh it before each timed pair. They are renderer measurements,
 not whole-game FPS.
 POSIX builds also report process CPU time separately from elapsed time.
 Scope timings separately report CPU submission and overlap; do not sum inclusive
-scopes. The fixture is native OpenGL only; mobile uses the SDL portable renderer,
-so desktop results do not qualify Android/iOS hardware performance.
+scopes. Check the reported active backend to catch renderer fallback.
+Desktop results do not qualify Android/iOS hardware performance.
+
+### Resource rows and terrain residency
+
+Use `GLOB2_BENCH_RESOURCE_ROWS=1` with the 512×64 synthetic map, Original
+artwork, and legacy OpenGL. Repeat with `GLOB2_BENCH_CAMERA_PAN=1` to
+include wrapped row selection. The
+`FRAME_RESOURCE_ROWS` counters report eligibility, frame-vector construction,
+and animated cell visits separately.
+
+For terrain residency, use `GLOB2_BENCH_TERRAIN_SWITCH=pages` with at least 72
+frames and zero warmup. The benchmark draws pages for four frames, direct
+terrain for 64 frames, then pages again.
+`FRAME_TERRAIN_RESIDENCY` reports direct atlas bytes, page texture bytes,
+retained page bytes, and peak combined texture bytes for the view. Compare
+the first frame after the switch and the final capture. Use
+`GLOB2_BENCH_TERRAIN_SWITCH=hd` to return through the HD artwork path, or
+`GLOB2_BENCH_TERRAIN_SWITCH=tiled` to exercise the tiled-capture draw options.
+Starting on programmable OpenGL, use `GLOB2_BENCH_TERRAIN_SWITCH=backend` to
+switch to legacy OpenGL and draw pages there on frame 68.
+
+### Direct terrain discovery and OpenGL diagnostics
+
+Set `GLOB2_BENCH_FOG=1` and `GLOB2_BENCH_DISCOVERY_CROSSING=1` on a
+synthetic map with at least 32 tiles on both axes. Place tiles (15, 15) and
+(16, 16) in the viewport. The fixture reveals those tiles on frame 4.
+The cumulative `FRAME_DIRECT_DISCOVERY` counter tracks rebuilt cells.
+Capture before and after the reveal to verify the boundary transition.
+
+On legacy OpenGL, `GLOB2_PROFILE_GL_ARRAYS=1` reports live, retired, and free
+array slots and allocated bytes. `GLOB2_BENCH_ARRAY_CHURN=1` replaces the same
+16 source textures across 21 cycles to verify that promotions continue after
+the page budget fills.
+
+On programmable OpenGL, full opaque redraws swap the backing color textures.
+Check partial redraws and discarded frames against the committed image.
+
+### Direct terrain
+
+Direct terrain is the default for flat views with Original artwork
+(`highResolutionArtwork=0`) on desktop legacy OpenGL, programmable OpenGL,
+SDL GPU with the direct terrain shaders, and WebGPU with the WGSL assets.
+It uses the map's terrain variants, coverage, contact bands, surf, and
+discovery. Desktop legacy OpenGL draws every view, HD artwork included, with
+the direct pass described below. On the other backends, HD artwork, editor views,
+tiled captures, and backends without direct terrain support use composed pages.
+
+The shader blends in floating point and uses linear atlas sampling. The page
+renderer can box-filter composed terrain when zoomed out. Compare captures
+at native zoom and during motion to check color and distant texture detail.
+
+`FRAME_DIRECT_TERRAIN` reports cumulative draws and upload bytes plus
+resident texture bytes. A rising draw count confirms direct terrain
+drew the frame. Legacy OpenGL uploads mixed coverage progressively, starting
+with the current viewport. Once coverage is resident, camera motion and
+animation leave upload bytes stable. Terrain, asset bundle, or registry changes
+rebuild the atlases.
+Discovery changes can upload a separate visibility texture. On programmable GL,
+`FRAME_DEVICE` also reports physical uploads for the whole renderer. Compare capture
+pixels, frame p95 and p99, startup time, and resident terrain memory on the same
+map and camera path.
+
+Legacy GL draws all terrain with one direct pass at every zoom, in games, the
+editor and tiled captures. The map's per-cell tables are built once, in 3 ms
+slices while the overview shows, and terrain edits update only the cells near
+a changed vertex. Each frame the pass streams the visible variants' artwork into
+one atlas near the display density (8 to 128 pixels a cell), and background
+workers build a coverage mask for each visible mixed cell into one atlas at the
+same density (8 to 128 texels a side), nearest the view centre first. Until its
+mask lands a mixed cell draws its previous-density mask after a zoom, or else
+its whole-map base mask; `DIRECT_TERRAIN_BASE` reports when the base covers
+the map, and only cells without a base mask yet draw a straight split between their corners. `FRAME_HD` reports the
+visible mixed cells still waiting. The editor and captures complete the view
+first: they build every visible mask in parallel and wait for streamed HD
+artwork. Pages serve the software and programmable-device renderers, and the
+browser's WebGL2 renderer: it drives Legacy GL through Emscripten's WebGL2 bridge,
+which the direct pass does not support. There pages draw native artwork until the
+view's `hd-terrain-*` families download, then HD.
+Direct terrain stops (`DIRECT_TERRAIN_FALLBACK`) only for device limits, such as
+a map wider than the maximum texture size; Legacy GL then shows the overview. On programmable GL, actual GPU uploads happen during frame submission,
+where device-wide memory pressure can defer the frame. Far zoom uses the shared overview. For a large-map admission check,
+set `GLOB2_BENCH_SIZE=512x64`, `GLOB2_BENCH_SPARSE_TERRAIN=1`,
+`GLOB2_BENCH_UNITS=0`, and `GLOB2_BENCH_ZOOM=0.55`. The sparse fixture uses
+32-cell terrain blocks so it exercises map dimensions without a dense
+coverage atlas. GPU time for a terrain-only draw and elapsed time
+for the complete renderer through GPU completion are separate measurements.
+
+On device renderers, use `GLOB2_RENDER_EXECUTION=parallel` to test building
+direct terrain coverage with presentation workers. Legacy OpenGL prepares
+coverage on the graphics thread in time slices and draws the overview beneath
+pending tiles. Measure the first metadata upload separately from subsequent
+coverage uploads.
 
 For comparisons with another revision, set `GLOB2_BENCH_PAUSE_PRESENTATION=1`
 to freeze terrain animation and `GLOB2_BENCH_WARMUP_FRAMES` to the same number of
@@ -89,7 +195,7 @@ See [skin rendering](skin-rendering.md) for production sprite export and skin pr
 
 ## CPU presentation batches
 
-Build `software-render-benchmark` and `torus-render-benchmark` with `release=1`.
+Build `software-render-benchmark` and `torus-render-benchmark` with `perf=1`.
 Use the same retained save, seed, animation, viewport, warmup and compute budget
 for `GLOB2_RENDER_EXECUTION=immediate`, `serial` and `parallel` in separate processes.
 Both standalone tools apply the launch `--compute-threads auto|N` budget to their
@@ -124,8 +230,8 @@ display. The latter distribution is weighted by displayed frames; the
 `simulation.deadline_lateness` scope records actual tick observations. Scene age
 includes drawing/presentation time and uses the captured tick completion time.
 `PROFILE_PAN=1` adds camera motion. Only actual draws admitted by the production
-frame pacer enter the distributions. Interactive observations require telemetry;
-`GLOB2_PERF_DISABLE` is rejected for this mode. Renderer-only timings exclude simulation;
+frame pacer enter the distributions. Production performance collection is mandatory
+in all modes; the retired disable variable has no effect. Renderer-only timings exclude simulation;
 interactive results include its contention and must be reported separately.
 
 For renderer-only composition diagnostics, `PROFILE_MODE=map PROFILE_WHOLE_MAP=1`

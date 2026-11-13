@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Controlled mechanism test on unmodified generated terrain, not an AI balance test.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
 #include "GradientFixture.h"
 #include <utility>
 #include "GlobalContainer.h"
 #include "Game.h"
+#include "GenerationWorld.h"
 #include "GameGUI.h"
 #include "GameGUIKeyActions.h"
 #include "MapEditKeyActions.h"
@@ -284,7 +285,7 @@ void run(const Scenario &scenario, const std::filesystem::path &output, unsigned
 			auto *inn = match.teams[original->owner->teamNumber]
 						->myBuildings[Building::GIDtoID(original->gid)];
 			require(inn != nullptr, "scenario inn exists before routing");
-			glob2test::awaitBuildingGradient(match, inn, worker->swimClass(), BuildingRoute::Footprint);
+			glob2test::awaitBuildingGradient(match, inn, accessClass(worker->movementAccess()), BuildingRoute::Footprint);
 		}
 	};
 	prepareFoodRoutes(game);

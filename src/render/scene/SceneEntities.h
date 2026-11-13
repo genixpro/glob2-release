@@ -7,7 +7,7 @@
 #include "sim/snapshot/WorldSnapshot.h"
 #include <span>
 
-#include <SDLGraphicContext.h>
+#include <GAGColor.h>
 
 #include <array>
 #include <string>
@@ -42,6 +42,7 @@ struct SceneSelectedBuilding
 using SceneBullet = SimulationSnapshot::BulletRecord;
 using SceneExplosion = SimulationSnapshot::ExplosionRecord;
 using SceneDeathAnimation = SimulationSnapshot::DeathRecord;
+using SceneUnitEffect = SimulationSnapshot::UnitEffectRecord;
 using SceneSectorEffects = SimulationSnapshot::SectorEffects;
 
 //! All units, buildings and effects of a PresentationFrame, with lookup by gid.

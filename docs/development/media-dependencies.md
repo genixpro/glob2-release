@@ -5,8 +5,8 @@ The recording build and native music playback use pinned codec inputs and bounde
 ## Embedded recording dependencies
 
 Client builds compile a pinned minimal FFmpeg/x264 stack through
-`scons/recording_dependencies.py`; the source SHA-256 lock is
-`scons/recording-versions.json`. Native builds need NASM on x86 targets and
+`buildsys/recording_dependencies.py`; the source SHA-256 lock is
+`buildsys/recording-versions.json`. Native builds need NASM on x86 targets and
 `pkg-config`; Linux builds with `libva` development headers include VAAPI. NVIDIA
 headers are pinned with the other sources. Mobile archives use the target compiler,
 ABI and SDK, including assembly flags; browser archives use standalone wasm32
@@ -27,7 +27,7 @@ target for the whole stereo stream. Vorbis music is no longer supported. Music
 sets retain their directory names and contain `a1.opus`, `a2.opus`, and `a3.opus`.
 The three tracks must decode to exactly equal positive frame counts, with one
 logical stream each, so mood changes remain aligned. Intro and menu music live
-in `data/zik/intro.opus` and `data/zik/menu.opus`.
+in `content/data/zik/intro.opus` and `content/data/zik/menu.opus`.
 
 Use `python3 tools/encode_music.py INPUT OUTPUT.opus` to encode from PCM masters
 or convert an existing custom Vorbis track. It uses FFmpeg/libopus with

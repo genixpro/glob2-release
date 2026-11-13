@@ -6,11 +6,8 @@
 
 // A terrain group is one gameplay mechanic: every built-in type in a group shares
 // this exact property profile and differs only in artwork, name and colours.
-// Groups are also the unit the editor palette and the terrain experiments use.
-// Adding a mechanic means adding a group here and, if it needs an experiment, one
-// ExperimentId in TerrainExperiments.h; adding a look means adding a row to
-// TerrainTypeTable.h. This header stays free of ExperimentalFeatures.h so the
-// gradient kernels can include it.
+// Groups also organize the editor palette. Add a mechanic here and a visual
+// variant in TerrainGroupTable.h and TerrainCatalog.cpp.
 enum class TerrainGroup : std::uint8_t
 {
 	Water,
@@ -63,7 +60,8 @@ inline constexpr auto TERRAIN_GROUPS = []
 	{
 		auto &sand = define(TerrainGroup::Sand, "sand", "[terrain group sand]", true);
 		sand.walkable = sand.shoreline = true;
-		sand.inhibitionQ8 = sand.shoreSupportQ8 = 256;
+		// Sand stops crops; algae regrowth comes from coasts, not from sand itself.
+		sand.inhibitionQ8 = 256;
 	}
 	{
 		auto &grass = define(TerrainGroup::Grass, "grass", "[terrain group grass]", true);
@@ -72,36 +70,38 @@ inline constexpr auto TERRAIN_GROUPS = []
 		grass.farmMaterial = materialIndex(MaterialId::Food);
 	}
 	{
+		// Ice, deep snow, wind-swept snow, frozen lake and glacier ice: slow, and the cold wears ground units down.
 		auto &ice = define(TerrainGroup::Ice, "ice", "[terrain group ice]", true);
 		ice.walkable = true;
 		ice.groundSpeedQ8 = 128;
 		ice.groundHealthQ8 = -8;
 	}
 	{
-		// Trail, dirt track, boardwalk: fast, buildable, nothing grows.
+		// Trail, brick path, boardwalk, sandstone, overgrown road: fast, buildable,
+		// nothing grows.
 		auto &paths = define(TerrainGroup::Paths, "paths", "[terrain group paths]", true);
 		paths.walkable = paths.buildable = true;
 		paths.groundSpeedQ8 = 512;
 	}
 	{
-		// Boulders, hedges, thickets: impassable on the ground, stop projectiles.
+		// Barriers (stone pillars, hedge, thicket, cliffs): impassable on the ground, stop projectiles.
 		auto &obstacles =
 			define(TerrainGroup::Obstacles, "obstacles", "[terrain group obstacles]", true);
 		obstacles.projectileBlocks = true;
 	}
 	{
-		// Ridges and outcrops: impassable on the ground, towers shoot over them.
+		// Outcrops (rock spires, basalt columns): impassable on the ground, towers shoot over them.
 		define(TerrainGroup::Ridges, "ridges", "[terrain group ridges]", true);
 	}
 	{
-		// Dirt, clay, gravel, flower meadow: buildable, inhibits growth like sand,
+		// Dirt, clay, shale, heath: buildable, inhibits growth like sand,
 		// but no shore support so it never acts as a coastline.
 		auto &barren = define(TerrainGroup::Barren, "barren", "[terrain group barren]", true);
 		barren.walkable = barren.buildable = true;
 		barren.inhibitionQ8 = 256;
 	}
 	{
-		// Mud, marsh, deep snow, scree: slow, unbuildable, nothing grows.
+		// Mud, marsh, scree: slow, unbuildable, nothing grows.
 		auto &rough = define(TerrainGroup::Rough, "rough", "[terrain group rough]", true);
 		rough.walkable = true;
 		rough.groundSpeedQ8 = 160;
@@ -113,11 +113,11 @@ inline constexpr auto TERRAIN_GROUPS = []
 	}
 	{
 		// Loam, moss, spring meadow: buildable crop land that irrigates its
-		// surroundings more strongly than water does.
+		// surroundings with a smaller contribution than water.
 		auto &fertile = define(TerrainGroup::Fertile, "fertile", "[terrain group fertile]", true);
 		fertile.walkable = fertile.buildable = fertile.resourcesGrow = true;
 		fertile.nonGrowingResources = fertile.fertilitySource = true;
-		fertile.fertilityQ8 = 768;
+		fertile.fertilityQ8 = 48;
 		fertile.allowedResources = TERRAIN_GRASS_RESOURCES;
 		fertile.farmMaterial = materialIndex(MaterialId::Food);
 	}

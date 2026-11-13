@@ -1,7 +1,8 @@
 #include "GenerationWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Walls.h"
-#include "Map.h"
+#include "TerrainGroupTable.h"
+#include "GenerationWorld.h"
 #include "ResourceSemantics.h"
 #include "Sketch.h"
 #include "TerrainType.h"
@@ -10,7 +11,7 @@
 #include <stdexcept>
 namespace MapGeneration
 {
-std::vector<unsigned char> seaMargin(const Map &map, const Torus &t,
+std::vector<unsigned char> seaMargin(const GenerationMap &map, const Torus &t,
 									 const std::vector<unsigned char> &sea,
 									 const std::vector<unsigned char> &notBeach)
 {
@@ -49,7 +50,7 @@ std::vector<unsigned char> seaMargin(const Map &map, const Torus &t,
 	return margin;
 }
 
-std::vector<unsigned char> seaVertices(const Map &map, const Torus &t,
+std::vector<unsigned char> seaVertices(const GenerationMap &map, const Torus &t,
 									   const std::vector<unsigned char> &lakes)
 {
 	std::vector<unsigned char> sea(t.size(), 0);
@@ -61,7 +62,7 @@ std::vector<unsigned char> seaVertices(const Map &map, const Torus &t,
 	return sea;
 }
 
-int seaEntry(const Map &map, const Torus &t, const std::vector<unsigned char> &margin,
+int seaEntry(const GenerationMap &map, const Torus &t, const std::vector<unsigned char> &margin,
 			 const std::vector<unsigned char> &inside)
 {
 	const std::vector<unsigned char> open = walkableTiles(map);
@@ -81,7 +82,7 @@ int seaEntry(const Map &map, const Torus &t, const std::vector<unsigned char> &m
 	return -1;
 }
 
-std::vector<unsigned char> sealCoasts(const Map &map, const Torus &t,
+std::vector<unsigned char> sealCoasts(const GenerationMap &map, const Torus &t,
 									  const std::vector<unsigned char> &margin,
 									  const std::vector<unsigned char> &wallable)
 {
@@ -182,7 +183,8 @@ std::vector<unsigned char> labelBorders(const Torus &t, const std::vector<int> &
 	return wall;
 }
 
-DesignedStone designedStone(const Map &map, const Torus &t, const std::vector<unsigned char> &wall)
+DesignedStone designedStone(const GenerationMap &map, const Torus &t,
+							const std::vector<unsigned char> &wall)
 {
 	const int n = t.w * t.h;
 	DesignedStone result;
@@ -200,7 +202,7 @@ DesignedStone designedStone(const Map &map, const Torus &t, const std::vector<un
 	return result;
 }
 
-std::vector<int> reachesWithShut(const Map &map, const Torus &t,
+std::vector<int> reachesWithShut(const GenerationMap &map, const Torus &t,
 								 const std::vector<unsigned char> &from,
 								 const std::vector<unsigned char> &shut)
 {
@@ -214,7 +216,7 @@ std::vector<int> reachesWithShut(const Map &map, const Torus &t,
 	return stepsFrom(t, from, open);
 }
 
-std::array<int, 2> colonyLeak(const Map &map, const Torus &t, int teams,
+std::array<int, 2> colonyLeak(const GenerationMap &map, const Torus &t, int teams,
 							  const std::vector<unsigned char> &shut)
 {
 	const int n = t.w * t.h;
@@ -245,7 +247,7 @@ std::array<int, 2> colonyLeak(const Map &map, const Torus &t, int teams,
 	return {-1, -1};
 }
 
-int pieceLeak(const Map &map, const Torus &t, const std::vector<int> &piece,
+int pieceLeak(const GenerationMap &map, const Torus &t, const std::vector<int> &piece,
 			  const std::vector<unsigned char> &shut)
 {
 	const int n = t.w * t.h;
@@ -406,8 +408,8 @@ int towerReach(const Torus &t, const std::vector<unsigned char> &buildable,
 	return best;
 }
 
-WalkSpread walkSpread(const Map &map, const Torus &t, const std::vector<std::vector<int>> &workers,
-					  const std::vector<int> &targets)
+WalkSpread walkSpread(const GenerationMap &map, const Torus &t,
+					  const std::vector<std::vector<int>> &workers, const std::vector<int> &targets)
 {
 	WalkSpread spread;
 	const std::vector<unsigned char> open = walkableTiles(map);
@@ -428,7 +430,7 @@ WalkSpread walkSpread(const Map &map, const Torus &t, const std::vector<std::vec
 	}
 	return spread;
 }
-std::vector<unsigned char> islandSeaMargin(const Map &map, const Torus &t,
+std::vector<unsigned char> islandSeaMargin(const GenerationMap &map, const Torus &t,
 										   const std::vector<unsigned char> &ponds,
 										   const std::vector<unsigned char> &roadTile,
 										   const std::vector<unsigned char> &otherSand)
@@ -443,7 +445,7 @@ std::vector<unsigned char> islandSeaMargin(const Map &map, const Torus &t,
 	return seaMargin(map, t, seaVertices(map, t, ponds), notBeach);
 }
 
-std::vector<unsigned char> sealedIslandStone(const Map &map, const Torus &t,
+std::vector<unsigned char> sealedIslandStone(const GenerationMap &map, const Torus &t,
 											 const std::vector<unsigned char> &margin,
 											 const std::vector<unsigned char> &land,
 											 const std::vector<unsigned char> &designed)
@@ -458,7 +460,8 @@ std::vector<unsigned char> sealedIslandStone(const Map &map, const Torus &t,
 	}
 	return stone;
 }
-std::string wallStanding(const Map &map, const Torus &t, const std::vector<unsigned char> &wall,
+std::string wallStanding(const GenerationMap &map, const Torus &t,
+						 const std::vector<unsigned char> &wall,
 						 const std::vector<unsigned char> &doors, const char *what)
 {
 	for (int i = 0; i < t.size(); ++i)
@@ -474,5 +477,235 @@ std::string wallStanding(const Map &map, const Torus &t, const std::vector<unsig
 				   ", " + std::to_string(y) + ").";
 	}
 	return "";
+}
+
+int cliffCoast(TerrainSketch &terrain, const Torus &t, const std::function<bool(int)> &wallable,
+			   const std::function<bool(int)> &sea, int reach, TerrainType cliff)
+{
+	const int n = t.w * t.h;
+	std::vector<unsigned char> seaMask(n, 0);
+	for (int i = 0; i < n; ++i)
+		seaMask[i] = sea(i);
+	const std::vector<int> fromSea = stepsFrom(t, seaMask);
+	int cliffs = 0;
+	for (int i = 0; i < n; ++i)
+		if (fromSea[i] >= 0 && fromSea[i] <= reach && wallable(i))
+		{
+			terrain[i] = cliff;
+			++cliffs;
+		}
+	return cliffs;
+}
+
+int thickenRidges(TerrainSketch &terrain, const Torus &t, const std::function<bool(int)> &canGrow,
+				  int *unresolved, TerrainType wall)
+{
+	const int n = t.w * t.h;
+	int added = 0, stuck = 0;
+	const auto rock = [&](int i) { return terrain[i] == wall; };
+	for (int i = 0; i < n; ++i)
+	{
+		generationCheckpoint();
+		if (!rock(i))
+			continue;
+		const int x = t.remainderX(i), y = i / t.w;
+		// The nine 3x3 blocks holding (x, y), by their top-left corner.
+		int best = -1, bestMissing = 10, bestMass = -1;
+		for (int oy = -2; oy <= 0 && best != -2; ++oy)
+			for (int ox = -2; ox <= 0; ++ox)
+			{
+				int missing = 0;
+				bool allowed = true;
+				for (int dy = 0; dy < 3 && allowed; ++dy)
+					for (int dx = 0; dx < 3; ++dx)
+					{
+						const int j = t.at(x + ox + dx, y + oy + dy);
+						if (rock(j))
+							continue;
+						if (!canGrow(j))
+						{
+							allowed = false;
+							break;
+						}
+						++missing;
+					}
+				if (!allowed)
+					continue;
+				if (missing == 0)
+				{
+					best = -2;
+					break;
+				}
+				int mass = 0;
+				for (int dy = -1; dy < 4; ++dy)
+					for (int dx = -1; dx < 4; ++dx)
+						mass += rock(t.at(x + ox + dx, y + oy + dy));
+				if (missing < bestMissing || (missing == bestMissing && mass > bestMass))
+				{
+					best = (oy + 2) * 3 + (ox + 2);
+					bestMissing = missing;
+					bestMass = mass;
+				}
+			}
+		if (best == -2)
+			continue;
+		if (best < 0)
+		{
+			++stuck;
+			continue;
+		}
+		const int ox = best % 3 - 2, oy = best / 3 - 2;
+		for (int dy = 0; dy < 3; ++dy)
+			for (int dx = 0; dx < 3; ++dx)
+			{
+				const int j = t.at(x + ox + dx, y + oy + dy);
+				if (!rock(j))
+				{
+					terrain[j] = wall;
+					++added;
+				}
+			}
+	}
+	if (unresolved)
+		*unresolved = stuck;
+	return added;
+}
+
+bool cornerOf(const Torus &t, const std::vector<unsigned char> &tiles, int i)
+{
+	const int x = t.remainderX(i), y = i / t.w;
+	return tiles[i] || tiles[t.at(x - 1, y)] || tiles[t.at(x, y - 1)] || tiles[t.at(x - 1, y - 1)];
+}
+
+std::vector<unsigned char> wallVertices(const Torus &t, const std::vector<unsigned char> &tiles,
+										const std::vector<unsigned char> *keepOpen,
+										const std::vector<unsigned char> *strict)
+{
+	const int n = t.w * t.h;
+	std::vector<unsigned char> v(n, 0);
+	for (int i = 0; i < n; ++i)
+	{
+		if (!tiles[i])
+			continue;
+		const int x = t.remainderX(i), y = i / t.w;
+		bool beside = false;
+		for (int dy = -1; dy <= 1 && keepOpen && !beside; ++dy)
+			for (int dx = -1; dx <= 1 && !beside; ++dx)
+				beside = (*keepOpen)[t.at(x + dx, y + dy)] && !tiles[t.at(x + dx, y + dy)];
+		if (beside)
+		{
+			for (int dy = 0; dy <= 1; ++dy)
+				for (int dx = 0; dx <= 1; ++dx)
+				{
+					const int c = t.at(x + dx, y + dy);
+					if (!cornerOf(t, *keepOpen, c))
+						v[c] = 1;
+				}
+			continue;
+		}
+		v[i] = 1;
+		// A wall tile touching another only at its lower corners: close the diagonal between them.
+		if (tiles[t.at(x + 1, y + 1)] && !tiles[t.at(x + 1, y)] && !tiles[t.at(x, y + 1)])
+			v[t.at(x + 1, y)] = 1;
+		if (tiles[t.at(x - 1, y + 1)] && !tiles[t.at(x - 1, y)] && !tiles[t.at(x, y + 1)])
+			v[t.at(x, y + 1)] = 1;
+	}
+	if (!keepOpen)
+		return v;
+	// Where a wall turns round a lane, leaning away can leave a wall tile one blocked corner, which
+	// does not block it: give it back corners until it has two, choosing each time the corner that
+	// blocks the fewest open tiles (an open tile is blocked once two of its corners are), and never
+	// one that would block a `strict` tile.
+	const auto blockedCorners = [&](int tile)
+	{
+		const int x = t.remainderX(tile), y = tile / t.w;
+		return int(v[tile]) + v[t.at(x + 1, y)] + v[t.at(x, y + 1)] + v[t.at(x + 1, y + 1)];
+	};
+	for (int i = 0; i < n; ++i)
+	{
+		if (!tiles[i])
+			continue;
+		const int x = t.remainderX(i), y = i / t.w;
+		while (blockedCorners(i) < 2)
+		{
+			int best = -1, bestCost = INT_MAX;
+			for (int c = 0; c < 4; ++c)
+			{
+				const int corner = t.at(x + c % 2, y + c / 2);
+				if (v[corner])
+					continue;
+				const int cx = t.remainderX(corner), cy = corner / t.w;
+				int cost = 0;
+				for (int dy = -1; dy <= 0; ++dy)
+					for (int dx = -1; dx <= 0; ++dx)
+					{
+						const int q = t.at(cx + dx, cy + dy);
+						if (tiles[q] || !(*keepOpen)[q])
+							continue;
+						const bool closes = blockedCorners(q) >= 1;
+						if (closes && strict && (*strict)[q])
+							cost += 1000;
+						cost += closes ? 10 : 1;
+					}
+				if (cost < bestCost)
+				{
+					bestCost = cost;
+					best = corner;
+				}
+			}
+			if (best < 0)
+				break;
+			v[best] = 1;
+		}
+	}
+	return v;
+}
+
+int paveTiles(TerrainSketch &terrain, const Torus &t, const std::vector<unsigned char> &tiles,
+			  const std::vector<unsigned char> &throat, std::vector<unsigned char> &paved,
+			  TerrainType throatTerrain)
+{
+	int count = 0;
+	for (int i = 0; i < t.w * t.h; ++i)
+		if (tiles[i])
+			for (int dy = 0; dy <= 1; ++dy)
+				for (int dx = 0; dx <= 1; ++dx)
+				{
+					const int v = t.at(t.remainderX(i) + dx, i / t.w + dy);
+					if (terrain[v] == WATER)
+						continue;
+					terrain[v] = throat[i] || terrain[v] == throatTerrain ? throatTerrain : TRAIL;
+					count += !paved[v];
+					paved[v] = 1;
+				}
+	return count;
+}
+
+int leakWithShut(const GenerationMap &map, const Torus &t, const std::vector<int> &units,
+				 const std::vector<unsigned char> &shut, bool swim,
+				 const std::function<bool(int)> &inside)
+{
+	const int n = t.w * t.h;
+	std::vector<unsigned char> open(n, 0);
+	for (int i = 0; i < n; ++i)
+	{
+		const TerrainProperties &p = map.terrainPropertiesAt(t.remainderX(i), i / t.w);
+		open[i] = !shut[i] && (p.walkable || (swim && p.swimmable));
+	}
+	const std::vector<int> steps = stepsFrom(t, tileMask(t, units), open);
+	int first = -1;
+	for (int i = 0; i < n; ++i)
+		if (steps[i] >= 0 && !inside(i) && (first < 0 || steps[i] < steps[first]))
+			first = i;
+	return first;
+}
+
+int wallTerrainMismatch(const GenerationMap &map, const Torus &t, const std::vector<unsigned char> &vertices,
+						TerrainGroup group)
+{
+	for (int i = 0; i < t.w * t.h; ++i)
+		if (vertices[i] && terrainGroup(map.vertexTerrainAt(t.remainderX(i), i / t.w)) != group)
+			return i;
+	return -1;
 }
 } // namespace MapGeneration

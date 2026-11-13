@@ -3,12 +3,15 @@
 
 // Private Map-owned execution state. Keeping this behind a pointer in Map.h
 // prevents queue, thread and scratch-storage details from entering Map's API.
+#include "BuildingRoute.h"
+#include "BuildingUtils.h"
 #include "GradientPipeline.h"
 #include "BuildingGradientJob.h"
 #include "ResourceGrowth.h"
 #include "BuildingGradientDepthPolicy.h"
 #include "SnapshotGradient.h"
 #include "ResourceSeedCache.h"
+#include "BuildingSeedTemplates.h"
 #include "TerrainSafetyCache.h"
 #include "ResourceGradientProbe.h"
 #include "ResourceGradientExploration.h"
@@ -25,11 +28,18 @@
 #include "Ressource.h"
 #include <unordered_map>
 #include <deque>
+#include <mutex>
+#include <memory>
 #include <utility>
-#include "Map.h"
+#include "gradient/MapRouting.h"
 
 struct GradientRuntime
 {
+    // Owner-thread metadata for published generations. A team mode switch must
+    // not change direction scoring or lazy expansion of an existing field.
+    // Publication/retirement own entry lifetime; checksums iterate logical slots.
+    std::map<const Uint16*, int> fieldCosts;
+    int loadingGradientVersion; // current routing-ratio format until a load sets it
     std::unique_ptr<ResourceGradientProbe> qualityProbe;
     AdaptiveGradientState adaptive;
     std::unique_ptr<GradientWorkStats> workStats;
@@ -76,6 +86,7 @@ struct GradientRuntime
 	std::optional<Uint32> worldResultsPublishedTick;
 	std::optional<Uint32> worldWorkSubmittedTick;
 	GradientPipeline pipeline;
+    bool materialDestinationsEnabled = false;
     struct FieldRequest { Uint16** slot; gradient_preparation::Request request; };
     std::deque<FieldRequest> fieldRequests;
 	// Scheduled building fields share the executor with the periodic pipeline.
@@ -91,18 +102,18 @@ struct GradientRuntime
 		int slot = 0;
 		bool stale = false;
 	};
-	static constexpr std::size_t BuildingRequestLimit = Team::MAX_COUNT * Building::MAX_COUNT * BUILDING_GRADIENT_COUNT;
+	static constexpr std::size_t BuildingRequestLimit = TEAM_MAX_COUNT * BuildingUtils::MAX_COUNT * BUILDING_GRADIENT_COUNT;
 	std::deque<BuildingRequest> buildingRequests;
 	// Reserved this tick, prepared together at the observation boundary.
 	std::vector<BuildingGradientJobPipeline::Job*> stagedBuildings;
 	// Explicit synchronous/editor field builds, split by diagnostic reason.
 	Uint64 buildingSynchronous = 0;
-	std::array<Uint64, std::size_t(Map::BuildingSyncReason::Count)> synchronousByReason{};
-	Map::BuildingSyncReason syncReason = Map::BuildingSyncReason::Other;
+	std::array<Uint64, std::size_t(MapRouting::BuildingSyncReason::Count)> synchronousByReason{};
+	MapRouting::BuildingSyncReason syncReason = MapRouting::BuildingSyncReason::Other;
 	void countSynchronous()
 	{
 		++buildingSynchronous;
-		++synchronousByReason[std::size_t(std::exchange(syncReason, Map::BuildingSyncReason::Other))];
+		++synchronousByReason[std::size_t(std::exchange(syncReason, MapRouting::BuildingSyncReason::Other))];
 	}
     ResourceGrowth::Pipeline growth;
 	// Owner reservations, consumed together at the immutable observation boundary.
@@ -117,8 +128,52 @@ struct GradientRuntime
 	bool supplierLocationsDirty = true;
 	std::unordered_map<std::size_t, std::vector<std::uint16_t>> overlaySupplierLocations;
 	ResourceSeedCache resourceSeeds;
+	// Owner-maintained building seed templates; derived, never saved.
+	BuildingSeedTemplates buildingSeeds;
 	// Shared immediate negative answer when global natural-source counts are zero.
 	std::vector<Uint16> absentMaterialField;
+	// Published material planes are shared with captures instead of copied.
+	// The map keeps one lease per plane key while its buffer is published and
+	// immutable. A buffer that leaves its slot (republication, removal) while a
+	// capture still holds it is adopted by the lease: it is never rewritten, and
+	// the last capture to drop it returns it to the recycler for the pipeline.
+	struct PlaneRecycler
+	{
+		static constexpr std::size_t Limit = 64;
+		std::mutex mutex;
+		std::size_t cells = 0;
+		std::vector<std::unique_ptr<Uint16[]>> buffers;
+		void give(Uint16* data, std::size_t count)
+		{
+			std::unique_ptr<Uint16[]> buffer(data);
+			std::lock_guard<std::mutex> lock(mutex);
+			if (count == cells && buffers.size() < Limit) buffers.push_back(std::move(buffer));
+		}
+		std::unique_ptr<Uint16[]> take(std::size_t count)
+		{
+			std::lock_guard<std::mutex> lock(mutex);
+			if (count != cells) { buffers.clear(); cells = count; }
+			if (buffers.empty()) return nullptr;
+			auto buffer = std::move(buffers.back());
+			buffers.pop_back();
+			return buffer;
+		}
+	};
+	struct PlaneLease
+	{
+		Uint16* cells = nullptr;
+		std::size_t count = 0;
+		std::weak_ptr<PlaneRecycler> recycler;
+		bool adopted = false; // written by the owner before it drops its reference
+		~PlaneLease()
+		{
+			if (!adopted) return;
+			if (auto target = recycler.lock()) target->give(cells, count);
+			else delete[] cells;
+		}
+	};
+	std::shared_ptr<PlaneRecycler> planeRecycler = std::make_shared<PlaneRecycler>();
+	std::array<std::shared_ptr<PlaneLease>, MapState::PlaneCount> planeLeases;
     std::shared_ptr<gradient_kernel::GradientDeviceService> deviceService;
     std::shared_ptr<gradient_kernel::BackendSession> backendSession;
     void shareBackendSession()
@@ -132,16 +187,6 @@ struct GradientRuntime
         if (backendSession) backendSession = std::make_shared<gradient_kernel::BackendSession>();
         shareBackendSession();
     }
-    GradientRuntime() {
-        pipeline.onSuperseded=[this](GradientPipeline::Job& job) {
-            if(job.adaptiveKey) {
-                const auto found=adaptive.fields.find(*job.adaptiveKey);
-                if(found!=adaptive.fields.end())found->second.inflight=false;
-            }
-        };
-        shareBackendSession();
-        if (const char* path=std::getenv("GLOB2_RESOURCE_GRADIENT_PROBE"))
-            if (*path) qualityProbe=std::make_unique<ResourceGradientProbe>(path);
-    }
+    GradientRuntime(); // GradientRuntime.cpp
 
 };

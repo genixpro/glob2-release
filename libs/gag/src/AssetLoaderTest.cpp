@@ -1,0 +1,541 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "Glob2Test.h"
+#include <chrono>
+#include <AssetLoader.h>
+#include "HighResolutionInputs.h"
+#include <GraphicContext.h>
+#include <FileManager.h>
+#include <ThreadSupport.h>
+#include <atomic>
+#include <algorithm>
+#include <future>
+#include <cstring>
+#include <fstream>
+#include <thread>
+#include <zlib.h>
+
+namespace {
+const unsigned char webp[] = {82,73,70,70,58,0,0,0,87,69,66,80,86,80,56,76,45,0,0,0,47,1,64,0,16,31,32,32,33,238,240,127,159,220,16,18,144,41,81,245,144,144,128,88,66,247,127,138,67,2,1,66,58,229,98,156,66,169,23,23,104,136,232,127,4,0};
+const unsigned char pixels[] = {17,39,71,255,121,77,55,0,25,80,100,128,0,255,30,255};
+void write(const std::filesystem::path& path, const void *bytes, size_t size) {
+    std::ofstream out(path, std::ios::binary); out.write(static_cast<const char*>(bytes), size);
+}
+}
+TEST_SUITE("AssetLoader") {
+TEST_CASE("H.264 asset groups publish decoded frames in order through the asset scheduler") {
+#ifdef __EMSCRIPTEN__
+    // Browser groups use the asynchronous worker, which cannot run in this synchronous fixture.
+    return;
+#endif
+    const auto fixture = glob2test::fixture("image-assets/video-group.h264");
+    glob2test::TempDir temp("video-asset");
+    std::filesystem::copy_file(fixture, temp.path / "group.h264");
+    const auto corrupt = std::string("not an Annex B group");
+    write(temp.path / "corrupt.h264", corrupt.data(), corrupt.size());
+    GAGCore::FileManager files("asset-loader-test");
+    files.addDir(temp.path.string());
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::AssetLoader loader(files, {workers, workers, 128u * 1024u * 1024u});
+        auto first = loader.requestVideoFrames("group.h264", 1024, 1024, 4);
+        if (!GAGCore::AssetLoader::videoFramesSupported()) {
+            CHECK_FALSE(loader.wait(first));
+            CHECK(first.error().find("unavailable") != std::string::npos);
+            continue;
+        }
+        auto second = loader.requestVideoFrames("group.h264", 1024, 1024, 4);
+        const auto group = loader.wait(first);
+        REQUIRE_MESSAGE(group, first.error());
+        CHECK(loader.wait(second) == group);
+        const auto submitted = loader.metrics().submitted;
+        CHECK(loader.wait(loader.requestVideoFrames("group.h264", 1024, 1024, 4)) == group);
+        CHECK(loader.metrics().submitted == submitted);
+        REQUIRE(group->frames.size() == 4);
+        CHECK_FALSE(group->frame(4));
+        for (unsigned i = 0; i < 4; ++i) {
+            const auto frame = group->frame(i);
+            REQUIRE(frame);
+            REQUIRE(frame->surface);
+            CHECK(frame->surface->format == SDL_PIXELFORMAT_ARGB8888);
+            CHECK(frame->surface->w == 1024);
+            CHECK(frame->surface->h == 1024);
+            Uint8 r, g, b, a;
+            REQUIRE(SDL_ReadSurfacePixel(frame->surface, 900, 900, &r, &g, &b, &a));
+            CHECK(r == 20 + 30 * i);
+            CHECK(g == 190 - 20 * i);
+            CHECK(b == 75 + 40 * i);
+            CHECK(a == 255);
+        }
+        auto wrongCount = loader.requestVideoFrames("group.h264", 1024, 1024, 3);
+        CHECK_FALSE(loader.wait(wrongCount));
+        auto wrongSize = loader.requestVideoFrames("group.h264", 1000, 1024, 4);
+        CHECK_FALSE(loader.wait(wrongSize));
+        auto malformed = loader.requestVideoFrames("corrupt.h264", 1024, 1024, 4);
+        CHECK_FALSE(loader.wait(malformed));
+        auto outOfBudget = loader.requestVideoFrames("group.h264", 2048, 2048, 16);
+        CHECK_FALSE(loader.wait(outOfBudget));
+        CHECK(outOfBudget.error().find("description") != std::string::npos);
+    }
+}
+TEST_CASE("Packed sprite locations preserve crop pixels and exact video alpha") {
+    using GAGCore::PackedSpriteFrame;
+    PackedSpriteFrame location;
+    CHECK_FALSE(PackedSpriteFrame::parse("@../page.webp,0,0,1,1", location));
+    CHECK_FALSE(PackedSpriteFrame::parse("@group.h264,-,1024,1024,4,4,0,0,1,1", location));
+    CHECK_FALSE(PackedSpriteFrame::parse("@group.h264,-,1024,1024,4,3,1024,0,1,1", location));
+    CHECK_FALSE(PackedSpriteFrame::parse("@page.webp,0,0,1,1,", location));
+    REQUIRE(PackedSpriteFrame::parse("@group.h264,-,1024,1024,4,3", location));
+    CHECK(location.cropWidth == 1024);
+    CHECK(location.cropHeight == 1024);
+    glob2test::TempDir temp("packed-sprite");
+    write(temp.path / "page.webp", webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test");
+    files.addDir(temp.path.string());
+    GAGCore::AssetLoader loader(files, {0, 0, 128u * 1024u * 1024u});
+    const std::string crop = "@page.webp,1,0,1,1";
+    REQUIRE(PackedSpriteFrame::parse(crop, location));
+    auto image = loader.wait(location.request(loader, crop, false));
+    REQUIRE(image);
+    Uint8 r, g, b, a;
+    REQUIRE(SDL_ReadSurfacePixel(image->surface, 0, 0, &r, &g, &b, &a));
+    CHECK(r == 121);
+    CHECK(g == 77);
+    CHECK(b == 55);
+    CHECK(a == 0);
+    const std::string badCrop = "@page.webp,2,0,1,1";
+    REQUIRE(PackedSpriteFrame::parse(badCrop, location));
+    CHECK_FALSE(loader.wait(location.request(loader, badCrop, false)));
+#ifndef __EMSCRIPTEN__
+    if (!GAGCore::AssetLoader::videoFramesSupported()) return;
+    std::filesystem::copy_file(glob2test::fixture("image-assets/video-group.h264"), temp.path / "group.h264");
+    std::vector<unsigned char> alpha(1024 * 1024, 255);
+    alpha[900 * 1024 + 900] = 73;
+    uLongf capacity = compressBound(alpha.size());
+    std::vector<unsigned char> compressed(capacity);
+    REQUIRE(compress(compressed.data(), &capacity, alpha.data(), alpha.size()) == Z_OK);
+    write(temp.path / "alpha.z", compressed.data(), capacity);
+    const std::string video = "@group.h264,alpha.z,1024,1024,4,1,900,900,1,1";
+    REQUIRE(PackedSpriteFrame::parse(video, location));
+    image = loader.wait(location.request(loader, video, false));
+    REQUIRE(image);
+    REQUIRE(SDL_ReadSurfacePixel(image->surface, 0, 0, &r, &g, &b, &a));
+    CHECK(r == 50);
+    CHECK(g == 170);
+    CHECK(b == 115);
+    CHECK(a == 73);
+    const std::string wrongAlpha = "@group.h264,broken.z,1024,1024,4,1,900,900,1,1";
+    write(temp.path / "broken.z", compressed.data(), capacity - 1);
+    REQUIRE(PackedSpriteFrame::parse(wrongAlpha, location));
+    CHECK_FALSE(loader.wait(location.request(loader, wrongAlpha, false)));
+#endif
+}
+TEST_CASE("directory snapshots share sorted membership and refresh without changing root precedence") {
+    glob2test::TempDir temp("directory-membership");
+    const std::string folder = temp.path.filename().string() + "-frames";
+    const auto firstRoot = temp.path / "first", secondRoot = temp.path / "second", thirdRoot = temp.path / "third";
+    for (const auto& root : {firstRoot, secondRoot, thirdRoot}) std::filesystem::create_directories(root / folder);
+    const char first = 'a', second = 'b';
+    write(firstRoot / folder / "z.webp", &first, 1);
+    write(firstRoot / folder / "same.webp", &first, 1);
+    write(firstRoot / folder / "a.webp", &first, 1);
+    write(secondRoot / folder / "same.webp", &second, 1);
+    write(secondRoot / folder / "b.webp", &second, 1);
+    write(thirdRoot / folder / "mounted.webp", &second, 1);
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::FileManager files("directory-membership");
+        files.addDir(firstRoot.string()); files.addDir(secondRoot.string());
+        GAGCore::AssetLoader loader(files, {workers, workers, 1024 * 1024});
+        auto one = loader.requestDirectory(folder), two = loader.requestDirectory(folder);
+        CHECK(loader.metrics().submitted == 1);
+        auto original = loader.wait(one), shared = loader.wait(two);
+        REQUIRE(original); CHECK(original == shared);
+        const std::vector<std::string> expected{"a.webp", "b.webp", "same.webp", "z.webp"};
+        CHECK(original->names == expected);
+        auto bytes = loader.wait(loader.requestBytes(folder + "/same.webp"));
+        REQUIRE(bytes); REQUIRE(bytes->size() == 1); CHECK((*bytes)[0] == first);
+        // A retained snapshot stays immutable while explicit invalidation sees a
+        // live filesystem addition. No process-global directory cache is added.
+        write(firstRoot / folder / "added.webp", &first, 1);
+        loader.invalidate();
+        auto refreshed = loader.wait(loader.requestDirectory(folder)); REQUIRE(refreshed);
+        CHECK(std::binary_search(refreshed->names.begin(), refreshed->names.end(), "added.webp"));
+        CHECK_FALSE(std::binary_search(original->names.begin(), original->names.end(), "added.webp"));
+        const auto generation = loader.sourceGeneration();
+        files.addDir(thirdRoot.string());
+        auto mounted = loader.wait(loader.requestDirectory(folder)); REQUIRE(mounted);
+        CHECK(loader.sourceGeneration() != generation);
+        CHECK(std::binary_search(mounted->names.begin(), mounted->names.end(), "mounted.webp"));
+        CHECK(std::is_sorted(mounted->names.begin(), mounted->names.end()));
+        CHECK(std::count(mounted->names.begin(), mounted->names.end(), "same.webp") == 1);
+        bytes = loader.wait(loader.requestBytes(folder + "/same.webp"));
+        REQUIRE(bytes); REQUIRE(bytes->size() == 1); CHECK((*bytes)[0] == first);
+        std::filesystem::remove(firstRoot / folder / "added.webp");
+    }
+}
+TEST_CASE("HD staging copies repeated uses then transfers exclusive pixels at the last use") {
+    glob2test::TempDir temp("hd-staging");
+    write(temp.path / "frame.webp", webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::AssetLoader loader(files, {workers, workers, 1024 * 1024});
+        GAGCore::HighResolutionInputs inputs;
+        inputs.add(loader, "frame.webp"); inputs.add(loader, "frame.webp");
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (inputs.pending() && std::chrono::steady_clock::now() < deadline) {
+            loader.poll(); std::this_thread::yield();
+        }
+        REQUIRE_FALSE(inputs.pending());
+        CHECK(inputs.size() == 2);
+        CHECK(loader.metrics().submitted == 2); // one read and one decode
+        auto first = inputs.consume("frame.webp");
+        REQUIRE(first.value); CHECK_FALSE(first.exclusive);
+        auto* pixelsOwner = first.value->surface;
+        auto copied = GAGCore::DrawableSurface::fromAssetImage(*first.value, first.exclusive, false);
+        CHECK(copied->getSDLSurface() != pixelsOwner);
+        first.value.reset();
+        auto last = inputs.consume("frame.webp");
+        REQUIRE(last.value); CHECK(last.exclusive);
+        auto adopted = GAGCore::DrawableSurface::fromAssetImage(*last.value, last.exclusive, false);
+        CHECK(adopted->getSDLSurface() == pixelsOwner);
+        CHECK(inputs.size() == 0);
+        auto* rgba = SDL_ConvertSurface(adopted->getSDLSurface(), SDL_PIXELFORMAT_RGBA32);
+        REQUIRE(rgba);
+        for (int y = 0; y < 2; ++y)
+            CHECK(std::memcmp(static_cast<char*>(rgba->pixels) + y * rgba->pitch, pixels + y * 8, 8) == 0);
+        SDL_DestroySurface(rgba);
+    }
+}
+TEST_CASE("HD staging preserves external consumers and cancellation cannot cancel their input") {
+    glob2test::TempDir temp("shared-hd-staging");
+    write(temp.path / "frame.webp", webp, sizeof(webp));
+    write(temp.path / "other.webp", webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    GAGCore::AssetLoader loader(files, {0, 0, 1024 * 1024});
+    auto retained = loader.requestImage("frame.webp", GAGCore::AssetLoader::Priority::Required, true);
+    GAGCore::HighResolutionInputs inputs;
+    inputs.add(loader, "frame.webp");
+    auto borrowed = loader.wait(retained); REQUIRE(borrowed);
+    auto shared = inputs.consume("frame.webp");
+    REQUIRE(shared.value); CHECK_FALSE(shared.exclusive);
+    CHECK(shared.value == borrowed);
+    CHECK(retained.get() == borrowed);
+    inputs.add(loader, "frame.webp"); inputs.clear();
+    CHECK(inputs.size() == 0); CHECK_FALSE(inputs.pending());
+    CHECK(retained.get() == borrowed);
+    GAGCore::HighResolutionInputs cancelled;
+    auto other = loader.requestImage("other.webp");
+    cancelled.add(loader, "other.webp", false); cancelled.clear();
+    CHECK(loader.wait(other));
+    // A missing optional input completes as a failure, without a stuck staging owner.
+    inputs.add(loader, "missing.webp");
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (inputs.pending() && std::chrono::steady_clock::now() < deadline) loader.poll();
+    REQUIRE_FALSE(inputs.pending());
+    CHECK_FALSE(inputs.consume("missing.webp").value);
+    CHECK(inputs.size() == 0);
+}
+TEST_CASE("HD request policy survives backend capability changes without discarding in-flight images") {
+    glob2test::TempDir temp("hd-policy-switch");
+    write(temp.path / "frame.webp", webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::AssetLoader loader(files, {workers, workers, 1024 * 1024});
+        GAGCore::HighResolutionInputs inputs;
+        inputs.add(loader, "frame.webp", false);
+        inputs.add("frame.webp", false);
+        auto base = loader.requestImage("frame.webp", GAGCore::AssetLoader::Priority::Required, false);
+        // Switch to a mip-capable device before the original decode completes.
+        inputs.request(loader, "frame.webp", true);
+        const auto wait = [&] {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (inputs.pending() && std::chrono::steady_clock::now() < deadline) {
+                loader.poll(); std::this_thread::yield();
+            }
+            REQUIRE_FALSE(inputs.pending());
+        };
+        wait();
+        REQUIRE(loader.wait(base));
+        REQUIRE(base.get()); CHECK(base.get()->mips.empty());
+        const auto submitted = loader.metrics().submitted;
+        inputs.request(loader, "frame.webp", true);
+        CHECK(loader.metrics().submitted == submitted);
+        auto first = inputs.consume("frame.webp", true);
+        REQUIRE(first.value); REQUIRE_FALSE(first.value->mips.empty());
+        CHECK_FALSE(first.exclusive); CHECK(inputs.size() == 1);
+        // A subsequent downgrade keeps the same completed upgraded result.
+        inputs.request(loader, "frame.webp", false);
+        auto last = inputs.consume("frame.webp", false);
+        REQUIRE(last.value); CHECK(last.value == first.value);
+        CHECK(inputs.size() == 0); CHECK_FALSE(inputs.pending());
+        inputs.add(loader, "frame.webp", true);
+        wait();
+        auto downgraded = inputs.consume("frame.webp", false);
+        REQUIRE(downgraded.value); CHECK_FALSE(downgraded.value->mips.empty());
+        CHECK(inputs.size() == 0);
+        // Authored atlas pixels and generated standalone mips sharing a path
+        // remain distinct registered requests and use counts.
+        inputs.add(loader, "frame.webp", false); inputs.add(loader, "frame.webp", true);
+        wait();
+        auto authored = inputs.consume("frame.webp", false);
+        auto generated = inputs.consume("frame.webp", true);
+        REQUIRE(authored.value); REQUIRE(generated.value);
+        CHECK(authored.value->mips.empty()); CHECK_FALSE(generated.value->mips.empty());
+        CHECK(inputs.size() == 0);
+        inputs.add(loader, "missing.webp", false);
+        inputs.request(loader, "missing.webp", true);
+        wait();
+        const auto failedSubmissions = loader.metrics().submitted;
+        for (int repeat = 0; repeat < 3; ++repeat) inputs.request(loader, "missing.webp", true);
+        CHECK(loader.metrics().submitted == failedSubmissions);
+        CHECK_FALSE(inputs.consume("missing.webp", false).value);
+        CHECK(inputs.size() == 0);
+    }
+    // A failed re-decode retains the immutable valid base already owned by
+    // the in-flight subscription, rather than dropping the HD layer.
+    GAGCore::AssetLoader loader(files, {0, 0, 1024 * 1024});
+    GAGCore::HighResolutionInputs inputs;
+    inputs.add(loader, "frame.webp", false);
+    while (inputs.pending()) loader.poll();
+    REQUIRE(inputs.state("frame.webp", false) == GAGCore::AssetLoader::State::Ready);
+    std::filesystem::remove(temp.path / "frame.webp");
+    loader.invalidate();
+    inputs.request(loader, "frame.webp", true);
+    while (inputs.pending()) loader.poll();
+    CHECK(loader.metrics().failed > 0);
+    const auto failedSubmissions = loader.metrics().submitted;
+    for (int repeat = 0; repeat < 3; ++repeat) inputs.request(loader, "frame.webp", true);
+    CHECK(loader.metrics().submitted == failedSubmissions);
+    auto retained = inputs.consume("frame.webp", true);
+    REQUIRE(retained.value); CHECK(retained.value->mips.empty());
+    CHECK(inputs.size() == 0);
+}
+TEST_CASE("WebP requests deduplicate and preserve alpha and invisible RGB in both execution modes") {
+    glob2test::TempDir temp("parallel-assets");
+    write(temp.path / "frame.webp", webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::AssetLoader loader(files, {workers, workers, 16});
+        auto first = loader.requestImage("frame.webp");
+        auto image = loader.wait(first); REQUIRE(image);
+        // Completion releases the transient byte dependency. Reusing the live
+        // image result must not create an unused extra read after that happens.
+        auto second = loader.requestImage("frame.webp");
+        REQUIRE(second.get() == image);
+        REQUIRE(image->surface->format == SDL_PIXELFORMAT_ARGB8888);
+        auto *rgba = SDL_ConvertSurface(image->surface, SDL_PIXELFORMAT_RGBA32); REQUIRE(rgba);
+        for (int y = 0; y < 2; ++y)
+            CHECK(std::memcmp(static_cast<char*>(rgba->pixels) + y * rgba->pitch, pixels + y * 8, 8) == 0);
+        SDL_DestroySurface(rgba);
+        CHECK(loader.metrics().submitted == 2);
+        CHECK(loader.metrics().oversizedJobs == 2); // encoded bytes and output/scratch
+        first.cancel(); CHECK(first.state() == GAGCore::AssetLoader::State::Cancelled);
+        CHECK(second.get() == image);
+        if (workers == 0) {
+            // A Required re-request must promote the still-pending byte input,
+            // not just its decode, ahead of unrelated Interactive IO work.
+            write(temp.path / "priority.webp", webp, sizeof(webp));
+            GAGCore::AssetLoader priorities(files, {0, 0, 1024 * 1024});
+            auto background = priorities.requestImage("priority.webp", GAGCore::AssetLoader::Priority::Background);
+            auto sentinel = priorities.requestRead<unsigned>("priority-sentinel", [background] {
+                CHECK(background.state() == GAGCore::AssetLoader::State::Ready);
+                return std::make_shared<const unsigned>(1);
+            }, GAGCore::AssetLoader::Priority::Interactive);
+            auto required = priorities.requestImage("priority.webp", GAGCore::AssetLoader::Priority::Required);
+            REQUIRE(priorities.wait(sentinel));
+            REQUIRE(priorities.wait(required));
+            CHECK(required.get() == background.get());
+        }
+    }
+}
+TEST_CASE("read backpressure yields to decoders and retained metadata cannot stall images") {
+    glob2test::TempDir temp("asset-backpressure");
+    write(temp.path / "metadata", webp, sizeof(webp));
+    for (unsigned i = 0; i < 8; ++i) write(temp.path / (std::to_string(i) + ".webp"), webp, sizeof(webp));
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    for (unsigned workers : {0u, 2u}) {
+        GAGCore::AssetLoader loader(files, {workers, workers, 128});
+        auto retained = loader.requestBytes("metadata"); REQUIRE(loader.wait(retained));
+        std::vector<GAGCore::AssetLoader::Handle<GAGCore::AssetImage>> images;
+        for (unsigned i = 0; i < 8; ++i) images.push_back(loader.requestImage(std::to_string(i) + ".webp"));
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (std::any_of(images.begin(), images.end(), [](const auto& image) { return image.pending(); }) &&
+               std::chrono::steady_clock::now() < deadline) { loader.poll(); std::this_thread::yield(); }
+        for (const auto& image : images) CHECK(image.get() != nullptr);
+        CHECK(retained.get()->size() == sizeof(webp));
+        // A ready image can precede destruction of its completed reader job,
+        // which still owns the encoded bytes. Verify cleanup within the same deadline.
+        while (loader.metrics().bufferedEncodedBytes && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::yield();
+        CHECK(loader.metrics().bufferedEncodedBytes == 0);
+    }
+}
+TEST_CASE("dependency continuations do not block workers and preparation overlaps") {
+    if (!GAGCore::ThreadSupport::available) return;
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {2, 1, 1024});
+    std::promise<void> release;
+    auto gate = release.get_future().share();
+    std::atomic<unsigned> entered{0};
+    auto work = [&] { ++entered; gate.wait(); return std::make_shared<const unsigned>(7); };
+    auto first = loader.request<unsigned>("first", {}, work, 64);
+    auto second = loader.request<unsigned>("second", {}, work, 64);
+    auto continuation = loader.request<unsigned>("sum", {first.dependency(), second.dependency()},
+        [first, second] { return std::make_shared<const unsigned>(*first.get() + *second.get()); }, 64);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (entered < 2 && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool overlapping = entered == 2;
+    release.set_value();
+    REQUIRE(overlapping);
+    auto value = loader.wait(continuation); REQUIRE(value); CHECK(*value == 14);
+    CHECK(loader.metrics().peakCpu == 2);
+    CHECK(loader.metrics().peakWorkingBytes <= 1024);
+}
+TEST_CASE("exclusive transfer refuses copied subscriptions and borrowed payloads") {
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {0, 0, 1024});
+    auto handle = loader.request<unsigned>("exclusive", {}, [] { return std::make_shared<const unsigned>(9); });
+    REQUIRE(loader.wait(handle));
+    auto copy = handle; CHECK(!handle.take()); copy = {};
+    auto borrowed = handle.get(); CHECK(!handle.take()); borrowed.reset();
+    auto owned = handle.take(); REQUIRE(owned); CHECK(*owned == 9);
+    CHECK(handle.state() == GAGCore::AssetLoader::State::Cancelled);
+    CHECK(loader.metrics().completed == 1); CHECK(loader.metrics().failed == 0);
+}
+TEST_CASE("retained continuation inputs survive cancellation of the caller subscription") {
+    if (!GAGCore::ThreadSupport::available) return;
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {1, 1, 1024});
+    auto input = loader.request<unsigned>("retained-input", {}, [] { return std::make_shared<const unsigned>(9); });
+    REQUIRE(loader.wait(input));
+    auto retained = input.retain();
+    std::promise<void> entered, release;
+    auto started = entered.get_future();
+    auto gate = release.get_future().share();
+    auto continuation = loader.request<unsigned>("retained-continuation", {retained.dependency()},
+        [retained, &entered, gate] { entered.set_value(); gate.wait(); return retained.get(); });
+    const bool running = started.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    input.cancel();
+    release.set_value();
+    REQUIRE(running);
+    CHECK(input.state() == GAGCore::AssetLoader::State::Cancelled);
+    CHECK(!input.retain().get());
+    auto value = loader.wait(continuation);
+    REQUIRE(value); CHECK(*value == 9);
+}
+TEST_CASE("unique completed requests do not accumulate expired cache metadata") {
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {0, 0, 1024});
+    auto live = loader.request<unsigned>("live", {}, [] { return std::make_shared<const unsigned>(7); });
+    REQUIRE(loader.wait(live));
+    for (unsigned i = 0; i < 512; ++i) {
+        auto transient = loader.request<unsigned>("unique:" + std::to_string(i), {}, [] { return std::make_shared<const unsigned>(1); });
+        REQUIRE(loader.wait(transient));
+    }
+    CHECK(loader.metrics().cachedKeys <= 129);
+    auto duplicate = loader.request<unsigned>("live", {}, [] { FAIL("live cache entry was pruned"); return std::make_shared<const unsigned>(0); });
+    CHECK(duplicate.get() == live.get());
+}
+TEST_CASE("reader workers overlap independently of CPU preparation") {
+    if (!GAGCore::ThreadSupport::available) return;
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {1, 2, 1024});
+    std::promise<void> release; auto gate = release.get_future().share();
+    std::atomic<unsigned> entered{0};
+    auto read = [&] { ++entered; gate.wait(); return std::make_shared<const unsigned>(1); };
+    auto first = loader.requestRead<unsigned>("read-a", read);
+    auto second = loader.requestRead<unsigned>("read-b", read);
+    auto cpu = loader.request<unsigned>("prepare", {}, [] { return std::make_shared<const unsigned>(2); });
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while ((entered < 2 || cpu.pending()) && std::chrono::steady_clock::now() < deadline) std::this_thread::yield();
+    const bool overlapping = entered == 2 && cpu.get() != nullptr;
+    release.set_value(); REQUIRE(overlapping);
+    REQUIRE(loader.wait(first)); REQUIRE(loader.wait(second));
+    CHECK(loader.metrics().peakReads == 2);
+}
+TEST_CASE("finalizers run only on the owner thread and expired owners cancel publication") {
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {2, 1, 1024});
+    auto lifetime = std::make_shared<int>(0);
+    auto expired = std::make_shared<int>(0);
+    const auto owner = std::this_thread::get_id();
+    bool published = false;
+    auto handle = loader.request<unsigned>("publish", {}, [] { return std::make_shared<const unsigned>(9); });
+    loader.onReady<unsigned>(handle, lifetime, [&](std::shared_ptr<const unsigned> value) {
+        CHECK(std::this_thread::get_id() == owner); REQUIRE(value); CHECK(*value == 9); published = true;
+    });
+    loader.onReady<unsigned>(handle, expired, [](std::shared_ptr<const unsigned>) { FAIL("expired owner received a result"); });
+    expired.reset();
+    REQUIRE(loader.wait(handle));
+    loader.poll(); CHECK(published);
+}
+TEST_CASE("nonpositive polling budgets do not start cooperative work or finalizers") {
+    GAGCore::FileManager files("asset-loader-test");
+    GAGCore::AssetLoader loader(files, {0, 0, 1024});
+    unsigned prepared = 0, published = 0;
+    auto lifetime = std::make_shared<unsigned>(0);
+    auto handle = loader.request<unsigned>("zero-budget", {}, [&] { ++prepared; return std::make_shared<const unsigned>(9); });
+    loader.onReady<unsigned>(handle, lifetime, [&](std::shared_ptr<const unsigned>) { ++published; });
+    loader.poll(0);
+    loader.poll(-1);
+    CHECK(handle.pending()); CHECK(prepared == 0); CHECK(published == 0);
+    REQUIRE(loader.wait(handle));
+    loader.poll();
+    CHECK(prepared == 1); CHECK(published == 1);
+}
+TEST_CASE("failures cancellation invalidation and shutdown leave usable handles") {
+    glob2test::TempDir temp("asset-errors");
+    write(temp.path / "bad.webp", "bad", 3);
+    GAGCore::FileManager files("asset-loader-test"); files.addDir(temp.path.string());
+    GAGCore::AssetLoader loader(files, {0, 0, 128});
+    auto missing = loader.requestImage("absent.webp");
+    CHECK(!loader.wait(missing)); CHECK(missing.state() == GAGCore::AssetLoader::State::Failed);
+    auto png = loader.requestImage("bad.png"); CHECK(!loader.wait(png));
+    auto corrupt = loader.requestImage("bad.webp");
+    CHECK(!loader.wait(corrupt)); CHECK(!corrupt.error().empty());
+    auto cancelled = loader.request<unsigned>("cancel", {}, [] { FAIL("cancelled work executed"); return std::make_shared<const unsigned>(0); });
+    cancelled.cancel(); loader.poll();
+    CHECK(cancelled.state() == GAGCore::AssetLoader::State::Cancelled);
+    auto old = loader.requestBytes("bad.webp"); REQUIRE(loader.wait(old));
+    write(temp.path / "bad.webp", webp, sizeof(webp));
+    loader.invalidate();
+    auto fresh = loader.requestImage("bad.webp"); REQUIRE(loader.wait(fresh));
+    CHECK(old.get()->size() == 3);
+    auto pending = loader.requestBytes("not-started");
+    loader.shutdown(); CHECK(pending.state() == GAGCore::AssetLoader::State::Cancelled);
+    CHECK(fresh.get() != nullptr);
+}
+}
+
+TEST_SUITE("CommunityAssets") {
+TEST_CASE("verified memory assets use the ordinary loader without shadowing installed files") {
+    glob2test::TempDir temp("community-assets");
+    const auto diskFolder=temp.path / "community/buildings" / std::string(64,'a');
+    std::filesystem::create_directories(diskFolder);
+    write(diskFolder / "sprite0.webp",webp,sizeof(webp));
+    write(diskFolder / "sprite99.webp",webp,sizeof(webp));
+    GAGCore::FileManager files("community-assets"); files.addDir(temp.path.string());
+    for(unsigned workers:{0u,2u}) {
+        GAGCore::AssetLoader loader(files,{workers,workers,1024*1024});
+        const auto folder="community/buildings/"+std::string(64,'a');
+        const auto path=folder+"/sprite0.webp";
+        auto bytes=std::make_shared<const GAGCore::AssetLoader::Bytes>(webp,webp+sizeof(webp));
+        CHECK_FALSE(loader.wait(loader.requestImage(path))); // never fall through to disk
+        loader.setCommunityFiles({{path,bytes}});
+        const auto directory=loader.wait(loader.requestDirectory(folder));
+        REQUIRE(directory); REQUIRE(directory->names.size()==1); CHECK(directory->names.front()=="sprite0.webp");
+        loader.setCommunityFiles({{path,bytes},{folder+"/sprite10.webp",bytes},{folder+"/sprite2r.webp",bytes}});
+        const auto expanded = loader.wait(loader.requestDirectory(folder)); REQUIRE(expanded);
+        const std::vector<std::string> expectedNames{"sprite0.webp","sprite10.webp","sprite2r.webp"};
+        CHECK(expanded->names == expectedNames);
+        CHECK(directory->names.size() == 1); // previously published snapshot is immutable
+        CHECK_FALSE(loader.wait(loader.requestImage(folder+"/sprite99.webp"))); // disk cannot leak into verified namespace
+
+        auto image=loader.wait(loader.requestImage(path)); REQUIRE(image);
+        CHECK(image->surface->w==2); CHECK(image->surface->h==2);
+        auto missing=loader.requestImage(folder+"/sprite1.webp"); CHECK_FALSE(loader.wait(missing));
+        CHECK_THROWS(loader.setCommunityFiles({{"data/gfx/stock0.webp",bytes}}));
+        auto changed=std::make_shared<const GAGCore::AssetLoader::Bytes>(1,0);
+        CHECK_THROWS(loader.setCommunityFiles({{path,changed}}));
+        CHECK(loader.wait(loader.requestBytes(path))==bytes);
+    }
+}
+}

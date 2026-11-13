@@ -41,10 +41,18 @@ optional layers through asset polling, rather than through screen destruction.
 
 Terrain uses the shared CPU material compositor and bounded 16 by 16 cell pages
 on software and GPU backends; see [terrain materials](../assets/terrain-materials.md).
+[Direct terrain](../development/rendering-benchmarks.md#direct-terrain)
+uses map-space atlases for Original artwork on desktop legacy OpenGL, programmable
+OpenGL, SDL GPU, and WebGPU; desktop legacy OpenGL also draws HD artwork with it. SDL GPU and WebGPU use offline shader assets. The atlas builder packs terrain data independently of the device. The
+camera transforms a terrain quad while its fragment shader blends material
+variants, coverage and shoreline effects. The page renderer handles HD artwork on
+the other backends, backends without direct terrain, tiled captures outside legacy
+OpenGL, and the browser's WebGL2 renderer (legacy OpenGL through Emscripten's WebGL2
+bridge), where pages draw native artwork until the view's HD families arrive.
 Fully revealed resources use canonical map rows, with sorted source-tile indices
 selecting the contiguous visible vertex range. Translation places a canonical row
 at its wrapped-map position, so camera panning does not change its vertices.
-Each resource entry compares its exact frame/visibility vector before reuse.
+Cached rows reuse frame data until their resource or terrain revisions change. Animated cells update their selected frames as the scene tick advances.
 Partial-discovery resources keep the ordinary drawing path. The resource geometry budget
 is 32 MiB of buffer payload with at most 4096 entries and least-recently-used
 eviction; CPU metadata and driver allocation overhead are additional. Each scene
@@ -80,10 +88,10 @@ GUV1 sidecar for procedural detail, so rebuilding the surface does not move save
 paint. Both renderers use the paint UVs when a sidecar is absent; malformed
 sidecars are rejected. See the [unit asset pipeline](../../tools/unit-animation/README.md#experimental-live-colony-skins).
 
-Colony-skin materials are declared once in `libgag/shaders/skin-materials.json`
+Colony-skin materials are declared once in `libs/gag/shaders/skin-materials.json`
 (ids, keys, display names, picker groups, which materials grow fur shells, the
 shell count and the fur length and depth bias every renderer uses) and shaded
-once in `libgag/shaders/skin-material.glsl`. `scons/skin_materials.py`
+once in `libs/gag/shaders/skin-material.glsl`. `buildsys/skin_materials.py`
 compiles both into the generated `include/glob2/SkinMaterials.h`
 (`SKIN_MATERIAL_COUNT`, `SKIN_MATERIAL_SHELLS`, the `SkinMaterials` table and the
 GLSL text) for the desktop, web and mobile builds; Colony Studio imports the GLSL
@@ -104,12 +112,12 @@ normal; their shader sets `alpha` to 0 where a shell carries no strand. Tiles
 are cached per pose, so no material can animate over time.
 
 To add a material: append it to the JSON, add `skinMaterial_<key>` and its
-dispatch line to the GLSL, mirror the entry in `platform/packages/protocol/src/skins.ts`,
+dispatch line to the GLSL, mirror the entry in `services/online/packages/protocol/src/skins.ts`,
 then run `test/build_system/test_skin_materials.py`, the `SkinMesh` display
 suite with `GLOB2_UPDATE_SKIN_FINGERPRINTS=1` once (it rewrites
 `test/fixtures/skins/material-fingerprints.json` and writes contact sheets under
 `artifacts/skins/materials/`) and review the sheets. While iterating on the
-GLSL, `tools/skins/material_spheres.mjs` (run from `platform/apps/web`) renders
+GLSL, `tools/skins/material_spheres.mjs` (run from `services/online/apps/web`) renders
 every material on a sphere through headless Chromium in seconds, and the
 `skins-materials.spec.ts` e2e captures each material on the worker at studio
 resolution. Any shader edit changes the
@@ -122,8 +130,10 @@ Drawing reads an immutable `PresentationFrame` (`src/render/scene/`). It retains
 the shared world snapshot, view request, captured timing and derived presentation
 results. Unit, building, team, relationship, entity-index, effect and map data are
 borrowed from standard snapshot components. There is no second entity extraction
-or map-array capture. `Game::drawMap` requires an explicitly supplied frame;
-`Game::drawSceneMap` accepts it directly.
+or map-array capture. `MapDrawer::drawMap` requires an explicitly supplied frame;
+`MapDrawer::drawSceneMap` accepts it directly. The draw functions are declared in
+`src/render/MapDrawer.h` and the per-viewer `ViewState` in `src/render/ViewState.h`,
+so `Game.h` carries no rendering declarations.
 
 - Interactive engines capture the standard simulation preset and all graphical
   payloads at each completed observation: session, effects, statistics, history,
@@ -172,7 +182,13 @@ or map-array capture. `Game::drawMap` requires an explicitly supplied frame;
   Shift-click diagnostic dumps select the displayed generation and serialize it
   only if that same entity still exists at the explicit owner boundary.
 - The editor and standalone tools explicitly obtain an owner-boundary snapshot before
-  preparing a frame. Offline map images and diagnostic PNGs use the same drawing
+  preparing a frame. The editor keeps one `SceneExtractor` and its current scene
+  (`EditorSceneCache`) and prepares again only when the boundary's
+  `boundarySerial` or the scene request changes. Every capture by a snapshot
+  store takes a new process-unique serial, kept by reuse and projection and never
+  repeated after `Store::reset()`. Map and owner edits therefore rebuild the scene,
+  as do selection, overlay, active team and zoom; panning and idle frames redraw it.
+  Offline map images and diagnostic PNGs use the same drawing
   passes and graphics-thread asset ownership. Diagnostic preparation consumes the
   published boundary rather than recapturing from the live game. A bounded diagnostic
   batch owns its fields and snapshot independently; PNG preparation and export do
@@ -219,6 +235,13 @@ discards the backlog. Foreground resume and graphics recreation
 reset pacing. Display refresh, rendering cost and existing slower screen cadences
 can keep the actual rate below the selected ceiling. Unlimited removes this
 limiter, without overriding display synchronization or screen update scheduling.
+Threaded games and the native map editor wait `GAGCore::pacedScreenWait`: until
+the pacer's next frame and at most `InputWakeMilliseconds` (8 ms) for input, so
+a frame slower than the target period is followed at once. Screens opt in with
+`Screen::followsRenderPacer()`. With Unlimited, a game redraws continuously; the
+editor does so while it has input or a new scene, and otherwise waits the input
+wake (`Screen::executionIdle()`), so an idle editor draws at most about 125 FPS rather
+than spinning.
 
 Simulation speed, save/replay formats and network contracts are independent of
 this preference. Headless runs, offline image exports and renderer benchmarks do
@@ -325,7 +348,7 @@ simulation, saves and replays are unaffected.
 
 - `FogFade` (`src/render/FogFade.h`), kept per view in `MapRenderState`, records for each
   tile whether it is fogged, its fade level when that last changed and the tick it changed
-  on. `Game::drawMap` updates it once per frame from the drawn Scene, and resets it while
+  on. `MapDrawer::drawMap` updates it once per frame from the drawn Scene, and resets it while
   the fade is not drawn (setting off, or `DRAW_WHOLE_MAP`), so it is `active()` exactly when
   the frame draws the fog faded. A tile changing state fades linearly from wherever it had
   reached, into the fog over `FogFade::DARKEN_TICKS` (37.5, or 1.25 seconds at normal speed)
@@ -342,8 +365,8 @@ simulation, saves and replays are unaffected.
   sprite's pixels are at their peak; the derivation is in `FogFade.cpp`), and fully fogged
   or fully clear corners draw the same single fill or sprite as with the setting off.
 - Enemy units fade with the clearer of their tile and the tile they come from, and so does
-  everything drawn for them: bars and status pips (through the `opacity` parameter of
-  `Game::anchorBars`, `drawStatusPip`, `drawPointBar` and `drawHealthBar`; queued bars take
+  everything drawn for them: bars and status badges (through the `opacity` parameter of
+  `MapDrawer::anchorBars`, `drawStatusPip`, `drawPointBar` and `drawHealthBar`; queued bars take
   it from their anchor), selection circles, the level-up number and magic effect, the
   carried resource and the accessibility label. A fading unit's sprite is translucent and so
   leaves the unit sprite batch; only the few units at the edge of the fog do.
@@ -351,8 +374,114 @@ simulation, saves and replays are unaffected.
   explosions, and remembered enemy buildings. Bullets near a fading unit therefore vanish
   at the fog swap.
 
+### Unit effects at buildings
+
+When a building produces or changes a unit, accelerated renderers play a short effect
+on it; the software renderer draws the unit as before, and **Detail effects: reduced**
+(`Settings::buildingParticles`) turns them all off. Timing and shapes are in
+`src/render/UnitEffects.h`.
+
+When a swarm produces a unit:
+
+- The swarm glows in a light version of its team colour for about 0.4 seconds, at 20% of
+  full strength.
+- The unit fades in over 10 ticks, sliding 2 pixels out of the swarm, as a team-colour
+  silhouette that settles to normal shading over one second while a few twinkles drift
+  up over it.
+- A cloud of team-coloured dust twinkles around the unit, with motes flashing white,
+  and fades out within 0.75 seconds. It travels with the unit as it walks away, its
+  motes spreading outward on top of the unit's own motion.
+
+When a unit comes out of a building that healed, fed or trained it:
+
+- It shimmers as a silhouette in the service's colour (heal green, feed yellow, training
+  white-gold) that settles over one second from 90%.
+- Seven copies of that building's own map icon (`presentation.iconFrame`, the glyph on
+  its zoomed-out chip) burst out of it at random angles, distances, sizes and start
+  times, then drift and fade within about 0.9 seconds. Like the dust, they are placed
+  around the unit's drawn centre each frame, so they keep pace with it rather than
+  being left behind. They never fly into the sector above the unit, where level
+  numbers rise.
+- A trained unit floats its highest new level, displayed as in the unit panel, rising
+  like a combat level-up number.
+
+When a hungry unit defects to the team whose inn will feed it, it shimmers in its new
+team's colour, brightening over two thirds of a second and settling over one more.
+What else plays depends on who watches:
+
+- The team that gained it sees a cloud of motes in its colour gather onto the unit (the
+  swarm's dust played backwards) and a soft heart in its colour pop up, wobble and rise.
+- The team that lost it sees motes in its own colour fall off the unit, and a heart in
+  its colour appear above, tremble, crack down the middle and fall in two halves.
+- Anyone else, and every replay viewer, sees both clouds of motes and no heart.
+
+Because conversion is caused by hunger, the effect starts where the unit stood when it
+switched, not at a building, and follows the unit as it walks on; it is hidden on a
+fogged tile and, unlike the others, dropped rather than left behind when the unit
+is not drawn.
+
+`Building::swarmStep` records spawns in `GameAnimations` beside death animations. A
+successful feed, heal or training (some level rose) at the end of a stay
+(`Unit::handleDisplacement`) records a pending service by unit gid; it plays when the
+unit actually comes out (`Unit::handleMovementExitingBuilding`, or `expelFromBuilding`
+for a unit already on its way out). A conversion (`Unit::handleActivity`) records its
+effect under the unit's new gid with the old team, dropping any effect left under
+the old gid. A unit expelled mid-stay, a trainee leaving while
+upgrades are disabled, or one whose course became invalid plays nothing. Records are
+render-only, absent from checksums, saves and replays, and kept only with a display.
+They are captured into the snapshot's effects (`UnitEffectRecord`), and `MapDrawer::drawMap`
+indexes them by unit and producing swarm for the frame. Each part runs from the
+record's age plus the drawn tick fraction, so it stops while paused. Dust, icons,
+twinkles and level numbers are drawn after the buildings, which would otherwise cover
+them.
+
+Sprites get the silhouette from `Sprite::silhouette`, a cached copy of the native frame
+filled with one colour, whose light is added over the sprite
+(`GraphicContext::drawSurfaceAdditive`); the swarm uses its team-colour layer alone.
+Dust motes add the light of their white cores and glints the same way, while their team
+colour blends normally, since added red turns yellow over grass. The icons are the white
+`mapicon` glyphs filled with the service's colour and blended normally, picking the
+largest pre-sized frame that fits on screen. Skinned meshes are
+brightened instead by adding their composited tile again, tinted (the `glow` arguments
+of `GraphicContext::drawSkinMesh`); pre-rendered skin sprites draw without it. Dust
+stars, glows and hearts are drawn procedurally by `UnitEffectArt`, one set per team hue, so the
+effects ship no new image assets.
+
+### Additive draws
+
+`GraphicContext::drawSurfaceAdditive` adds a surface's light (its colour times alpha) to
+what is already drawn instead of blending over it, so effects can brighten rather than
+tint. It first flushes queued batches to keep painter order, then uses a filtered,
+additively blended blit:
+
+- **Device renderers** (SDL GPU, programmable GL, WebGPU): a `DrawPacket` blit with
+  `Blend::Additive`.
+- **Portable SDL renderer:** `SDL_BLENDMODE_ADD` on the texture for that draw only.
+- **Legacy GL:** an immediate quad with `GL_SRC_ALPHA, GL_ONE`.
+
+The software renderer draws the surface normally. A backend opts in through
+`RenderBackend::blitAdditive`.
 
 See [adaptive zoom detail](zoom-detail.md).
+
+### Swimming units
+
+The swim artwork is seen from above with the body lying flat, so a swimmer is placed in
+the water rather than on it by fading its limbs, not by cutting it at a waterline.
+`MapDrawer::drawUnit` sets a `RadialFade` (`libs/gag/include/RadialFade.h`) on the graphic
+context with a `RadialFadeScope` (`libs/gag/include/RenderStateScope.h`) around a
+swimmer's sprite: the torso stays opaque and opacity falls to a floor towards the
+outstretched limbs. Every unit draw path honours it (classic sprites with or without the
+team-colour shader, pre-rendered skin sprites, and live skin meshes on the legacy GL and
+device renderers) by drawing the quad as a grid whose vertex opacity carries the fade;
+only the native software surface without a renderer backend draws unfaded.
+Each arm stroke of the swim clip sends a ring out from the limb tips, timed from the
+unit's animation phase so ripples follow the visible stroke. A moving swimmer's ring fades
+to nothing ahead of it, so the ripple spreads backwards; one treading water ripples all
+round. The ring is drawn as short line segments whose opacity carries that crescent; the
+constants, ring timing and segment geometry are in `src/unit/render/SwimmingPresentation.h`.
+All of it is presentation: it reads the unit's action, heading and animation phase and
+changes no simulation state.
 
 ## Clouds, bars and resource batches
 
@@ -378,7 +507,7 @@ existing paths; cache-backed team-color surfaces cannot be deferred safely.
 
 ### Portable shader build artifacts
 
-`libgag/shaders/renderer-manifest.json` declares skin/rig, world/cloud, smooth-point and 2D primitive
+`libs/gag/shaders/renderer-manifest.json` declares skin/rig, world/cloud, smooth-point and 2D primitive
 vertex layouts, uniform blocks and resource bindings. Generate build artifacts
 with `python3 tools/shaders/generate.py --output artifacts/shaders/generated`.
 The output contains GLSL ES 3.00, desktop GLSL 3.30 and Vulkan GLSL 4.50 sources,
@@ -417,7 +546,7 @@ On an Apple build host, compile the translated output separately with
 contains the exact `xcodebuild -version` output (`xcodeVersion`), SDK name and
 version (`sdk`, `sdkVersion`), and SHA-256 digests of the resolved `metal` and
 `metallib` executables (`metalSha256`, `metallibSha256`). It must match the existing
-Xcode pin in `mobile/toolchain.json`; `--developer-dir` selects a bundle without
+Xcode pin in `platforms/mobile/toolchain.json`; `--developer-dir` selects a bundle without
 changing the system selection. This separate step compiles MSL to AIR, links
 `.metallib`, checks the library magic and compiled function name, and records
 source and library hashes with the entrypoint. Failed or incomplete builds leave
@@ -540,7 +669,7 @@ capabilities, even when the window uses a GPU device. Graphics settings are also
 available from the in-game and editor menus; the running engine or editor is retained
 while settings are open.
 
-The browser WebGPU adapter (`browser/webgpu-device.js` and `WebGPUDevice.cpp`)
+The browser WebGPU adapter (`platforms/web/webgpu-device.js` and `WebGPUDevice.cpp`)
 prepares adapters, devices and shader pipelines asynchronously before changing
 presentation ownership. `glob2_webgpu_prepare(shaderDirectory)` and
 `glob2_webgpu_poll()` return pending (0), ready (1), or failed (-1), with
@@ -593,8 +722,8 @@ browser acceptance.
 The packed C++ wrapper has a separate regression proof. Build it with
 `tools/shaders/build_webgpu_cpp_proof.py`, supplying `--emxx` from the pinned
 Emscripten SDK, the browser SDL prefix with `--sdl-prefix`, and generated shaders
-with `--shader-directory`. Serve its output with `browser/serve.py`, then run
-`NODE_PATH=browser/node_modules node tools/shaders/prove_webgpu_cpp.cjs URL`.
+with `--shader-directory`. Serve its output with `platforms/web/serve.py`, then run
+`NODE_PATH=platforms/web/node_modules node tools/shaders/prove_webgpu_cpp.cjs URL`.
 It checks all four textured skin atlas offsets, straight and premultiplied
 render-target sampling, and pressure eviction with live restoration sources and
 an unpresented frame lease. Exercising only JavaScript records would miss C++
@@ -656,8 +785,9 @@ bytes, including leases held by queued submissions and retiring devices; bounded
 lookup and shared-ownership bookkeeping is accounted separately. Exhausted
 admission falls back to CPU composition. GPU coverage allocations retain their
 independent 32 MiB budget. `terrain-compose` reads four straight RGBA materials,
-RGBA16_UINT coverage weights/margin and R8_UINT palette selectors. Its 144-byte
-fragment block holds composition parameters and per-material seam constants.
+RGBA16_UINT coverage weights/margin and R8_UINT palette selectors. Its 352-byte
+fragment block holds composition parameters, per-material seam and surf constants,
+and the cell's world origin and animation time for surf.
 `terrain-reduce` performs the reference alpha-weighted box reduction for divisors
 1, 2, 4, 8, 16 and 32 with a 16-byte parameter block. Straight intermediates
 retain packed-ARGB wrapping; final premultiplied targets apply the same byte
@@ -709,6 +839,9 @@ mip chains keep their existing upload and compression path. Unsupported contexts
 (including older contexts without integer shaders), non-power-of-two surfaces and failed pipeline
 creation retain CPU preparation. Native scratch textures and shaders are released
 before their owning context is destroyed.
+On little-endian desktop OpenGL, the CPU fallback for tightly packed,
+power-of-two ARGB surfaces uploads the original pixels directly and reuses
+one scratch buffer for the smaller levels.
 
 The portable SDL renderer used on mobile samples standalone HD frames without
 mip chains, so those requests decode only base pixels. In-flight HD requests retain

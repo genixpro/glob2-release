@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "InGameStatistics.h"
+#include "Map.h"
+#include "ProfileNeeds.h"
 #include "GeneratorRegistry.h"
 #include <vector>
 #include <string>
@@ -11,6 +14,7 @@
 #include <cstdint>
 #include "AIImplementation.h"
 #include "AINames.h"
+#include "AIRegistry.h"
 #include "CustomGameScreen.h"
 #include "OnlineServices.h"
 #include "InstanceConfig.h"
@@ -25,7 +29,9 @@
 #include <set>
 #include "Engine.h"
 #include "FrontendTheme.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include "TeamStat.h"
 #include <SDL3_image/SDL_image.h>
 #include <cmath>
@@ -34,6 +40,8 @@
 #include "LandscapePickerScreen.h"
 #include "StartQualityScreen.h"
 #include <ui/Screen.h>
+#include <ui/Host.h>
+#include <ui/TextLayout.h>
 #include "LobbyMapCatalog.h"
 #include "LobbyMapPreview.h"
 #include "MapGenerator.h"
@@ -79,6 +87,167 @@ struct CountingAI : AIImplementation {
 // Named in friend declarations, so it stays at global scope.
 struct CustomGameSetupHarness
 {
+    static void bulkAIChoice()
+    {
+        using namespace GAGGUI::ui;
+        GAGGUI::ScreenStack stack(*globalContainer->gfx);
+        CustomGameScreen screen(stack);
+        screen.setup.setCapacity(4);
+        REQUIRE(screen.setup.setController(3, CustomGameSetup::Closed));
+        screen.setup.colonies[0].ai = AI::CASTOR;
+        screen.setup.colonies[1].ai = AI::NUMBI;
+        screen.setup.colonies[2].ai = AI::NICOWAR;
+        screen.setup.colonies[3].ai = AI::MAXIMA;
+        screen.setup.colonies[5].ai = AI::ECONO; // Retained, currently inactive.
+        screen.setup.colonies[1].alliance = 3;
+        const auto original = screen.setup;
+        const auto catalog = screen.gameHeader.getBuildingCatalogSnapshot();
+        const auto sameColony = [](const auto &a, const auto &b)
+        {
+            return a.controller == b.controller && a.ai == b.ai &&
+                   a.aiLibraryId == b.aiLibraryId && a.alliance == b.alliance;
+        };
+        FixedTextMeasurer text(8, 16);
+        Host host(Glob2UI::themeFor(Glob2UI::Surface::Frontend), [&](const Presentation &p)
+        { return screen.playersTab(p, p.compact() || p.safe.w < p.pt(720)); });
+        host.setMeasurer(&text);
+        host.setPresentation(Presentation::forSurface(1280, 1024, 1, false));
+        host.layoutIfNeeded();
+        REQUIRE(host.find("players/ai"));
+        CHECK(host.find("players/ai")->accessibleText() == Toolkit::getStringTable()->getString("[Mixed]"));
+        CHECK(screen.commonAISelection() == -1);
+        const int nicowar = AINames::selectionIndex(AI::NICOWAR);
+        std::string error;
+        REQUIRE(host.act("players/ai", {ActionKind::Select, nicowar}, error));
+        const auto semantic = screen.setup;
+        for (int i = 0; i < Team::MAX_COUNT; ++i)
+        {
+            if (i == 1 || i == 2)
+            {
+                CHECK(semantic.colonies[i].ai == AI::NICOWAR);
+                CHECK(semantic.colonies[i].aiLibraryId.empty());
+            }
+            else
+                CHECK(sameColony(semantic.colonies[i], original.colonies[i]));
+            CHECK(semantic.colonies[i].alliance == original.colonies[i].alliance);
+            CHECK(semantic.colonies[i].controller == original.colonies[i].controller);
+        }
+        CHECK(screen.setup.mapRevision == original.mapRevision);
+        CHECK(screen.gameHeader.getBuildingCatalogSnapshot() == catalog);
+        CHECK(screen.commonAISelection() == nicowar);
+
+        // The ordinary popup/keyboard path must apply exactly the same model edit.
+        screen.setup = original;
+        host.invalidate(); host.layoutIfNeeded();
+        const auto point = host.bounds("players/ai").center();
+        for (auto type : {SDL_EVENT_MOUSE_BUTTON_DOWN, SDL_EVENT_MOUSE_BUTTON_UP})
+        {
+            SDL_Event event{}; event.type = type; event.button.button = SDL_BUTTON_LEFT;
+            event.button.x = point.x; event.button.y = point.y;
+            host.event(event);
+        }
+        REQUIRE(host.popupOpen());
+        auto key = [&](SDL_Keycode code)
+        { SDL_Event event{}; event.type = SDL_EVENT_KEY_DOWN; event.key.key = code; host.event(event); };
+        key(SDLK_HOME);
+        for (int i = 0; i < nicowar; ++i) key(SDLK_DOWN);
+        key(SDLK_RETURN);
+        REQUIRE_FALSE(host.popupOpen());
+        for (int i = 0; i < Team::MAX_COUNT; ++i)
+            CHECK(sameColony(screen.setup.colonies[i], semantic.colonies[i]));
+
+        screen.setup = original;
+        REQUIRE(screen.setup.setController(2, CustomGameSetup::Shared));
+        screen.selectAIForComputers(nicowar);
+        CHECK(screen.setup.colonies[2].controller == CustomGameSetup::Shared);
+        CHECK(screen.setup.colonies[2].ai == AI::NICOWAR);
+        CHECK(screen.setup.colonies[3].ai == original.colonies[3].ai);
+        screen.setup = original;
+
+        // Community strategies use the existing per-colony identity selection.
+        screen.aiStorage = std::make_unique<Online::MemoryStorage>();
+        screen.aiLibrary = std::make_unique<Script::Library>(*screen.aiStorage);
+        const auto id = screen.aiLibrary->put(
+            "export function metadata(){return {apiVersion:2,name:'Bulk fixture'}} "
+            "export function step(){}", "bulk-fixture.js");
+        const int custom = int(AINames::selectionOrder().size());
+        screen.selectAIForComputers(custom);
+        for (int i : {1, 2})
+        {
+            CHECK(screen.setup.colonies[i].ai == AI::JAVASCRIPT);
+            CHECK(screen.setup.colonies[i].aiLibraryId == id);
+        }
+        CHECK(screen.commonAISelection() == custom);
+        host.invalidate(); host.layoutIfNeeded();
+        auto revisionOf = [](const SurfaceSnapshot &surface, const std::string &key)
+        {
+            std::function<std::uint64_t(const std::vector<ControlSnapshot> &)> find;
+            find = [&](const auto &controls) -> std::uint64_t
+            {
+                for (const auto &control : controls)
+                {
+                    if (control.key == key) return control.revision;
+                    if (const auto revision = find(control.children)) return revision;
+                }
+                return 0;
+            };
+            return find(surface.controls);
+        };
+        const auto oldCatalog = host.inspect();
+        screen.aiLibrary->put(
+            "export function metadata(){return {apiVersion:2,name:'Bulk fixture'}} "
+            "export function step(){} // changed source, identical visible name", "bulk-fixture.js", id);
+        host.invalidate(); host.layoutIfNeeded();
+        const auto replacedCatalog = host.inspect();
+        CHECK(revisionOf(oldCatalog, "players/ai") != revisionOf(replacedCatalog, "players/ai"));
+        CHECK(revisionOf(oldCatalog, "colony/1/ai") != revisionOf(replacedCatalog, "colony/1/ai"));
+        auto stale = semanticDispatch();
+        stale->surface = oldCatalog.instance; stale->key = "players/ai";
+        stale->revision = revisionOf(oldCatalog, "players/ai");
+        stale->action = {ActionKind::Select, nicowar};
+        host.event(stale->event());
+        CHECK(stale->consumed); CHECK_FALSE(stale->error.empty());
+        CHECK(screen.setup.colonies[1].ai == AI::JAVASCRIPT);
+        // Changing the bulk action's subjects also retires the previous target,
+        // even when every displayed choice still has the same value and label.
+        screen.setup.colonies[3].controller = CustomGameSetup::Computer;
+        screen.setup.colonies[3].ai = AI::JAVASCRIPT;
+        screen.setup.colonies[3].aiLibraryId = id;
+        host.invalidate(); host.layoutIfNeeded();
+        CHECK(revisionOf(host.inspect(), "players/ai") != revisionOf(replacedCatalog, "players/ai"));
+        screen.setup.colonies[3] = original.colonies[3];
+        const auto community = screen.setup;
+        screen.frozenAIs["unchanged"] = "frozen source";
+        screen.selectAIForComputers(custom + 1);
+        for (int i = 0; i < Team::MAX_COUNT; ++i)
+            CHECK(sameColony(screen.setup.colonies[i], community.colonies[i]));
+        CHECK(screen.frozenAIs.at("unchanged") == "frozen source");
+        screen.forRoom = true;
+        screen.selectAIForComputers(custom); // Community choices are not offered in rooms.
+        CHECK(screen.frozenAIs.at("unchanged") == "frozen source");
+        screen.forRoom = false;
+
+        for (auto [width, height, scale, touch] :
+             {std::tuple{1280, 1024, 1.0, false}, std::tuple{640, 480, 1.0, false},
+              std::tuple{390, 844, 1.0, true}, std::tuple{844, 390, 1.0, true},
+              std::tuple{1280, 1024, 1.5, false}})
+        {
+            screen.setup = original;
+            const auto presentation = Presentation::forSurface(width, height, scale, touch);
+            host.setPresentation(presentation); host.invalidate(); host.layoutIfNeeded();
+            const auto bounds = host.bounds("players/ai");
+            CHECK_FALSE(bounds.empty());
+            CHECK(presentation.viewport.contains(bounds));
+            REQUIRE(host.act("players/ai", {ActionKind::Select, nicowar}, error));
+            CHECK(screen.commonAISelection() == nicowar);
+        }
+        screen.setup.colonies[1].controller = CustomGameSetup::Closed;
+        screen.setup.colonies[2].controller = CustomGameSetup::Closed;
+        host.invalidate(); host.layoutIfNeeded();
+        CHECK(screen.commonAISelection() == -2);
+        CHECK_FALSE(host.find("players/ai"));
+    }
+
     static void catalogExperimentsInPreview()
     {
         glob2test::HeadlessGame world({.teams=2, .header=true});
@@ -100,7 +269,7 @@ struct CustomGameSetupHarness
             CHECK(screen.getGameHeader().getExperiments().has("preview-building"));
             CHECK(screen.getGameHeader().getBuildingCatalogSnapshot() == world.game.buildingsTypes.snapshotJson());
         }
-        REQUIRE(screen.loadMap((glob2test::sourceRoot() / "maps/FourSquares1.map.gz").string()));
+        REQUIRE(screen.loadMap((glob2test::contentRoot() / "maps/FourSquares1.map.gz").string()));
         CHECK_FALSE(screen.getGameHeader().getExperiments().has("preview-building"));
         globalContainer->settings.experiments.clear();
     }
@@ -157,9 +326,18 @@ struct CustomGameSetupHarness
         world.gui.prepareLocalPresentation(scene);
         world.gui.setPublishedScene(&scene);
         globalContainer->liveSpectating = true;
-        world.gui.measurementPage = world.gui.statisticsPages() - 1;
+        world.gui.statistics().selectTopic(InGameStatisticsPanel::Topic::World);
         globalContainer->gfx->drawFilledRect(0, 0, 640, 480, 0, 0, 32);
-        world.gui.drawStatisticsPage(195);
+        // Use the same host and sidebar geometry as the production HUD.
+        const auto bounds = world.gui.statisticsBounds();
+        REQUIRE(bounds.w > 0);
+        REQUIRE(bounds.h > 0);
+        REQUIRE(bounds.x >= 0);
+        REQUIRE(bounds.y >= 0);
+        REQUIRE(bounds.right() <= globalContainer->gfx->getW());
+        REQUIRE(bounds.bottom() <= globalContainer->gfx->getH());
+        REQUIRE(world.gui.statisticsHost().root());
+        world.gui.drawStatisticsPanel();
         const auto path = glob2test::artifactDir() / "probability-sixteen-colonies.png";
         REQUIRE(IMG_SavePNG(globalContainer->gfx->getSDLSurface(), path.string().c_str()));
         globalContainer->liveSpectating = false;
@@ -171,8 +349,11 @@ struct CustomGameSetupHarness
         GAGGUI::ScreenStack stack(*globalContainer->gfx);
         CustomGameScreen screen(stack);
         screen.beginExecution(globalContainer->gfx);
-        auto fields=screen.colonyFields(0,screen.presentation());
-        fields.controller->tap({},screen.host());
+        screen.selectTab(1);
+        screen.host().layoutIfNeeded();
+        auto* controller=screen.host().find("colony/0/controller");
+        REQUIRE(controller);
+        controller->tap({},screen.host());
         REQUIRE(screen.host().popupOpen());
         std::string text;
         std::function<void(GAGGUI::ui::Node*)> collect=[&](auto* node) {
@@ -227,7 +408,6 @@ struct CustomGameSetupHarness
 		original.librarySelection[0] = "maps/FourSquares1.map";
 		original.librarySelection[1] = original.setup.premadeMap;
 		original.expanded[0] = original.expanded[2] = true;
-		original.landscapeSortOrder = 1;
 		// Crater Lakes is one of the four modern height-map generators that
 		// still exposes a "repeat landscape" control; Old Islands (the prior
 		// choice) has no repeat option in the modular registry, so it would
@@ -249,7 +429,13 @@ struct CustomGameSetupHarness
 		REQUIRE((restored.decode(encoded) && restored.encode() == encoded));
 		checkExtraRules(restored.setup);
 		REQUIRE(restored.setup.mapRevision == 0);
-		REQUIRE(restored.landscapeSortOrder == 1);
+		// A retired Random preference still loads without changing the rest of the draft.
+		auto randomSorted = encoded;
+		const auto pickerAt = randomSorted.find("picker 1\n");
+		REQUIRE(pickerAt != std::string::npos);
+		randomSorted.replace(pickerAt, 9, "picker 0\n");
+		REQUIRE(restored.decode(randomSorted));
+		REQUIRE(restored.encode() == encoded);
 		// Versions 1–7 predate the custom-generator identity row. Synthesized
 		// historical fixtures must omit it, rather than only changing the header.
 		const auto previousFormat = [&](int version)
@@ -315,7 +501,7 @@ struct CustomGameSetupHarness
 				old.replace(old.find("nbTeams 16"), 10, "nbTeams 12");
 			}
 			CustomGamePreferences fromOld;
-			REQUIRE((fromOld.decode(old) && fromOld.landscapeSortOrder == (version == 1 ? 0 : 1)));
+			REQUIRE(fromOld.decode(old));
 			REQUIRE(fromOld.setup.winProbabilityPermille == 0);
 			REQUIRE(fromOld.setup.premadeMap == original.setup.premadeMap);
 			REQUIRE(fromOld.setup.colonies[3].aiLibraryId.empty());
@@ -424,7 +610,7 @@ struct CustomGameSetupHarness
 		original.setup.random = true;
 		original.setup.generatorHistory.select(original.setup.generator, fjord);
 		auto &g = original.setup.generator;
-		g.options["lake-connected"] = 1;
+		g.options["nunataks"] = 0;
 		g.options["resource-islands"] = 7;
 		g.options["lake-size"] = 50;
 		original.setup.capacity = g.nbTeams;
@@ -451,63 +637,140 @@ struct CustomGameSetupHarness
 		};
 		REQUIRE(restored.decode(withOption("retired-option 5")));
 		REQUIRE((restored.setup.generator.options == g.options && restored.encode() == encoded));
-		for (const char *corrupt : {"lake-connected 2", "resource-islands 21", "coast-roughness -1"})
+		for (const char *corrupt : {"nunataks 2", "resource-islands 21", "coast-roughness -1"})
 		{
 			REQUIRE(!restored.decode(withOption(corrupt)));
 			REQUIRE(restored.encode() == encoded);
 		}
-		REQUIRE(!restored.decode(encoded.substr(0, at) + "options 3\nlake-connected 1\n" +
+		REQUIRE(!restored.decode(encoded.substr(0, at) + "options 3\nnunataks 1\n" +
 								encoded.substr(end)));
 		std::cout << "PASS preferences keep every generator option, and older files still load\n";
 	}
-	// FEEDBACK 2026-09-17, in two parts. First: "'random' isn't actually randomizing the order...
-	// I want it to be dynamically random" - Random must not be a fixed order that looks shuffled
-	// once (the registry's own catalog order, which used to be exactly what Random fell through
-	// to) and then repeats identically forever. Second, refining that fix once it was tried in
-	// the UI: "I don't like how the random order changes sometimes while I'm using the UI...
-	// randomized once when the app starts and then stays consistent for the duration of
-	// execution" - so the permutation itself must be a real shuffle (not the untouched catalog
-	// order), but two sheets built in the same process run must land on the SAME order as each
-	// other, not a fresh one each time; only a relaunch (a new process) draws again.
-	static void landscapeRandomOrder()
+	static void landscapeAlphabeticalOrder(bool display = false)
 	{
-		std::vector<LandscapePickerScreen::Entry> shown;
-		for (int method : GeneratorRegistry::builtins().methods(false))
+		GenerationRequest request;
+		request.method = -1; // These checks do not need generated previews.
+		// Display names can differ from catalog IDs and input order, including translations.
+		std::vector<LandscapePickerScreen::Entry> shown = {
+			{"Zulu", request, -1, {"terrain:dry"}},
+			{"Alpha", request, -1, {"terrain:wet"}},
+			{"Beta", request, -1, {"terrain:dry"}},
+			{"Alpha", request, -1, {"terrain:dry"}}};
+		LandscapePickerScreen first("Landscape", shown, 2);
+		LandscapePickerScreen second("Landscape", shown, 2);
+		REQUIRE(first.visible == std::vector<int>({1, 3, 2, 0}));
+		REQUIRE(first.visible == second.visible);
+		REQUIRE(first.selection() == 2);
+		first.filters[0] = "dry";
+		first.rebuild();
+		REQUIRE(first.visible == std::vector<int>({3, 2, 0}));
+		REQUIRE(first.selection() == 2);
+		first.filters[0].clear();
+		first.rebuild();
+		REQUIRE(first.visible == second.visible);
+		if (display)
 		{
+			first.beginExecution(globalContainer->gfx);
+			first.paintFrame(SDL_GetTicks());
+			REQUIRE(!first.host().find("landscape/sort"));
+			SDL_Event event{};
+			event.type = SDL_EVENT_KEY_DOWN;
+			event.key.key = SDLK_RIGHT;
+			first.handleExecutionEvent(event);
+			REQUIRE(first.selection() == 0); // Beta -> Zulu in display order.
+			event.key.key = SDLK_LEFT;
+			first.handleExecutionEvent(event);
+			REQUIRE(first.selection() == 2);
+			first.paintFrame(SDL_GetTicks());
+			const auto path = glob2test::artifactDir() / "alphabetical-picker.bmp";
+			globalContainer->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory() + "/alphabetical-picker.bmp");
+			globalContainer->gfx->nextFrame();
+			REQUIRE(std::filesystem::exists(path));
+			first.endExecute(0);
+			first.finishExecution();
+		}
+		std::cout << "PASS landscape picker sorts display names consistently and preserves selection through filtering\n";
+	}
+	// Landscapes these settings rule out leave the grid for a collapsed trailing group, decided
+	// up front; each offers the nearest shared settings that make it valid, and taking them puts
+	// it back in the grid, selected.
+	static void landscapeUnavailableGroup(bool display = false)
+	{
+		// A few landscapes keep the up-front checks quick in a debug build; Symmetric arena and
+		// The Comb cannot seat 6 colonies, the others can.
+		std::vector<LandscapePickerScreen::Entry> shown;
+		for (const char *id : {"symmetric-arena", "comb", "contested-commons", "savannah", "swamp"})
+		{
+			const int method = GeneratorRegistry::builtins().idOf(id);
 			GenerationRequest request;
 			request.setMethodDefaults(method);
-			shown.push_back({GenerationRequest::methodName(method), request, method});
+			request.wDec = request.hDec = 8;
+			request.nbTeams = 6;
+			shown.push_back({GenerationRequest::methodName(method), request, method, {}});
 		}
-		std::vector<int> identity(shown.size());
-		std::iota(identity.begin(), identity.end(), 0);
-		LandscapePickerScreen first("Landscape", shown, 0);
-		LandscapePickerScreen second("Landscape", shown, 0);
-		REQUIRE((first.sortOrder == LandscapePickerScreen::SortOrder::Random &&
-			  second.sortOrder == LandscapePickerScreen::SortOrder::Random));
-		// A real shuffle, not the untouched catalog order left alone...
-		REQUIRE(first.visible != identity);
-		// ...but the SAME shuffle every time within this one process run, however many sheets are
-		// opened - the process-lifetime permutation this fix's refinement asked for.
-		REQUIRE(first.visible == second.visible);
-		// Touching a filter must not redraw it either: narrowing still respects the one order
-		// this run drew, just with the excluded entries missing from it.
-		LandscapePickerScreen third("Landscape", shown, 0);
-		if (!third.filterCategories.empty())
+		LandscapePickerScreen opened("Landscape", shown, 0);
+		REQUIRE(opened.unavailableShown()); // Symmetric arena, the current one, is ruled out.
+		LandscapePickerScreen picker("Landscape", shown, 2);
+		REQUIRE(picker.visible.size() + picker.unavailable.size() == shown.size());
+		REQUIRE(picker.unavailable.size() == 2);
+		REQUIRE(!picker.unavailableShown());
+		for (int i : picker.visible)
+			REQUIRE(picker.incompatible[std::size_t(i)].empty());
+		if (display)
 		{
-			third.filters[0] = "does-not-exist";
-			third.rebuild();
-			third.filters[0].clear();
-			third.rebuild();
+			// Rolls the compatible previews, opens the group and captures it with the grid above.
+			picker.beginExecution(globalContainer->gfx);
+			const Uint32 deadline = SDL_GetTicks() + 120000;
+			do
+			{
+				REQUIRE(Sint32(SDL_GetTicks() - deadline) < 0);
+				SDL_Delay(10);
+				picker.onTimer(SDL_GetTicks());
+				picker.paintFrame(SDL_GetTicks());
+			} while (picker.busy() || !picker.presentationSettled());
+			REQUIRE(picker.host().find("landscape/unavailable"));
+			REQUIRE(!picker.host().find("landscape/fix/" + std::to_string(picker.unavailable.front())));
+			globalContainer->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory() + "/landscape-unavailable-closed.bmp");
+			globalContainer->gfx->nextFrame();
+			picker.setUnavailableShown(true);
+			picker.paintFrame(SDL_GetTicks());
+			picker.host().scrollIntoView("landscape/fix/" + std::to_string(picker.unavailable.back()));
+			picker.paintFrame(SDL_GetTicks());
+			REQUIRE(picker.host().find("landscape/fix/" + std::to_string(picker.unavailable.front())));
+			globalContainer->gfx->printScreen(glob2test::artifactDirFromWorkingDirectory() + "/landscape-unavailable-open.bmp");
+			globalContainer->gfx->nextFrame();
+			picker.endExecute(LandscapePickerScreen::CANCEL);
+			picker.finishExecution();
 		}
-		REQUIRE(third.visible == first.visible);
-		// Alphabetical stays the deterministic alternative: same entries, same order, every time.
-		LandscapePickerScreen sortedA("Landscape", shown, 0,
-									  LandscapePickerScreen::SortOrder::Alphabetical);
-		LandscapePickerScreen sortedB("Landscape", shown, 0,
-									  LandscapePickerScreen::SortOrder::Alphabetical);
-		REQUIRE(sortedA.visible == sortedB.visible);
-		std::cout << "PASS landscape picker Random order is a real shuffle drawn once per process "
-					 "run, Alphabetical stays stable\n";
+		int fixable = -1, unfixable = 0;
+		for (int i : picker.unavailable)
+		{
+			INFO(shown[std::size_t(i)].name);
+			REQUIRE(!picker.incompatible[std::size_t(i)].empty());
+			if (!picker.settingsFix(i))
+				++unfixable;
+			else if (fixable < 0 && picker.settingsFix(i)->changes.size() == 1)
+				fixable = i;
+		}
+		REQUIRE(fixable >= 0);
+		REQUIRE(unfixable == 0);
+		// The Comb seats at most 4 colonies at 256 x 256 but 8 at 512 x 512: one size step beats
+		// two colony steps, and a size fix keeps the map square.
+		const int comb = 1;
+		REQUIRE(picker.settingsFix(comb));
+		REQUIRE(picker.settingsFix(comb)->changes == std::vector<std::pair<std::string, int>>({{"width", 9}, {"height", 9}}));
+		const auto fix = *picker.settingsFix(fixable);
+		const std::size_t ruledOut = picker.unavailable.size();
+		REQUIRE(!fix.label.empty());
+		picker.applySettingsFix(fixable);
+		REQUIRE(picker.selection() == fixable);
+		REQUIRE(std::find(picker.visible.begin(), picker.visible.end(), fixable) != picker.visible.end());
+		REQUIRE(picker.incompatible[std::size_t(fixable)].empty());
+		REQUIRE(picker.sharedTeams() == fix.changes.front().second);
+		std::cout << "PASS " << shown.size() - ruledOut << " of " << shown.size()
+				  << " landscapes fit 256 x 256 with 6 colonies; " << unfixable
+				  << " ruled out with no single-setting fix; \"" << fix.label << "\" restores "
+				  << shown[std::size_t(fixable)].name << "\n";
 	}
 	static void previewPriority()
 	{
@@ -618,8 +881,7 @@ struct CustomGameSetupHarness
 			request.method = -1; // Finish cheaply; results are replaced with the fixture below.
 			entries.push_back({"Landscape " + std::to_string(100 + i), request});
 		}
-		LandscapePickerScreen picker("Landscape", entries, 0,
-									 LandscapePickerScreen::SortOrder::Alphabetical);
+		LandscapePickerScreen picker("Landscape", entries, 0);
 		picker.beginExecution(globalContainer->gfx);
 		picker.paintFrame(0);
 		while (picker.busy())
@@ -693,6 +955,29 @@ struct CustomGameSetupHarness
 		}
 		picker.endExecute(0);
 		picker.finishExecution();
+	}
+
+	static void translatedMapModesFit()
+	{
+		GAGGUI::ScreenStack screens(*globalContainer->gfx);
+		CustomGameScreen screen(screens);
+		screen.beginExecution(globalContainer->gfx);
+		for (bool random : {true, false})
+		{
+			screen.setMapMode(random);
+			screen.paintFrame(SDL_GetTicks());
+			const auto pane = screen.host().bounds("lobby/map");
+			CHECK(pane.w > 0);
+			for (const char *key : {"map/mode/0", "map/mode/1"})
+			{
+				const auto button = screen.host().bounds(key);
+				CHECK(button.w > 0);
+				CHECK(button.x >= pane.x);
+				CHECK(button.x + button.w <= pane.x + pane.w);
+			}
+		}
+		screen.endExecute(0);
+		screen.finishExecution();
 	}
 
 	static void preferencesScreen(bool write)
@@ -1527,26 +1812,26 @@ struct CustomGameSetupHarness
     {
       auto &options = screen.setup.generator.options;
       const auto revision = screen.setup.mapRevision;
-      REQUIRE(options["lake-connected"] == 0);
-      clickControl("generator/lake-connected");
-      REQUIRE((options["lake-connected"] == 1 && screen.setup.mapRevision != revision &&
+      REQUIRE(options["nunataks"] == 1);
+      clickControl("generator/nunataks");
+      REQUIRE((options["nunataks"] == 0 && screen.setup.mapRevision != revision &&
              !screen.validMap && screen.previewPending));
-      REQUIRE(host.focused() == "generator/lake-connected");
-      host.focus("generator/lake-connected", true);
+      REQUIRE(host.focused() == "generator/nunataks");
+      host.focus("generator/nunataks", true);
       keyEvent(SDLK_SPACE);
-      REQUIRE(options["lake-connected"] == 0);
+      REQUIRE(options["nunataks"] == 1);
       keyEvent(SDLK_RETURN);
-      REQUIRE(options["lake-connected"] == 1);
+      REQUIRE(options["nunataks"] == 0);
       // Tab walks off the checkbox and Shift+Tab back onto it, like any other control.
       keyEvent(SDLK_TAB);
-      REQUIRE(host.focused() != "generator/lake-connected");
+      REQUIRE(host.focused() != "generator/nunataks");
       keyEvent(SDLK_TAB, SDL_KMOD_SHIFT);
-      REQUIRE(host.focused() == "generator/lake-connected");
+      REQUIRE(host.focused() == "generator/nunataks");
       preview();
       REQUIRE(screen.validMap);
       capture("map-checkboxes");
-      clickControl("generator/lake-connected");
-      REQUIRE(options["lake-connected"] == 0);
+      clickControl("generator/nunataks");
+      REQUIRE(options["nunataks"] == 1);
     }
     landscape(MapGenerationDescriptor::eRIVER);
 
@@ -1669,6 +1954,7 @@ struct CustomGameSetupHarness
       auto pickerPaint = [&] { picker.paintFrame(SDL_GetTicks()); };
       REQUIRE((picker.previewer.threadCount() == 2 && picker.busy()));
       pickerPaint(); // placeholders while every tile is still pending
+      REQUIRE(!pickerHost.find("landscape/sort"));
       globalContainer->gfx->printScreen(output + "/landscape-picker-pending.bmp");
       // Cards in view roll first, and scrolling the grid moves that eligible set with it.
       picker.updatePreviewPriority();
@@ -1752,6 +2038,12 @@ struct CustomGameSetupHarness
       auto seedsShown = [&] {
         std::vector<std::uint32_t> seeds;
         for (const auto &tile : picker.tiles) {
+            const auto slot = std::size_t(&tile - picker.tiles.data());
+            INFO("landscape=" << shown[slot].name << " slot=" << slot
+                 << " rootSeed=" << picker.previewer.seeds[slot]
+                 << " state=" << int(tile.preview.state) << " size=" << tile.preview.width
+                 << "x" << tile.preview.height << " colonies=" << tile.preview.starts.size()
+                 << " diagnostic=" << tile.preview.detail);
 			REQUIRE((tile.preview.state == LandscapePreviewer::State::Ready &&
 				   tile.preview.width == 256 && tile.preview.height == 256 &&
 				   tile.preview.starts.size() == 4));
@@ -1829,7 +2121,7 @@ struct CustomGameSetupHarness
         REQUIRE(scrolled);
       }
       // Keyboard navigation follows the displayed sort/filter order, not the
-      // registry identity of a landscape (these differ in Random order).
+      // registry identity of a landscape.
       const auto position = std::find(picker.visible.begin(), picker.visible.end(), other);
       REQUIRE(position != picker.visible.end());
       const int left = std::max(0, int(position - picker.visible.begin()) - 1);
@@ -2128,7 +2420,24 @@ struct CustomGameSetupHarness
 		REQUIRE(parsed);
 		REQUIRE_MESSAGE(errors.empty(), (errors.empty() ? std::string() : errors.front()));
 		const auto &catalog = RulesetCatalog::shipped();
-		REQUIRE((catalog.rulesets.size() == parsed->rulesets.size() && catalog.rulesets.size() == 13));
+		REQUIRE(catalog.rulesets.size() == parsed->rulesets.size());
+		// Every ruleset the file declares loads, once, so none is silently dropped.
+		{
+			std::string text;
+			GAGCore::InputLineStream lines(Toolkit::getFileManager()->openInputStreamBackend(RulesetCatalog::filename));
+			while (!lines.isEndOfStream())
+				text += lines.readLine() + "\n";
+			const auto declared = nlohmann::json::parse(text).at("rulesets");
+			REQUIRE(catalog.rulesets.size() == declared.size());
+			std::set<std::string> ids;
+			for (const auto &entry : declared)
+			{
+				const std::string id = entry.at("id").get<std::string>();
+				INFO(id);
+				REQUIRE(ids.insert(id).second);
+				REQUIRE(catalog.find(id));
+			}
+		}
 		REQUIRE((catalog.standard().id == "standard" && catalog.standard().values.empty()));
 		std::set<const Rule *> used;
 		for (const auto &ruleset : catalog.rulesets)
@@ -2289,7 +2598,19 @@ struct CustomGameSetupHarness
 		REQUIRE((s.controllerCount() == Team::MAX_COUNT && !s.humanColony()));
 		// Only watching: one against all leaves the first colony alone, and every equal split
 		// of the sixteen colonies is offered.
-		REQUIRE(TeamLayout::offered(s.activeColonies()).size() == 11);
+		{
+			const int n = s.activeColonies();
+			std::vector<TeamLayout::Layout> expected{TeamLayout::Layout{TeamLayout::Layout::FreeForAll, {}, -1}};
+			for (int small = n / 2; small >= 1; --small)
+				expected.push_back(TeamLayout::Layout{TeamLayout::Layout::Split, {small, n - small}, -1});
+			for (int size = 2; size * 3 <= n; ++size)
+				if (n % size == 0)
+					expected.push_back(TeamLayout::Layout{TeamLayout::Layout::Split, std::vector<int>(std::size_t(n / size), size), -1});
+			const auto offered = TeamLayout::offered(n);
+			REQUIRE(offered.size() == expected.size());
+			for (const auto &layout : expected)
+				REQUIRE(std::count(offered.begin(), offered.end(), layout) == 1);
+		}
 		REQUIRE(s.applyTeamLayout(TeamLayout::Layout{TeamLayout::Layout::Split, {1, 15}, -1}));
 		REQUIRE((s.teamLayout().oneVsAll() && s.loneColony(s.teamLayout()) == 0));
 		REQUIRE(std::string(s.legacyFormat()) == "Custom teams");
@@ -2384,7 +2705,7 @@ struct CustomGameSetupHarness
 									("glob2-live-test-" + std::to_string(getpid()) + ".map"))
 									   .string();
 			const std::string transient = glob2IsGzipPath(resolvedMap) ? glob2GzipWritePath(transientBase) : transientBase;
-			std::filesystem::copy_file(glob2test::sourceRoot() / resolvedMap, transient,
+			std::filesystem::copy_file(glob2test::contentRoot() / resolvedMap, transient,
 									   std::filesystem::copy_options::overwrite_existing);
 			Engine e;
 			auto header = Engine::loadMapHeader(transient);
@@ -2524,13 +2845,49 @@ static void commonChecks()
 	Toolkit::getFileManager()->remove(CustomGamePreferences::filename);
 	CustomGameSetupHarness::preferencesModel();
 	CustomGameSetupHarness::preferencesOptions();
-	CustomGameSetupHarness::landscapeRandomOrder();
+	CustomGameSetupHarness::landscapeAlphabeticalOrder();
 	CustomGameSetupHarness::previewPriority();
 	REQUIRE(NET_Init());
 }
 
 TEST_SUITE("CustomGameSetup")
 {
+	TEST_CASE("landscape alphabetical layout and navigation [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(setupOptions(true));
+		CustomGameSetupHarness::landscapeAlphabeticalOrder(true);
+	}
+	TEST_CASE("landscape alphabetical order and retired sorting preferences" * glob2test::needs({"generators"}))
+	{
+		glob2test::HeadlessGlobals globals(setupOptions(false));
+		CustomGameSetupHarness::preferencesModel();
+		CustomGameSetupHarness::landscapeAlphabeticalOrder();
+	}
+	TEST_CASE("landscapes ruled out by the sheet's settings collapse into a fixable group" * glob2test::needs({"generators"}))
+	{
+		glob2test::HeadlessGlobals globals(setupOptions(false));
+		CustomGameSetupHarness::landscapeUnavailableGroup();
+	}
+	TEST_CASE("landscape unavailable group capture [display:1000x700][artifacts]" * glob2test::needs({"generators"}))
+	{
+		glob2test::HeadlessGlobals globals(setupOptions(true, true));
+		CustomGameSetupHarness::landscapeUnavailableGroup(true);
+	}
+
+	TEST_CASE("Telugu map mode buttons fit the desktop map pane [display:800x600][writes-preferences]")
+	{
+		auto options = setupOptions(true, false, "te");
+		options.width = 800;
+		options.height = 600;
+		glob2test::HeadlessGlobals globals(options);
+		CustomGameSetupHarness::translatedMapModesFit();
+	}
+    TEST_CASE("bulk AI choice shares semantic and human behavior and preserves excluded colonies")
+    {
+        glob2test::HeadlessGlobals globals(setupOptions(false));
+        CustomGameSetupHarness::bulkAIChoice();
+    }
+
     TEST_CASE("map previews retain embedded experimental catalogs through cache hits")
     {
         glob2test::HeadlessGlobals globals(setupOptions(false));
@@ -2574,7 +2931,7 @@ TEST_SUITE("CustomGameSetup")
         CustomGameSetupHarness::catalogLaunch();
     }
 
-	TEST_CASE("custom AI library identities and released preferences round trip")
+	TEST_CASE("custom AI library identities and released preferences round trip" * glob2test::needs({"generators"}))
 	{
 		glob2test::HeadlessGlobals globals(setupOptions(false));
 		CustomGameSetupHarness::preferencesModel();
@@ -2608,10 +2965,17 @@ TEST_SUITE("CustomGameSetup")
 	CustomGameSetupHarness::rulesets();
 	const auto &selection = AINames::selectionOrder();
 	REQUIRE(selection.back() == AI::NONE);
-	REQUIRE((std::set<int>(selection.begin(), selection.end()) ==
-		std::set<int>{AI::ECONO, AI::NUMBI, AI::WARRUSH, AI::CASTOR, AI::CORTEX,
-			AI::CABINO, AI::NICOWAR, AI::MAXIMA, AI::NONE}));
-	REQUIRE(selection.size() == 9);
+	// Every built-in AI this build registers is offered exactly once, and nothing else.
+	// Scripted AIs are chosen from the AI library instead.
+	std::size_t builtins = 0;
+	for (int id = 0; id < AI::SIZE; ++id)
+	{
+		INFO(id);
+		const bool builtin = id != AI::JAVASCRIPT && AIRegistry::available(id);
+		REQUIRE(std::count(selection.begin(), selection.end(), id) == (builtin ? 1 : 0));
+		builtins += builtin;
+	}
+	REQUIRE(selection.size() == builtins);
 	for (size_t i = 1; i + 1 < selection.size(); ++i)
 		REQUIRE(AINames::getAIStrength(selection[i-1]) <= AINames::getAIStrength(selection[i]));
 	for (int id : selection)
@@ -2752,7 +3116,7 @@ TEST_SUITE("CustomGameSetup")
 		std::cout << "PASS preview restart joins superseded workers safely\n";
 	}
 #if defined(__APPLE__) || defined(__linux__)
-	TEST_CASE("Comb preview fits a 512 KiB worker stack")
+	TEST_CASE("Comb preview fits a 512 KiB worker stack" * glob2test::needs({"generators"}))
 	{
 		glob2test::HeadlessGlobals globals(setupOptions(false));
 		struct Work

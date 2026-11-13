@@ -26,9 +26,9 @@ those experiments in their header like any map that contains them.
 | Signature | Construction |
 | --- | --- |
 | Golden grass with lone and dead trees | Tall grass over the dry plain in noise-ranked sweeps, thinning to scrub; trees, small clumps and dead trees dotted on it |
-| Red earth | Every crop plot is sealed in dirt and clay instead of sand; dry patches become clay pans with gravel |
+| Red earth | Every crop plot is sealed in clay instead of sand; dry patches become clay pans |
 | Kopjes | A ridge-rock core with stone on its flanks, skirted by scree |
-| Watering holes and game trails | Larger neutral ponds with a deep centre, a mud ring (maize holes) or sand bank (rice holes), fish in the shallows; dirt tracks from each home's approaches to the nearest hole |
+| Watering holes and game trails | Larger neutral ponds with a deep centre, a mud ring (maize holes) or sand bank (rice holes), fish in the shallows; brick paths from each home's approaches to the nearest hole |
 
 ## Controls and supported requests
 
@@ -38,7 +38,7 @@ those experiments in their header like any map that contains them.
 | Dry patches | 0–20%, step 1 | 8% | Share of eligible plains vertices turned into clay pans, outside home, approach and feature reservations. This excludes plot seals and beaches. |
 | Grassland | 0–100%, step 5 | 70% | Share of the dry plain under tall grass; a further eighth of it, thinned, is scrub. |
 | Kopjes | Few / Normal / Many | Normal | Share of plain features that are kopjes: 15 / 25 / 40%. |
-| Game trails | On / off | On | Dirt tracks along each approach and on to the nearest watering hole. |
+| Game trails | On / off | On | Brick paths along each approach and on to the nearest watering hole. |
 | Wheat, wood, stone, algae, fruit, fish, camp-site amounts | 0–300%, step 25 | 100% | Additional deposits; exact tile counts saturate when eligible plots fill. Wheat also scales maize, rice and potatoes. |
 
 Sides are existing power-of-two sizes **128, 256, 512**, square or rectangles up to
@@ -89,16 +89,16 @@ operations explain their units; the evidence section records actual verification
   therefore a play constraint, even when static gathering paths say more wheat is
   reachable. Both plots fit the radius-23 reservation and leave the western approaches
   clear. The radius-two quarry sits 18 tiles east.
-- **Seals:** every plot is ringed by two corner rows of dirt (stretches of it clay, on
-  noise). Barren earth stops growth and inhibits the water probe exactly as sand did,
+- **Seals:** every plot is ringed by two corner rows of barren earth, drawn as clay like
+  every barren corner on the map. Barren earth stops growth and inhibits the water probe exactly as sand did,
   so the containment proof is unchanged, but a pure earth tile can carry a building.
   Kopje plots are sealed in scree instead.
 - **Algae:** one radius-one clump per 30 eligible pure-water tiles at 100%,
   scaled by abundance using the existing fertility-aware `seedAlgae` operation.
   It never creates water or changes land connectivity.
 - **Watering holes:** radius 6.5, 25% ripple, with vertices three or more steps inside
-  the shallows turned to deep water (no algae or fish grow there; a tile mixing shallow
-  and deep corners is neither walkable nor swimmable, which only matters inside the pond).
+  the shallows turned to deep water (no algae or fish grow there). Mixed shallow/deep
+  cells remain swimmable, with an averaged movement speed.
   Crop plots radius five lie 11.5 tiles either side of the centre: one holds maize or rice
   (drawn per hole, 38 tiles at 100%, scaled by the wheat amount), the other wood (28).
   Three radius-two fruit plots lie on the local east side, 12 tiles out and seven apart,
@@ -120,7 +120,7 @@ operations explain their units; the evidence section records actual verification
   legal gap at seed 1001 on a 128×128 four-colony map; exhaustive eligibility removes
   that sampling failure without shrinking homes or rerolling the seed. A radius-19
   reservation plus a one-tile gap must fit clear of every home, approach and earlier hole.
-- **Game trails:** each approach carries a dirt track (fast, buildable, nothing grows)
+- **Game trails:** each approach carries a brick path (fast, buildable, nothing grows)
   from 18 tiles out to its end, and a trail runs on from the end to the rim of the
   nearest watering hole, bowed up to four tiles. Track is laid only on grass corners of
   no plot, never inside any home reservation but its own approach, and never inside a
@@ -136,8 +136,8 @@ operations explain their units; the evidence section records actual verification
   (the Kopjes share), a potato patch (15%) or a grove. A grove is radius three, seven
   wood at 100%, finite when dry. A potato patch is radius 3.5, eight potatoes at 100%:
   potatoes regrow without water, so the sealed patch is renewable food on the dry plain.
-  A kopje is a radius-four stone plot sealed in scree with a radius-2.2 ridge-rock and
-  outcrop core over its centre: four stone at 100% on its flanks, impassable rock that
+  A kopje is a radius-four stone plot sealed in scree with a radius-2.2 ridge-rock
+  core over its centre: four stone at 100% on its flanks, impassable rock that
   towers shoot over.
 - **Lone trees and camp-sites:** shared dart throwing with spacing 12 proposes tree
   sites outside every reservation and plot; each is a tree, a clump of two or three, or
@@ -152,7 +152,7 @@ operations explain their units; the evidence section records actual verification
   until cleared.
 - **Dry patches:** periodic noise with cell period 14 makes coherent patches instead
   of speckles. `sprinkleSand` ranks eligible vertices and keeps three steps from water;
-  the patches then become clay with gravel. Beaches are laid after all terrain
+  the patches then become clay. Beaches are laid after all terrain
   operations, and deep water after them. Plot eligibility is then trimmed to final
   pure-grass tiles; beaches and kopje cores may remove plot tiles, but starter floors
   are never reduced.
@@ -254,7 +254,7 @@ as well as maize holes.
 
 The source definition and its request/world validators define accepted settings and
 finished-map guarantees. Run the focused `MapGeneratorDefaults` contracts and the
-platform golden rows, inspect small/large rectangles and resource extremes, then
+sim-diff map fingerprints, inspect small/large rectangles and resource extremes, then
 check populated games with complete seat rotations. See [generator verification](verification.md)
 for commands, revisions, save/replay checks and evidence requirements.
 

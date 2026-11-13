@@ -1,5 +1,6 @@
 """Experiment planners. All execution goes through Coordinator."""
 import argparse
+import copy
 import itertools
 import json
 import random
@@ -9,11 +10,13 @@ from .analysis import POLICIES, reanalyze
 from .bundles import inspect_bundle
 from .common import atomic_json, digest, read_json
 from .coordinator import Coordinator
+from .jobs import DEFAULT_GAME_TICKS, win_probability_threshold
 from .model import generator_samples, grid, job, rotations, seeded_samples, validate_experiment
 
 
 class Planner:
     def __init__(self, kind, config, bundles):
+        config = copy.deepcopy(config)
         self.kind, self.config = kind, config
         self.bundles = {bundle['id']: bundle for bundle in bundles}
         self.builds = config.get('builds', list(self.bundles))
@@ -25,6 +28,18 @@ class Planner:
         self.jobs, self.maps = [], {}
         if config.get('parameter_domain', 'search') not in ('search', 'legal'):
             raise ValueError('parameter_domain must be search or legal')
+        if config.get('resource_claims', 'default') not in ('default', 'off'):
+            raise ValueError('resource_claims must be default or off')
+        if config.get('resource_claims') == 'default' and any('resource_claims_default' not in self.bundles[build]['capabilities'] for build in self.builds):
+            raise ValueError('build has no default resource-claim policy')
+        experiments = config.get('experiments', [])
+        if not isinstance(experiments, list) or any(not isinstance(key, str) or not key for key in experiments):
+            raise ValueError('experiments must be a list of experiment keys')
+        if experiments:
+            for build in self.builds:
+                known = self.bundles[build]['capabilities'].get('experiments')
+                if not isinstance(known, list) or set(experiments)-set(known):
+                    raise ValueError('requested experiments must exist in each pinned build catalog')
 
     def parameter_samples(self, build, method, count, seed):
         return generator_samples(self.bundles[build]['capabilities'], method, count, seed,
@@ -61,11 +76,16 @@ class Planner:
         config = self.config
         fmt = rng.choice(formats)
         n = 2 if fmt == '1v1' else 4
+        if fmt == 'ffa' and 'ffa_colonies' in config:
+            n = rng.choice(config['ffa_colonies'])
+        replacement = config.get('seat_sampling', 'distinct') == 'with_replacement'
         if fmt == '2v2':
-            a, b = rng.sample(ais, 2) if len(ais) >= 2 else (ais[0], ais[0])
+            a, b = ([rng.choice(ais), rng.choice(ais)] if replacement else
+                    rng.sample(ais, 2) if len(ais) >= 2 else (ais[0], ais[0]))
             players, alliances = [a, a, b, b], [1, 1, 2, 2]
         else:
-            players = rng.sample(ais, n) if len(ais) >= n else [rng.choice(ais) for _ in range(n)]
+            players = (rng.sample(ais, n) if not replacement and len(ais) >= n else
+                       [rng.choice(ais) for _ in range(n)])
             alliances = None
         method = rng.choice(methods)
         map_seed, game_seed = rng.getrandbits(32), rng.getrandbits(32)
@@ -82,11 +102,12 @@ class Planner:
                   'symmetric_control': method == 15, 'block': f'{method}:{map_seed}:{game_seed}'}
         value = job('game', build, seeds={'map': map_seed, 'game': game_seed},
                     config={'generator': method, 'params': params, 'candidates': config.get('candidates', 5),
-                            'players': players, 'ticks': config.get('ticks', 90000), 'ai_params': {},
+                            'players': players, 'ticks': config.get('ticks', DEFAULT_GAME_TICKS), 'ai_params': {},
                             **({'rules': config['rules']} if 'rules' in config else {}),
+                            **({'experiments': config['experiments']} if 'experiments' in config else {}),
+                            **({'resource_claims': config['resource_claims']} if 'resource_claims' in config else {}),
                             **({'alliances': alliances} if alliances else {}),
-                            **({'win_probability_permille': config['win_probability_permille']}
-                               if config.get('win_probability_permille') else {})},
+                            'win_probability_permille': win_probability_threshold(config)},
                     outputs=config.get('outputs', {}), limits={'timeout_seconds': config.get('timeout_seconds', 3600)},
                     labels=labels)
         self.jobs.append(value)
@@ -130,11 +151,12 @@ class Planner:
         value = job('game', build,
                     inputs={'map': {'job': generated['id'], 'artifact': f'map-r{rotation}.map.gz'}},
                     depends_on=[generated['id']], seeds={'game': seed},
-                    config={'players': players, 'ticks': config.get('ticks', 90000),
+                    config={'players': players, 'ticks': config.get('ticks', DEFAULT_GAME_TICKS),
                             'ai_params': overrides or {}, **({'alliances': alliances} if alliances else {}),
                             **({'rules': config['rules']} if 'rules' in config else {}),
-                            **({'win_probability_permille': config['win_probability_permille']}
-                               if config.get('win_probability_permille') else {})},
+                            **({'experiments': config['experiments']} if 'experiments' in config else {}),
+                            **({'resource_claims': config['resource_claims']} if 'resource_claims' in config else {}),
+                            'win_probability_permille': win_probability_threshold(config)},
                     outputs=config.get('outputs', {}), limits={'timeout_seconds': config.get('timeout_seconds', 3600)},
                     labels=labels)
         self.jobs.append(value)
@@ -195,16 +217,28 @@ class Planner:
         else:
             ais = config.get('ais') or [a['name'] for a in self.bundles[self.builds[0]]['capabilities']['ais'] if a['id'] != 0]
             if not ais: raise ValueError('AI comparison needs selectable active AIs')
-            # Ratings use the final game result. Keep the standard Elo sample
-            # lightweight so workers spend their capacity simulating duels rather
-            # than producing and transferring per-tick histories. Callers that
-            # need AI decision traces can still request telemetry explicitly.
+            # Automatic probability summaries travel in compact results. Full
+            # per-sample/AI logs remain optional and consume the storage budget.
             config.setdefault('outputs', {})
             # The standard Elo cohort is a cheap, directly comparable duel at one
             # map size. Callers can still request teams or FFA explicitly.
             formats = config.get('formats',['1v1'])
             for fmt in formats:
                 if fmt not in ('1v1','2v2','ffa'): raise ValueError('unknown format')
+            if 'ffa_colonies' in config or 'seat_sampling' in config:
+                if 'sample_games' not in config:
+                    raise ValueError('ffa_colonies and seat_sampling require sample_games')
+                if config.get('balanced_duels'):
+                    raise ValueError('balanced_duels does not accept ffa_colonies or seat_sampling')
+                if config.get('seat_sampling', 'distinct') not in ('distinct', 'with_replacement'):
+                    raise ValueError('seat_sampling must be distinct or with_replacement')
+                if 'ffa_colonies' in config:
+                    counts = config['ffa_colonies']
+                    if (not isinstance(counts, list) or not counts or
+                            any(type(n) is not int or not 2 <= n <= 16 for n in counts)):
+                        raise ValueError('ffa_colonies must be a nonempty list of integers in 2..16')
+                    if 'ffa' not in formats:
+                        raise ValueError('ffa_colonies requires an ffa format')
             if 'sample_games' in config:
                 if type(config['sample_games']) is not int or config['sample_games'] <= 0:
                     raise ValueError('sample_games must be a positive integer')
@@ -260,14 +294,14 @@ def experiment_main(kind):
     for name in ('plan','submit'):
         p=sub.add_parser(name);p.add_argument('config');p.add_argument('--bundle',action='append',required=True)
         p.add_argument('--output',required=True)
-    p=sub.add_parser('reanalyze');p.add_argument('directory');p.add_argument('--policy',choices=POLICIES,default='prestige')
+    p=sub.add_parser('reanalyze');p.add_argument('directory');p.add_argument('--policy',choices=POLICIES,default='win_probability')
     p.add_argument('--seed',type=int,default=1);p.add_argument('--draws',type=int,default=1000);p.add_argument('--k',type=float,default=32)
     p.add_argument('--output')
     args=parser.parse_args()
     try:
         if args.command=='reanalyze':
             report=reanalyze(args.directory,args.policy,args.draws,args.seed,args.k,args.output)
-            print(json.dumps({'results':report['committed_results'],'ratings':report['ratings']},indent=2))
+            print(json.dumps({'results':report['committed_results'],'ratings':report['ratings'],'score_definition':report['score_definition'],'probability_scores':report['probability_scores']},indent=2))
         else:
             manifest=Planner(kind,read_json(args.config),[inspect_bundle(p) for p in args.bundle]).plan()
             if args.command=='plan': atomic_json(args.output,manifest)

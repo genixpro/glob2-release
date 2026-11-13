@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "TeamCapacity.h"
+#include "AIImplementationId.h"
 #include "CustomGameSetup.h"
 #include "LegacyGenerationDescriptor.h"
 #include "RulesetCatalog.h"
@@ -25,11 +27,6 @@ struct CustomGamePreferences
 	bool userMaps = false;
 	std::string librarySelection[2];
 	bool expanded[3] = {false, false, false};
-	// The landscape picker's sort order (LandscapePickerScreen::SortOrder): 0 random (its
-	// catalog order, shuffled once so no landscape is favoured), 1 alphabetical. Kept as a plain
-	// int here, the same way other UI choices in this struct are, so the wire format does not
-	// depend on that screen's header.
-	int landscapeSortOrder = 0;
 
 	struct Field
 	{
@@ -59,7 +56,7 @@ struct CustomGamePreferences
 			FIELD(stoneRatio, 0, 64), FIELD(riverDiameter, 0, 160),
 			FIELD(craterDensity, 0, 64), FIELD(extraIslands, 0, 10),
 			FIELD(oldIslandSize, 1, 70), FIELD(oldBeach, 0, 4),
-			FIELD(smooth, 1, 8), FIELD(nbTeams, 2, Team::MAX_COUNT),
+			FIELD(smooth, 1, 8), FIELD(nbTeams, 2, TEAM_MAX_COUNT),
 			FIELD(nbWorkers, 1, 8)
 #undef FIELD
 		};
@@ -75,7 +72,7 @@ struct CustomGamePreferences
 		const bool custom = !selected.packageHash.empty();
 		if (custom)
 			legacy.method = MapGenerationDescriptor::Method(
-				GeneratorRegistry::builtins().methods(false).front());
+				GeneratorRegistry::builtins().defaultMethod(false));
 		std::ostringstream out;
 		out << "glob2-custom-game 8\n"
 			<< "setup " << setup.random << ' ' << setup.capacity << ' ' << setup.prestige << ' '
@@ -94,7 +91,8 @@ struct CustomGamePreferences
 			<< "libraries " << std::quoted(librarySelection[0]) << ' '
 			<< std::quoted(librarySelection[1]) << '\n'
 			<< "sections " << expanded[0] << ' ' << expanded[1] << ' ' << expanded[2] << '\n'
-			<< "picker " << landscapeSortOrder << '\n'
+			// Retain the retired picker field for compatibility with older builds.
+			<< "picker 1\n"
 			<< "generator " << int(legacy.method) << ' ' << legacy.logRepeatAreaTimes << '\n';
 		out << "custom-generator " << std::quoted(custom ? std::string(selected.id) : std::string{})
 			<< '\n';
@@ -153,7 +151,7 @@ struct CustomGamePreferences
 		};
 		int version, random, prestige, revealed, locked, user, method, repeat;
 		if (!word("glob2-custom-game") || !number(version, 1, 8) || !word("setup") ||
-			!number(random, 0, 1) || !number(s.capacity, 1, Team::MAX_COUNT) ||
+			!number(random, 0, 1) || !number(s.capacity, 1, TEAM_MAX_COUNT) ||
 			!number(prestige, 0, 1) || !number(revealed, 0, 1) || !number(locked, 0, 1) ||
 			!number(s.speed, 0, Settings::GAME_SPEED_MAXIMUM) || !number(user, 0, 1))
 			return false;
@@ -186,8 +184,9 @@ struct CustomGamePreferences
 			if (!number(value, 0, 1)) return false;
 			expanded = value;
 		}
-		// The sort-order line was added at version 2; a version-1 file keeps the random default.
-		if (version >= 2 && (!word("picker") || !number(draft.landscapeSortOrder, 0, 1))) return false;
+		// Consume the retired sorting preference without applying it.
+		int ignoredSortOrder;
+		if (version >= 2 && (!word("picker") || !number(ignoredSortOrder, 0, 1))) return false;
 		if (!word("generator") || !number(method, 0, 1000) || !number(repeat, 0, 5)) return false;
 		// Method validity is checked against the live registry rather than a
 		// hardcoded range, so it stays correct as generators are added or
@@ -229,16 +228,16 @@ struct CustomGamePreferences
 		// that wire size independent of the live cap; version 4 stores a count.
 		constexpr int legacyColonyCount = 12;
 		int colonyCount = legacyColonyCount;
-		if (version >= 4 && !number(colonyCount, 1, Team::MAX_COUNT)) return false;
+		if (version >= 4 && !number(colonyCount, 1, TEAM_MAX_COUNT)) return false;
 		if (s.capacity > colonyCount) return false;
 		int humans = 0;
 		for (int i = 0; i < colonyCount; ++i) {
 			auto &c = s.colonies[i];
 			int controller, ai;
-			if (!number(controller, 0, CustomGameSetup::Closed) || !number(ai, 0, AI::SIZE - 1) ||
-				!number(c.alliance, 0, Team::MAX_COUNT - 1)) return false;
+			if (!number(controller, 0, CustomGameSetup::Closed) || !number(ai, 0, AIImplementationIds::SIZE - 1) ||
+				!number(c.alliance, 0, TEAM_MAX_COUNT - 1)) return false;
 			c.controller = CustomGameSetup::Controller(controller);
-			c.ai = AI::ImplementationID(ai);
+			c.ai = AIImplementationIds::ImplementationID(ai);
 			if (version >= 5 && (!(in >> std::quoted(c.aiLibraryId)) || c.aiLibraryId.size() > 128))
 				return false;
 			humans += controller == CustomGameSetup::Human || controller == CustomGameSetup::Shared;

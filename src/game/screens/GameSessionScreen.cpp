@@ -1,5 +1,7 @@
+#include "ui/DiagnosticText.h"
 #include "tutorial/TutorialModel.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "hive/HiveDialog.h"
 #include "GameSessionScreen.h"
 #include "Engine.h"
 #include "scripting/javascript/ScriptRuntime.h"
@@ -52,11 +54,15 @@ void GameSessionScreen::updateExecution(Uint32 tick)
 		cancelScreenInputReceipt(); input.clear();
 		if (globalContainer->mix)
 			globalContainer->mix->setNextTrack(MusicTrack::Menu, true);
-		stack.push(std::make_unique<MessageScreen>(std::string("Game stopped: ") + failure.what() +
-													   "\nReview the embedded JavaScript and its "
-													   "resource use before restarting this game.",
-												   std::vector<std::string>{"OK"}),
-				   [this](GAGGUI::Screen &, int) { endExecute(0); });
+		const std::string raw = failure.what();
+		Glob2UI::DiagnosticText presenter;
+		const auto message = Glob2UI::bulgarianErrorLocale()
+			? Glob2UI::literalSurfaceFormat(Glob2UI::nativeSurfaceText("[game stopped %0]", "Game stopped: %0"), {presenter(raw)}) + "\n" +
+				Glob2UI::nativeSurfaceText("[game stopped script help]", "Review the embedded JavaScript and its resource use before restarting this game.")
+			: "Game stopped: " + raw + "\nReview the embedded JavaScript and its resource use before restarting this game.";
+		stack.push(std::make_unique<MessageScreen>(message,
+			std::vector<std::string>{Glob2UI::bulgarianErrorLocale() ? Glob2UI::nativeSurfaceText("[ok]", "Ok") : "OK"}),
+			[this](GAGGUI::Screen &, int) { endExecute(0); });
 	}
 }
 
@@ -126,6 +132,7 @@ void GameSessionScreen::updateExecutionImpl(Uint32 tick)
 		clock = lastTick = tick;
 		engine->prepareRun();
 		engine->beginSession(clock);
+		engine->beginIntroCover();
 		nextTick = clock;
 		started = true;
 		finishingSession = false;
@@ -313,7 +320,7 @@ Uint32 GameSessionScreen::executionDelay(Uint32 now, Uint32 fallback)
 	// Keep client/network updates responsive between capped drawing frames.
     // Unlimited removes the drawing wait; no fixed 120 FPS ceiling remains.
     if (engine->simulationThreaded())
-        return std::min(Uint32(8), globalContainer->gfx->renderFrameWait());
+        return GAGCore::pacedScreenWait(globalContainer->gfx->renderFrameWait());
 	return engine->sessionPollDelay(clock + static_cast<Uint32>(now - lastTick));
 }
 
@@ -352,4 +359,11 @@ void GameSessionScreen::suspendExecution()
 	}
 	cancelScreenInputReceipt(); input.clear();
 	resetClock = true;
+}
+
+std::vector<GAGGUI::ui::Host *> GameSessionScreen::inspectionHosts()
+{
+	// An input receipt can request inspection before the results-screen push is
+	// applied. Teardown has already released the gameplay scene at that point.
+	return started && !finished && engine ? engine->inspectionHosts() : std::vector<GAGGUI::ui::Host *>{};
 }

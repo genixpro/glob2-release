@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "HeadlessGame.h"
 #include <algorithm>
 #include "ScopedEnvironment.h"
+#include "JoiningThread.h"
 #include "Engine.h"
 #include "Player.h"
 #include "AI.h"
@@ -21,6 +25,7 @@
 #include <tuple>
 #include <ChecksumStream.h>
 #include "StatsChecksum.h"
+#include "Unit.h"
 
 namespace
 {
@@ -83,7 +88,8 @@ TEST_SUITE("TeamStatsPipeline")
             u->performance[FLY]=0;
             u->performance[WALK]=c==WATER_ONLY_CLASS ? 0 : (c ? waterCosts[c]*2 : 20);
             u->performance[SWIM]=c ? 20 : 0;
-            REQUIRE(u->swimClass()==c);
+            REQUIRE(Map::swimClass(u->performance[WALK],u->performance[SWIM])==c);
+            CHECK(u->movementAccess()==movementAccessFromLegacy(c));
             u->medical=Unit::MED_HUNGRY;
         }
         auto* flying=w.addUnit(WORKER,20,8); flying->performance[FLY]=20;
@@ -790,7 +796,7 @@ TEST_SUITE("TeamStatsPipeline")
 		w.game.stepCounter = 1;
 		CHECK_FALSE(p.publishDue(w.game));
 		CHECK(p.metrics.published == 0);
-		std::jthread release(
+		glob2test::JoiningThread release(
 			[&]
 			{
 				gate.deadline.wait(false);

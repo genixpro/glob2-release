@@ -4,14 +4,15 @@
 #pragma once
 
 #include "UnitConsts.h"
+#include "CoverageBuilding.h"
 #include "UnitStatistics.h"
 #include <array>
 #include <span>
-#include "Version.h"
 #include "IntBuildingType.h"
 #include "Ressource.h"
 
 #include <vector>
+#include <string>
 #include "AITelemetry.h"
 
 class Map;
@@ -34,9 +35,6 @@ static constexpr int MAX_BUILDING_LONG_LEVEL = NB_BUILDING_LONG_LEVELS - 1;
 //! width is independent of Team::MAX_COUNT.
 static constexpr int END_OF_GAME_STAT_INTERVAL_MASK = 0x1FF;
 
-// Wire-locked growth-distance bands: keep order and count stable for old saves.
-inline constexpr int GROWTH_COVERAGE_RADII[] = {8, 16, 32};
-inline constexpr int GROWTH_COVERAGE_BANDS = sizeof(GROWTH_COVERAGE_RADII) / sizeof(GROWTH_COVERAGE_RADII[0]);
 
 struct TeamStat
 {
@@ -45,39 +43,39 @@ struct TeamStat
     void configureUnits(std::size_t count);
     std::size_t capacityBytes() const { return buildingCountByVariant.capacity()*sizeof(int)+numberUnitPerType.extraCapacityBytes()+isFree.extraCapacityBytes()+upgradeStatePerType.extraCapacityBytes(); }
 
-	int totalUnit;
+	int totalUnit{};
 	UnitStatistics<int> numberUnitPerType;
-	int workersByConstructionLevel[NB_UNIT_LEVELS];
-	int totalFree;
+	int workersByConstructionLevel[NB_UNIT_LEVELS]{};
+	int totalFree{};
 	UnitStatistics<int> isFree;
-	int totalNeeded;
-	int totalNeededPerLevel[NB_UNIT_LEVELS];
+	int totalNeeded{};
+	int totalNeededPerLevel[NB_UNIT_LEVELS]{};
 
 	std::vector<int> buildingCountByVariant; // concrete catalog IDs, including construction variants
-	int totalBuilding; // Note that this is the total number of *finished* buildings, building sites are ignored
-	int numberBuildingPerType[IntBuildingType::NB_BUILDING];
-	int numberBuildingPerTypePerLevel[IntBuildingType::NB_BUILDING][NB_BUILDING_LONG_LEVELS];
+	int totalBuilding{}; // Note that this is the total number of *finished* buildings, building sites are ignored
+	int numberBuildingPerType[IntBuildingType::NB_BUILDING]{};
+	int numberBuildingPerTypePerLevel[IntBuildingType::NB_BUILDING][NB_BUILDING_LONG_LEVELS]{};
 
-	int needFoodCritical;
+	int needFoodCritical{};
 	// Number of units that are hungry but there aren't able to eat
-	int needFoodNoInns;
-	int needFood;
-	int needHeal;
-	int needNothing;
-	int upgradeState[NB_ABILITY][NB_UNIT_LEVELS];
+	int needFoodNoInns{};
+	int needFood{};
+	int needHeal{};
+	int needNothing{};
+	int upgradeState[NB_ABILITY][NB_UNIT_LEVELS]{};
 	UnitStatistics<std::array<std::array<int,NB_UNIT_LEVELS>,NB_ABILITY>> upgradeStatePerType;
 
-	int totalFood;
-	int totalFoodCapacity;
-	int totalUnitFoodable;
-	int totalUnitFooded;
+	int totalFood{};
+	int totalFoodCapacity{};
+	int totalUnitFoodable{};
+	int totalUnitFooded{};
 
-	int totalHP;
-	int totalAttackPower;
+	int totalHP{};
+	int totalAttackPower{};
     int carriers=0,builders=0,meleeUnits=0,rangedUnits=0,scouts=0,idleCarriers=0,idleDefenders=0;
-	int totalDefensePower;
+	int totalDefensePower{};
 		
-	int happiness[HAPPINESS_COUNT+1];
+	int happiness[HAPPINESS_COUNT+1]{};
 };
 
 struct TeamSmoothedStat
@@ -110,6 +108,15 @@ struct EndOfGameStat
 	
 	// units, buildings, prestige
 	int value[TYPE_NB_STATS];
+};
+
+// Probability is alliance-wide and sampled after outcome evaluation, separately
+// from the delayed per-team statistics pipeline. Explicit ticks preserve gaps
+// when continuing older saves; missing history must never become zero chance.
+struct WinProbabilitySample
+{
+    Uint32 tick = 0;
+    int permille = 0;
 };
 
 // Per-variant diagnostics use the catalog's concrete IDs; no family/tier limit.
@@ -372,7 +379,7 @@ public:
     std::size_t unitTypeCount=NB_UNIT_TYPE;
     void configureUnits(std::size_t count);
 
-  struct CoverageBuilding { int x, y, width, height; bool operator==(const CoverageBuilding &) const = default; };
+  using CoverageBuilding = ::CoverageBuilding;
   std::vector<CoverageBuilding> coverageBuildings;
   Uint32 coverageBuildingTick = 0;
   Uint32 coverageBuildingGeneration = 0;
@@ -421,7 +428,9 @@ public:
   static Uint32 measurementChecksum(const GameplayMeasurements&);
   void printEconomy(const Team*, Uint32 tick) const;
   static void saveSample(GAGCore::OutputStream*, const TeamStatsSample&);
-  static TeamStatsSample loadSample(GAGCore::InputStream*, int versionMinor = VERSION_MINOR,bool privateAdaptive174=false);
+  // Current-format load; defined in TeamStat.cpp so this header needs no version constants.
+  static TeamStatsSample loadSample(GAGCore::InputStream*);
+  static TeamStatsSample loadSample(GAGCore::InputStream*, int versionMinor, bool privateAdaptive174=false);
 
 
   std::shared_ptr<const TeamStats> frozenDisplay() const;
@@ -476,11 +485,18 @@ private:
 	friend class Game;
 	
 	std::vector<EndOfGameStat> endOfGameStats;
+    std::vector<WinProbabilitySample> winProbabilityHistory;
+    std::string winProbabilityModel;
 	
 	bool load(GAGCore::InputStream *stream, Sint32 versionMinor,bool privateAdaptive174=false);
 	void save(GAGCore::OutputStream *stream);
 
 public:
+    void recordWinProbability(Uint32 tick, int permille, const std::string &model);
+    const std::vector<WinProbabilitySample> &getWinProbabilityHistory() const { return winProbabilityHistory; }
+    const std::string &getWinProbabilityModel() const { return winProbabilityModel; }
+    // Twice the trapezoidal area, in permille*ticks. Integer until reporting.
+    Uint64 winProbabilityAreaTwice() const;
 	TeamStat *getLatestStat(void) { displaySnapshot.reset(); return &(stats[statsIndex]); }
 	//! Read-only access for code that only measures, such as the win probability
 	//! model, so it does not need friendship to reach the sample ring.

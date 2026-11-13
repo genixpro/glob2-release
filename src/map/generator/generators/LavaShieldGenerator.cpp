@@ -4,7 +4,7 @@
 #include "FertilityField.h"
 #include "Farmland.h"
 #include "ScoredSettlements.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "Grid.h"
@@ -17,6 +17,7 @@
 #include "Roads.h"
 #include "Sketch.h"
 #include "StartQuality.h"
+#include "TerrainProperties.h"
 #include <algorithm>
 #include <climits>
 #include <cmath>
@@ -99,7 +100,7 @@ constexpr int kFordClearance = 4;
 // Along a flow, live or cooled, the ground changes every dozen tiles or so (kEdgeCell). Below
 // kCrustBelow on that noise, the grass within kCrustReach corners of the flow carries stone; up
 // to kBareBelow it is left plain so units can walk right up to the flow; up to kScreeBelow a
-// scree apron runs out to kScreeReach corners; above it, ash (dirt, or clay) runs out to
+// scree apron runs out to kScreeReach corners; above it, ash (drawn as dirt) runs out to
 // kAshReach corners. The crust gives about a third of the old full-width stone tongues' tiles
 // and keeps every colony's nearest quarry within the old distances. Each reach is for 256-tile
 // sides and halves at 128, where the wedges are narrow and their open ground is the expansion.
@@ -120,8 +121,8 @@ struct Layout
 	Torus t{1, 1};
 	Stretch stretch;
 	TerrainSketch terrain;
-	// hot: tiles with any lava-group corner (never painted over). wall: tiles whose four corners
-	// are all lava-group, the impassable flows and crater. fords: the cooled crossings' tiles;
+	// hot: tiles with any lava-group corner (never painted over). wall: lava-touching tiles
+	// blocked by the corner movement vote. fords: the walkable cooled crossings' tiles;
 	// fordTiles lists them per long tongue. flowEdge and fordCorners are the corners the
 	// margins along the flows are measured from, once the towns are placed (furnishMargins).
 	std::vector<unsigned char> rim, lake, hot, wall, fords, flowEdge, fordCorners;
@@ -198,6 +199,10 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 		circuit.push_back({p.x, p.y, kRoadHalfWidth});
 	}
 	strokePath(L.rim, t, circuit, 1, true);
+	// Navigation and validation require each flagged rim cell to stay open.
+	// Protect its complete corner footprint: reserving only its top-left track
+	// vertex let two lava-root corners close that cell under blocked ties.
+	const auto rimCorners = tileCorners(t, L.rim);
 
 	auto &rng = context.stream("lava-flows");
 	const auto roll = [&]() { return rng() / 4294967296.0; };
@@ -344,7 +349,7 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 		if (L.lake[i])
 			L.terrain[i] = LAVA;
 		else if (L.rim[i])
-			L.terrain[i] = DIRT_TRACK;
+			L.terrain[i] = BRICK_PATH;
 	}
 	if (o.islets)
 	{
@@ -369,7 +374,7 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 			continue;
 		if (ford[i])
 			L.terrain[i] = SCREE;
-		else if (live[i])
+		else if (live[i] && !rimCorners[i])
 			L.terrain[i] = LAVA;
 		else if (cooled[i] && L.terrain[i] == GRASS)
 			L.terrain[i] = SCREE;
@@ -388,7 +393,7 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 		for (int i = 0; i < t.size(); ++i)
 			if (drawn[i] == SCREE && cooled[i] && !ford[i] &&
 				around(i, [&](int j) { return !cooled[j] && drawn[j] != LAVA; }))
-				L.terrain[i] = GRAVEL;
+				L.terrain[i] = SHALE;
 	}
 	// Ember fringes every lava vertex that touches anything but lava.
 	{
@@ -399,16 +404,18 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 	}
 	const auto isHot = [&](int i)
 	{ return L.terrain[i] == LAVA || L.terrain[i] == EMBER_FIELD; };
-	// The crater wall inside the circuit is ash; the rim outside it is volcanic loam. The
+	// The crater wall inside the circuit is ash (dirt); the rim outside it is volcanic loam. The
 	// margins along the flows wait for the towns (furnishMargins).
 	L.flowEdge.assign(t.size(), 0);
 	for (int i = 0; i < t.size(); ++i)
 		L.flowEdge[i] = (live[i] && isHot(i)) ||
-						(cooled[i] && (L.terrain[i] == SCREE || L.terrain[i] == GRAVEL));
+						(cooled[i] && (L.terrain[i] == SCREE || L.terrain[i] == SHALE));
 	L.fordCorners = ford;
 	auto &palette = context.stream("lava-palette");
-	const PeriodicNoise ash(t.w, t.h, 7, palette), soil(t.w, t.h, 9, palette),
-		rimEdge(t.w, t.h, 10, palette), seaFloor(t.w, t.h, 20, palette);
+	// One look per role: the ash and soil fields that once split the ash into dirt and clay and the
+	// loam into loam and moss are still drawn, so the rim's edge and the sea floor stay as they were.
+	[[maybe_unused]] const PeriodicNoise ash(t.w, t.h, 7, palette), soil(t.w, t.h, 9, palette);
+	const PeriodicNoise rimEdge(t.w, t.h, 10, palette), seaFloor(t.w, t.h, 20, palette);
 	int craterAsh = 0, loam = 0, deep = 0;
 	for (int i = 0; i < t.size(); ++i)
 	{
@@ -420,13 +427,13 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 		const double circuit = crater.radiusAt(std::atan2(q.y, q.x)) + 5;
 		if (radius < circuit - 2)
 		{
-			L.terrain[i] = ash.at(x, y) > 0.5 ? CLAY : DIRT;
+			L.terrain[i] = DIRT;
 			++craterAsh;
 		}
 		else if (radius > circuit + 2 &&
 				 radius < L.rootRadius + 1 + kRimSwing * (2 * rimEdge.at(x, y) - 1))
 		{
-			L.terrain[i] = soil.at(x, y) > 0.62 ? MOSS : LOAM;
+			L.terrain[i] = LOAM;
 			++loam;
 		}
 	}
@@ -459,9 +466,14 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 			hot += isHot(c);
 			forded = forded || ford[c];
 		}
+		const auto movement = combineCornerRules(
+			terrainProperties(TerrainType(L.terrain[corners[0]])),
+			terrainProperties(TerrainType(L.terrain[corners[1]])),
+			terrainProperties(TerrainType(L.terrain[corners[2]])),
+			terrainProperties(TerrainType(L.terrain[corners[3]])));
 		L.hot[i] = hot > 0;
-		L.wall[i] = hot == 4;
-		L.fords[i] = forded && hot < 4;
+		L.wall[i] = hot > 0 && !movement.walkable && !movement.swimmable;
+		L.fords[i] = forded && movement.walkable;
 	}
 	for (const auto &cut : fordVertices)
 	{
@@ -617,13 +629,13 @@ Town townPlan(GenerationContext &context)
 
 // Rank terrain candidates after beaches and the flows, before their margins. The completed
 // colony score below is the deciding measurement; this shortlist only bounds its cost.
-std::vector<RankedSite> candidateSites(const Layout &L, Map &map, const Town &town)
+std::vector<RankedSite> candidateSites(const Layout &L, GenerationMap &map, const Town &town)
 {
 	const Torus &t = L.t;
 	// Pure grass, or the rim's loam, which a town turns back to grass (populate).
 	TerrainSketch ground = L.terrain;
 	for (auto &v : ground)
-		if (v == LOAM || v == MOSS)
+		if (v == LOAM)
 			v = GRASS;
 	const auto usable = pureTiles(ground, t, GRASS);
 	// A cheap Chebyshev bound first, then the town's own footprint: a long town fits ground a
@@ -698,8 +710,11 @@ std::vector<unsigned char> furnishMargins(const Layout &L, TerrainSketch &terrai
 	const auto fromFlow = stepsFrom(t, L.flowEdge);
 	const auto fromFord = stepsFrom(t, L.fordCorners);
 	auto &stream = context.stream("lava-margins");
-	const PeriodicNoise edge(t.w, t.h, kEdgeCell, stream), ash(t.w, t.h, 7, stream),
-		slope(t.w, t.h, 9, stream);
+	// The ash field no longer picks between dirt and clay but is still drawn, so the slope field after
+	// it, which places the ash, stays as it was.
+	const PeriodicNoise edge(t.w, t.h, kEdgeCell, stream);
+	[[maybe_unused]] const PeriodicNoise ash(t.w, t.h, 7, stream);
+	const PeriodicNoise slope(t.w, t.h, 9, stream);
 	const double scale = std::clamp(std::min(t.w, t.h) / 256.0, 0.5, 1.0);
 	const auto reach = [&](int r) { return std::max(1, int(std::lround(r * scale))); };
 	const int crustReach = reach(kCrustReach), screeReach = reach(kScreeReach),
@@ -718,7 +733,7 @@ std::vector<unsigned char> furnishMargins(const Layout &L, TerrainSketch &terrai
 			(std::hypot(q.x, q.y) - L.rootRadius) / (kAshSlope * (L.islandRadius - L.rootRadius));
 		if (down >= 0 && down < 1 && slope.at(x, y) > kAshFrom + (1 - kAshFrom) * down)
 		{
-			terrain[i] = ash.at(x, y) > 0.5 ? CLAY : DIRT;
+			terrain[i] = DIRT;
 			++ashen;
 			continue;
 		}
@@ -736,7 +751,7 @@ std::vector<unsigned char> furnishMargins(const Layout &L, TerrainSketch &terrai
 		}
 		else if (n >= kScreeBelow && d <= ashReach)
 		{
-			terrain[i] = ash.at(x, y) > 0.5 ? CLAY : DIRT;
+			terrain[i] = DIRT;
 			++ashen;
 		}
 	}
@@ -759,7 +774,7 @@ std::vector<unsigned char> furnishMargins(const Layout &L, TerrainSketch &terrai
 // Materialize a candidate and the winning world through exactly the same stages.
 // The caller restores engine RNG before each trial, so rejected worlds cannot alter
 // resource amounts/varieties in the chosen world. All other streams are local contexts.
-bool populate(Game &game, GenerationContext &context, const Layout &L, const Town &town,
+bool populate(GenerationWorld &game, GenerationContext &context, const Layout &L, const Town &town,
 			  const std::vector<int> &homes)
 {
 	const Torus &t = L.t;
@@ -779,7 +794,7 @@ bool populate(Game &game, GenerationContext &context, const Layout &L, const Tow
 		{
 			const int i = t.at(t.remainderX(p) + dx, p / t.w + dy);
 			townGrass[i] = 1;
-			if (terrain[i] == LOAM || terrain[i] == MOSS)
+			if (terrain[i] == LOAM)
 				terrain[i] = GRASS;
 		}
 		for (const auto &[dx, dy] : town.ring)
@@ -875,11 +890,11 @@ bool populate(Game &game, GenerationContext &context, const Layout &L, const Tow
 				shore = shore || v == WATER || v == DEEP_WATER;
 			}
 		if (track[i] && !shore)
-			terrain[i] = DIRT_TRACK;
+			terrain[i] = BRICK_PATH;
 	}
 	std::vector<unsigned char> sand(t.size(), 0);
 	for (int i = 0; i < t.size(); ++i)
-		sand[i] = terrain[i] == SAND || terrain[i] == DIRT_TRACK;
+		sand[i] = terrain[i] == SAND || terrain[i] == BRICK_PATH;
 	const auto roadGround = roadTiles(t, sand);
 	for (int i = 0; i < t.size(); ++i)
 		reserve[i] = reserve[i] || roadGround[i];
@@ -887,7 +902,7 @@ bool populate(Game &game, GenerationContext &context, const Layout &L, const Tow
 	for (int i = 0; i < t.size(); ++i)
 		rock[i] = rock[i] && !reserve[i];
 	writeVertices(game.map, terrain);
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	for (int i = 0; i < t.size(); ++i)
 		if (rock[i])
 			map.setResourceByIndex(t.remainderX(i), i / t.w, STONE, 1);
@@ -1085,7 +1100,7 @@ std::string qualityFailure(const StartQualityReport &report)
 	return {};
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "lava layout";
 	const Layout L = design(context.request, context);
@@ -1101,7 +1116,8 @@ bool generate(Game &game, GenerationContext &context)
 	std::vector<std::vector<int>> proposals;
 	for (int deal = 0; deal < kDeals; ++deal)
 		proposals.push_back(chooseSites(L, sites, context, deal, town));
-	const auto build = [&](Game &world, GenerationContext &c, const std::vector<int> &homes)
+	const auto build =
+		[&](GenerationWorld &world, GenerationContext &c, const std::vector<int> &homes)
 	{ return populate(world, c, L, town, homes); };
 	const auto selected = chooseScoredSettlements(context, proposals, build, qualityFailure);
 	if (selected.selected < 0)
@@ -1114,7 +1130,7 @@ bool generate(Game &game, GenerationContext &context)
 	return build(game, context, selected.sites);
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
@@ -1179,7 +1195,10 @@ GeneratorDefinition lavaShieldDefinition()
 			// gravel, stone is a crust along the flows, the rim is loam, roads are dirt tracks and
 			// the open sea is deep water.
 			// Revision 7: the crater is uninterrupted lava, without void vents.
-			7,
+			// Revision 9: live roots preserve all corners of reserved circuit cells.
+			// Revision 10: fertile ground contributes 48 Q8 to crop growth.
+			// Revision 11: algae now regrows near any coast, so its best-growing water moved.
+			12, // 12: one look per role (ash all dirt, the rim all loam)
 			false,
 			{GeneratorControl{"tongue-count", "Lava tongues", 3, 9, 1, 5, ControlGroup::Layout}
 				 .withSearchRange(4, 7),

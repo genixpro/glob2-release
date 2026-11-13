@@ -2,6 +2,7 @@
 // Copyright (C) 2026 glob2 contributors
 
 #include "FertilityFieldTest.h"
+#include "TerrainProperties.h"
 #include <utility>
 #include <algorithm>
 #include <cmath>
@@ -99,7 +100,7 @@ namespace
 		TinyMap()
 		{
             // Unit binaries do not initialize Toolkit or an installed asset search path.
-            resourceRegistryValue = ResourceRegistry::loadFile((glob2test::sourceRoot() / "data/resources/registry.json").string());
+            resourceRegistryValue = ResourceRegistry::loadFile((glob2test::contentRoot() / "data/resources/registry.json").string());
             rebuildTerrainCounts();
 			wDec = hDec = kMapDec;
 			w = h = 1 << kMapDec;
@@ -235,10 +236,14 @@ void FertilityFieldTest::testForMapZeroesNonGrass()
 	map.makeSand(6, 6);
 	map.putResource(10, 10, WHEAT);
 	const Fertility::Field field = Fertility::forMap(map);
-	// Fish make open water food habitat; sand never is.
-	CHECK(field.at(4, 4) > 0u);
+	// Sand is never food habitat, and neither is grass straight against water:
+	// that cell is a shore, so the pond's shore ring cuts it off from the
+	// wheat, and only the ungated field still rates its water fertile.
 	CHECK_EQ(std::uint32_t(0), field.at(6, 6));
-	CHECK(field.at(5, 4) > 0u);
+	CHECK_EQ(std::uint32_t(0), field.at(5, 4));
+	CHECK_EQ(std::uint32_t(0), field.at(4, 4));
+	CHECK(Fertility::forMap(map, false).at(4, 4) > 0u);
+	CHECK(field.at(10, 10) > 0u);
 }
 
 void FertilityFieldTest::testForMapZeroesGrassNoDepositReaches()
@@ -340,17 +345,42 @@ TEST_CASE("habitat and movement edits reuse exact ecology fields")
     const auto land=cache.landField().values(), aquatic=cache.aquaticField();
     const auto wheat=map.resourceGrowthRateAt(index,WHEAT);
     REQUIRE(wheat>0);
-    // A lone sand vertex makes the four cells around it shore, without sand's inhibition.
-    for(const auto type : {TRAIL,ICE,SAND,GRASS})
+    for(const auto type : {TRAIL,ICE,GRASS})
     {
-        if (type==SAND) { map.paintCell(index,GRASS); map.setVertexTerrain(7,8,SAND); }
-        else map.paintCell(index,type);
+        map.paintCell(index,type);
+        // Habitat and movement differ, but the numeric ecology inputs do not.
         // This also checks validity after each edit's terrain-generation bump.
         REQUIRE(cache.validFor(map));
         CHECK(map.resourceGrowthField().landField().values()==land);
         CHECK(cache.aquaticField()==aquatic);
         CHECK(map.resourceGrowthRateAt(index,WHEAT)==(type==GRASS ? wheat : 0));
     }
+    // One sand corner contributes a quarter of its inhibition (sand alone is no
+    // coast), so the four surrounding cells change the cached ecology inputs.
+    map.setVertexTerrain(7,8,SAND);
+    CHECK_FALSE(cache.validFor(map));
+    CHECK(map.terrainPropertiesAt(index).inhibitionQ8==64);
+    CHECK_FALSE(map.terrainPropertiesAt(index).coast);
+    CHECK(map.terrainPropertiesAt(index).walkable);
+    CHECK_FALSE(map.terrainPropertiesAt(index).resourcesGrow);
+    CHECK_FALSE(map.terrainPropertiesAt(index).buildable);
+    map.resourceGrowthField();
+    REQUIRE(cache.validFor(map));
+    CHECK(cache.landField().values()!=land);
+    CHECK(map.resourceGrowthRateAt(index,WHEAT)==0);
+    Fertility::GrowthCache fresh;
+    fresh.rebuild(map);
+    CHECK(cache.landField().values()==fresh.landField().values());
+    CHECK(cache.aquaticField()==fresh.aquaticField());
+    // Removing the numeric sand contribution invalidates again and restores the
+    // exact original fields and wheat rate before occupancy-only edits below.
+    map.setVertexTerrain(7,8,GRASS);
+    CHECK_FALSE(cache.validFor(map));
+    map.resourceGrowthField();
+    REQUIRE(cache.validFor(map));
+    CHECK(cache.landField().values()==land);
+    CHECK(cache.aquaticField()==aquatic);
+    CHECK(map.resourceGrowthRateAt(index,WHEAT)==wheat);
     map.putResource(8,8,WHEAT);
     map.setResourceAmount(index,8);
     map.setResourcesGrow(index % map.getW(),index / map.getW(),false);
@@ -401,7 +431,7 @@ TEST_CASE("future terrain ecology properties invalidate only their effective inp
         {
         case 0: changed.fertilitySource=true; changed.fertilityQ8=-128; break;
         case 1: changed.inhibitionQ8=128; break;
-        case 2: changed.shoreSupportQ8=128; break;
+        case 2: changed.coast=true; break;
         case 3: changed.growthQ8=0; break;
         case 4: changed.growthQ8=512; break;
         }

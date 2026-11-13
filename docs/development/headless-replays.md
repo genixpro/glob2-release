@@ -9,6 +9,12 @@ capped-game adjudication belongs in offline analysis.
 
 Run AI games without a GUI to generate `.replay` files for cross-codebase fidelity testing (C++ vs Rust).
 
+Version 205 shares amphibious routing fields and stores their captured preparation
+costs. Earlier replays are rejected; supported older saves still load and retain a
+minimum save version of 58. See [shared amphibious routing](resource-gradient-model.md#shared-amphibious-routing)
+for field transitions and cache migration. Version 194 previously changed
+replenishment staffing so assigned couriers finish deliveries before dismissal.
+
 Version 121 gives each AI controller an independent saved random stream. Version
 122 also gives each Econo and Nicowar controller a private gradient cache. AI
 orders and game trajectories can differ from earlier versions for the same
@@ -33,6 +39,17 @@ placements adopt the new streams and trajectories.
 Supported saved games still load and adopt the current simulation;
 the save floor remains 58.
 
+Format 213 adds resource claims and corrects worker material-target projection
+and harvest eligibility. These corrections can change ordinary worker movement
+even when claims are disabled, and from this format demanded adaptive gradients
+refresh after 256 ticks instead of 1,024. It also extends authoritative snapshot
+checksums to cover claim routes and bounded recovery, so the replay floor is 213.
+Earlier saves remain loadable and adopt the corrected simulation, still without
+claims. New games start with claims (the `contention-v2` policy); a replay's
+header is the saved starting state, so playback restores them. `game run
+--resource-claims off` is a baseline setup that cannot record a replay; see
+[resource claims](../tools/tournaments.md#resource-claims).
+
 Unit format 153 embeds resolved unit definitions, assigned job purposes and
 extended cargo before dependent state. It uses network protocol 69 and simulation
 revision 47 when introduced. New recordings checksum the catalog and extended state. Legacy saves
@@ -47,7 +64,7 @@ New saves retain published lists, pending completed outputs,
 admissions and remaining publication deadlines for deterministic continuation.
 
 Structured `game run` accepts `--ai-order-delay N`, where `N` is an integer
-from 0 through 8 and defaults to 8 for a new match. It is one match-wide engine
+from 0 through 16 and defaults to 8 for a new match. It is one match-wide engine
 setting, shared by all native and JavaScript AI players. `--rule aiOrderDelay=N`
 sets the same rule. Saved games retain their original setting; do not override it
 when continuing a save. Delay 8 intentionally changes response pacing compared
@@ -230,7 +247,7 @@ pipeline to produce curated datasets (exact counts per matchup).
 ```
 
 - `--map <name>` is the bare map filename without `.map` (resolved as
-  `maps/<name>.map`, or `maps/<name>.map.gz` when that exists). On a typo the
+  `content/maps/<name>.map`, or `content/maps/<name>.map.gz` when that exists). On a typo the
   binary fails fast with a clear message; it does **not** silently retry
   random maps.
 - `--matchup <list>` is one AI name per team. The list length must
@@ -290,7 +307,7 @@ For work counts without quality collection, `--gradient-work-stats PATH` enables
 raw per-family scheduling events and adjacent `.summary.csv` and `.intervals.csv`
 outputs. It is independently opt-in and defaults off. Result metadata records
 the separate model and collector contracts, whether a generic model is trained,
-the 24,000 milli-unit threshold, 32-tick warm admission minimum, 1,024-tick
+the 24,000 milli-unit threshold, 32-tick warm admission minimum, 256-tick
 demanded-field safety cap and explicit fixed-interval research overrides.
 The cap permits admission at that age; it does not bypass capacity or the
 eight-tick publication delay. An untrained
@@ -360,13 +377,15 @@ partition verification jobs by it; the definition of the data hash is in the
 [turn protocol](../multiplayer/turn-engine.md#simulation-version).
 
 CI verifies `test/fixtures/multiplayer/FourSquares1.g2mr` on Linux, Windows, macOS and in
-three browsers (`test/run-browser-determinism.py` and `browser/tests/determinism.spec.js`)
+three browsers (`test/run-browser-determinism.py` and `platforms/web/tests/determinism.spec.js`)
 and requires every selected `checksums.txt` trace to be identical. Full verification
-compares seven traces: two Linux builds, Windows, macOS and three browsers. The committed
-`FourSquares1.verify-trace.txt` is the expected trace, and CI fails when the platforms
-agree on a different one; the engine test that checks it also regenerates both files
-under `--update-fixtures`. A change that moves the trace changed the simulation and
-must bump `SIM_REVISION` ([simulation version](../multiplayer/turn-engine.md#simulation-version)).
+compares seven traces: two Linux builds, Windows, macOS and three browsers. Each run
+must also reach a `verified` verdict against the checksums the record's clients
+reported, so a simulation change fails on every platform; no expected trace is
+committed. The engine test that verifies the record regenerates it under
+`--update-fixtures`, and records the trace for `tools/sim_fingerprint.py`. A change
+that moves the record changed the simulation and must bump `SIM_REVISION`
+([simulation version](../multiplayer/turn-engine.md#simulation-version)).
 
 ## AI-Trainer Dataset Output
 
@@ -552,7 +571,7 @@ binary `.checksums` sidecar's total is the deep hash (header flag bit 0). Deep a
 routine hashes use different algorithms and observation boundaries and must not
 be compared directly.
 `game run` result fields `initialChecksum` and `finalChecksum` use the routine
-snapshot schema, identified by `checksum_algorithm: "snapshot-v3"`. They do not
+snapshot schema, identified by `checksum_algorithm: "snapshot-v4"`. They do not
 trigger deep verification. `match verify`'s `checksums.txt` always contains routine
 source-turn hashes, including the terminal samples.
 
@@ -573,7 +592,7 @@ offloading when measuring checksum optimizations.
 | 4 | Econo | `AI::ECONO` | Expansionist (shared AI runtime) |
 | 5 | Nicowar | `AI::NICOWAR` | Strongest economy-focused AI (shared AI runtime) |
 | 6 | Cortex | `AI::CORTEX` | Food-aware growth and supported attack waves (experimental) |
-| 7 | Maxima | `AI::MAXIMA` | Standalone colony developer with relentless attacks; strategy configured through `data/maxima` and `GLOB2_MAXIMA_*` (see [Maxima](../ai/maxima/README.md)) |
+| 7 | Maxima | `AI::MAXIMA` | Standalone colony developer with relentless attacks; strategy configured through `content/data/maxima` and `GLOB2_MAXIMA_*` (see [Maxima](../ai/maxima/README.md)) |
 | 8 | Cabino | `AI::CABINO` | Resurrected 2005-2007 Nicowar: independent cooperating modules, outside the shared AI runtime. |
 
 Player types that trigger AI loading: any `BasePlayer::type >= P_AI (5)`. The player type encodes which AI: `P_AI + implementationID` maps to the enum above.
@@ -667,9 +686,18 @@ online sim-version gates reject clients using the older boundary. See the
 
 ### Probability-based early victory
 
-Structured `game run` runs accept `--win-probability PERMILLE` (501–1000).
-This appends the optional rule after existing winning conditions; omit it to play
-the game out. Evaluation begins at tick 5120 and repeats every 512 ticks. Results
+Every game automatically records alliance win-probability history at the 512-tick
+cadence, with a final sample at the reported terminal tick. Full `result.json`
+teams include `win_probability_history` (`[tick, permille]`) and `win_probability`
+(final prediction, model identity, coverage and trapezoidal area). This needs no
+telemetry flag. Detailed log samples remain opt-in with `--telemetry team-timeline`.
+See [whole-game scoring](../tools/tournaments.md#whole-game-probability-scores).
+
+New structured `game run` runs default to `--win-probability 950` (95%).
+Use `--win-probability 0` to play the game out, or choose 501–1000 for another
+threshold. This appends the rule after existing winning conditions; loaded saves
+retain their saved rules and reject an explicit threshold override. Evaluation
+begins at tick 5120 and repeats every 512 ticks. Results
 called by the model report `termination: "win_probability"`. See the
 [model guide](../ai/architecture/win-probability-model.md) for calibration and its limits.
 

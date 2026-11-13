@@ -8,6 +8,9 @@
 // bot that queues ordinary orders, or by nobody; AI seats run locally as on every
 // client. Used for end-to-end tests of a deployed instance (docs/hosting/README.md).
 
+#include "CompileProfile.h"
+#include "Map.h"
+#include "ComputeExecutor.h"
 #include <SDL3/SDL.h>
 
 #include <chrono>
@@ -266,6 +269,8 @@ static int play(const Options& options, const fs::path& output)
 		std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
 	Game& game = engine.gui.game;
+	// The owner is stopped; finish statistics before read-only serialization.
+	game.winProbabilitySyncStep(true);
 	std::ostringstream result;
 	result << "{\"schema_version\":1,\"job_type\":\"turn_client\",\"status\":\"completed\",\"match_id\":"
 	       << Headless::quote(matchId) << ",\"seat\":" << seat << ",\"sim_version\":" << Headless::quote(local.key())
@@ -310,6 +315,8 @@ int runTurnClient(const Cli::Request &request)
 	fs::path output;
 	try
 	{
+		// Agents play real assignments, whose results other players and verifiers rely on.
+		CompileProfile::requireFull("The online agent (online turn-client)");
         Options options;
         options.assignment = request.positionals.at(0);
         options.map = request.get("--map-file");

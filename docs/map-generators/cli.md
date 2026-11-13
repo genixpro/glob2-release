@@ -1,7 +1,7 @@
 # Map generation, PNG previews, and JSON reports
 
 The normal **client executable** includes map tools. Build with
-`scons release=1 server=0`, then run the examples from the repository root.
+`python3 tools/dev_build.py release=1`, then run the examples from the repository root.
 Set `GLOB2_BIN` to the executable for your platform (for example,
 `export GLOB2_BIN="$PWD/build/darwin/client/release/src/glob2"` on macOS,
 `build/linux/client/release/src/glob2` on Linux, or
@@ -93,6 +93,24 @@ colony markers; pass matching `--width`, `--height`, `--teams`, and a fixed seed
 Seam repair is enabled by default. Use `--image-seam-width 0` when the decoded
 geography must remain unstitched; mandatory terrain legality and colony
 initialization still apply.
+
+## Use every core, and many maps in one process
+
+The `map` commands use the whole machine inside one request: `map study
+--candidates N` generates its candidates in parallel and chooses exactly as a
+serial search would, the JSON report measures its three movement models and each
+colony in parallel, and `map render` composes terrain on every core.
+`--compute-threads N` caps the threads one `map` command uses (`1` keeps it on its
+own core); a runner that already starts one process per CPU should pass each its
+share. Results never depend on the width.
+
+`map study-worker` runs many studies in one process: each stdin line is a JSON
+array of `map study` arguments (`["map","study","river","--seed","3",
+"--output-dir","out/3"]`), run exactly as that command line would be, followed by
+the line `glob2-study-worker done CODE` with its exit code. Generator packages are
+given to the worker itself, not to its lines. Study sweeps use it through
+`tools/map_generation_study.py`; `GLOB2_STUDY_WORKER=0` runs one process per map
+instead.
 
 ## Discover and configure generators
 
@@ -236,19 +254,30 @@ which implies water. The palette is:
 
 Ice, Trail and the catalogue types keep their imported vertices: seam repair and
 beaches reshape only grass, sand and water, and adjacent water is not converted
-into sand. Import records their required terrain experiments in the map. Their
+into sand. All imported terrains are available without experiment flags. Their
 colors are distinct from resource colors. Images exported before terrain moved
 to vertices used one pixel per whole tile for these types; they import as
 vertices, so a lone such pixel makes four mixed tiles rather than one whole tile.
 
 The terrain catalogue types export with the `image` colour of their row in
-`src/map/TerrainTypeTable.h` (boulders `#585A5C`, hedge `#264E28`, thicket `#364222`,
-ridge `#626870`, outcrop `#6E706C`, dirt `#80684A`, clay `#9E7054`, gravel `#8A8276`,
-flower meadow `#3C7E30`, mud `#604C38`, marsh `#4A604E`, deep snow `#DEE4EC`, scree
-`#767A80`, dirt track `#AA8E68`, boardwalk `#A48054`, lava `#BE501E`, ember field
+`src/map/TerrainCatalog.cpp` (boulders `#585A5C`, hedge `#264E28`, thicket `#364222`,
+ridge `#626870`, outcrop `#6E706C`, dirt `#80684A`, clay `#9E7054`, shale `#8A8276`,
+heath `#3C7E30`, mud `#604C38`, mudflat `#4A604E`, deep snow `#DEE4EC`, scree
+`#767A80`, brick path `#AA8E68`, boardwalk `#A48054`, lava `#BE501E`, ember field
 `#5A3426`, loam `#4A3E28`, moss `#2E602A`, spring meadow `#5C963A`, deep water
-`#0A3CA0`, dark water `#0E264E`, hole `#0A0A0E`, chasm `#18121A`). Import recognises
-them **only by exact colour**: every other pixel classifies by nearest colour among
+`#0A3CA0`, dark water `#0E264E`, hole `#0A0A0E`, chasm `#18121A`, lush grass `#196531`,
+dry grass `#787B34`, dune sand `#CC9755`, pale sand `#D3CAA8`, sandstone tiles
+`#968C6E`, pumice field `#3A3736`, frozen lake `#8DACB9`, weathered sandstone
+`#A68A56`, hardpan `#D4CCC0`, tundra `#5B5745`, glacier ice `#60A0D2`, overgrown road `#86806A`, laterite `#A65A36`,
+cliffs `#886C52`, molten lava pool `#B73F0C`, slate ashlar `#686C76`, basalt causeway
+`#4C4A4C`, scoria blocks `#584C44`, rime ashlar `#B5BBD4`, moonstone lozenges `#BEC0D1`,
+frost pinwheel `#B9BCD2`, arctic tundra `#89888D`, glacier `#B0C8E2`, icefall `#94C4E2`, sandstone benches `#D6AA7C`, obsidian ridge
+`#3E3E4A`, granite tors `#8C8C7C`, travertine terraces `#E2DAC8`, penitentes `#DEE8F6`, termite mounds `#AA7048`,
+hoodoos `#DEA074`, petrified stumps `#8E806C`, steppe grass `#5C7D65`, moor grass `#54714D`). Heath, shale, mudflat
+and brick path keep the image colours they had before their redesign, so
+existing exported images still import them, although the minimap shows the
+colour of each new texture. Import recognises the catalogue types **only by
+exact colour**: every other pixel classifies by nearest colour among
 the classic entries above, so existing images never acquire catalogue terrain or
 its experiment requirements by accident. Imported catalogue cells record their
 group's experiment like ice and trail do.
@@ -335,7 +364,7 @@ exported images, maps and command logs are retained under `artifacts/map-image/`
 
 The optional online AI Map Studio uses this same categorical importer and normal
 map serialization. Its maintained offline Python modules live under
-`platform/packages/map-studio/python`; provider calls belong to the durable online
+`services/online/packages/map-studio/python`; provider calls belong to the durable online
 worker. Legacy `map_image_examples.py` and `map_image_crop.py` entry points retain
 the original square four-colony workflow. `studio_pipeline.py` generalizes
 reference preparation, carrier geometry and crop selection for the studio's
@@ -369,6 +398,9 @@ without upscaling. The final surface is allocated at that size and world geometr
 is scaled directly into it; no full-resolution map canvas is allocated. The
 maximum square output surface is 256 MiB, separate from assets and Scene storage.
 Output replaces the destination only after PNG encoding and close succeed.
+
+An export composes terrain pages on every logical CPU, since nothing else shares
+them; `--compute-threads N` caps that, and the output is the same at any width.
 
 A `.field` starts with positive `width height`, then exactly `width * height`
 row-major signed 64-bit integers. Dimensions must match the map; up to 16,777,216

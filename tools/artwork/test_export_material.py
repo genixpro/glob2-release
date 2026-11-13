@@ -23,9 +23,20 @@ from material_tiles import ROOT, pixel_sha256  # noqa: E402
 
 
 def synthetic_material(name, size=512):
-    """A square stand-in for generated art: a procedural render, upscaled."""
-    image = terrain_synth.render_phase(name, 0)[1][3]
-    return image.resize((size, size), Image.Resampling.BICUBIC)
+    """A square stand-in for generated art: a procedural render, resized.
+
+    Positional recipes contribute their whole first block, since one cell of
+    a block is a fragment whose statistics need not match the material's.
+    """
+    tiles = terrain_synth.render_phase(name, 0)[1]
+    grid = terrain_synth.RECIPES[name].grid
+    if not grid:
+        return tiles[3].resize((size, size), Image.Resampling.BICUBIC)
+    cell = tiles[0].width
+    image = Image.new("RGBA", (grid * cell, grid * cell))
+    for v, tile in enumerate(tiles[:grid * grid]):
+        image.paste(tile, ((v % grid) * cell, (v // grid) * cell))
+    return image.resize((size, size), Image.Resampling.BOX)
 
 
 @unittest.skipUnless(PIL.__version__ == terrain_synth.PILLOW_VERSION, "needs the pinned Pillow")
@@ -42,10 +53,10 @@ class ExportMaterial(unittest.TestCase):
         self.tmp.cleanup()
 
     def prepare(self, name):
-        source_dir = self.root / "datasrc/gfx" / name
+        source_dir = self.root / "content-src/gfx" / name
         source_dir.mkdir(parents=True)
         synthetic_material(name).save(source_dir / "material.png")
-        shutil.copy(ROOT / "datasrc/gfx" / name / "provenance.json", source_dir / "provenance.json")
+        shutil.copy(ROOT / "content-src/gfx" / name / "provenance.json", source_dir / "provenance.json")
 
     def test_export_check_and_validate(self):
         self.prepare("boulders")
@@ -56,25 +67,25 @@ class ExportMaterial(unittest.TestCase):
         self.assertEqual(document["prompt"], export_material.MATERIAL_PROMPTS["boulders"])
         self.assertEqual(len(document["reference_sha256"]), 4)
         for i in range(16):
-            path = self.root / f"data/gfx/terrain-boulders{i}.png"
+            path = self.root / f"content/data/gfx/terrain-boulders{i}.png"
             with Image.open(path) as image:
                 self.assertEqual(image.size, (32, 32))
-                self.assertEqual(pixel_sha256(image), document["runtime_sha256"][f"data/gfx/terrain-boulders{i}.png"])
+                self.assertEqual(pixel_sha256(image), document["runtime_sha256"][f"content/data/gfx/terrain-boulders{i}.png"])
         self.assertEqual(export_material.check("boulders", self.root), 16)
         result = validate_material.validate("boulders", self.root)
         self.assertEqual(result["method"], "image-generator")
         # Any edit to a committed frame or the source is caught.
-        with Image.open(self.root / "data/gfx/terrain-boulders5.png") as image:
+        with Image.open(self.root / "content/data/gfx/terrain-boulders5.png") as image:
             edited = image.copy()
         edited.putpixel((10, 10), (255, 0, 255, 255))
-        edited.save(self.root / "data/gfx/terrain-boulders5.png")
+        edited.save(self.root / "content/data/gfx/terrain-boulders5.png")
         with self.assertRaises(ValueError):
             validate_material.validate("boulders", self.root)
         with self.assertRaises(ValueError):
             export_material.check("boulders", self.root)
 
     def test_rejects_small_or_non_square_sources(self):
-        source_dir = self.root / "datasrc/gfx/hedge"
+        source_dir = self.root / "content-src/gfx/hedge"
         source_dir.mkdir(parents=True)
         Image.new("RGBA", (256, 256), (40, 80, 40, 255)).save(source_dir / "material.png")
         with self.assertRaises(ValueError):
@@ -105,11 +116,11 @@ class ExportMaterial(unittest.TestCase):
             self.assertIn(name.replace("_", " ").split()[0], prompt.lower(), name)
         self.assertEqual(
             set(export_material.MATERIAL_PROMPTS),
-            {"boulders", "hedge", "thicket", "lava", "ember_field", "flower_meadow", "outcrop"},
+            {"boulders", "hedge", "thicket", "lava", "ember_field", "heath", "outcrop"},
         )
 
     def test_committed_materials_validate(self):
-        for name in terrain_synth.BUILTIN_ORDER:
+        for name in terrain_synth.SYNTH_ORDER:
             with self.subTest(material=name):
                 method = validate_material.validate(name)["method"]
                 if terrain_synth.RECIPES[name].placeholder_only:

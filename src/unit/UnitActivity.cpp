@@ -4,17 +4,21 @@
 #include "Unit.h"
 #include "Team.h"
 #include "Map.h"
-#include "Game.h"
+#include "GameHeader.h"
+#include "UnitCargo.h"
+#include "sim/SimServices.h"
 
 #include "Building.h"
+#include "render/GameAnimations.h"
 
 #include "Utilities.h"
 
 void Unit::handleActivity(void)
 {
+    const MaterialClaimObservation claimObservation{*this};
 	// A pre-rule save may still have a unit walking to training. Cancel its
 	// subscription before entering; feeding and healing use the same activity.
-	if (owner->game->gameHeader.isUnitUpgradesDisabled() && activity==ACT_UPGRADING
+	if (owner->ctx.gameHeader->isUnitUpgradesDisabled() && activity==ACT_UPGRADING
 		&& destinationPurpose!=FEED && destinationPurpose!=HEAL
 		&& displacement==DIS_GOING_TO_BUILDING && attachedBuilding)
 		stopAttachedForBuilding(true);
@@ -83,6 +87,7 @@ void Unit::handleActivity(void)
 	}
 	else if (needToRecheckMedical())
 	{
+        if (owner->map->activeClaimsEnabled()) releaseActiveMaterialClaim();
 		// disconnect from building
 		if (attachedBuilding)
 		{
@@ -111,10 +116,10 @@ void Unit::handleActivity(void)
 					// Unit conversion code
 
 					// Send events and keep track of number of unit converted
-					currentTeam->pushGameEvent(GameEvent::unitLostConversion(owner->game->stepCounter, posX, posY, targetTeam->teamNumber));
+					currentTeam->pushGameEvent(GameEvent::unitLostConversion(owner->ctx.tick(), posX, posY, targetTeam->teamNumber));
 					currentTeam->unitConversionLost++;
 
-					targetTeam->pushGameEvent(GameEvent::unitGainedConversion(owner->game->stepCounter, posX, posY, currentTeam->teamNumber));
+					targetTeam->pushGameEvent(GameEvent::unitGainedConversion(owner->ctx.tick(), posX, posY, currentTeam->teamNumber));
 					targetTeam->unitConversionGained++;
 
 					// Find free slot in other team
@@ -135,7 +140,8 @@ void Unit::handleActivity(void)
 							previousClearingArea.reset(); previousClearingAreaDistance=UNIT_CLEAR_AREA_DISTANCE_NONE;
 						}
 						const Uint16 targetGID = GIDfrom(targetID, targetTeam->teamNumber);
-						const Uint32 identity = owner->game->allocateScriptIdentity(false, targetGID);
+						const Uint16 previousGID = gid;
+						const Uint32 identity = owner->ctx.services->allocateScriptIdentity(false, targetGID);
 						++currentTeam->stats.events().conversionsOut[typeNum];
 						++targetTeam->stats.events().conversionsIn[typeNum];
 						Sint32 currentID=Unit::GIDtoID(gid);
@@ -155,14 +161,18 @@ void Unit::handleActivity(void)
 							owner->map->setGroundUnit(posX, posY, targetGID);
 						}
 						// A client selection follows the unit across the conversion.
-						owner->game->publishClientEvent(ClientEvent::UnitConverted{
+						owner->ctx.services->publishClientEvent(ClientEvent::UnitConverted{
 							UnitRef{gid, scriptIdentity}, UnitRef{targetGID, identity}});
+                        owner->map->forgetClaimRecovery(ResourceClaims::unitOwner(gid,scriptIdentity));
+                        if (owner->map->activeClaimsEnabled()) releaseActiveMaterialClaim();
 						scriptIdentity = identity;
-						owner->game->unitCargo.transfer(gid,targetGID);
+						owner->ctx.unitCargo->transfer(gid,targetGID);
 						gid=targetGID;
 						owner=targetTeam;
 						targetTeam->attachUnit(targetID, this);
 						race=&targetTeam->race;
+						owner->ctx.animations->onUnitConverted(*owner->map, posX, posY, currentTeam, targetTeam,
+							previousGID, targetGID);
 					}
 				}
 

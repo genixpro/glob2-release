@@ -5,7 +5,8 @@
 #include "Race.h"
 #include "Team.h"
 #include "Map.h"
-#include "Game.h"
+#include "gradient/MapRouting.h"
+#include "GameHeader.h"
 
 #include "Building.h"
 
@@ -13,6 +14,8 @@
 #include "MapInternal.h"
 #include "Utilities.h"
 #include "GlobalContainer.h"
+#include "render/GameAnimations.h"
+#include "render/UnitEffects.h"
 #include <climits>
 
 void Unit::waitForGradient()
@@ -37,7 +40,7 @@ void Unit::followPendingBuildingRoute(Building &building, BuildingRoute route)
 	if (!headingX && !headingY)
 		return;
 	const int preferred = Unit::directionFromDxDy(headingX, headingY);
-	const int access = swimClass();
+	const int access = accessClass(movementAccess());
 	// Match flyToTarget's preference order, but respect ground occupancy and terrain.
 	for (const int offset : {0, 1, 7, 2, 6, 3, 5, 4})
 	{
@@ -275,6 +278,15 @@ void Unit::handleMovementRemovingBlackAround()
 		|| !owner->map->isFreeForGroundUnit(posX+dx,posY+dy,canSwim,owner->me)) movement=performance[FLY]?MOV_RANDOM_FLY:MOV_RANDOM_GROUND;
 }
 
+namespace
+{
+struct AttackCandidate { int x, y, quality; };
+// Scan scratch for the simulation thread; nothing survives the call.
+thread_local std::vector<AttackCandidate> attackCandidates;
+thread_local std::vector<MapRouting::PointTarget> attackTargetCells;
+thread_local std::vector<MapRouting::PointTargetResult> attackTargetResults;
+}
+
 void Unit::handleMovementAttackingAround()
 {
 	int quality=INT_MAX; // Smaller is better.
@@ -294,6 +306,7 @@ void Unit::handleMovementAttackingAround()
 	{
 		// we look for the best target to attack around us
 		const int radius=runtimeTraits().attackSearchRadius;
+		attackCandidates.clear();
 		for (int x=-radius; x<=radius; x++)
 		{
 			for (int y=-radius; y<=radius; y++)
@@ -313,10 +326,10 @@ void Unit::handleMovementAttackingAround()
 						{
 							int id=Building::GIDtoID(gid);
 							int newQuality=((x*x+y*y)<<Q8_FIXED_POINT_SHIFT);
-							Building *b=owner->game->teams[team]->myBuildings[id];
+							Building *b=owner->ctx.teams[team]->myBuildings[id];
 							int shootDamage=b->runtime->damage(typeNum);
 							newQuality/=(1+shootDamage);
-							tryAcquireAttackTarget(x, y, newQuality, quality);
+							attackCandidates.push_back({x, y, newQuality});
 						}
 					}
 					gid=owner->map->getGroundUnit(posX+x, posY+y);
@@ -327,18 +340,19 @@ void Unit::handleMovementAttackingAround()
 						if (owner->attackableTeams() & tm)
 						{
 							int id=Building::GIDtoID(gid);
-							Unit *u=owner->game->teams[team]->myUnits[id];
+							Unit *u=owner->ctx.teams[team]->myUnits[id];
 							if (((owner->sharedVisionExchange & tm)==0))
 							{
 								int attackStrength=u->getRealAttackStrength();
 								int newQuality=Uint32((x*x+y*y)<<Q8_FIXED_POINT_SHIFT)/(Uint32(attackStrength)+1u);
-								tryAcquireAttackTarget(x, y, newQuality, quality);
+								attackCandidates.push_back({x, y, newQuality});
 							}
 						}
 					}
 				}
 			}
 		}
+		acquireBestAttackTarget(quality);
 	}
 
 	}
@@ -353,9 +367,9 @@ void Unit::handleMovementAttackingAround()
 		// Under guard-area balancing a crowded area's tiles sit below the goal
 		// value, so "inside" is the painted bit there.
 		const Uint16* guardGradient = performance[FLY] || attachedBuilding ? nullptr
-			: owner->map->getGuardAreasGradient(owner->teamNumber, swimClass());
+			: owner->map->routing().getGuardAreasGradient(owner->teamNumber, movementAccess());
 		if (!performance[FLY] && !attachedBuilding && !guardGradient) { waitForGradient(); return; }
-		const bool balancing = owner->game->gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing);
+		const bool balancing = owner->ctx.gameHeader->hasExperiment(ExperimentId::GuardAreaBalancing);
 		auto insideGuardArea = [&](int x, int y)
 		{
 			if (balancing || performance[FLY])
@@ -364,24 +378,24 @@ void Unit::handleMovementAttackingAround()
 		};
 		if (!attachedBuilding && performance[FLY] && !owner->map->hasAirRoutingConstraints()
             && !balancing && !insideGuardArea(posX,posY)) {
-            const auto* field=owner->map->getGuardAreasGradient(owner->teamNumber,AIR_MOVEMENT_CLASS);
-            if(!field){owner->map->gradientMovementDemand({GradientFieldFamily::Guard,Uint8(owner->teamNumber),AIR_MOVEMENT_CLASS});waitForGradient();return;}
+            const auto* field=owner->map->routing().getGuardAreasGradient(owner->teamNumber,MovementAccess::Air);
+            if(!field){owner->map->routing().gradientMovementDemand({GradientFieldFamily::Guard,Uint8(owner->teamNumber),AIR_MOVEMENT_CLASS});waitForGradient();return;}
             Sint32 goalX=0,goalY=0;
-            setValidTarget(owner->map->getGlobalGradientDestination(field,posX,posY,&goalX,&goalY));
+            setValidTarget(owner->map->routing().getGlobalGradientDestination(field,posX,posY,&goalX,&goalY));
             const GradientFieldKey key{GradientFieldFamily::Guard,Uint8(owner->teamNumber),AIR_MOVEMENT_CLASS};
-            if(validTarget()){directGradientDecision=key;owner->map->gradientMovementDemand(key);}
-            else owner->map->directGradientMovement(key,posX,posY,entityRandom,field,false,false);
+            if(validTarget()){directGradientDecision=key;owner->map->routing().gradientMovementDemand(key);}
+            else owner->map->routing().directGradientMovement(key,posX,posY,entityRandom,field,false,false);
             if (validTarget()) { targetX=goalX; targetY=goalY; }
             movement=validTarget()?MOV_FLYING_TARGET:MOV_RANDOM_FLY;
             return;
         }
-		if (!attachedBuilding && findDisplacement([&](int* pathDx, int* pathDy) { return owner->map->pathfindArea(entityRandom, Map::AreaKind::Guard, owner->teamNumber, movementClass(), posX, posY, pathDx, pathDy); }))
+		if (!attachedBuilding && findDisplacement([&](int* pathDx, int* pathDy) { return owner->map->routing().pathfindArea(entityRandom, MapRouting::AreaKind::Guard, owner->teamNumber, movementAccess(), posX, posY, pathDx, pathDy); }))
 
 		{
 			directionFromDxDy();
 			movement = MOV_GOING_DX_DY;
 			// get the target position of guard area for display
-			owner->map->getGlobalGradientDestination(owner->map->getGuardAreasGradient(owner->teamNumber, movementClass()), posX, posY, &targetX, &targetY);
+			owner->map->routing().getGlobalGradientDestination(owner->map->routing().getGuardAreasGradient(owner->teamNumber, movementAccess()), posX, posY, &targetX, &targetY);
 			setValidTarget(true);
 		}
 		else if (attachedBuilding || insideGuardArea(posX, posY))
@@ -444,16 +458,54 @@ void Unit::handleMovementAttackingAround()
 	if (performance[FLY] && movement==MOV_RANDOM_GROUND) movement=MOV_RANDOM_FLY;
 }
 
+// Candidates are considered in scan order: each one better than the target held
+// so far is searched for, and the step of that search is kept even when it
+// fails. Ground units resolve every candidate with one bounded search, which
+// answers exactly what the separate searches would.
+void Unit::acquireBestAttackTarget(int& quality)
+{
+	if (attackCandidates.empty())
+		return;
+	if (performance[FLY])
+	{
+		for (const auto& c : attackCandidates)
+			tryAcquireAttackTarget(c.x, c.y, c.quality, quality);
+		return;
+	}
+	auto& targets = attackTargetCells;
+	targets.clear();
+	for (const auto& c : attackCandidates)
+		targets.push_back({posX + c.x, posY + c.y});
+	owner->map->routing().pathfindPointTargets(posX, posY, targets, movementAccess(), owner->me,
+		GOING_TARGET_MAX_PATH_LENGTH, attackTargetResults);
+	for (std::size_t i = 0; i < attackCandidates.size(); ++i)
+	{
+		const auto& c = attackCandidates[i];
+		if (c.quality >= quality)
+			continue;
+		const auto& r = attackTargetResults[i];
+		dx = r.reached ? r.dx : 0;
+		dy = r.reached ? r.dy : 0;
+		if (r.reached)
+			acceptAttackTarget(c.x, c.y, c.quality, quality);
+	}
+}
+
 void Unit::tryAcquireAttackTarget(int x, int y, int newQuality, int& quality)
 {
 	if (newQuality >= quality)
 		return;
     bool pathfind = findDisplacement([&](int* pathDx,int* pathDy) {
-        return owner->map->pathfindPointToPoint(posX,posY,posX+x,posY+y,pathDx,pathDy,
-            movementClass(),owner->me,performance[FLY] ? Map::GRADIENT_COST_LIMIT/GRADIENT_STEP : GOING_TARGET_MAX_PATH_LENGTH);
+        return owner->map->routing().pathfindPointToPoint(posX,posY,posX+x,posY+y,pathDx,pathDy,
+            movementAccess(),owner->me,performance[FLY] ? Map::GRADIENT_COST_LIMIT/GRADIENT_STEP : GOING_TARGET_MAX_PATH_LENGTH);
     });
 	if (!pathfind)
 		return;
+	acceptAttackTarget(x, y, newQuality, quality);
+}
+
+void Unit::acceptAttackTarget(int x, int y, int newQuality, int& quality)
+{
 	if (abs(x)<=1 && abs(y)<=1)
 	{
 		movement=MOV_ATTACKING_TARGET;
@@ -511,12 +563,12 @@ void Unit::handleMovementClearingResources()
         bool source=validTarget() && map->warpDistSquare(targetX,targetY,bx,by)<=usr2
             && map->isClearableResourceForMaterials(targetX,targetY,attachedBuilding->clearingMaterialMask);
         if (!source) {
-            if (map->requestBuildingField(attachedBuilding,AIR_MOVEMENT_CLASS,BuildingRoute::Clearing)==FieldReadiness::Pending) {
+            if (map->routing().requestBuildingField(attachedBuilding,MovementAccess::Air,BuildingRoute::Clearing)==FieldReadiness::Pending) {
                 waitForGradient();
                 return;
             }
-            const auto* field=map->buildingGradient(attachedBuilding,AIR_MOVEMENT_CLASS,BuildingRoute::Clearing);
-            source=field && map->getGlobalGradientDestination(field,posX,posY,&targetX,&targetY);
+            const auto* field=map->routing().buildingGradient(attachedBuilding,MovementAccess::Air,BuildingRoute::Clearing);
+            source=field && map->routing().getGlobalGradientDestination(field,posX,posY,&targetX,&targetY);
         }
         setValidTarget(source);
         if (source) movement=MOV_FLYING_TARGET;
@@ -526,7 +578,7 @@ void Unit::handleMovementClearingResources()
 	const auto route = findGradientDisplacement(
 		[&](int *pathDx, int *pathDy)
 		{
-			return map->queryBuildingStep(entityRandom, attachedBuilding, movementClass(), posX, posY,
+			return map->routing().queryBuildingStep(entityRandom, attachedBuilding, movementAccess(), posX, posY,
 										  pathDx, pathDy, BuildingRoute::Clearing);
 		});
 	if (route == StepResult::Pending)
@@ -540,7 +592,7 @@ void Unit::handleMovementClearingResources()
 		directionFromDxDy();
 		movement=MOV_GOING_DX_DY;
 	}
-	else if (attachedBuilding->anyResourceToClear[swimAccessVariant(movementClass())]==2)
+	else if (attachedBuilding->anyResourceToClear[swimAccessVariant(accessClass(movementAccess()))]==2)
 	{
 		stopAttachedForBuilding(false);
 		movement=performance[FLY]?MOV_RANDOM_FLY:MOV_RANDOM_GROUND;
@@ -563,7 +615,7 @@ void Unit::handleMovementRandom()
 	}
 	else if (!performance[FLY] && map->getForbidden(posX, posY)&owner->me)
 	{
-		const auto escape = findGradientDisplacement([&](int* pathDx, int* pathDy) { return map->queryForbiddenStep(nullptr, owner->teamNumber, movementClass(), posX, posY, pathDx, pathDy); });
+		const auto escape = findGradientDisplacement([&](int* pathDx, int* pathDy) { return map->routing().queryForbiddenStep(nullptr, owner->teamNumber, movementAccess(), posX, posY, pathDx, pathDy); });
 		if (escape == StepResult::Pending) { waitForGradient(); return; }
 		if (escape == StepResult::Step)
 
@@ -581,24 +633,24 @@ void Unit::handleMovementRandom()
 	{
 		// g==0: on obstacle. g==1: no clearing area reachable from this cell.
 		// Both cases mean "nothing found".
-		const Uint16 *clearAreasGradient = owner->map->getClearAreasGradient(owner->teamNumber, movementClass());
+		const Uint16 *clearAreasGradient = owner->map->routing().getClearAreasGradient(owner->teamNumber, movementAccess());
         if(!clearAreasGradient) {
             if(medical==MED_FREE && foodStepsLeft(trigHungry)>0)
-                map->gradientMovementDemand({GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementClass())});
+                map->routing().gradientMovementDemand({GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementAccess())});
             waitForGradient();return;
         }
 
 		Uint16 g = clearAreasGradient[owner->map->coordToIndex(posX, posY)];
 		int distance = gradientTiles(g);
         if(g<=GRADIENT_UNREACHABLE && medical==MED_FREE && foodStepsLeft(trigHungry)>0) {
-            const GradientFieldKey key{GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementClass())};
-            map->gradientMovementDemand(key);
-            map->gradientMovementOutcome({key,posX,posY,entityRandom},clearAreasGradient,{});
+            const GradientFieldKey key{GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementAccess())};
+            map->routing().gradientMovementDemand(key);
+            map->routing().gradientMovementOutcome({key,posX,posY,entityRandom},clearAreasGradient,{});
         }
 		if(g > GRADIENT_UNREACHABLE && distance < foodStepsLeft(trigHungry) && medical == MED_FREE)
 		{
 			int tempTargetX, tempTargetY;
-			bool path = owner->map->getGlobalGradientDestination(clearAreasGradient, posX, posY, &tempTargetX, &tempTargetY);
+			bool path = owner->map->routing().getGlobalGradientDestination(clearAreasGradient, posX, posY, &tempTargetX, &tempTargetY);
 			int guid = owner->map->isClearingAreaClaimed(tempTargetX, tempTargetY, owner->teamNumber);
 			int other_distance = INT_MAX;
 			if(guid != NOGUID)
@@ -613,11 +665,11 @@ void Unit::handleMovementRandom()
 				dy=0;
                 const bool direct=performance[FLY] && !map->hasAirRoutingConstraints();
                 if(direct) {
-                    directGradientDecision=GradientFieldKey{GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementClass())};
-                    map->gradientMovementDemand(*directGradientDecision);
+                    directGradientDecision=GradientFieldKey{GradientFieldFamily::Clear,Uint8(owner->teamNumber),Uint8(movementAccess())};
+                    map->routing().gradientMovementDemand(*directGradientDecision);
                 }
                 if (!direct)
-                    findDisplacement([&](int* pathDx, int* pathDy) { return owner->map->queryAreaStep(entityRandom, Map::AreaKind::Clear, owner->teamNumber, movementClass(), posX, posY, pathDx, pathDy)==StepResult::Step; });
+                    findDisplacement([&](int* pathDx, int* pathDy) { return owner->map->routing().queryAreaStep(entityRandom, MapRouting::AreaKind::Clear, owner->teamNumber, movementAccess(), posX, posY, pathDx, pathDy)==StepResult::Step; });
 
 
 				targetX = tempTargetX;
@@ -681,7 +733,7 @@ void Unit::handleMovementGoingToFlagOrBuilding()
 		const auto result = findGradientDisplacement(
 			[&](int *pathDx, int *pathDy)
 			{
-				return map->queryBuildingStep(entityRandom, targetBuilding, movementClass(), posX, posY,
+				return map->routing().queryBuildingStep(entityRandom, targetBuilding, movementAccess(), posX, posY,
 											  pathDx, pathDy, route);
 			});
 		if (result == StepResult::Pending) {
@@ -720,6 +772,7 @@ void Unit::handleMovementExitingBuilding()
 		jobPurpose=UnitJobPurpose::None;
 		activity=ACT_RANDOM;
 		movement=MOV_EXITING_BUILDING;
+		owner->ctx.animations->onUnitLeftBuilding(*owner->map, gid, posX, posY, dx, dy, owner, UnitEffect::emergeTicks(speed));
 		attachedBuilding->removeUnitFromInside(this);
 		attachedBuilding->updateConstructionState();
 		attachedBuilding=NULL;
@@ -735,50 +788,48 @@ void Unit::handleMovementExitingBuilding()
 
 void Unit::handleMovementGoingToResource()
 {
+    if(owner->map->activeClaimsEnabled() && materialClaimDecision()) {
+        if(activeMaterialClaim || !attachedBuilding || !projectsSupplierFetch(*attachedBuilding,destinationPurpose)) {
+            handleActiveMaterialMovement();return;
+        }
+    }
+    handleClassicMaterialMovement();
+}
+
+void Unit::handleClassicMaterialMovement()
+{
+    const MaterialClaimObservation claimObservation{*this};
 	Map *map=owner->map;
 
 	if (performance[FLY] && !map->hasAirRoutingConstraints()) {
         // Reuse the shared destination query only when the old source expires;
         // ordinary travel neither follows nor refreshes a movement field.
         const auto sourceAvailable=[&] {
-            if (map->isMaterialTakeableSlot(targetX,targetY,destinationPurpose)) return true;
-            if (!attachedBuilding) return false;
-            const unsigned modes=map->materialSupplyModesSlot(attachedBuilding,destinationPurpose);
-            const auto eligible=[&](const Building* supplier) {
-                return map->stockSupplierEligibleSlot(supplier,attachedBuilding,destinationPurpose,modes);
-            };
-            const auto supplier=map->getBuilding(targetX,targetY);
-            if (supplier!=NOGBID && Building::GIDtoTeam(supplier)==owner->teamNumber
-                && eligible(owner->myBuildings[Building::GIDtoID(supplier)])) return true;
-            // Overlay providers have no building tile. Inspect their small
-            // instance lists, retaining the shared query's supplier policies.
-            const auto overlay=[&](const Building* b) {
-                return !b->type->semantics.occupiesGround
-                    && ((targetX-b->posX+map->getW()) & (map->getW()-1))<b->type->width
-                    && ((targetY-b->posY+map->getH()) & (map->getH()-1))<b->type->height
-                    && eligible(b);
-            };
-            if (modes&1) for (const Building* b:owner->stockSuppliers) if (overlay(b)) return true;
-            if (modes&2) for (const Building* b:owner->directStockSuppliers) if (overlay(b)) return true;
-            return false;
+            return map->routing().materialDestinationValidSlot(owner->teamNumber,destinationPurpose,MovementAccess::Air,
+                targetX,targetY,attachedBuilding && attachedBuilding->fetchesFromMarkets(),attachedBuilding);
         };
         const bool needsDestination=!validTarget() || !sourceAvailable();
         const Uint16* demandField=nullptr;
         std::optional<GradientFieldKey> demandKey;
         if(needsDestination) {
+            setValidTarget(false);
             const bool sharedMarkets=attachedBuilding && attachedBuilding->fetchesFromMarkets();
-            demandField=map->getMaterialGradientSlot(owner->teamNumber,destinationPurpose,AIR_MOVEMENT_CLASS,sharedMarkets,attachedBuilding,&demandKey);
-            if(!demandField){if(demandKey)map->gradientMovementDemand(*demandKey);waitForGradient();return;}
+            demandField=map->routing().getMaterialGradientSlot(owner->teamNumber,destinationPurpose,MovementAccess::Air,sharedMarkets,attachedBuilding,&demandKey);
+            if(!demandField){if(demandKey)map->routing().gradientMovementDemand(*demandKey);waitForGradient();return;}
         }
         const auto observeFlight=[&](bool moved,bool valid) {
             if(!demandKey)return;
-            if(moved && valid){directGradientDecision=*demandKey;map->gradientMovementDemand(*demandKey);}
-            else map->directGradientMovement(*demandKey,posX,posY,entityRandom,demandField,moved,valid);
+            if(moved && valid){directGradientDecision=*demandKey;map->routing().gradientMovementDemand(*demandKey);}
+            else map->routing().directGradientMovement(*demandKey,posX,posY,entityRandom,demandField,moved,valid);
         };
         if (needsDestination && !findMaterialDestination(destinationPurpose,&targetX,&targetY,nullptr,
                 attachedBuilding && attachedBuilding->fetchesFromMarkets(),attachedBuilding)) {
             observeFlight(false,false);
-            stopAttachedForBuilding(false);
+            // A reachable but stale field can resolve to an expired source.
+            // Keep the assignment while the normal demand recovery refreshes it.
+            if (map->routing().queryMaterialDistance(owner->teamNumber,destinationPurpose,MovementAccess::Air,
+                    posX,posY,nullptr,attachedBuilding && attachedBuilding->fetchesFromMarkets(),attachedBuilding)!=RouteResult::Reachable)
+                stopAttachedForBuilding(false);
             movement=MOV_RANDOM_FLY;
             return;
         }
@@ -797,25 +848,19 @@ void Unit::handleMovementGoingToResource()
     }
 
 	int teamNumber=owner->teamNumber;
-	int swim=movementClass();
+	const auto access=movementAccess();
 	bool stopWork;
 	const bool withMarkets=attachedBuilding && attachedBuilding->fetchesFromMarkets();
-	const auto result = findGradientDisplacement([&](int* pathDx, int* pathDy) { return map->queryMaterialStep(entityRandom, teamNumber, destinationPurpose, swim, posX, posY, pathDx, pathDy, &stopWork, attachedBuilding, withMarkets); });
+    bool projectedValid=false;
+	const auto result = findGradientDisplacement([&](int* pathDx, int* pathDy) { return map->routing().queryMaterialStep(entityRandom, teamNumber, destinationPurpose, access, posX, posY, pathDx, pathDy, &stopWork, attachedBuilding, withMarkets,&targetX,&targetY,&projectedValid); });
+    setValidTarget(projectedValid);
 	if (result == StepResult::Pending || result == StepResult::AtGoal) { waitForGradient(); return; }
 	if (result == StepResult::Step)
 	{
 		directionFromDxDy();
 		movement=MOV_GOING_DX_DY;
-		// targetX/Y (also the debug path line, hotkey T) were set once, by
-		// ascending a gradient, when the fetch task started. pathfindMaterial
-		// above re-reads the resource gradient that governs the step fresh
-		// every action, and that field can be rebuilt while the unit is still
-		// walking. Re-ascend from here whenever the stored target has stopped
-		// being a peak of that same gradient; isGradientPeak is a cheap check
-		// to run every action, the ascent itself only when it actually goes stale.
-		const Uint16 *gradient = map->getMaterialGradientSlot(teamNumber, destinationPurpose, swim, withMarkets, attachedBuilding);
-		if (gradient && !map->isGradientPeak(gradient, targetX, targetY))
-			map->getGlobalGradientDestination(gradient, posX, posY, &targetX, &targetY);
+        // The projection came from the actual first step and the same field.
+        // It describes this decision, not a commitment across future rebuilds.
 	}
 	else
 	{

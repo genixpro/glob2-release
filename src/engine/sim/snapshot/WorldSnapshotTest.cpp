@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
 #include "GradientFixture.h"
 #include "sim/snapshot/TeamRecords.h"
 #include "WorldSnapshot.h"
@@ -17,6 +19,7 @@
 #include <cstring>
 #include <nlohmann/json.hpp>
 #include <ThreadSupport.h>
+#include "sim/EntityRefOf.h"
 
 namespace {
 constexpr SimulationSnapshot::CaptureOptions allOptions{
@@ -25,6 +28,87 @@ constexpr SimulationSnapshot::CaptureOptions allOptions{
 
 TEST_SUITE("WorldSnapshot")
 {
+    TEST_CASE("boundary serials identify a capture and never repeat after a store reset")
+    {
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame fixture{glob2test::GameOptions{.wDec=5, .hDec=5, .teams=1, .clearImmobile=true, .loadDefaultRace=true}};
+        SimulationSnapshot::Store store;
+        const auto first = store.captureBoundary(fixture.game, {.presentation=true});
+        REQUIRE(first.boundarySerial != 0);
+        // A reused boundary and its projections keep the serial.
+        CHECK(store.captureBoundary(fixture.game, {.presentation=true}).boundarySerial == first.boundarySerial);
+        CHECK(store.captureBoundary(fixture.game).boundarySerial == first.boundarySerial);
+        CHECK(first.presentationView({.presentation=true}).boundarySerial == first.boundarySerial);
+        CHECK(first.simulationView().boundarySerial == first.boundarySerial);
+        // An owner edit and a tracked map change each capture a new boundary.
+        store.invalidateBoundary();
+        const auto edited = store.captureBoundary(fixture.game, {.presentation=true});
+        CHECK(edited.boundarySerial > first.boundarySerial);
+        fixture.game.map.markTerrain(0);
+        const auto painted = store.captureBoundary(fixture.game, {.presentation=true});
+        CHECK(painted.boundarySerial > edited.boundarySerial);
+        // A reset returns the revisions to their start; the serial still moves on.
+        store.reset();
+        const auto restarted = store.captureBoundary(fixture.game, {.presentation=true});
+        CHECK(restarted.observationRevision == first.observationRevision);
+        CHECK(restarted.boundarySerial > painted.boundarySerial);
+        // Separate stores never share a serial.
+        SimulationSnapshot::Store other;
+        CHECK(other.captureBoundary(fixture.game, {.presentation=true}).boundarySerial > restarted.boundarySerial);
+    }
+
+    TEST_CASE("material source coordinates stay immutable with their captured publication")
+    {
+        using Frozen = const gradient_kernel::OwnedDestinations&;
+        static_assert(std::is_same_v<decltype(std::declval<Frozen>().x[0]), const Uint16&>);
+        static_assert(std::is_same_v<decltype(std::declval<Frozen>().x.get()), const Uint16*>);
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame fixture{glob2test::GameOptions{.wDec=5, .hDec=5, .teams=1, .discovered=true, .clearImmobile=true, .loadDefaultRace=true}};
+        auto& map = fixture.game.map;
+        map.routing().configureGradientPipeline(0, 1);
+        map.routing().setMaterialDestinationsEnabled(true);
+        map.setResourceByIndex(12, 12, WHEAT, 1);
+        const auto* live = glob2test::awaitGradient(fixture.game, [&] { return map.routing().getMaterialGradientSlot(0, WHEAT, MovementAccess::Land); });
+        REQUIRE(map.routing().materialGradientDestinations(live));
+        SimulationSnapshot::Store store;
+        const auto before = store.captureBoundary(fixture.game);
+        const auto key = MapState::planeKey(0, WHEAT, 0, false);
+        const auto* field = before.resourceFields->find(key);
+        REQUIRE(field); REQUIRE(field->destinations);
+        const auto index = map.coordToIndex(4, 4);
+        CHECK(field->destinations->x[index] == 12); CHECK(field->destinations->y[index] == 12);
+        CHECK(field->destinationGeneration > 0);
+        // Dropping the live metadata must not revoke or mutate an older lease.
+        map.routing().setMaterialDestinationsEnabled(false);
+        store.invalidateBoundary(); // This fixture's private store is outside Game's invalidation hook.
+        const auto after = store.captureBoundary(fixture.game);
+        const auto* replaced = after.resourceFields->find(key);
+        REQUIRE(replaced); CHECK_FALSE(replaced->destinations);
+        CHECK(replaced->destinationGeneration == 0);
+        CHECK(field->destinations->x[index] == 12); CHECK(field->destinations->y[index] == 12);
+    }
+
+    TEST_CASE("resource claims are not snapshot state and leave captured stock shared")
+    {
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame fixture({.loadDefaultRace=true, .header=true});
+        auto& map = fixture.game.map;
+        SimulationSnapshot::Store store;
+        store.setVerification(true);
+        const auto before = store.captureBoundary(fixture.game);
+        const auto index = map.coordToIndex(4, 4);
+        // Claims reserve stock in the ledger only; no snapshot consumer reads
+        // them, so recording and releasing one copies no resource arrays.
+        const auto copied = store.metrics.mapBytesCopied;
+        REQUIRE(map.recordMaterialClaim(10, {Uint32(index), Uint32(index), 0, 0}));
+        const auto after = store.captureBoundary(fixture.game);
+        CHECK(after.resources == before.resources);
+        REQUIRE(map.releaseMaterialClaim(10));
+        const auto released = store.captureBoundary(fixture.game);
+        CHECK(released.resources == before.resources);
+        CHECK(store.metrics.mapBytesCopied == copied);
+    }
+
     TEST_CASE("named views retain only their standard inputs")
     {
         glob2test::HeadlessGlobals globals;
@@ -646,7 +730,7 @@ TEST_SUITE("WorldSnapshot")
 		REQUIRE(building); REQUIRE(worker);
 		building->unitsWorking.push_back(worker);
 		game.map.setResourceByIndex(20, 20,WHEAT, 1);
-		glob2test::awaitGradient(game,[&] { return game.map.getMaterialGradientSlot(0, materialIndex(MaterialId::Food), 0); });
+		glob2test::awaitGradient(game,[&] { return game.map.routing().getMaterialGradientSlot(0, materialIndex(MaterialId::Food), MovementAccess::Land); });
 		SimulationSnapshot::Store store;
 		auto mutateAndCapture = [&] {
 			++game.stepCounter;
@@ -654,7 +738,7 @@ TEST_SUITE("WorldSnapshot")
 			game.map.setGroundUnit(25, 25, NOGUID);
 			game.map.addGuardArea(20, 20, 0);
 			game.map.setMapDiscovered(20, 20, game.teams[0]->me);
-			game.map.updateMaterialGradient(0, Uint8(materialIndex(MaterialId::Food)), 0);
+			game.map.routing().updateMaterialGradient(0, Uint8(materialIndex(MaterialId::Food)), MovementAccess::Land);
 			building->priority = int(game.stepCounter);
 			return store.captureBoundary(game, allOptions);
 		};
@@ -720,8 +804,8 @@ TEST_SUITE("WorldSnapshot")
 		const auto catalog = SimulationSnapshot::captureCatalog(fixture.game);
 		auto captured = SimulationSnapshot::capture(fixture.game, catalog);
 		AIEngine::AIWorldView held(captured);
-		const auto* frozenLocal = held.building(Game::refOf(local));
-		const auto* frozenShared = held.building(Game::refOf(shared));
+		const auto* frozenLocal = held.building(refOf(local));
+		const auto* frozenShared = held.building(refOf(shared));
 		REQUIRE(frozenLocal); REQUIRE(frozenShared);
 		for (const auto& building : held.buildings) {
 			const auto* live = fixture.game.resolveBuilding(building.identity);
@@ -739,8 +823,8 @@ TEST_SUITE("WorldSnapshot")
 		fixture.game.teams[0]->teamMaterials[WOOD] = 37;
 		local->priority = 1;
 		AIEngine::AIWorldView later(SimulationSnapshot::capture(fixture.game, catalog));
-		CHECK(later.buildingResources(*later.building(Game::refOf(local)))[WOOD] == 31);
-		CHECK(later.buildingResources(*later.building(Game::refOf(shared)))[WOOD] == 37);
+		CHECK(later.buildingResources(*later.building(refOf(local)))[WOOD] == 31);
+		CHECK(later.buildingResources(*later.building(refOf(shared)))[WOOD] == 37);
 		CHECK(frozenLocal->priority == -1);
 		CHECK(held.buildingResources(*frozenLocal)[WOOD] == 17);
 		CHECK(held.buildingResources(*frozenShared)[WOOD] == 23);
@@ -749,8 +833,8 @@ TEST_SUITE("WorldSnapshot")
 			SimulationSnapshot::bit(SimulationSnapshot::Component::Entities));
 		CHECK_FALSE(partial.teams);
 		AIEngine::AIWorldView entitiesOnly(std::move(partial));
-		CHECK(entitiesOnly.buildingResources(*entitiesOnly.building(Game::refOf(local)))[WOOD] == 31);
-		CHECK(entitiesOnly.building(Game::refOf(shared))->usesTeamResources);
+		CHECK(entitiesOnly.buildingResources(*entitiesOnly.building(refOf(local)))[WOOD] == 31);
+		CHECK(entitiesOnly.building(refOf(shared))->usesTeamResources);
 	}
 	TEST_CASE("flat relationship ranges preserve every building list in order")
 	{
@@ -770,10 +854,10 @@ TEST_SUITE("WorldSnapshot")
 			REQUIRE(live);
 			CHECK(view.working.offset == cursor);
 			CHECK(view.working.count == live->unitsWorking.size());
-			for (const auto* unit : live->unitsWorking) CHECK(snapshot.entities->relationships.at(cursor++) == Game::refOf(unit));
+			for (const auto* unit : live->unitsWorking) CHECK(snapshot.entities->relationships.at(cursor++) == refOf(unit));
 			CHECK(view.inside.offset == cursor);
 			CHECK(view.inside.count == live->unitsInside.size());
-			for (const auto* unit : live->unitsInside) CHECK(snapshot.entities->relationships.at(cursor++) == Game::refOf(unit));
+			for (const auto* unit : live->unitsInside) CHECK(snapshot.entities->relationships.at(cursor++) == refOf(unit));
 		}
 		CHECK(cursor == snapshot.entities->relationships.size());
 	}
@@ -1016,7 +1100,7 @@ TEST_SUITE("WorldSnapshot")
         CHECK(full.resourceFields == simulation.resourceFields);
         CHECK(store.metrics.coreMaterializations == 1);
 		REQUIRE(full.entities->units.size() == 1);
-		CHECK(full.entities->relationships.front() == Game::refOf(unit));
+		CHECK(full.entities->relationships.front() == refOf(unit));
 		CHECK_FALSE(simulation.session); CHECK_FALSE(simulation.history);
 		REQUIRE(full.session); REQUIRE(full.effects); REQUIRE(full.statistics); REQUIRE(full.history);
 		CHECK(store.metrics.captures == 2);
@@ -1208,11 +1292,11 @@ TEST_SUITE("WorldSnapshot")
         check("unit team", [&](auto& entities) { entities.units[0].team=1; });
         check("building team", [&](auto& entities) { entities.buildings[0].team=1; });
         check("unit attack strength", [&](auto& entities) { ++entities.units[0].realAttackStrength; });
-        check("working reference", [&](auto& entities) { entities.relationships[entities.buildings[0].working.offset]=Game::refOf(occupant); });
-        check("inside reference", [&](auto& entities) { entities.relationships[entities.buildings[0].inside.offset]=Game::refOf(worker); });
+        check("working reference", [&](auto& entities) { entities.relationships[entities.buildings[0].working.offset]=refOf(occupant); });
+        check("inside reference", [&](auto& entities) { entities.relationships[entities.buildings[0].inside.offset]=refOf(worker); });
         check("working count", [&](auto& entities) { entities.buildings[0].working.count=0; });
         check("inside offset", [&](auto& entities) { entities.buildings[0].inside.offset=entities.relationships.size(); });
-        check("unreferenced relationship", [&](auto& entities) { entities.relationships.push_back(Game::refOf(worker)); });
+        check("unreferenced relationship", [&](auto& entities) { entities.relationships.push_back(refOf(worker)); });
         check("derived maximum hp", [&](auto& entities) { ++entities.buildings[0].maxHp; });
         check("shared inventory binding", [&](auto& entities) { entities.buildings[0].usesTeamResources=!entities.buildings[0].usesTeamResources; });
         check("supply mask", [&](auto& entities) { entities.buildings[0].availableSupplyMask^=1; });

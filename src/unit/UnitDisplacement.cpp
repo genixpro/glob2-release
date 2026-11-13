@@ -9,14 +9,35 @@
 #include "Race.h"
 #include "Team.h"
 #include "Map.h"
-#include "Game.h"
+#include "gradient/MapRouting.h"
+#include "GameHeader.h"
+#include "AreaEffects.h"
 
 #include "Building.h"
 
 #include "Utilities.h"
 #include "GlobalContainer.h"
+#include "render/GameAnimations.h"
+#include "render/UnitEffects.h"
 
 namespace {
+std::optional<Offset> materialPickup(Unit& unit)
+{
+    auto& map=*unit.owner->map;
+    // A worker without a valid claim picks up exactly as with claims off; its
+    // harvest then uses takeHarvest too.
+    if(map.activeClaimsEnabled())unit.releaseInvalidActiveMaterialClaim();
+    if(!unit.activeMaterialClaim)return map.doesUnitTouchMaterialSource(&unit,static_cast<MaterialId>(unit.destinationPurpose));
+    // A claimed worker picks up only its own reservation, or exchanges it for
+    // adjacent stock it can reserve (prepareActiveMaterialPickup).
+    for(int dx=-1;dx<=1;++dx)for(int dy=-1;dy<=1;++dy)
+        if(map.isMaterialTakeableSlot(unit.posX+dx,unit.posY+dy,unit.destinationPurpose)
+            && !map.isForbidden(unit.posX+dx,unit.posY+dy,unit.owner->me)
+            && unit.prepareActiveMaterialPickup(unit.posX+dx,unit.posY+dy))
+            return Offset{dx,dy};
+    return std::nullopt;
+}
+
 // Crowding eligibility changes independently of tile movement when a warrior
 // enters/leaves a building or finishes a capability upgrade. Stack-only and
 // owner-thread; this records a conservative event, not a weighted seed change.
@@ -27,12 +48,13 @@ struct GuardCostEligibility {
         return !unit.isDead && unit.displacement!=Unit::DIS_INSIDE && unit.hasCapability(UnitRuntimeTraits::GuardIdle);
     }
     explicit GuardCostEligibility(Unit& value):unit(value),before(eligible(value)) {}
-    ~GuardCostEligibility() {if(before!=eligible(unit))unit.owner->map->gradientGuardCostsChanged(unit.owner->teamNumber);}
+    ~GuardCostEligibility() {if(before!=eligible(unit))unit.owner->map->routing().gradientGuardCostsChanged(unit.owner->teamNumber);}
 };
 }
 
 void Unit::handleDisplacement(void)
 {
+    const MaterialClaimObservation claimObservation{*this};
     const GuardCostEligibility guardCostEligibility(*this);
 	switch (activity)
 	{
@@ -63,10 +85,14 @@ void Unit::handleDisplacement(void)
 
 			if (displacement==DIS_GOING_TO_RESOURCE)
 			{
-				if (auto off = owner->map->doesUnitTouchMaterialSource(this, static_cast<MaterialId>(destinationPurpose)))
+				if (auto off = materialPickup(*this))
 				{
 					dx = off->dx;
 					dy = off->dy;
+                    // During harvesting these coordinates identify the touched
+                    // pickup tile, which can differ from the projected goal.
+                    targetX=(posX+dx)&(owner->map->getW()-1);
+                    targetY=(posY+dy)&(owner->map->getH()-1);
 					displacement=DIS_HARVESTING;
 					setValidTarget(false);
 				}
@@ -74,7 +100,7 @@ void Unit::handleDisplacement(void)
 				{
 					// The gradient led here to a stocked market of ours: take the
 					// resource at its door and carry it home.
-					if (Building *market = owner->map->touchedStockedMarketSlot(this, destinationPurpose))
+					if (Building *market = owner->map->routing().touchedStockedMarketSlot(this, destinationPurpose))
 					{
 						if (hasCapability(UnitRuntimeTraits::ExtendedCargo) && !canCarryMaterial(destinationPurpose)) { stopAttachedForBuilding(false); break; }
 						receiveCarriedMaterial(destinationPurpose,market->withdrawMaterialPacket(destinationPurpose));
@@ -92,14 +118,14 @@ void Unit::handleDisplacement(void)
 				// Inside a farm area (farm-areas experiment) the grain comes off
 				// the ripest tile of the connected field rather than off the tile
 				// under the animation, and an exhausted field hands out nothing.
-				// Everywhere else this is the old unconditional grant.
+				// Outside pooled fields, harvest the touched deposit directly.
 				if (hasCapability(UnitRuntimeTraits::ExtendedCargo) && !canCarryMaterial(destinationPurpose)) {
 					// This pickup never consumed its source. Do not let the old
 					// harvest animation become an idle clearing completion.
 					movement=performance[FLY]?MOV_RANDOM_FLY:MOV_RANDOM_GROUND;
 					stopAttachedForBuilding(false); break;
 				}
-				const bool gotResource = owner->map->takeHarvest(posX, posY, dx, dy,
+				const bool gotResource = usesMaterialClaimPickup()?takeActiveMaterialClaim():owner->map->takeHarvest(posX, posY, dx, dy,
 					static_cast<MaterialId>(destinationPurpose), owner->me);
 				assert(movement == MOV_HARVESTING);
 				movement = MOV_RANDOM_GROUND; // we do this to avoid the handleMovement() to additionally decResource() the same resource.
@@ -226,6 +252,12 @@ void Unit::handleDisplacement(void)
 							if (useful && cargoDeliveryProgress) { displacement=DIS_FILLING_BUILDING; break; }
 							if (carriedPacketCount()>=unsigned(runtimeTraits().cargoCapacity)) { stopAttachedForBuilding(false); break; }
 						}
+						// Reconsider inventory-driven staffing only after the load has finished
+						// unloading, before committing this worker to another delivery trip.
+						if (attachedBuilding->finishesDeliveryTrips() && attachedBuilding->unitsWorking.size()>
+							unsigned(std::max(0,attachedBuilding->desiredMaxUnitWorking))) {
+							stopAttachedForBuilding(false); break;
+						}
 						if (!performance[HARVEST]) { stopAttachedForBuilding(false); break; }
 						int needs[MaterialSlotCount];
 						attachedBuilding->computeWishedMaterials(needs);
@@ -244,7 +276,7 @@ void Unit::handleDisplacement(void)
 								int distance;
 								const auto route=performance[FLY]
 									? queryMaterialDestination(r,nullptr,nullptr,&distance,false,attachedBuilding)
-									: map->queryMaterialDistance(teamNumber,r,swimClass(),posX,posY,&distance,false,attachedBuilding);
+									: map->routing().queryMaterialDistance(teamNumber,r,movementAccess(),posX,posY,&distance,false,attachedBuilding);
 								if (route==RouteResult::Pending) { if (pendingResource<0) pendingResource=r; continue; }
 								if (route!=RouteResult::Reachable || (distance<<1)>=timeLeft) continue;
 
@@ -268,10 +300,12 @@ void Unit::handleDisplacement(void)
 								assert(activity==ACT_FILLING);
 								{
 									int dummyDist;
-									if (auto off = owner->map->doesUnitTouchMaterialSource(this, static_cast<MaterialId>(destinationPurpose)))
+									if (auto off = materialPickup(*this))
 									{
 										dx = off->dx;
 										dy = off->dy;
+                                        targetX=(posX+dx)&(owner->map->getW()-1);
+                                        targetY=(posY+dy)&(owner->map->getH()-1);
 										displacement=DIS_HARVESTING;
 										setValidTarget(false);
 									}
@@ -399,7 +433,7 @@ void Unit::handleDisplacement(void)
 				// Feed and heal visits share this displacement state with training.
 				// A saved trainee must use the normal exit path to release its room,
 				// without waiting for an upgrade timer or recording a training gain.
-				if (insideTimeout>=0 || (owner->game->gameHeader.isUnitUpgradesDisabled()
+				if (insideTimeout>=0 || (owner->ctx.gameHeader->isUnitUpgradesDisabled()
 					&& destinationPurpose!=FEED && destinationPurpose!=HEAL))
 				{
 					displacement=DIS_EXITING_BUILDING;
@@ -408,17 +442,19 @@ void Unit::handleDisplacement(void)
 					// course. Release its original reservation before changing any
 					// levels, then exit using the existing movement clocks.
 					const bool trainingVisit=destinationPurpose!=FEED && destinationPurpose!=HEAL;
-					const auto courses=trainingVisit && !owner->game->gameHeader.isUnitUpgradesDisabled()
+					const auto courses=trainingVisit && !owner->ctx.gameHeader->isUnitUpgradesDisabled()
 						? trainingVisitCourses(*attachedBuilding,destinationPurpose) : std::optional<Uint32>{};
-					if (trainingVisit && !owner->game->gameHeader.isUnitUpgradesDisabled() && courses)
+					if (trainingVisit && !owner->ctx.gameHeader->isUnitUpgradesDisabled() && courses)
 						++owner->stats.events().trainingVisits[typeNum];
 
 					if (destinationPurpose==FEED)
 					{
 						hungry=foodCapacity();
-						if (owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
+						if (owner->ctx.areaEffects->enabled()) areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
 						fruitCount=attachedBuilding->eatOnce(&fruitMask, this);
 						setNeedToRecheckMedical(true);
+						owner->ctx.animations->onUnitServiced(gid, Uint8(UnitEffect::Kind::Feed),
+							attachedBuilding->gid, attachedBuilding->typeNum, 0);
 					}
 					else if (destinationPurpose==HEAL)
 					{
@@ -427,12 +463,14 @@ void Unit::handleDisplacement(void)
 						attachedBuilding->owner->stats.events().hpRestored +=
 							std::max<Sint64>(0, Sint64(performance[HP]) - hp);
 						hp=performance[HP];
-						if (owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
+						if (owner->ctx.areaEffects->enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
 						setNeedToRecheckMedical(true);
+						owner->ctx.animations->onUnitServiced(gid, Uint8(UnitEffect::Kind::Heal),
+							attachedBuilding->gid, attachedBuilding->typeNum, 0);
 					}
 					// Restored units already inside exit safely without gaining a level.
 					// New training visits are rejected by Team::findBestUpgrade.
-					else if (!owner->game->gameHeader.isUnitUpgradesDisabled())
+					else if (!owner->ctx.gameHeader->isUnitUpgradesDisabled())
 					{
 						if(!courses) { attachedBuilding->releaseService(this); setNeedToRecheckMedical(true); break; }
 						attachedBuilding->settleService(this);
@@ -452,9 +490,19 @@ void Unit::handleDisplacement(void)
 						else
 							applyTrainingUnchecked(attachedBuilding->type->semantics.training[destinationPurpose], destinationPurpose);
 
+						// The exit effect floats the highest new level, displayed 1-based
+						// except SWIM, which is stored that way.
+						int shownLevel = 0;
 						for (int a = 0; a < NB_ABILITY; ++a)
+						{
 							owner->stats.events().abilityGains[typeNum][a] +=
 								std::max(0, level[a] - previousLevels[a]);
+							if (level[a] > previousLevels[a])
+								shownLevel = std::max(shownLevel, a == SWIM ? level[a] : 1 + level[a]);
+						}
+						if (shownLevel)
+							owner->ctx.animations->onUnitServiced(gid, Uint8(UnitEffect::Kind::Train),
+								attachedBuilding->gid, attachedBuilding->typeNum, Uint8(std::min(shownLevel, 255)));
 					}
 				}
 				else
@@ -539,7 +587,7 @@ bool Unit::locationIsInEnemyGuardTowerRange(int x, int y)const
 	//TODO: totally fix this totally hacky implementation.
 	for(int i=0;i<Team::MAX_COUNT;i++)
 	{
-		Team *t = owner->game->teams[i];
+		Team *t = owner->ctx.teams[i];
 		if((t)&&(owner->enemies & t->me))
 		{
 			// The live index contains every occupied slot in the original slot order.
@@ -573,7 +621,7 @@ void Unit::applyPartialInsideBenefit()
 	{
 		if (attachedBuilding->type->semantics.feeding.partial == BuildingPartialService::None) return;
 		hungry=int(Sint64(hungry)+((Sint64(foodCapacity())-hungry)*elapsed)/total);
-		if (hungry>=foodCapacity() && owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
+		if (hungry>=foodCapacity() && owner->ctx.areaEffects->enabled()) areaServiceRemainders[BuildingAreaEffects::Feeding]=0;
 		fruitCount=attachedBuilding->eatOnce(&fruitMask, this);
 	}
 	else
@@ -583,13 +631,16 @@ void Unit::applyPartialInsideBenefit()
 		const Sint64 restored = ((Sint64(performance[HP]) - hp) * elapsed) / total;
 		attachedBuilding->owner->stats.events().hpRestored += std::max<Sint64>(0, restored);
 		hp=int(Sint64(hp)+restored);
-		if (hp>=performance[HP] && owner->game->areaEffects.enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
+		if (hp>=performance[HP] && owner->ctx.areaEffects->enabled()) areaServiceRemainders[BuildingAreaEffects::Healing]=0;
 	}
 }
 
 void Unit::expelFromBuilding(int x, int y, int dx, int dy)
 {
     const GuardCostEligibility guardCostEligibility(*this);
+	// A unit already on its way out had its whole service; one expelled mid-stay
+	// gets a partial benefit and no exit effect.
+	const bool served = displacement==DIS_EXITING_BUILDING;
 	applyPartialInsideBenefit();
 	standardRandomActivity();
 	insideTimeout=0;
@@ -599,5 +650,9 @@ void Unit::expelFromBuilding(int x, int y, int dx, int dy)
 	this->dy=dy;
 	delta=0;
 	movement=MOV_EXITING_BUILDING;
+	if (served)
+		owner->ctx.animations->onUnitLeftBuilding(*owner->map, gid, posX, posY, dx, dy, owner, UnitEffect::emergeTicks(speed));
+	else
+		owner->ctx.animations->onUnitGone(gid);
 	handleActionExitingBuilding();
 }

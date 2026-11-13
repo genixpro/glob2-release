@@ -6,8 +6,11 @@
 #include <cmath>
 
 #include "BuildingType.h"
-#include "Game.h"
+#include "AreaEffects.h"
+#include "sim/SimServices.h"
 #include "Map.h"
+#include "gradient/MapRouting.h"
+#include "Building.h"
 #include "Team.h"
 #include "Unit.h"
 
@@ -40,7 +43,7 @@ bool allRemainingUnitsTrapped(Team& team)
 	// An active ally may clear an exit. Do not attempt a reachability proof.
 	for (int i = 0; i < Team::MAX_COUNT; ++i)
 	{
-		Team* ally = team.game->teams[i];
+		Team* ally = team.ctx.teams[i];
 		if (ally && ally != &team && (team.allies & ally->me)
 			&& ally->isAlive && !ally->hasLost && ally->playersMask != 0)
 			return false;
@@ -199,15 +202,15 @@ namespace
 	bool jobCost(Unit *u, Building *b, int resource, int *cost)
 	{
 		Map *map = b->owner->map;
-		int swimClass = u->movementClass();
+		int swimClass = accessClass(u->movementAccess());
 		if (b->globalGradient[swimClass] == NULL)
 			return false;
 		if (u->carriedMaterial >= 0)
-			return u->hasCarriedMaterial(resource) && map->buildingAvailable(b, swimClass, u->posX, u->posY, cost, BuildingRoute::Footprint);
+			return u->hasCarriedMaterial(resource) && map->routing().buildingAvailable(b, movementAccessFromLegacy(swimClass), u->posX, u->posY, cost, BuildingRoute::Footprint);
 		// Fetch and carry: the plain distances, as hiring uses them.
 		int toBuilding, toResource;
-		if (!map->buildingAvailable(b, swimClass, u->posX, u->posY, &toBuilding, BuildingRoute::Footprint)
-			|| !map->materialAvailableSlot(b->owner->teamNumber, resource, swimClass, u->posX, u->posY, &toResource, b->fetchesFromMarkets(), b))
+		if (!map->routing().buildingAvailable(b, movementAccessFromLegacy(swimClass), u->posX, u->posY, &toBuilding, BuildingRoute::Footprint)
+			|| !map->routing().materialAvailableSlot(b->owner->teamNumber, resource, movementAccessFromLegacy(swimClass), u->posX, u->posY, &toResource, b->fetchesFromMarkets(), b))
 			return false;
 		*cost = toBuilding + toResource;
 		return true;
@@ -229,7 +232,7 @@ namespace
             *cost=1+Sint32(std::sqrt(map->warpDistSquare(u->posX,u->posY,b->posX,b->posY)));
             return true;
         }
-		return map->buildingAvailable(b, u->movementClass(), u->posX, u->posY, cost, BuildingRoute::Footprint);
+		return map->routing().buildingAvailable(b, u->movementAccess(), u->posX, u->posY, cost, BuildingRoute::Footprint);
 	}
 
 	// Move `u`'s booking from one inn to the other; both keep their head count.
@@ -243,6 +246,7 @@ namespace
 
 	void assignTask(Unit *u, Building *b, int resource)
 	{
+        if(u->owner->map->activeClaimsEnabled())u->releaseActiveMaterialClaim();
 		u->attachedBuilding->removeUnitFromWorking(u);
 		u->attachedBuilding = b;
 		u->destinationPurpose = resource;
@@ -252,14 +256,15 @@ namespace
 		{
 			u->displacement = Unit::DIS_GOING_TO_BUILDING;
 			u->setTargetBuilding(b);
+            u->setValidTarget(true);
 		}
 		else
 		{
 			u->displacement = Unit::DIS_GOING_TO_RESOURCE;
 			u->setTargetBuilding(NULL);
-			b->owner->map->materialAvailableUpdateSlot(b->owner->teamNumber, resource, u->movementClass(), u->posX, u->posY, &u->targetX, &u->targetY, NULL, b->fetchesFromMarkets(), b);
+            u->setValidTarget(u->queryMaterialDestination(resource,&u->targetX,&u->targetY,nullptr,
+                b->fetchesFromMarkets(),b)==RouteResult::Reachable);
 		}
-		u->setValidTarget(true);
 	}
 }
 
@@ -355,6 +360,9 @@ void Team::syncStep(void)
 	int nbUsefulUnitsAlone = 0;
 	bool hasHealthyOrRecoveringUnit = false;
 	PerformanceTelemetry::Scope unitTime(PerformanceTelemetry::Id::Units);
+	// Contention-triggered claims compare against where this team's workers
+	// were heading as its unit step begins (a no-op without claims).
+	map->prepareClaimContention(teamNumber);
 	// Select once per team. The usual loop has no aura branch per unit;
 	// pulse services still run immediately before that unit's normal update.
 	const auto stepUnits = [&]<bool areaPulse>() {
@@ -388,7 +396,7 @@ void Team::syncStep(void)
 		}
 	}
 	};
-	if (game->areaEffects.enabled() && !(game->stepCounter & (BuildingAreaEffects::PulseTicks-1)))
+	if (ctx.areaEffects->enabled() && !(ctx.tick() & (BuildingAreaEffects::PulseTicks-1)))
 		stepUnits.template operator()<true>();
 	else
 		stepUnits.template operator()<false>();
@@ -405,7 +413,7 @@ void Team::syncStep(void)
 			{
 				if (!building->type->isVirtual)
 				{
-					stats.events().variants.resize(game->buildingsTypes.size());
+					stats.events().variants.resize(ctx.buildingsTypes->size());
 					++stats.events().variants[building->typeNum].removed[GameplayMeasurements::DEMOLISHED];
 					if (building->type->shortTypeNum>=0 && building->type->shortTypeNum<IntBuildingType::NB_BUILDING && building->getLongLevel()<NB_BUILDING_LONG_LEVELS)
 						++stats.events().removed[GameplayMeasurements::DEMOLISHED][building->type->shortTypeNum][building->getLongLevel()];
@@ -429,7 +437,7 @@ void Team::syncStep(void)
 	if (isDirtyGlobalGradient)
 	{
 		dirtyGlobalGradient();
-		map->updateTeamAreaGradients(teamNumber);
+		map->routing().updateTeamAreaGradients(teamNumber);
 	}
 
 	for (std::list<Building *>::iterator it=buildingsToBeDestroyed.begin(); it!=buildingsToBeDestroyed.end(); ++it)
@@ -446,7 +454,7 @@ void Team::syncStep(void)
 
 		// Selections notice the removal when their BuildingRef stops resolving;
 		// the client still needs the gid to drop its pending per-gid shadow.
-		game->publishClientEvent(ClientEvent::BuildingRemoved{building->gid});
+		ctx.services->publishClientEvent(ClientEvent::BuildingRemoved{building->gid});
 
 		detachBuilding(Building::GIDtoID(building->gid));
 		delete building;
@@ -466,6 +474,8 @@ void Team::syncStep(void)
 			++it;
 	}
 
+	// Hire-time claim targets for this team, from the state hiring starts at.
+	map->prepareClaimHireTargets(teamNumber);
 	updateAllBuildingTasks();
 	// Round robin visits at most four existing units, independent of empty IDs.
 	const auto candidates=std::min<std::size_t>(SWAP_CHECKS_PER_TICK,liveUnits.size());
@@ -494,7 +504,7 @@ void Team::syncStep(void)
 		}
 
 	for (std::list<Building *>::iterator it=turrets.begin(); it!=turrets.end(); ++it)
-		(*it)->turretStep(game->stepCounter);
+		(*it)->turretStep(ctx.tick());
 
 	bool isDying= (playersMask==0)
 		|| allRemainingUnitsTrapped(*this)
@@ -514,7 +524,7 @@ void Team::syncStep(void)
 
 void Team::dirtyGlobalGradient()
 {
-	game->dirtyWarFlagGradient();
+	ctx.services->dirtyWarFlagGradient();
 	for (Building* building : liveBuildings)
 		building->resetPathfindGradients(Building::GradientDrop::Team);
 }

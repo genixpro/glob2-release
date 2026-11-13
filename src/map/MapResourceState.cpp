@@ -2,6 +2,8 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "Map.h"
+#include "ComputeTelemetry.h"
+#include "gradient/MapRouting.h"
 #include "MapAssetBundle.h"
 #include "gradient/ResourceSeedCache.h"
 #include "gradient/GradientRuntime.h"
@@ -69,11 +71,11 @@ void Map::installCatalogs(std::shared_ptr<const TerrainRegistry> terrain,
         for (unsigned mask=sources;mask;mask&=mask-1) ++counts[std::countr_zero(mask)];
         deposits[i]=r;
     }
-    finishGradientPipeline();
-    gradientRuntime->growth.reset();
-    auto priorAdaptiveFields=std::move(gradientRuntime->adaptive.fields);
-    gradientRuntime->adaptive={};
-    gradientRuntime->marketTargets={};
+    routing().finishGradientPipeline();
+    routing().gradientRuntime->growth.reset();
+    auto priorAdaptiveFields=std::move(routing().gradientRuntime->adaptive.fields);
+    routing().gradientRuntime->adaptive={};
+    routing().gradientRuntime->marketTargets={};
     terrainRegistryValue = std::move(terrain);
     assetBundleValue = std::move(assets);
     resourceRegistryValue=next;
@@ -95,17 +97,17 @@ void Map::installCatalogs(std::shared_ptr<const TerrainRegistry> terrain,
         // not captured inputs yet and will capture the replacement catalogs.
         for (int team=0;team<Team::MAX_COUNT;++team)
             for (int swim=0;swim<MOVEMENT_CLASS_COUNT;++swim) {
-                gradientRuntime->pipeline.invalidate(&forbiddenGradient[team][swim]);
-                gradientRuntime->pipeline.invalidate(&guardAreasGradient[team][swim]);
-                gradientRuntime->pipeline.invalidate(&clearAreasGradient[team][swim]);
+                routing().gradientRuntime->pipeline.invalidate(&routing().forbiddenGradient[team][swim]);
+                routing().gradientRuntime->pipeline.invalidate(&routing().guardAreasGradient[team][swim]);
+                routing().gradientRuntime->pipeline.invalidate(&routing().clearAreasGradient[team][swim]);
                 for (int material=0;material<MaterialCount;++material) {
-                    gradientRuntime->pipeline.invalidate(&materialGradients[team][material][swim]);
+                    routing().gradientRuntime->pipeline.invalidate(&routing().materialGradients[team][material][swim]);
 
-                    gradientRuntime->pipeline.invalidate(&marketMaterialGradients[team][material][swim]);
+                    routing().gradientRuntime->pipeline.invalidate(&routing().marketMaterialGradients[team][material][swim]);
                 }
             }
-        for (auto& [key,field]:gradientRuntime->materialFields) {
-            gradientRuntime->pipeline.invalidate(&field.published);
+        for (auto& [key,field]:routing().gradientRuntime->materialFields) {
+            routing().gradientRuntime->pipeline.invalidate(&field.published);
             field.topology=0;
         }
     }
@@ -115,7 +117,7 @@ void Map::installCatalogs(std::shared_ptr<const TerrainRegistry> terrain,
     // requests, but never reinterpret old capture evidence under new semantics.
     // In-flight old-catalog jobs above are superseded at their original dues.
     for(const auto& [key,oldField]:priorAdaptiveFields) {
-        auto& field=gradientRuntime->adaptive.enroll(key);
+        auto& field=routing().gradientRuntime->adaptive.enroll(key);
         field.submitted=oldField.submitted;field.queued=oldField.queued;
     }
 }
@@ -210,12 +212,12 @@ void Map::refreshResourceTotal(size_t index)
 
 void Map::materialStockChanged(size_t index, MaterialMask before, MaterialMask beforeAvailable, bool notifyTargets)
 {
-    if(notifyTargets && beforeAvailable!=materialMaskAt(index) && !gradientRuntime->adaptive.fields.empty()) {
-        auto prior=captureGradientTargetCell(index);
+    if(notifyTargets && beforeAvailable!=materialMaskAt(index) && !routing().gradientRuntime->adaptive.fields.empty()) {
+        auto prior=routing().captureGradientTargetCell(index);
         // This entry point changes stocks without changing the resource type.
         // Whole-resource replacement supplies its complete before-image instead.
         prior.materials=beforeAvailable;
-        gradientTargetCellChanged(index,prior);
+        routing().gradientTargetCellChanged(index,prior);
     }
     const auto after=resourceMaterialMaskAt(index);
     // Renewable membership may include empty stocks, but all such yields are
@@ -234,9 +236,10 @@ void Map::materialStockChanged(size_t index, MaterialMask before, MaterialMask b
 
 void Map::rebuildResourceState()
 {
+    invalidateAllActiveMaterialClaims();
     resourceChanges.markAll();
-    gradientRuntime->adaptive={};
-    gradientRuntime->marketTargets={};
+    routing().gradientRuntime->adaptive={};
+    routing().gradientRuntime->marketTargets={};
     bumpStaticMaterialSourceGeneration();
     resourceStockIndices.clear(); resourceStocks.clear(); freeResourceStocks.clear(); materialSourceCounts.fill(0);
     for (size_t i=0;i<cellCount();++i)
@@ -258,6 +261,15 @@ void Map::setMaterialAmount(size_t index,MaterialId materialId,Uint16 amount)
     const auto& yield=resourceRegistry().yields(static_cast<ResourceId>(r.type))[material];
     amount=std::min(amount,yield.capacity);
     if (amount==oldAmount) return;
+    auto claimOwners=amount<oldAmount && !amount ? farmMaterialClaimOwners(index,~Uint32(0),MaterialMask(1u<<material)) : std::vector<ResourceClaims::Owner>{};
+    if (activeClaimsEnabled() && amount<oldAmount) {
+        const auto source=materialClaims.ownersAtSource(Uint32(index));
+        claimOwners.insert(claimOwners.end(),source.begin(),source.end());
+        if (!amount) {
+            const auto access=materialClaims.ownersAtAccess(Uint32(index));
+            claimOwners.insert(claimOwners.end(),access.begin(),access.end());
+        }
+    }
     const bool crossesZero=(oldAmount==0)!=(amount==0);
     // Only availability transitions affect counters; capture renewable membership
     // before mutation, including an empty persistent stock that can regrow.
@@ -268,6 +280,7 @@ void Map::setMaterialAmount(size_t index,MaterialId materialId,Uint16 amount)
     else { resourceStocks[resourceStockIndices[index]-1][material]=amount; refreshResourceTotal(index); }
     if (crossesZero) materialStockChanged(index,before,beforeAvailable);
     if (!r.amount && !p.persistsWhenEmpty) replaceResource(index,Resource{});
+    revalidateMaterialClaimOwners(std::move(claimOwners),!amount);
 }
 
 void Map::setResourceAmount(size_t index, Uint32 amount)

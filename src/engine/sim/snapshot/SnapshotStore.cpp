@@ -1,9 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "ComputeExecutor.h"
+#include "Map.h"
 #include "SnapshotStore.h"
 #include "Game.h"
 #include <algorithm>
+#include <atomic>
 namespace SimulationSnapshot
 {
+namespace
+{
+// Shared by every store, so serials never repeat across resets, worlds or games.
+std::atomic<Uint64> nextBoundarySerial{1};
+}
 Handle Store::captureBoundary(const Game& game, CaptureOptions options)
 {
 	auto required = captureRequirements(options);
@@ -21,6 +29,7 @@ Handle Store::captureBoundary(const Game& game, CaptureOptions options)
 		catalogConfigurationRevision = game.gameHeader.observationRevision();
 	}
 	const auto copiedBefore = storage.bytesCopied;
+	const auto seedsBefore = storage.buildingSeedBytesCopied;
 	const auto entityBefore = storage.entityBytesCopied;
 	const auto sidecarBefore = storage.entitySidecarBytesCopied;
 	auto next = capture(game, catalog, required, latest ? &*latest : nullptr, &storage, unchangedBoundary);
@@ -28,7 +37,9 @@ Handle Store::captureBoundary(const Game& game, CaptureOptions options)
 	metrics.entityBytesCopied += storage.entityBytesCopied - entityBefore;
 	metrics.entitySidecarBytesCopied += storage.entitySidecarBytesCopied - sidecarBefore;
 	next.observationRevision = observationRevision;
+	next.boundarySerial = nextBoundarySerial.fetch_add(1, std::memory_order_relaxed);
 	metrics.mapBytesCopied += storage.bytesCopied - copiedBefore;
+	metrics.buildingSeedBytesCopied += storage.buildingSeedBytesCopied - seedsBefore;
 	if (detailedMetrics || game.map.computeExecutor().telemetryEnabled()) {
 		const Handle empty;
 		accountCapture(next, latest ? *latest : empty, storage.bytesCopied - copiedBefore);
@@ -79,7 +90,7 @@ void Store::accountCapture(const Handle& next, const Handle& previous, Uint64 co
 	if (next.resourceFields) for (const auto& field : next.resourceFields->planes) {
 		const auto* found = previous.resourceFields ? previous.resourceFields->find(field.key) : nullptr;
 		if (found && found->values == field.values) ++metrics.reusedComponents;
-		else metrics.bytesCopied += field.values->size() * sizeof(Uint16);
+		else metrics.bytesCopied += field.cells * sizeof(Uint16);
 	}
     if (next.session && next.session == previous.session) ++metrics.reusedComponents;
     else if (next.session) metrics.bytesCopied+=sizeof(Session)+next.session->players.size()*sizeof(Session::Player)
@@ -88,7 +99,8 @@ void Store::accountCapture(const Handle& next, const Handle& previous, Uint64 co
     else if (next.effects) {
         metrics.bytesCopied+=next.effects->sectors.size()*sizeof(SectorEffects);
         for (const auto& sector:next.effects->sectors) metrics.bytesCopied+=sector.bullets.size()*sizeof(BulletRecord)
-            +sector.explosions.size()*sizeof(ExplosionRecord)+sector.deaths.size()*sizeof(DeathRecord);
+            +sector.explosions.size()*sizeof(ExplosionRecord)+sector.deaths.size()*sizeof(DeathRecord)
+            +sector.unitEffects.size()*sizeof(UnitEffectRecord);
     }
     if (next.statisticsInputs && next.statisticsInputs == previous.statisticsInputs) ++metrics.reusedComponents;
     else if(next.statisticsInputs) {
@@ -106,7 +118,7 @@ void Store::accountCapture(const Handle& next, const Handle& previous, Uint64 co
     if (next.telemetry && next.telemetry == previous.telemetry) ++metrics.reusedComponents;
     else if (next.telemetry) {
         for (const auto& row:next.telemetry->rows) metrics.bytesCopied+=sizeof(row)
-            +row.fields.size()*sizeof(AITelemetry::Field)+row.values.size()*sizeof(AITelemetry::Value)
+            +row.values.size()*sizeof(AITelemetry::Value)
             +row.named.size()*sizeof(AITelemetry::NamedValue);
     }
     if (next.history && next.history == previous.history) ++metrics.reusedComponents;

@@ -4,7 +4,7 @@
 #include "FractalMapSupport.h"
 #include "Drawing.h"
 #include "BalancedStarts.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "Growth.h"
 #include "Morphology.h"
 #include "Pipeline.h"
@@ -796,10 +796,10 @@ void stampCrossings(Layout &L, const CrossingSelection &selection, GenerationCon
 	context.telemetry.measure("fractal.crossings.major-shortfall", selection.majorShortfall);
 }
 
-bool furnishAndSettle(Game &game, GenerationContext &context, const Layout &L)
+bool furnishAndSettle(GenerationWorld &game, GenerationContext &context, const Layout &L)
 {
 	const auto &t = L.t;
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	context.stage = "fractal terrain and contained farms";
 	writeVertices(map, L.terrain);
 
@@ -1116,11 +1116,11 @@ bool furnishAndSettle(Game &game, GenerationContext &context, const Layout &L)
 	}
 	return true;
 }
-std::string validate(const Game &game, const GenerationContext &context, const Layout &L)
+std::string validate(const GenerationWorld &game, const GenerationContext &context, const Layout &L)
 {
 	if (const auto error = designMismatch(L, game.map, "fractal map"); !error.empty())
 		return error;
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	const auto &t = L.t;
 	const auto walk = walkFromFirstColony(map, context.request.nbTeams, "fractal land",
 										  "over the designed routes");
@@ -1176,11 +1176,20 @@ std::string validate(const Game &game, const GenerationContext &context, const L
 				   " cannot fit six complete upgrade envelopes with circulation: " +
 				   upgrades.failure;
 	}
+	// Crossings reserve terrain vertices. The walking footprint consists of
+	// cells with at least two crossing corners; a lone boundary corner is a
+	// water-majority fringe, not part of the designed lane. Check every cell
+	// of that footprint, in addition to the finished-world connectivity above.
 	for (int i = 0; i < t.size(); ++i)
 	{
-		if (L.crossings[i] && !map.terrainPropertiesAt(t.remainderX(i), i / t.w).walkable)
-			return "A designed crossing was lost at (" + std::to_string(t.remainderX(i)) + "," +
-				   std::to_string(i / t.w) + ") during terrain rasterization.";
+		const int x = t.remainderX(i), y = i / t.w;
+		const unsigned crossingCorners = unsigned(L.crossings[i] != 0) +
+			unsigned(L.crossings[t.at(x + 1, y)] != 0) +
+			unsigned(L.crossings[t.at(x, y + 1)] != 0) +
+			unsigned(L.crossings[t.at(x + 1, y + 1)] != 0);
+		if (crossingCorners >= 2 && !map.terrainPropertiesAt(x, y).walkable)
+			return "A designed crossing was lost at (" + std::to_string(x) + "," +
+				   std::to_string(y) + ") during terrain rasterization.";
 	}
 	return "";
 }

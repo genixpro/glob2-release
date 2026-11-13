@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "BrushSwatches.h"
+#include "MapAssetBundle.h"
+#include "TerrainBuiltins.h"
+#include "TerrainPresentation.h"
 #include "GlobalContainer.h"
 #include "GraphicContext.h"
 #include "map/TerrainRegistry.h"
@@ -10,8 +13,14 @@
 
 using GAGCore::DrawableSurface;
 
-BrushSwatches::BrushSwatches() = default;
+BrushSwatches::BrushSwatches() : assets(MapAssetBundle::empty()) {}
 BrushSwatches::~BrushSwatches() = default;
+
+void BrushSwatches::bind(std::shared_ptr<const TerrainRegistry> terrain,
+						 std::shared_ptr<const ResourceRegistry> resources)
+{
+	bind(std::move(terrain), std::move(resources), MapAssetBundle::empty());
+}
 
 void BrushSwatches::bind(std::shared_ptr<const TerrainRegistry> terrain,
 						 std::shared_ptr<const ResourceRegistry> resources,
@@ -124,7 +133,6 @@ std::unique_ptr<DrawableSurface> BrushSwatches::composeTerrain(TerrainType type,
 	// the current instance for each new swatch, rather than retaining a flag
 	// tied to the previous instance. Cached swatches need no texture work.
 	const bool gpu = globalContainer->gfx->rendererCapabilities().accelerated;
-	compositor.prepare(gpu, 0);
 	const auto &catalog = compositor.catalog();
 	// A custom material binding takes precedence over the imported base look.
 	const auto appearance = terrainRegistry->appearance(type);
@@ -151,28 +159,32 @@ std::unique_ptr<DrawableSurface> BrushSwatches::composeTerrain(TerrainType type,
 	if (binding != catalog.bindings.end())
 	{
 		DrawableSurface texture(size, size);
-		TerrainVisual::Recipe recipe;
-		recipe.corners.fill(binding->second);
-		recipe.width = recipe.height = 2;
+		std::array<TerrainVisual::Recipe, 4> recipes;
 		for (int y = 0; y < 2; ++y)
 			for (int x = 0; x < 2; ++x)
 			{
+				auto &recipe = recipes[y * 2 + x];
+				recipe.corners.fill(binding->second);
+				recipe.width = recipe.height = 2;
 				recipe.x = x;
 				recipe.y = y;
-				compositor.compose(recipe, texture.getSDLSurface(), x * cell, y * cell, scale);
 			}
+		compositor.prepareForRecipes(gpu, 0, recipes);
+		for (const auto &recipe : recipes)
+			compositor.compose(recipe, texture.getSDLSurface(), recipe.x * cell, recipe.y * cell, scale);
 		texture.markPixelsChanged();
 		base.drawSurface(0, 0, &texture);
-		// Raised decor (boulders, hedges, rock) over each cell, as the map draws
-		// it for cells surrounded by the same material.
-		if (auto *sprite = compositor.decorSprite(binding->second))
+		// Flat overlays (fertile glints): one lit step of each cell's cycle, so the
+		// still swatch shows the mark the map animates.
+		if (auto *sprite = compositor.overlaySprite(binding->second))
+		{
+			const auto &cycles = catalog.materials[binding->second].overlay.cycles;
 			for (int y = 0; y < 2; ++y)
 				for (int x = 0; x < 2; ++x)
 				{
-					const int frame = catalog.decorFrame(binding->second, x, y, false);
-					if (frame < 0)
-						continue;
-					auto *source = sprite->nativeFrame(frame);
+					const auto &cycle = cycles[unsigned(y * 2 + x) % cycles.size()];
+					const auto lit = std::find_if(cycle.begin(), cycle.end(), [](int f) { return f >= 0; });
+					auto *source = lit == cycle.end() ? nullptr : sprite->nativeFrame(*lit);
 					if (source && source->getSDLSurface())
 					{
 						const int w = source->getW() * scale, h = source->getH() * scale;
@@ -180,6 +192,30 @@ std::unique_ptr<DrawableSurface> BrushSwatches::composeTerrain(TerrainType type,
 								  h, source);
 					}
 				}
+		}
+		// Raised decor (boulders, hedges, rock) over each cell, as the map draws
+		// it for cells surrounded by the same material. The swatch is a window
+		// onto a repeating 2x2 patch: neighbouring cells outside it whose decor
+		// reaches in (tall obstacles rise up to 80 px) are drawn too, in row
+		// order, so tops are not cut off at the swatch edge.
+		if (auto *sprite = compositor.decorSprite(binding->second))
+		{
+			const auto reach = compositor.decorReach();
+			const int above = (reach.down + 31) / 32, below = (reach.up + 31) / 32,
+					  side = (reach.side + 31) / 32;
+			for (int y = -above; y < 2 + below; ++y)
+				for (int x = -side; x < 2 + side; ++x)
+				{
+					const int frame = catalog.decorFrame(binding->second, x & 1, y & 1, false);
+					if (frame < 0)
+						continue;
+					auto *source = sprite->nativeFrame(frame);
+					if (source && source->getSDLSurface())
+						drawFrame(base, x * cell - TerrainVisual::decorOffsetX(source->getW()) * scale,
+								  y * cell - TerrainVisual::decorOffsetY(source->getH()) * scale,
+								  source->getW() * scale, source->getH() * scale, source);
+				}
+		}
 	}
 	makeOpaque(base);
 	auto result = std::make_unique<DrawableSurface>(px, px);
@@ -195,9 +231,7 @@ std::unique_ptr<DrawableSurface> BrushSwatches::composeResource(ResourceId id, T
 	if (auto *ground = terrain(backdrop, px))
 		result->drawSurface(0, 0, ground);
 	const auto &presentation = resourceRegistry->presentation(id);
-	const auto &sprites = ResourceSprites::resolve(resourceRegistry, assets);
-	auto *sprite =
-		resourceIndex(id) < sprites.sprites.size() ? sprites.sprites[resourceIndex(id)] : nullptr;
+	auto *sprite = ResourceSprites::resolve(resourceRegistry, assets).sprite(id, /*waitForLoad=*/true);
 	if (sprite && !presentation.levels.empty())
 	{
 		// The fullest stage, the look an author expects of a freshly painted deposit.
@@ -235,7 +269,6 @@ GAGCore::DrawableSurface *BrushSwatches::terrainScene(TerrainType type, TerrainT
 		return found == catalog.bindings.end() ? TerrainVisual::MaterialId(0) : found->second;
 	};
 	const auto material = materialFor(type), other = materialFor(neighbor);
-	compositor.prepare(false, int(phase * catalog.materials[material].animationTicks));
 	auto source = std::make_unique<DrawableSurface>(192, 192);
 	auto cellMaterial = [&](int x, int y)
 	{
@@ -247,10 +280,11 @@ GAGCore::DrawableSurface *BrushSwatches::terrainScene(TerrainType type, TerrainT
 				   ? material
 				   : other;
 	};
+	std::array<TerrainVisual::Recipe, 36> recipes;
 	for (int y = 0; y < 6; ++y)
 		for (int x = 0; x < 6; ++x)
 		{
-			TerrainVisual::Recipe recipe;
+			auto &recipe = recipes[y * 6 + x];
 			recipe.x = x;
 			recipe.y = y;
 			recipe.width = recipe.height = 6;
@@ -261,12 +295,19 @@ GAGCore::DrawableSurface *BrushSwatches::terrainScene(TerrainType type, TerrainT
 			for (int dy = -1; dy <= 2; ++dy)
 				for (int dx = -1; dx <= 2; ++dx)
 					recipe.neighborhood[(dy + 1) * 4 + dx + 1] = cellMaterial(x + dx, y + dy);
-			compositor.compose(recipe, source->getSDLSurface(), x * 32, y * 32, 1);
 		}
+	compositor.prepareForRecipes(false, int(phase * catalog.materials[material].animationTicks), recipes);
+	for (const auto &recipe : recipes)
+		compositor.compose(recipe, source->getSDLSurface(), recipe.x * 32, recipe.y * 32, 1);
 	source->markPixelsChanged();
-	// Decor uses the same per-material sprite and coordinate selection as map rows.
-	for (int y = 0; y < 6; ++y)
-		for (int x = 0; x < 6; ++x)
+	// Decor uses the same per-material sprite and coordinate selection as map
+	// rows. The scene repeats every six cells; cells just outside it whose
+	// decor reaches in are drawn too, so tall obstacles are not clipped.
+	const auto reach = compositor.decorReach();
+	const int above = (reach.down + 31) / 32, below = (reach.up + 31) / 32,
+			  side = (reach.side + 31) / 32;
+	for (int y = -above; y < 6 + below; ++y)
+		for (int x = -side; x < 6 + side; ++x)
 		{
 			const std::array<TerrainVisual::MaterialId, 4> corners = {
 				cellMaterial(x, y), cellMaterial(x + 1, y), cellMaterial(x, y + 1),
@@ -289,12 +330,13 @@ GAGCore::DrawableSurface *BrushSwatches::terrainScene(TerrainType type, TerrainT
 			const bool edge = count < 4;
 			if (auto *sprite = compositor.decorSprite(decorated))
 			{
-				const int frame = catalog.decorFrame(decorated, x, y, edge, variation);
+				const int frame =
+					catalog.decorFrame(decorated, (x + 6) % 6, (y + 6) % 6, edge, variation);
 				if (frame >= 0)
 					if (auto *image = sprite->nativeFrame(frame))
-						drawFrame(*source, x * 32 + 16 - image->getW() / 2,
-								  y * 32 + 16 - image->getH() / 2, image->getW(), image->getH(),
-								  image);
+						drawFrame(*source, x * 32 - TerrainVisual::decorOffsetX(image->getW()),
+								  y * 32 - TerrainVisual::decorOffsetY(image->getH()), image->getW(),
+								  image->getH(), image);
 			}
 		}
 	makeOpaque(*source);
@@ -321,9 +363,7 @@ GAGCore::DrawableSurface *BrushSwatches::resourceStage(ResourceId id, TerrainTyp
 	if (auto *ground = terrain(backdrop, px))
 		result->drawSurface(0, 0, ground);
 	const auto &presentation = resourceRegistry->presentation(id);
-	const auto &sprites = ResourceSprites::resolve(resourceRegistry, assets);
-	auto *sprite =
-		resourceIndex(id) < sprites.sprites.size() ? sprites.sprites[resourceIndex(id)] : nullptr;
+	auto *sprite = ResourceSprites::resolve(resourceRegistry, assets).sprite(id, /*waitForLoad=*/true);
 	if (sprite && !presentation.levels.empty())
 	{
 		const ResourceSpriteLevel *level = &presentation.levels.front();

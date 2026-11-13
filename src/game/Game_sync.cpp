@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "ComputeExecutor.h"
+#include "gradient/MapRouting.h"
 #include <PerformanceTelemetry.h>
-#include "AICastor.h"
 
 #include <assert.h>
 #include <string.h>
@@ -35,6 +36,9 @@
 #include "ReplayReader.h"
 #include "AITelemetry.h"
 #include "TurretTargeting.h"
+#include "Team.h"
+#include "Building.h"
+#include "GameScripting.h"
 
 #define BULLET_IMGID 0
 
@@ -64,7 +68,7 @@ void Game::buildProjectSyncStep(Sint32 localTeam)
 					if (teamNumber == localTeam)
 						map.displayedForbiddenView.set(map.coordToIndex(x, y), false);
 				}
-			map.updateForbiddenGradient(teamNumber);
+			map.routing().updateForbiddenGradient(teamNumber);
 			std::list<BuildProject>::iterator to_erase=bpi;
 			bpi++;
 			buildProjects.erase(to_erase);
@@ -84,7 +88,7 @@ void Game::buildProjectSyncStep(Sint32 localTeam)
 						if (teamNumber == localTeam)
 							map.displayedForbiddenView.set(map.coordToIndex(x, y), false);
 					}
-				map.updateForbiddenGradient(teamNumber);
+				map.routing().updateForbiddenGradient(teamNumber);
 				b->owner->addToStaticAbilitiesLists(b);
 				b->update();
 				std::list<BuildProject>::iterator to_erase=bpi;
@@ -115,33 +119,43 @@ void Game::wonSyncStep(void)
 
 }
 
-void Game::winProbabilitySyncStep()
+void Game::winProbabilitySyncStep(bool force)
 {
-	// Diagnostic only, and off unless GLOB2_TEAM_TIMELINE asks for it. The
-	// numbers are the ones the optional win probability victory condition reads,
-	// so a test can check the engine and tools/win_probability_model.py agree
-	// sample by sample instead of only at the end, and a divergence between two
-	// platforms shows up as a diff rather than as a desynchronised game.
-	//
-	// Runs on the 512-tick boundary TeamStats samples at, after the teams have
-	// stepped, so it reports exactly the state the condition was evaluated on.
-	if ((stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) != 0)
+	// Read the same state as the victory condition, regardless of whether the
+	// rule or detailed telemetry is enabled. This history never drives play.
+	if ((stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) != 0 && !isGameEnded && !force)
 		return;
-	if (!getenv("GLOB2_TEAM_TIMELINE"))
-		return;
+	bool newSample = false;
+	for (int t = 0; t < teamsCount(); ++t)
+	{
+		const auto &history = teams[t]->stats.getWinProbabilityHistory();
+		newSample |= history.empty() || history.back().tick != stepCounter;
+	}
+	if (!newSample) return;
 	std::vector<int> allianceOf;
-	const std::vector<WinProbability::Slot> slots = WinProbability::slotsOf(*this, allianceOf);
+	// The probability rule has just assigned loss flags. Preserve the actual
+	// prediction that ended the match instead of turning a 95% call into 100%.
+	Uint32 ignoreLostTeams = 0;
+	for (int t = 0; t < teamsCount(); ++t)
+	{
+		if (teams[t]->winCondition == WCWinProbability) ignoreLostTeams |= 1u << t;
+	}
+	const std::vector<WinProbability::Slot> slots = WinProbability::slotsOf(*this, allianceOf, ignoreLostTeams);
 	const std::vector<int> chances = WinProbability::permille(slots);
+	for (int t = 0; t < teamsCount(); ++t)
+		teams[t]->stats.recordWinProbability(stepCounter, chances[allianceOf[t]], WinProbability::modelId());
+	if (!getenv("GLOB2_TEAM_TIMELINE")) return;
 	for (size_t i = 0; i < slots.size(); ++i)
 		std::cout << "GLOB2_WINPROB alliance=" << i
 			<< " tick=" << stepCounter
 			<< " alive=" << (slots[i].alive ? 1 : 0)
 			<< " permille=" << chances[i]
-			<< " units=" << slots[i].units
-			<< " prestige=" << slots[i].prestige
-			<< " barracks=" << slots[i].barracks
+			<< " feeding=" << slots[i].feeding
 			<< " explorers=" << slots[i].explorers
-			<< " foodCritical=" << slots[i].foodCritical
+			<< " barracksLevels=" << slots[i].barracksLevels
+			<< " delivered=" << slots[i].delivered
+			<< " innWalkDistance=" << slots[i].innWalkDistance
+			<< " swarmFilling=" << slots[i].swarmFilling
 			<< " attack=" << slots[i].attack
 			<< std::endl;
 }
@@ -217,7 +231,7 @@ void Game::prestigeSyncStep()
 
 void Game::advanceLiveSimulation(Sint32 localTeam)
 {
-	map.applyGradientBackendRequest();
+	map.routing().applyGradientBackendRequest();
     assert(completedObservation && completedObservation->tick == stepCounter);
 	applyClientRequests();
 	if (!anyPlayerWaited)
@@ -233,6 +247,10 @@ void Game::advanceLiveSimulation(Sint32 localTeam)
 		areaEffects.beginTick(*this);
 		for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
 			teams[i]->syncStep();
+
+        // Unit decisions are complete: seal one route batch now so its frozen
+        // searches overlap map, script and telemetry work before tick+1.
+        map.flushClaimRoutes();
 
 		map.syncStep(stepCounter);
 		if (globalContainer->replaying && globalContainer->replayReader)

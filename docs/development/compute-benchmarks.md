@@ -22,7 +22,7 @@ The engine polls each eligible controller at most once per logical tick. A tick'
 decisions form one deferred batch on the map's compute executor, one job per controller
 on that controller's lane: a controller's jobs run in FIFO order without overlap, while
 different controllers may run concurrently with each other and with map computation.
-One match-wide delay of 0–8 ticks sets the order's deadline, which is also the
+One match-wide delay of 0–16 ticks sets the order's deadline, which is also the
 batch's due tick: workers run deferred batches earliest due first. At the deadline
 the owner waits for the batch (it runs no shared jobs itself), then publishes the
 complete batch in player order. A slow worker cannot postpone an order's
@@ -79,7 +79,7 @@ Hiring plans on the executor from the shared completed-tick snapshot; see
 [simulation hiring](../architecture/simulation.md#hiring). Use shared executor diagnostics for scheduling waits and external process CPU
 measurements for performance. Separate hiring phase timers are retired.
 
-Structured `game run` accepts `--ai-order-delay D` for a new match (default 8
+Structured `game run` accepts `--ai-order-delay D` for a new match (default 14
 ticks). Delays are simulation rules, separate from local thread configuration.
 A loaded match's configured AI delay cannot be overridden.
 
@@ -123,10 +123,11 @@ installed at their deadline and dropped (superseded or destination gone);
 `building_gradient_max_pending` is the deepest queue and `building_gradient_wait_ns`
 the owner's time joining jobs at their deadlines; `building_gradient_pending` is the
 number still in flight when the run ended. `building_gradient_synchronous` counts
-building walking fields built on the owner: cold fields, queue overflow and stuck
-units' rebuilds when no refresh can be queued. An area paint or a team-wide reset
-keeps a building's walking fields serving and refreshes them on schedule instead
-of dropping them. `building_gradient_synchronous_by_reason` splits that count:
+building walking fields built on the owner: cold fields, queue overflow and
+rebuilds requested by a unit blocked by an obstacle its field does not know, when
+no refresh can be queued. An area paint or a team-wide reset keeps a building's
+walking fields serving instead of dropping them; a building's own route is
+rebuilt when it comes due by age (`BUILDING_FIELD_REFRESH_TICKS`). `building_gradient_synchronous_by_reason` splits that count:
 `cold_*` by what last dropped the field (`new`, `idle` eviction, the building's
 `own` reset, a `team`-wide reset, an `area` paint), then `overflow`, `inactive`
 (a map without a game, as in the editor) and `other`.
@@ -172,7 +173,9 @@ warmup, including AI deadline waits. Stalled calls do not create tick samples.
 Use these separate instrumented runs for tick-time distributions; ordinary
 paired timing runs retain the default loop and do not pay histogram sampling.
 
-Snapshot component pools permit 22 buffers. Resource-plane pools retain a 17-epoch bound per plane. These limits account for retained immutable inputs across consumer horizons; buffers allocate on
+Snapshot component pools permit 22 buffers. Resource planes are not pooled per
+snapshot: captures share the map's published buffers, and adopted buffers return to
+a recycler of at most 64 spare planes. These limits account for retained immutable inputs across consumer horizons; buffers allocate on
 demand and retain reusable capacity. Lease counters include the store's latest snapshot
 and references from pooled components, rather than counting only workers. Shared catalog
 and terrain payloads are counted once. Byte accounting includes nested vector and growth
@@ -395,14 +398,15 @@ their source signatures and digests.
 ## Executor wait diagnostics and tracing
 
 Use `--compute-telemetry waits` to attribute unfinished required batches to AI,
-periodic/building gradients, resource growth, hiring, presentation, other or mixed work.
+periodic/building gradients, resource growth, hiring, presentation, checksums, team
+statistics, turrets, claim routing and hire targets (`claims`), other or mixed work.
 Use `trace` for scheduling events. Collection defaults to off; legacy compute timing
 fields are unavailable (`null`) unless the selected mode collects them. Benchmark readers
 must check availability rather than treating null as zero. The gradient pipeline benchmark
 accepts `--compute-telemetry off|waits|trace`, defaulting to off; timing and tracing variants
 must be compared separately. See [the telemetry contract](performance-telemetry.md#optional-compute-executor-diagnostics).
 
-For overhead validation, use release compilation, retained games and paired repetitions
+For overhead validation, use perf compilation (`perf=1 opt=3`), retained games and paired repetitions
 with an instrumentation-free control built with the same compiler and flags. Include empty
 batches, tiny and substantial callbacks. Rotate execution order and retain every sample,
 wall time, process CPU, memory, tick latency, and lost-event counts. Inspect optimized disabled

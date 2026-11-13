@@ -22,6 +22,7 @@ WORKER_RUNTIMES = (
     ('music-worker.js', 'music-output.js', 'music-runtime.js', 'music-runtime.wasm'),
     ('recording-worker.js', 'recording-storage.js', 'recording-video.js',
      'recording-runtime.js', 'recording-runtime.wasm'),
+    ('asset-video-worker.js', 'asset-video-runtime.js', 'asset-video-runtime.wasm'),
     ('hive-worker.js', 'hive-runtime.js', 'hive-runtime.wasm'),
 )
 ENCODINGS = ('', '.br', '.gz')
@@ -32,7 +33,7 @@ def localization_files(release):
     """Check localized launchers before changing any files in the served release."""
     if 'src="i18n.js"' not in (release / 'index.html').read_text():
         return ()
-    catalogs = Path(__file__).resolve().parents[1] / 'platform/packages/i18n/locales'
+    catalogs = Path(__file__).resolve().parents[1] / 'services/online/packages/i18n/locales'
     expected = {'locales/' + path.name for path in catalogs.glob('*.json')}
     actual = {'locales/' + path.name for path in (release / 'locales').glob('*.json')}
     if not expected or actual != expected:

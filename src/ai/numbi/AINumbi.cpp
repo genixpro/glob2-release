@@ -9,6 +9,8 @@
 // All share the single AINumbi declaration in AINumbi.h.
 
 #include <Stream.h>
+#include "Building.h"
+#include "Map.h"
 #include <sstream>
 
 #include "AINumbi.h"
@@ -21,6 +23,7 @@
 #include "Player.h"
 #include "Utilities.h"
 #include "Unit.h"
+#include "Team.h"
 
 using std::shared_ptr;
 

@@ -13,13 +13,15 @@
 #include "BuildingCapabilities.h"
 #include "ResourceRegistry.h"
 #include "CellRules.h"
-#include "MapAssetBundle.h"
 #include "MapStateView.h"
 #include "ResourcePlaneKey.h"
+#include "field/GradientDestinationPlanes.h"
 #include "MapChangeTracking.h"
+#include "BuildingSeedPlanes.h"
 #include <span>
 #include <stdexcept>
 #include <limits>
+class MapAssetBundle;
 
 namespace SimulationSnapshot
 {
@@ -81,7 +83,13 @@ struct Occupancy { std::vector<OccupancyCell> cells; ChunkStamps stamps; };
 using AreaCell = MapState::AreaCell;
 struct Areas { std::vector<AreaCell> cells; bool farmEnabled = false; ChunkStamps stamps; };
 struct VisibilityCell { Uint32 discovered = 0, visible = 0; };
-struct Visibility { std::vector<Uint32> discovered, visible; ChunkStamps stamps; };
+struct Visibility
+{
+	std::vector<Uint32> discovered, visible;
+	ChunkStamps stamps; // visible
+	ChunkStamps discoveredStamps;
+	Uint64 discoveryRevision = 0;
+};
 static_assert(std::is_trivially_copyable_v<ResourceCell>);
 static_assert(std::is_trivially_copyable_v<OccupancyCell>);
 static_assert(std::is_trivially_copyable_v<AreaCell>);
@@ -118,7 +126,8 @@ struct Entities
 		return std::span<const BuildingView>(buildings).subspan(range.offset,range.count);
 	}
 };
-struct Teams { std::vector<TeamView> values; int totalPrestige = 0; };
+struct Teams { std::vector<TeamView> values; int totalPrestige = 0;
+    bool prestigeWinCondition = false, prestigeAlliesShareVictory = false; int prestigeToReach = 0; };
 struct Rules
 {
 	RuleView values;
@@ -131,7 +140,12 @@ struct ResourceField
 {
 	Uint16 key = 0;
 	Uint64 generation = 0;
-	std::shared_ptr<const std::vector<Uint16>> values;
+	//! The published cells, shared with the map (MapRouting::sharePublishedPlane): immutable.
+	std::shared_ptr<const Uint16[]> values;
+	std::size_t cells = 0;
+    std::shared_ptr<const gradient_kernel::OwnedDestinations> destinations;
+    Uint64 destinationGeneration = 0;
+	std::span<const Uint16> span() const { return values ? std::span<const Uint16>(values.get(), cells) : std::span<const Uint16>{}; }
 };
 // The live planes at capture, in the map's publication order, with a dense
 // key index so consumers look a plane up without hashing.
@@ -151,6 +165,11 @@ struct Handle
 {
 	Uint32 tick = 0;
 	Uint64 observationRevision = 0;
+	//! Process-unique number of the Store capture this handle came from, kept by
+	//! every projection. Equal nonzero serials hold the same world, so a consumer
+	//! can keep what it derived from one. Unlike the revisions, it never repeats
+	//! after Store::reset(). Zero: not captured by a Store, never treat as equal.
+	Uint64 boundarySerial = 0;
 	int width = 0, height = 0;
 	Requirements requirements = 0;
 	std::shared_ptr<const Session> session;
@@ -173,7 +192,10 @@ struct Handle
 	std::shared_ptr<const ResourceFields> resourceFields;
 	std::shared_ptr<const Fertility::GrowthCache> growth;
 	std::shared_ptr<const BuildingAreaEffects::FertilitySnapshot> areaFertility;
+	//! Derived building seed templates, for building field seeding only.
+	std::shared_ptr<const MapState::BuildingSeedSnapshot> buildingSeeds;
 	Uint64 worldIdentity = 0, configurationRevision = 0;
+    Uint32 activeClaimRuntimeChecksum = 0;
 	std::array<Uint64, 5> mapGenerations{};
 	//! Named views share existing buffers and retain only their consumer's inputs.
 	Handle simulationView() const;
@@ -195,7 +217,7 @@ struct Handle
 	Uint16 cellRuleAt(std::size_t index) const
 	{ checkTileIndex(index); return terrain ? terrain->cellRules.at(index) : Uint16(GRASS); }
 	const TerrainProperties& terrainPropertiesAt(std::size_t index) const
-	{ checkTileIndex(index); return terrain ? (*terrain->rules)[terrain->cellRules.at(index)].properties : terrainProperties(GRASS); }
+	{ checkTileIndex(index); return terrain ? (*terrain->rules)[terrain->cellRules.at(index)].properties : builtinTerrainProperties(GRASS); }
 	ResourceCell resourceAt(std::size_t index) const
 	{ checkTileIndex(index); return resources ? resources->cells.at(index) : ResourceCell{}; }
 	OccupancyCell occupancyAt(std::size_t index) const

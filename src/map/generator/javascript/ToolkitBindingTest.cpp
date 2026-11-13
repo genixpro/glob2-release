@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ToolkitBinding.h"
+#include "Map.h"
 #include "ToolkitRecords.h"
 #include "GenerationWork.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "Unit.h"
 #include <nlohmann/json.hpp>
 

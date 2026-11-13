@@ -7,6 +7,8 @@
 #include <GraphicContext.h>
 #include <Toolkit.h>
 #include <webp/encode.h>
+#include <map>
+#include <set>
 namespace
 {
 std::string image(unsigned size, bool lossless = false, unsigned red = 210, bool full = false)
@@ -29,6 +31,39 @@ std::string image(unsigned size, bool lossless = false, unsigned red = 210, bool
 	std::string result(reinterpret_cast<char *>(encoded), count);
 	WebPFree(encoded);
 	return result;
+}
+// The colony-sprites-v1 layout: every clip but the last (the swarm) is a unit animation of
+// directions x phases frames split into 64-frame pages; the swarm is one still frame.
+constexpr unsigned UnitClips = Online::SkinSpriteClips.size() - 1;
+constexpr unsigned SwarmClip = UnitClips;
+constexpr unsigned UnitFrames = 8 * 32, PageFrames = 64, PagesPerClip = UnitFrames / PageFrames;
+constexpr unsigned UnitPages = UnitClips * PagesPerClip;
+constexpr unsigned TurnFirst = UnitFrames, TurnFrames = 32;
+// Which frames of which clip the parsed pages cover; a frame on two pages fails.
+std::map<unsigned, std::set<unsigned>> coverage(const Online::SkinSpriteManifest &manifest)
+{
+	std::map<unsigned, std::set<unsigned>> frames;
+	for (const auto &page : manifest.pages)
+		for (unsigned frame = page.first; frame < page.first + page.frames; ++frame)
+			REQUIRE(frames[page.clip].insert(frame).second);
+	return frames;
+}
+// Every unit clip covers all its directions and phases (and its turn frames when the
+// bundle carries turns), and the swarm its single frame; no other clip appears.
+void requireEveryClip(const Online::SkinSpriteManifest &manifest, bool turns)
+{
+	const auto frames = coverage(manifest);
+	REQUIRE(frames.size() == Online::SkinSpriteClips.size());
+	for (unsigned clip = 0; clip < Online::SkinSpriteClips.size(); ++clip)
+	{
+		INFO(Online::SkinSpriteClips[clip]);
+		std::set<unsigned> expected;
+		const unsigned end = clip == SwarmClip ? 1 : turns ? TurnFirst + TurnFrames : UnitFrames;
+		for (unsigned frame = 0; frame < end; ++frame)
+			expected.insert(frame);
+		REQUIRE(frames.count(clip) == 1);
+		CHECK(frames.at(clip) == expected);
+	}
 }
 struct Fixture
 {
@@ -57,28 +92,43 @@ struct Fixture
 			   {"logicalSizes", Online::SkinSpriteLogicalSizes},
 			   {"encoding", "bundled-images-v3-webp-only"},
 			   {"pages", nlohmann::json::array()}};
-		for (unsigned i = 0; i < 29; ++i)
+		for (unsigned i = 0; i <= UnitPages; ++i)
 		{
-			const auto &bytes = i < 28 ? unit : swarm;
-			doc["pages"].push_back({{"clip", Online::SkinSpriteClips[i < 28 ? i / 4 : 7]},
-									{"first", i < 28 ? i % 4 * 64 : 0},
-									{"frames", i < 28 ? 64 : 1},
-									{"width", i < 28 ? 1024 : 128},
-									{"height", i < 28 ? 1024 : 128},
+			const bool u = i < UnitPages;
+			const auto &bytes = u ? unit : swarm;
+			doc["pages"].push_back({{"clip", Online::SkinSpriteClips[u ? i / PagesPerClip : SwarmClip]},
+									{"first", u ? i % PagesPerClip * PageFrames : 0},
+									{"frames", u ? PageFrames : 1},
+									{"width", u ? 1024 : 128},
+									{"height", u ? 1024 : 128},
 									{"bytes", bytes.size()},
 									{"sha256", Online::Sha256::hex(bytes)}});
 		}
 		skin.spriteManifestHash = Online::Sha256::hex(doc.dump());
 	}
+	void addProneHarvest()
+	{
+		doc["proneHarvestMapping"] = {{"directions", 8}, {"phases", 64}, {"logicalSize", 38}};
+		doc["proneHarvestPages"] = nlohmann::json::array();
+		for (unsigned i = 0; i < 8; ++i)
+		{
+			auto page = doc["pages"][0];
+			page["clip"] = "worker-prone-harvest";
+			page["first"] = i * 64;
+			doc["proneHarvestPages"].push_back(page);
+		}
+		skin.spriteManifestHash = Online::Sha256::hex(doc.dump());
+	}
+
 	void addTurns()
 	{
-		doc["turnMapping"] = {{"first", 256}, {"frames", 32}, {"phaseShift", 3}};
+		doc["turnMapping"] = {{"first", TurnFirst}, {"frames", TurnFrames}, {"phaseShift", 3}};
 		doc["turnPages"] = nlohmann::json::array();
-		for (unsigned clip = 0; clip < 7; ++clip)
+		for (unsigned clip = 0; clip < UnitClips; ++clip)
 		{
-			auto page = doc["pages"][clip * 4];
-			page["first"] = 256;
-			page["frames"] = 32;
+			auto page = doc["pages"][clip * PagesPerClip];
+			page["first"] = TurnFirst;
+			page["frames"] = TurnFrames;
 			doc["turnPages"].push_back(page);
 		}
 		skin.spriteManifestHash = Online::Sha256::hex(doc.dump());
@@ -87,6 +137,41 @@ struct Fixture
 } // namespace
 TEST_SUITE("SkinSprites")
 {
+	TEST_CASE("prone harvest pages are optional, complete and bounded")
+	{
+		for (bool turns : {false, true})
+		{
+			Fixture f;
+			if (turns)
+				f.addTurns();
+			Online::SkinSpriteManifest manifest;
+			REQUIRE(manifest.parse(f.doc.dump(), f.skin));
+			f.addProneHarvest();
+			REQUIRE(manifest.parse(f.doc.dump(), f.skin));
+			CHECK(manifest.pages.back().clip == 8);
+			CHECK(manifest.pages.back().first == 448);
+			for (int fault = 0; fault < 6; ++fault)
+			{
+				auto doc = f.doc;
+				if (fault == 0)
+					doc.erase("proneHarvestMapping");
+				if (fault == 1)
+					doc["proneHarvestPages"].erase(7);
+				if (fault == 2)
+					doc["proneHarvestPages"][1]["first"] = 0;
+				if (fault == 3)
+					doc["proneHarvestMapping"]["phases"] = 32;
+				if (fault == 4)
+					doc["proneHarvestPages"][0]["clip"] = "swarm";
+				if (fault == 5)
+					doc["proneHarvestPages"][0]["frames"] = 128;
+				f.skin.spriteManifestHash = Online::Sha256::hex(doc.dump());
+				CHECK_FALSE(manifest.parse(doc.dump(), f.skin));
+				CHECK(manifest.pages.empty());
+			}
+		}
+	}
+
 	TEST_CASE("padded turn shadows keep their native size and shared mesh center")
 	{
 		glob2test::ToolkitScope toolkit;
@@ -122,10 +207,11 @@ TEST_SUITE("SkinSprites")
 		REQUIRE(manifest.parse(f.doc.dump(), f.skin));
 		f.addTurns();
 		REQUIRE(manifest.parse(f.doc.dump(), f.skin));
-		REQUIRE(manifest.pages.size() == 36);
-		CHECK(manifest.pages.back().clip == 6);
-		CHECK(manifest.pages.back().first == 256);
-		CHECK(manifest.pages.back().frames == 32);
+		requireEveryClip(manifest, true);
+		CHECK(manifest.pages.size() == f.doc["pages"].size() + f.doc["turnPages"].size());
+		CHECK(manifest.pages.back().clip == UnitClips - 1);
+		CHECK(manifest.pages.back().first == TurnFirst);
+		CHECK(manifest.pages.back().frames == TurnFrames);
 		for (unsigned fault = 0; fault < 11; ++fault)
 		{
 			auto doc = f.doc;
@@ -164,7 +250,8 @@ TEST_SUITE("SkinSprites")
 		Fixture f;
 		Online::SkinSpriteManifest manifest;
 		REQUIRE(manifest.parse(f.doc.dump(), f.skin));
-		CHECK(manifest.pages.size() == 29);
+		requireEveryClip(manifest, false);
+		CHECK(manifest.pages.size() == f.doc["pages"].size());
 		CHECK(Online::validSkinSpritePage(f.unit, manifest.pages[0]));
 		CHECK_FALSE(Online::validSkinSpritePage(f.swarm, manifest.pages[0]));
 		auto lossless = image(1024, true);
@@ -279,7 +366,7 @@ TEST_SUITE("SkinSprites")
 		CHECK_FALSE(sprites.draw(*gfx, 2, 0, 0, 10, 10, 38, 38));
 		CHECK(sprites.decodedBytes() == 0);
 	}
-	TEST_CASE("software turns share hash cached images with movement in either request order")
+	TEST_CASE("software turns and prone harvest share cached images with movement")
 	{
 		glob2test::ToolkitScope toolkit;
 		auto *gfx = GAGCore::Toolkit::initGraphic(128, 128, 0, "skin turns");
@@ -287,6 +374,7 @@ TEST_SUITE("SkinSprites")
 		{
 			Fixture f;
 			f.addTurns();
+			f.addProneHarvest();
 			Online::MemoryStorage storage;
 			OnlineFakes::Http http;
 			Online::SkinSprites sprites(storage, "https://example.test", [&](auto request)
@@ -306,6 +394,10 @@ TEST_SUITE("SkinSprites")
 			sprites.poll();
 			for (unsigned frame : {256u, 287u, 0u, 63u, 255u})
 				REQUIRE(sprites.draw(*gfx, 2, 0, frame, 10, 10, 38, 38));
+			for (unsigned direction = 0; direction < 8; ++direction)
+				for (unsigned phase : {0u, 63u})
+					REQUIRE(sprites.draw(*gfx, 2, 8, direction * 64 + phase, 10, 10, 38, 38));
+			CHECK_FALSE(sprites.draw(*gfx, 2, 8, 512, 10, 10, 38, 38));
 			CHECK_FALSE(sprites.draw(*gfx, 2, 0, 288, 10, 10, 38, 38));
 			CHECK(http.count("/pages/" + Online::Sha256::hex(f.unit)) == 1);
 			sprites.remove(2);

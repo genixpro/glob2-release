@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <Environment.h>
-#include "EngineFixtures.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include "ScopedEnvironment.h"
 #include <vector>
 #include <string>
@@ -9,6 +13,7 @@
 #include <utility>
 #include <chrono>
 #include <thread>
+#include <future>
 #include <cstdlib>
 #include <cstdint>
 #include <iterator>
@@ -24,6 +29,7 @@
 #include "sim/presentation/SceneInputs.h"
 #include "sim/presentation/ScenePreparation.h"
 #include "MenuColony.h"
+#include "render/ViewState.h"
 #include "GameGUITouch.h"
 #include <GraphicContext.h>
 #include "Unit.h"
@@ -72,6 +78,7 @@
 #include <filesystem>
 #include <fstream>
 #include <stdexcept>
+#include "sim/EntityRefOf.h"
 
 namespace
 {
@@ -85,7 +92,187 @@ GAGCore::CooperativeSlice fixedSlice()
 
 TEST_SUITE("EngineSession")
 {
-    TEST_CASE("buffered input receipts wait for GUI dispatch and cancel exact ranges [display]")
+	TEST_CASE("timing aggregation never holds the scheduler mutex")
+	{
+		if constexpr (!GAGCore::ThreadSupport::available)
+			return;
+		ComputeExecutor executor;
+		executor.configure(2);
+		std::atomic<bool> entered{false};
+		ComputeExecutor::Group group{1,
+									 {+[](void *state, std::size_t)
+									  { static_cast<std::atomic<bool> *>(state)->store(true); },
+									  &entered}};
+		// Deliberately stop the worker at timing publication. Scheduler queries must
+		// still finish while that independent shard is locked.
+		std::unique_lock hold(executor.performanceShards[1].mutex);
+		auto ticket = executor.submit(std::span(&group, 1), 1, {ComputeProducer::AI, 0, 1});
+		// Hang guards only: the worker enters at once, and a query that blocked on
+		// the held shard would never return before hold.unlock() below.
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (!entered.load() && std::chrono::steady_clock::now() < deadline)
+			std::this_thread::yield();
+		CHECK_MESSAGE(entered.load(), "the worker never entered its group");
+		auto query = std::async(std::launch::async,
+								[&]
+								{
+									const auto until = std::chrono::steady_clock::now() +
+													   std::chrono::milliseconds(100);
+									bool incomplete = true;
+									do
+									{
+										incomplete = incomplete && !executor.finished(ticket);
+										std::this_thread::yield();
+									} while (std::chrono::steady_clock::now() < until);
+									return incomplete;
+								});
+		const bool ready = query.wait_for(std::chrono::seconds(30)) == std::future_status::ready;
+		CHECK_MESSAGE(ready, "scheduler query blocked on the locked timing shard");
+		hold.unlock();
+		const bool incomplete = query.get();
+		CHECK(incomplete);
+		executor.join(ticket, {JoinReason::TickDeadline, 1});
+		auto result = std::make_unique<PerformanceTelemetry::Collector>();
+		executor.absorbPerformance(*result);
+		CHECK(result->window[unsigned(PerformanceTelemetry::Id::ComputeAI)].calls == 1);
+	}
+
+	TEST_CASE("telemetry mailbox samples share their returned tick watermark")
+	{
+		glob2test::HeadlessGlobals globals;
+		Engine engine;
+		SimulationRunner runner(engine);
+		auto captured = std::make_unique<PerformanceTelemetry::Collector>();
+		std::atomic<bool> done{false};
+		auto publisher = std::async(std::launch::async,
+									[&]
+									{
+										for (Uint32 tick = 1; tick <= 200; ++tick)
+										{
+											std::lock_guard lock(runner.telemetryMutex);
+											runner.telemetryMailbox.record(
+												PerformanceTelemetry::Id::OwnerAdvance, 1);
+											runner.completedTelemetryTick = tick;
+										}
+										done = true;
+									});
+		do
+		{
+			const auto tick = runner.absorbTelemetry(*captured);
+			CHECK(captured->window[unsigned(PerformanceTelemetry::Id::OwnerAdvance)].calls == tick);
+		} while (!done.load());
+		publisher.get();
+		CHECK(runner.absorbTelemetry(*captured) == 200);
+		CHECK(captured->window[unsigned(PerformanceTelemetry::Id::OwnerAdvance)].calls == 200);
+	}
+	TEST_CASE("results finalize non-AI telemetry with optional diagnostics off [display]")
+	{
+		glob2test::ScopedEnvironment serial("GLOB2_SIM_THREAD", "0");
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .loadStrings = true, .width = 800, .height = 600});
+		REQUIRE(NET_Init());
+		struct Network
+		{
+			~Network() { NET_Quit(); }
+		} network;
+		globalContainer->automaticEndingGame = false;
+		globalContainer->settings.autosaveGames = false;
+		globalContainer->computeThreads = 2;
+		auto engine = std::make_unique<Engine>();
+		REQUIRE(engine->initCampaign("maps/balanced.map") == Engine::EE_NO_ERROR);
+		GAGGUI::ScreenStack stack(*globalContainer->gfx);
+		auto screen = std::make_unique<GameSessionScreen>(stack, std::move(engine));
+		auto *session = screen.get();
+		stack.push(std::move(screen));
+		stack.frame(SDL_GetTicks(), {});
+		auto *running = session->runningEngine();
+		REQUIRE(running);
+		auto &executor = running->gui.game.map.computeExecutor();
+		REQUIRE(executor.telemetryMode() == ComputeTelemetryMode::Off);
+		if (executor.threadCount() < 2)
+			return;
+		struct Deferred
+		{
+			ComputeExecutor &executor;
+			std::promise<ComputeExecutor::CompletionTicket> ready;
+			static void run(void *ptr, std::size_t)
+			{
+				auto &self = *static_cast<Deferred *>(ptr);
+				self.ready.set_value(self.executor.defer());
+			}
+		} deferred{executor};
+		ComputeExecutor::Group group{1, {Deferred::run, &deferred}};
+		executor.submit(std::span(&group, 1), 100000, {ComputeProducer::Hiring, 0, 100000});
+		auto ticket = deferred.ready.get_future().get();
+		auto &perf = PerformanceTelemetry::collector();
+		executor.absorbPerformance(perf);
+		const auto prior = perf.total[unsigned(PerformanceTelemetry::Id::QueueHiring)].calls +
+						   perf.window[unsigned(PerformanceTelemetry::Id::QueueHiring)].calls;
+		const auto checksum = running->gui.game.checkSum();
+		auto complete = std::async(std::launch::async,
+								   [ticket]
+								   {
+									   std::this_thread::sleep_for(std::chrono::milliseconds(20));
+									   return ticket->complete();
+								   });
+		running->gui.isRunning = false;
+		stack.frame(SDL_GetTicks() + 40, {});
+		CHECK(complete.get());
+		CHECK(executor.liveBatches() == 0);
+		CHECK(perf.total[unsigned(PerformanceTelemetry::Id::QueueHiring)].calls >= prior + 1);
+		CHECK(running->gui.game.checkSum() == checksum);
+	}
+	TEST_CASE("runner telemetry marks only suspension state transitions")
+	{
+		glob2test::HeadlessGlobals globals;
+		Engine engine;
+		SimulationRunner runner(engine);
+		auto &flags = PerformanceTelemetry::collector().windowFlags;
+		const auto saved = flags;
+		flags = 0;
+		runner.resume();
+		CHECK(flags == 0);
+		runner.suspend();
+		CHECK((flags & PerformanceTelemetry::Suspended) != 0);
+		flags = 0;
+		runner.suspend();
+		CHECK(flags == 0);
+		runner.resume();
+		CHECK((flags & PerformanceTelemetry::Resumed) != 0);
+		flags = 0;
+		runner.resume();
+		CHECK(flags == 0);
+		flags = saved;
+	}
+	TEST_CASE(
+		"game screen inspection stops before results replace the released gameplay scene [display]")
+	{
+		glob2test::ScopedEnvironment serial("GLOB2_SIM_THREAD", "0");
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .loadStrings = true, .width = 800, .height = 600});
+		REQUIRE(NET_Init());
+		struct NetworkScope
+		{
+			~NetworkScope() { NET_Quit(); }
+		} network;
+		globalContainer->automaticEndingGame = false;
+		globalContainer->settings.autosaveGames = false;
+		auto engine = std::make_unique<Engine>();
+		REQUIRE(engine->initCampaign("maps/balanced.map") == Engine::EE_NO_ERROR);
+		GAGGUI::ScreenStack stack(*globalContainer->gfx);
+		auto screen = std::make_unique<GameSessionScreen>(stack, std::move(engine));
+		auto *session = screen.get();
+		CHECK(session->inspectionHosts().empty());
+		stack.push(std::move(screen));
+		stack.frame(SDL_GetTicks(), {});
+		REQUIRE(session->runningEngine());
+		session->runningEngine()->gui.isRunning = false;
+		stack.frame(SDL_GetTicks() + 40, {});
+		// The parent is retained under the results screen, but its HUD's scene
+		// was released by finishSessionForHost. MCP completion must not read it.
+		CHECK(session->inspectionHosts().empty());
+	}
+	TEST_CASE("buffered input receipts wait for GUI dispatch and cancel exact ranges [display]")
 	{
 		glob2test::ScopedEnvironment serial("GLOB2_SIM_THREAD", "0");
 		glob2test::HeadlessGlobals globals(
@@ -545,7 +732,7 @@ TEST_SUITE("EngineSession")
         REQUIRE(materializations==1);
 
         engine.gui.gamePaused=true;
-        request.selectedBuilding=Game::refOf(building);
+        request.selectedBuilding=refOf(building);
         request.includePanels=true;
         request.includeHistory=true;
         request.includeTelemetry=true;
@@ -557,7 +744,7 @@ TEST_SUITE("EngineSession")
         const auto* frame=engine.runner->acquireScene(); REQUIRE(frame);
         REQUIRE(engine.retainedPresentation);
         const auto& retained=engine.retainedPresentation->world;
-        CHECK(engine.retainedPresentation->request.selectedBuilding==Game::refOf(building));
+        CHECK(engine.retainedPresentation->request.selectedBuilding==refOf(building));
         CHECK(retained.tick==world.tick);
         CHECK(retained.observationRevision==world.observationRevision);
         CHECK(retained.entities==world.entities);
@@ -581,9 +768,9 @@ TEST_SUITE("EngineSession")
         do {
             colony.draw(800, 600);
             SDL_Delay(1);
-        } while (!colony.view.scene && SDL_GetTicks() < readyBy);
-        REQUIRE(colony.view.scene);
-        CHECK(colony.view.scene->tick == initialTick);
+        } while (!colony.view->scene && SDL_GetTicks() < readyBy);
+        REQUIRE(colony.view->scene);
+        CHECK(colony.view->scene->tick == initialTick);
         CHECK(colony.game->snapshots().metrics.captures == captures);
         colony.update(1000);
         colony.update(1040);
@@ -591,9 +778,25 @@ TEST_SUITE("EngineSession")
         const auto afterStep = colony.game->snapshots().metrics.captures;
         colony.draw(800, 600);
         CHECK(colony.game->snapshots().metrics.captures == afterStep);
-        CHECK(colony.view.scene->tick == initialTick);
+        CHECK(colony.view->scene->tick == initialTick);
         colony.pause();
-        colony.draw(800, 600);
+		// FrontendTheme frees this serial colony during a foreground match, but the
+		// results screen paints it while the finished engine is still alive.
+		// Budget both executors, all four possible foreground banks, collectors,
+		// and a fixed allowance for the chart caches and GPU timing ring.
+		auto foreground = std::make_unique<ComputeExecutor>();
+		const auto mainMaximum = foreground->performanceStorageBytes() +
+								 (ComputeExecutor::PerformanceShards - 1) *
+									 sizeof(ComputeExecutor::PerformanceShard::Metrics);
+		const auto decorative = colony.game->map.computeExecutor().performanceStorageBytes();
+		CHECK(decorative ==
+			  foreground->performanceStorageBytes());
+		constexpr std::size_t presentationReserve = 384 * 1024;
+		const auto nonHistory = 4 * sizeof(PerformanceTelemetry::Collector) + mainMaximum +
+								decorative + presentationReserve;
+		CHECK(nonHistory <= 4 * 1024 * 1024);
+		CHECK(sizeof(PerformanceTelemetry::History) + nonHistory <= 16 * 1024 * 1024);
+		colony.draw(800, 600);
         CHECK(colony.game->snapshots().metrics.captures == afterStep);
     }
 
@@ -1136,21 +1339,21 @@ TEST_SUITE("EngineSession")
 		                    }
 		            }
 		            auto regular = seed;
-		            map.updateGlobalGradient(regular.data());
+		            map.routing().updateGlobalGradient(regular.data());
 		            require(regular == expected, "Synchronous gradient differs from queue oracle");
 		            auto scheduled = seed;
-		            auto task = map.updateGlobalGradientTask(scheduled.data());
+		            auto task = map.routing().updateGlobalGradientTask(scheduled.data());
 		            unsigned slices = 0;
 		            while (!task.advance()) require(++slices < 1000, "Gradient did not converge");
 		            require(task.result() && (!fixture || slices >= 8) && scheduled == expected,
 		                    "Scheduled gradient must yield and match the queue oracle");
 		            auto cancelled = seed;
 		            {
-		                auto partial = map.updateGlobalGradientTask(cancelled.data());
+		                auto partial = map.routing().updateGlobalGradientTask(cancelled.data());
 		                if (fixture) require(!partial.advance() && !partial.advance(), "Gradient cancellation must precede completion");
 		            }
 		            // Monotonic relaxation can resume from an interrupted sweep.
-		            map.updateGlobalGradient(cancelled.data());
+		            map.routing().updateGlobalGradient(cancelled.data());
 		            require(cancelled == expected, "Interrupted gradient could not converge on restart");
 		        }
 		    }
@@ -1211,7 +1414,7 @@ TEST_SUITE("EngineSession")
 		            require(replayGui.load(&header), "Could not load replay header for the memory recording");
 		        }
 		        ReplayWriter memory;
-		        memory.init("", replayGui);
+		        replayGui.startReplay(memory, "");
 		        for (ReplayWriter* recording : {&writer, &memory}) {
 		            recording->setCheckSum(0xa1b2c3d4);
 		            recording->pushOrder(std::make_shared<PauseGameOrder>(true));

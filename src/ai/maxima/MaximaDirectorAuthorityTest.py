@@ -21,7 +21,7 @@ class MaximaDirectorAuthorityTest(unittest.TestCase):
         cls.state = (ROOT / "src/ai/maxima/AIMaximaState.cpp").read_text()
         cls.farming_policy = (ROOT / "src/ai/maxima/AIMaximaFarmingPolicy.cpp").read_text()
         cls.strategy = (ROOT / "src/ai/maxima/AIMaximaStrategy.cpp").read_text()
-        cls.base = (ROOT / "data/maxima/base.strategy").read_text()
+        cls.base = (ROOT / "content/data/maxima/base.strategy").read_text()
 
     def test_director_and_immutable_plan_are_explicit_boundaries(self) -> None:
         self.assertIn("class StrategyDirector", self.header)
@@ -32,7 +32,7 @@ class MaximaDirectorAuthorityTest(unittest.TestCase):
             self.source,
             "void Maxima::evaluate_strategy",
         )
-        self.assertLess(cycle.index("allocate_resources()"),
+        self.assertLess(cycle.index("allocate_resources(runtime)"),
                         cycle.index("finalize_director_plan(runtime)"))
 
     def test_classic_authority_and_blending_cannot_return(self) -> None:
@@ -80,9 +80,11 @@ class MaximaDirectorAuthorityTest(unittest.TestCase):
             executor = function(source, start)
             permitted = {
                 "void Maxima::update_fruit_flags": ("strategy.fruit.units_per_flag",),
-                # Per-flag sizing is mechanical; the director still owns the
-                # target and total attack force, as it does for fruit flags.
-                "void Maxima::control_offense(": ("strategy.military.attack_unit_cap",),
+                # Per-flag sizing and a fixed arrival grace are mechanical; the
+                # director still owns targets, total force and stall thresholds.
+                # Each constant is read once; all other policy comes from budget.
+                "void Maxima::control_offense(": ("strategy.military.attack_unit_cap",
+                                                  "strategy.tactics.arrival_grace_ticks"),
             }
             for setting in permitted.get(start, ()):
                 self.assertEqual(executor.count(setting), 1, setting)
@@ -97,10 +99,12 @@ class MaximaDirectorAuthorityTest(unittest.TestCase):
     def test_dirty_plan_is_recomputed_before_scheduled_executors(self) -> None:
         tick = function(self.source, "void Maxima::tick")
         # tick delegates evaluation through the sole director entrypoint.
-        # Dirty and uninitialized plans must still enter that slot immediately.
+        # Uninitialized plans enter that slot immediately; dirty plans enter it
+        # once the configured gap since the last review (snapshot.tick) has passed.
         due = tick[tick.index("const bool strategyReviewDue="):
                    tick.index("if(strategyReviewDue)")]
-        self.assertRegex(due, r"!director\.initialized\s*\|\|\s*director\.dirty\s*\|\|")
+        self.assertRegex(due, r"!director\.initialized\s*\n?\s*\|\|\s*\(director\.dirty\s*&&\s*"
+                         r"timer-snapshot\.tick>=strategy\.scheduling\.strategy_review_min_gap_ticks\)")
         review = function(tick, "if(strategyReviewDue)")
         self.assertEqual(review.count("check_phases(runtime);"), 1)
         replan = tick.index("check_phases(runtime);")

@@ -5,7 +5,10 @@
 #include "unit/render/ColonySkinPreview.h"
 #include "GlobalContainer.h"
 #include "SoftwareTerrainCache.h"
+#include "terrain/DirectTerrain.h"
 #include "OverviewTerrainCache.h"
+#include "ResourceRowCache.h"
+#include "UnitEffectArt.h"
 
 MapRenderState::MapRenderState() = default;
 MapRenderState::~MapRenderState() = default;
@@ -30,10 +33,23 @@ SoftwareTerrainCache &MapRenderState::terrainCache(Uint64 mapIdentity)
 	return *terrainCache_;
 }
 
+DirectTerrain &MapRenderState::directTerrain()
+{
+    if (!directTerrain_)
+        directTerrain_ = std::make_unique<DirectTerrain>();
+    return *directTerrain_;
+}
+
 ColonySkinPreview &MapRenderState::skinPreview()
 {
 	if (!skinPreview_) skinPreview_ = std::make_unique<ColonySkinPreview>();
 	return *skinPreview_;
+}
+
+UnitEffectArt &MapRenderState::effectArt()
+{
+	if (!effectArt_) effectArt_ = std::make_unique<UnitEffectArt>();
+	return *effectArt_;
 }
 
 void MapRenderState::swapSkinPreview(MapRenderState &other)

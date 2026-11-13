@@ -2,7 +2,7 @@
 #include "ContinentsGenerator.h"
 #include "Biomes.h"
 #include "Contact.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Grid.h"
 #include "Growth.h"
@@ -372,11 +372,8 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	// when a small or ragged continent has too few roomy squares for its colonies.
 	TerrainSketch beached = L.terrain;
 	layBeaches(beached, t);
-	const std::vector<unsigned char> pureWater = pureTiles(beached, t, WATER);
 	const std::vector<unsigned char> pureGrass = pureTiles(beached, t, GRASS);
-	std::vector<unsigned char> walkable(size_t(n), 0);
-	for (int i = 0; i < n; ++i)
-		walkable[i] = !pureWater[i];
+	const auto walkable = walkableTiles(beached, t);
 	// Islets are not the mainland even when they are the largest land: they must be excluded
 	// before the largest piece is taken.
 	std::vector<unsigned char> ground = walkable;
@@ -585,7 +582,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return L;
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "continents layout";
 	const ContinentsOptions o(context.request);
@@ -596,7 +593,7 @@ bool generate(Game &game, GenerationContext &context)
 		context.detail = L.failure;
 		return false;
 	}
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const Torus &t = L.t;
 	const int n = t.size(), teams = context.request.nbTeams;
 	for (int k = 0; k < teams; ++k)
@@ -694,7 +691,7 @@ bool generate(Game &game, GenerationContext &context)
 	return true;
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
@@ -730,7 +727,7 @@ GeneratorDefinition continentsDefinition()
 		44,
 		// 33 was Patchwork, retired 2026-09-13 and never reused
 		"Continents",
-		4, // 3: the dry reserve's fields are dealt patchiest first, not from the top rows
+		6, // 6: algae now regrows near any coast, so its best-growing water moved; 3: the dry reserve's fields are dealt patchiest first, not from the top rows
 		false,
 		{GeneratorControl::choice(
 			 "continent", "Continent",

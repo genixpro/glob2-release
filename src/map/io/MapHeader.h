@@ -6,8 +6,9 @@
 #include "BaseTeam.h"
 #include "SaveLoadProfile.h"
 #include <stdexcept>
-#include "Team.h"
+#include "TeamCapacity.h"
 #include "ExperimentalFeatures.h"
+#include "ChecksumScheme.h"
 #include <vector>
 
 namespace GAGCore
@@ -24,7 +25,6 @@ namespace GAGCore
 class MapHeader
 {
 public:
-	ExperimentSet requiredTerrainExperiments;
 	ExperimentSet requiredResourceExperiments;
 	std::vector<CatalogExperimentDefinition> resourceExperimentDefinitions;
 	std::vector<std::string> resourceExperimentKeys() const
@@ -118,8 +118,9 @@ public:
 	/// Returns the complete game checksum
 	void resetGameSHA1();
 
-	/// Returns a checksum of the map header information
-	Uint32 checkSum() const;
+	/// Returns a checksum of the map header information. Only Legacy152 mixes in
+	/// the file format version, which saving rewrites without changing the game.
+	Uint32 checkSum(ChecksumScheme scheme = ChecksumScheme::Current) const;
 	
 	///Comparison does *not* count file version numbers
 	bool operator!=(const MapHeader& rhs) const;
@@ -139,7 +140,7 @@ private:
 	
 	/// The teams in the map. BaseTeam is used to allow access to information like team numbers and
 	/// team colors without loading the entire game.
-	BaseTeam teams[Team::MAX_COUNT];
+	BaseTeam teams[TEAM_MAX_COUNT];
 	
 	/// If this is true, this map header represents a saved game, rather than a new map
 	bool isSavedGame;

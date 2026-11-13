@@ -10,7 +10,7 @@
 #include <queue>
 #include <utility>
 #include <vector>
-class Map;
+class GenerationMap;
 struct GenerationContext;
 namespace MapGeneration
 {
@@ -20,17 +20,24 @@ namespace MapGeneration
 /// finally writes out with writeVertices.
 using TerrainSketch = std::vector<unsigned char>;
 
-/// Grass may never touch water (each tile takes its rules from its four corner vertices), so every
-/// land vertex beside water becomes sand. Like Map::layBeaches() this reads only the original
-/// terrain, so the result doesn't depend on scan order; unlike it, water is never eaten away.
+/// Beaches are a generation convention: every non-WATER vertex beside WATER becomes sand.
+/// Like Map::layBeaches() this reads only the original terrain, so the result doesn't depend on
+/// scan order; unlike it, water is never eaten away.
 void layBeaches(TerrainSketch &, const Torus &);
 
 /// Writes the sketch to the map's vertices, re-deriving every tile from its corners.
-void writeVertices(Map &, const TerrainSketch &);
+void writeVertices(GenerationMap &, const TerrainSketch &);
+
+/// The terrain to write when a design keeps two sketches: `mechanics`, the canonical type of every
+/// vertex's rule group (GRASS, SAND, SHALE, SCREE...) that every shared helper and check reads, and
+/// `looks`, the artwork chosen for it (LUSH_GRASS, DUNE_SAND, WEATHERED_SANDSTONE...), 0 where none
+/// was chosen. A look is taken only where it shares its mechanic's terrain group, so looks can never
+/// change a rule: anything else keeps its mechanic. WATER is type 0 and so is never a look.
+TerrainSketch composeLooks(const TerrainSketch &mechanics, const TerrainSketch &looks);
 
 /// Every corner vertex of tile (x, y) takes `type`, with no beach laid: the tile becomes pure
 /// `type`, and the eight tiles sharing those corners mix it with their own.
-void paintTile(Map &, int x, int y, TerrainType type);
+void paintTile(GenerationMap &, int x, int y, TerrainType type);
 
 int countTiles(const TerrainSketch &, TerrainType);
 
@@ -38,15 +45,27 @@ int countTiles(const TerrainSketch &, TerrainType);
 /// set for those tiles to take a terrain of their own.
 std::vector<unsigned char> tileCorners(const Torus &, const std::vector<unsigned char> &tiles);
 
+/// Paves a route traced as tiles (tracePath) onto the sketch as `type`. Width 1 sets each traced
+/// tile's top-left vertex: a line one vertex thick that leaves no pure tile of its own, a lane's mark
+/// as the old one-corner sand roads were. Width 2 sets all four corners of every traced tile, so the
+/// traced tiles become pure `type`: a road that reads as one. Only vertices `allowed` accepts change.
+/// Returns the vertices changed.
+int paveRoute(TerrainSketch &, const Torus &, const std::vector<unsigned char> &route, int width,
+			  TerrainType type, const std::function<bool(int)> &allowed);
+
 /// The tiles whose four corner vertices all hold `type` (tile (x, y) takes its rules from vertices
 /// (x, y), (x + 1, y), (x, y + 1) and (x + 1, y + 1)): what the sketch will draw as pure grass,
 /// sand or water. Buildings and deposits need pure grass, and the engine's growth tests read pure
 /// water and pure sand, so this is the sketch as the game will see it.
 std::vector<unsigned char> pureTiles(const TerrainSketch &, const Torus &, TerrainType type);
 
+/// The walking permission derived from each tile's four built-in terrain profiles.
+/// Use for travel and connectivity; mixed water-majority cells are not land.
+std::vector<unsigned char> walkableTiles(const TerrainSketch &, const Torus &);
+
 /// The same pure-terrain mask from a finished map's corner-derived tiles. Use after all terrain repairs
 /// when validating a growth or shoreline promise; mixed beach tiles belong to none of the masks.
-std::vector<unsigned char> pureTiles(const Map &, TerrainType);
+std::vector<unsigned char> pureTiles(const GenerationMap &, TerrainType);
 
 /// Decorative patches of sand inside the land, away from any shore: of the grass tiles `eligible`
 /// allows that lie at least `inland` steps from water, the `share` (0 to 1) with the highest

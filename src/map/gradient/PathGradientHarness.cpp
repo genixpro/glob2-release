@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise the real Uint16 pathfinding kernel against an independent heap oracle.
 #include "Glob2Test.h"
+#include "TerrainBuiltins.h"
 #include <array>
 #include "GlobalContainer.h"
 #include "Map.h"
+#include "gradient/MapRouting.h"
 #include "BuildingGradientSearch.h"
 #include "BuildingGradientDepthPolicy.h"
 #include "GradientPipeline.h"
@@ -78,7 +80,7 @@ std::vector<Uint16> oracle(const std::vector<Uint16>& seeds,
 	const std::vector<Uint16>& terrain, int width, int height, int swimClass, int maxCost, const std::vector<TerrainType>* semantic = nullptr,
 	bool semanticPerCell = false, const TerrainRegistry* registry = nullptr)
 {
-	constexpr int waterSteps[] = {10, 5, 7, 10, 13, 20, 30};
+	constexpr int waterSteps[] = {10, 5, 7, 10, 13, 20, 30, 10};
 	constexpr int Infinity = INT_MAX / 2;
 	const int limit = std::min(maxCost, CostLimit);
 	std::vector<int> distance(seeds.size(), Infinity);
@@ -99,8 +101,9 @@ std::vector<Uint16> oracle(const std::vector<Uint16>& seeds,
 		// Reverse traversal enters this settled cell in the forward path.
 		const size_t corners[4] = {i, size_t(y) * width + (x + 1) % width, size_t((y + 1) % height) * width + x,
 			size_t((y + 1) % height) * width + (x + 1) % width};
-		bool water = true;
-		for (const auto corner : corners) water = water && PathMap::isWater(terrain[corner]);
+		unsigned waterCorners = 0;
+		for (const auto corner : corners) waterCorners += PathMap::isWater(terrain[corner]);
+		const bool water = waterCorners >= 3; // Grass/water fixtures have no blocked corners.
 		int cardinal = water && swimClass<AIR_MOVEMENT_CLASS ? waterSteps[swimClass] : 10;
         if (semantic)
         {
@@ -109,13 +112,39 @@ std::vector<Uint16> oracle(const std::vector<Uint16>& seeds,
             const auto properties=[&](TerrainType t)->const TerrainProperties& {
                 return registry ? registry->properties(t) : terrainProperties(t);
             };
-            const auto p = semanticPerCell ? properties(s[i])
-                : combineCornerRules(properties(s[corners[0]]), properties(s[corners[1]]),
-                    properties(s[corners[2]]), properties(s[corners[3]]));
-            const int base = swimClass==AIR_MOVEMENT_CLASS ? 10 : p.swimmable ? waterSteps[swimClass] : 10;
-            const unsigned speed=swimClass==AIR_MOVEMENT_CLASS ? p.airSpeedQ8 : p.groundSpeedQ8;
+            const bool air = swimClass==AIR_MOVEMENT_CLASS;
+            bool swimming;
+            unsigned speed;
+            int health;
+            if (semanticPerCell)
+            {
+                const auto &p = properties(s[i]);
+                swimming = p.swimmable;
+                speed = air ? p.airSpeedQ8 : p.groundSpeedQ8;
+                health = air ? p.airHealthQ8 : p.groundHealthQ8;
+            }
+            else
+            {
+                // Independently price raw corners: the production merge and cost
+                // helpers must not determine their own expected oracle result.
+                unsigned walking = 0, swimmers = 0, blocked = 0;
+                std::int32_t speedSum = 0, healthSum = 0;
+                for (const auto corner : corners)
+                {
+                    const auto &p = properties(s[corner]);
+                    if (p.walkable) ++walking;
+                    else if (p.swimmable) ++swimmers;
+                    else ++blocked;
+                    speedSum += air ? p.airSpeedQ8 : p.groundSpeedQ8;
+                    healthSum += air ? p.airHealthQ8 : p.groundHealthQ8;
+                }
+                swimming = blocked < 2 && swimmers > walking;
+                speed = unsigned(speedSum / 4);
+                health = healthSum / 4; // Signed division truncates toward zero.
+            }
+            const int base = air ? 10 : swimming ? waterSteps[swimClass] : 10;
             cardinal = std::max(1u, (base*256 + speed/2)/speed);
-            cardinal = std::min(181, (cardinal*(256+20*std::max(0,-int(swimClass==AIR_MOVEMENT_CLASS ? p.airHealthQ8 : p.groundHealthQ8)))+128)/256);
+            cardinal = std::min(181, (cardinal*(256+20*std::max(0,-health))+128)/256);
         }
 		for (int dy = -1; dy <= 1; ++dy)
 			for (int dx = -1; dx <= 1; ++dx)
@@ -148,7 +177,7 @@ void check(int widthShift, int heightShift, const std::vector<Uint16>& seeds,
 	const auto expected = oracle(seeds, terrain, width, height, swimClass, cap);
 	PathMap map(widthShift, heightShift, terrain);
 	auto actual = seeds;
-	map.propagateGradient(actual.data(), swimClass, cap);
+	map.routing().propagateGradient(actual.data(), swimClass, cap);
 	for (size_t i = 0; i < actual.size(); ++i)
 	{
 		if (actual[i] != expected[i])
@@ -163,9 +192,9 @@ void check(int widthShift, int heightShift, const std::vector<Uint16>& seeds,
 	// capacity/deferred seeds must never leak logical state between calls.
 	std::vector<Uint16> otherTerrain(4, 256), otherSeeds{Goal, 1, 0, 65000};
 	PathMap other(1, 1, otherTerrain);
-	other.propagateGradient(otherSeeds.data(), (swimClass + 1) % 7, 43);
+	other.routing().propagateGradient(otherSeeds.data(), (swimClass + 1) % 7, 43);
 	actual = seeds;
-	map.propagateGradient(actual.data(), swimClass, cap);
+	map.routing().propagateGradient(actual.data(), swimClass, cap);
 	require(actual == expected, "repeat after different Map/class/cap diverged");
 	++cases; cellsChecked += actual.size();
 }
@@ -273,7 +302,7 @@ void parallelChecks()
 		{
 			std::array<std::vector<Uint16>, 7> actual;
 			for (auto &field : actual) field = seeds;
-			map.computeExecutor().run(7, [&](size_t swim) { map.propagateGradient(actual[swim].data(), swim); });
+			map.computeExecutor().run(7, [&](size_t swim) { map.routing().propagateGradient(actual[swim].data(), swim); });
 			for (int swim = 0; swim < 7; ++swim) require(actual[swim] == expected[swim], "parallel propagation differs from oracle");
 		}
 		// Concurrent independent lazy searches, including serial water initialization.
@@ -477,7 +506,7 @@ TEST_CASE("mixed terrain costs match heap oracle and immutable lazy searches [pa
         seeds[0]=Goal;
         const auto expected=oracle(seeds,oldTerrain,w,h,sw,CostLimit,&terrain);
         auto actual=seeds;
-        map.propagateGradient(actual.data(),sw);
+        map.routing().propagateGradient(actual.data(),sw);
         REQUIRE(actual==expected);
         actual=seeds;
         BuildingGradientSearch search;
@@ -823,7 +852,7 @@ TEST_CASE("lazy terrain costs preserve uniform materials and source costs [pathf
                 // Map dispatch and resumable searches are separate entry points;
                 // both must charge the goal's terrain in the reverse field.
                 auto actual = seeds;
-                map.propagateGradient(actual.data(), swim);
+                map.routing().propagateGradient(actual.data(), swim);
                 REQUIRE(actual == expected);
                 actual = seeds;
                 BuildingGradientSearch search;
@@ -954,7 +983,7 @@ TEST_CASE("air movement costs share eager and immutable lazy fields against the 
         seeds[0]=Goal;
         const auto expected=oracle(seeds,classic,1<<ws,1<<hs,AIR_MOVEMENT_CLASS,CostLimit,&terrain);
         auto actual=seeds;
-        map.propagateGradient(actual.data(),AIR_MOVEMENT_CLASS);
+        map.routing().propagateGradient(actual.data(),AIR_MOVEMENT_CLASS);
         REQUIRE(actual==expected);
         actual=seeds;
         BuildingGradientSearch search;
@@ -1004,7 +1033,7 @@ TEST_CASE("authored air speed and damage profiles agree across scalar SIMD and l
         if(!cpuVariantAvailable(selected))continue;
         setBackend(selected);
         auto actual=seeds;
-        map.propagateGradient(actual.data(),AIR_MOVEMENT_CLASS);
+        map.routing().propagateGradient(actual.data(),AIR_MOVEMENT_CLASS);
         REQUIRE(actual==expected);
         actual=seeds;
         BuildingGradientSearch search;

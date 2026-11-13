@@ -5,7 +5,7 @@
 // round trip as comma-separated keys, and a key this build no longer knows is
 // dropped rather than failing the load.
 
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
 #include "ExperimentalFeatures.h"
 #include "Settings.h"
 #include <FileManager.h>
@@ -52,7 +52,7 @@ TEST_SUITE("SettingsExperiments")
 		auto* strings = GAGCore::Toolkit::getStringTable();
 		std::set<std::string> listed;
 		{
-			std::ifstream keys(glob2test::sourceRoot() / "data/texts.keys.txt");
+			std::ifstream keys(glob2test::contentRoot() / "data/texts.keys.txt");
 			for (std::string line; std::getline(keys, line);)
 				listed.insert(line);
 		}

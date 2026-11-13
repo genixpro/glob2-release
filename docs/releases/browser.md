@@ -11,8 +11,8 @@ workflow trigger.
 
 The build job verifies the exact public tag commit and matching game version
 (without requiring desktop store metadata), installs the locked
-Emscripten SDK, builds `scons target=web release=1`, and packages the client with
-`browser/package-static.py`. Its `browser-release` artifact includes SHA-256
+Emscripten SDK, builds `tools/dev_build.py target=web release=1 web-package`, and packages the client with
+`platforms/web/package-static.py`. Its `browser-release` artifact includes SHA-256
 checksums. The package includes the versioned presentation-surface runtime and
 each Emscripten shader preload (`index.data`, including the separate threaded
 preload). These payloads participate in the release identity and require verified
@@ -21,13 +21,22 @@ existing package. The isolated publication job verifies the artifact before usin
 Google Cloud Workload Identity Federation through the `browser-release`
 GitHub environment; the build job has no cloud identity permission.
 
-The destination is `gs://glob2-browser-pharaoh-418820-20260909` in project
+Both generated runtime variants must reference the versioned Wasm filename,
+whether Emscripten emits single or double quotes. Changes to these rewriting
+rules bump the static packaging policy so changed output receives a new cache
+identity even when the build inputs are unchanged.
+
+The destination is `gs://glob2-browser` in project
 `bradley-personal-20261027`. Versioned JavaScript, WebAssembly and data objects receive
-explicit content types and immutable one-year caching. They are uploaded before
-`index.html`, which requires cache revalidation. Older assets remain available
+explicit content types and immutable one-year caching. Publication uses
+`platforms/web/publish-static.py` to verify the complete package and upload its gzip
+representations, including translation catalogs, launcher font CSS, pinned fonts
+and licences. Stable assets such as `i18n.js`, catalogs and font CSS require cache
+revalidation. All assets are uploaded before `index.html`, which is published last
+and also requires revalidation. Older assets remain available
 for open sessions and rollback; publication never synchronizes with deletion.
 The public entry point is
-<https://storage.googleapis.com/glob2-browser-pharaoh-418820-20260909/index.html>.
+<https://storage.googleapis.com/glob2-browser/index.html>.
 
 The release environment requires `GLOB2_BROWSER_WIF_PROVIDER` and
 `GLOB2_BROWSER_SERVICE_ACCOUNT` variables. The dedicated `glob2-browser-release`

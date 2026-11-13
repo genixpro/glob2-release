@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Save during an explorer's final step into a building; retain corruption checks.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "HeadlessGame.h"
 #include "GlobalContainer.h"
 #include "Game.h"
 #include "GameGUI.h"
@@ -186,7 +188,6 @@ TEST_SUITE("EnteringUnitSave")
 	        const auto state=[](Game& game) {
 	            std::vector<Uint32> fields,buildings,units;
 	            game.checkSum(&fields,&buildings,&units,true);
-	            fields.erase(fields.begin()); // loaded map format 88 vs current format
 	            fields.insert(fields.end(),buildings.begin(),buildings.end());
 	            fields.insert(fields.end(),units.begin(),units.end());
 	            return fields;

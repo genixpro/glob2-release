@@ -1,0 +1,184 @@
+name: sim-diff
+
+# Compares what the simulation computes before and after a pull request: the
+# merge base and the pull request are built at the perf tier and fingerprinted on
+# the same scenarios (tools/sim_fingerprint.py), and tools/sim_diff.py reports the
+# first scenario, tick and component that differ. Runs only when the change
+# reaches the simulation path (ci_policy.touches_simulation).
+#
+# Verdict, with the sim version key of each side (test/check_sim_revision.py --key-at):
+#   output differs, key unchanged -> fail (bump SIM_REVISION)
+#   output differs, key changed   -> pass
+#   output equal,   key changed   -> warning (equal output does not prove behaviour
+#                                    is unchanged, so it never forbids a bump)
+# Generator maps are keyed by generator revision, so a generator change that bumps
+# its own revision is a new scenario, not a difference. On master pushes the same
+# comparison against the parent commit is a post-merge audit that opens an issue
+# instead of failing. See "Simulation diff" in docs/development/simulation-verification.md.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+# Each master push is its own audit: one group per commit, because a group holds
+# only one pending run and a newer push would otherwise replace the queued audit.
+concurrency:
+  group: sim-diff-${{ github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/') && github.ref != format('refs/heads/{0}', github.event.repository.default_branch)) }}
+
+permissions:
+  contents: read
+
+env:
+  GLOB2_DEV_MODE: isolated
+
+jobs:
+  relevant:
+    name: simulation path changed
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      simulation: ${{ steps.paths.outputs.simulation }}
+      base: ${{ steps.paths.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: blob:none
+      - id: paths
+        env:
+          # A master push is audited against the commit before it.
+          BASE_SHA: ${{ github.event.pull_request.base.sha || (github.event_name == 'push' && github.event.before) || 'origin/master' }}
+        run: |
+          base=$(git merge-base "$BASE_SHA" HEAD)
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          git diff --name-only "$base" HEAD > /tmp/changed.txt
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import sys
+          sys.path.insert(0, '.github/scripts')
+          from ci_policy import touches_simulation
+          paths = open('/tmp/changed.txt').read().split()
+          print('simulation=' + ('true' if touches_simulation(paths) else 'false'))
+          PY
+
+  sim-diff:
+    name: sim-diff
+    needs: relevant
+    if: ${{ needs.relevant.outputs.simulation == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+      issues: write  # the post-merge audit opens an issue
+    env:
+      CCACHE: 1
+      CCACHE_DIR: /tmp/glob2-ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_MAXSIZE: 3G
+      BASE: ${{ needs.relevant.outputs.base }}
+    steps:
+      - name: Install dependencies
+        timeout-minutes: 15
+        run: |
+          sudo tee /etc/apt/apt.conf.d/80-ci-network >/dev/null <<'CONF'
+          Acquire::Retries "3";
+          Acquire::http::Timeout "30";
+          Acquire::https::Timeout "30";
+          CONF
+          sudo apt-get update -qq
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ca-certificates git g++-13 python3 python3-venv scons pkg-config nasm libva-dev ccache \
+            cmake ninja-build libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev \
+            libopusfile-dev libopus-dev libogg-dev libspeex-dev \
+            libboost-dev libssl-dev \
+            zlib1g-dev libfribidi-dev libpcre3-dev \
+            libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/sdl3
+        with:
+          cc: gcc-13
+          cxx: g++-13
+      - uses: ./.github/actions/renderer-shader-tools
+      - name: Restore the compiler cache
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ccache-fast-ubuntu-24.04-gcc13-${{ env.BASE }}
+          restore-keys: ccache-fast-ubuntu-24.04-gcc13-
+      # The merge base builds in its own worktree so it reads its own content/data;
+      # the shared compiler cache makes the second build mostly cache hits.
+      - name: Build the merge base and the pull request
+        run: |
+          export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
+          prefix="$PWD/build/sdl3-ci/prefix"
+          git worktree add --detach ../glob2-base "$BASE"
+          # The test binaries carry the [golden] cases whose traces the goldens part compares.
+          targets="build/linux/client/perf/src/glob2 map-generator-golden-test engine-tests unit-tests"
+          (cd ../glob2-base && GLOB2_SDL3_PREFIX="$prefix" python3 tools/dev_build.py perf=1 CC=gcc-13 CXX=g++-13 -j4 $targets)
+          GLOB2_SDL3_PREFIX="$prefix" python3 tools/dev_build.py perf=1 CC=gcc-13 CXX=g++-13 -j4 $targets
+      - name: Fingerprint both builds
+        run: |
+          export LD_LIBRARY_PATH="$PWD/build/sdl3-ci/prefix/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          mkdir -p artifacts/sim-diff
+          python3 tools/sim_fingerprint.py ../glob2-base/build/linux/client/perf/src/glob2 \
+            --checkout ../glob2-base --out artifacts/sim-diff/base.json.gz
+          python3 tools/sim_fingerprint.py build/linux/client/perf/src/glob2 --out artifacts/sim-diff/candidate.json.gz
+      - name: Judge the verdict
+        id: verdict
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set +e
+          python3 tools/sim_diff.py artifacts/sim-diff/base.json.gz artifacts/sim-diff/candidate.json.gz \
+            --json artifacts/sim-diff/verdict.json | tee artifacts/sim-diff/verdict.txt
+          status=${PIPESTATUS[0]}
+          set -e
+          base_key=$(python3 test/check_sim_revision.py --key-at "$BASE")
+          head_key=$(python3 test/check_sim_revision.py --key-at HEAD)
+          {
+            echo "### sim-diff"
+            echo
+            echo "Sim version key: \`$base_key\` on the base, \`$head_key\` here."
+            echo
+            echo '```'
+            cat artifacts/sim-diff/verdict.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$status" = 2 ]; then
+            echo "::error::sim-diff could not compare the bundles"
+            exit 1
+          fi
+          if [ "$status" = 0 ]; then
+            if [ "$base_key" != "$head_key" ]; then
+              echo "::warning::sim-diff: the sim version key moved but no scenario changed; equal output does not prove behaviour is unchanged, so the bump stands"
+            fi
+            exit 0
+          fi
+          if [ "$base_key" != "$head_key" ]; then
+            echo "::notice::sim-diff: simulation output changed and the sim version key moved"
+            exit 0
+          fi
+          message="the simulation output changed but the sim version key did not; bump SIM_REVISION in src/game/SimRevision.h (or, for a generator, its revision)"
+          if [ "$EVENT" = push ]; then
+            echo "::warning::sim-diff post-merge audit: $message"
+            short=$(git rev-parse --short HEAD)
+            gh issue create --title "sim-diff: $short changed simulation output without a sim version bump" \
+              --body "$(printf 'The post-merge audit compared %s with its parent %s.\n\n```\n%s\n```\n\n%s\n\nRun: %s\n' \
+                "$(git rev-parse HEAD)" "$BASE" "$(cat artifacts/sim-diff/verdict.txt)" "$message" "$RUN_URL")" || \
+              echo "::warning::could not open the audit issue"
+            exit 0
+          fi
+          echo "::error::sim-diff: $message"
+          exit 1
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: sim-diff-${{ github.run_id }}
+          path: artifacts/sim-diff/
+          retention-days: 14

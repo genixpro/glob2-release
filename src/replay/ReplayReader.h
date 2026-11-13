@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include "ReplayTelemetry.h"
 #include "ChecksumSample.h"
@@ -11,6 +12,7 @@
 #include <assert.h>
 #include <string>
 #include "Types.h"
+#include "FileFormatVersions.h"
 
 namespace GAGCore
 {
@@ -22,10 +24,11 @@ class Order;
 //! Malformed or truncated replay bodies are rejected, including partial recordings.
 
 //! Oldest replay format (the VERSION_MINOR the replay was written with) that
-//! the reader still accepts. Version 186 admits four building gradients per team per tick;
-//! older recorded orders cannot reproduce its gradient and movement decisions.
+//! the reader still accepts. Version 213 extends authoritative snapshot checksums to
+//! claim routes and bounded recovery (snapshot v4); earlier recordings follow different
+//! simulation trajectories or checksum coverage.
 //! Save compatibility has a separate floor in Version.h.
-static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = 186;
+static constexpr Uint16 REPLAY_MINIMUM_VERSION_MINOR = FILE_FORMAT_VERSION_RESOURCE_CLAIMS;
 
 
 /// This class is used for reading replays.
@@ -48,6 +51,10 @@ public:
 	/// Returns true if successful.
 	///  ! IMPORTANT: It owns the stream afterwards. It will delete the stream when it's no longer used.
 	bool loadReplay(GAGCore::InputStream *stream, bool skipToOrders);
+
+	/// Reads and discards a replay's game header. GameGUI registers it (GameGUI.cpp),
+	/// so the replay reader does not link the GUI itself.
+	static std::function<bool(GAGCore::InputStream *)> &headerSkipper();
 
 	/// Loads the replay with the given filename. Returns true if successful.
 	bool loadReplay(const std::string &filename);

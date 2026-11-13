@@ -143,6 +143,7 @@ const std::vector<std::string>& simDataFiles()
 		"data/nicowar.default.txt",
 		"data/nicowar.txt",
 		"data/resources/registry.json",
+		"data/texts.list.txt",
         "data/units/registry.json",
 		"data/usl/Glob2/Runtime/Game.usl",
 		"data/usl/Language/Runtime/Classes.usl",
@@ -190,6 +191,8 @@ std::string simDataHashOf(const std::vector<SimDataFile>& files)
 	}
 	return toHex(hash.finish());
 }
+
+SimDataFile simRevisionEntry() { return simRevisionEntry(SIM_REVISION); }
 
 SimDataFile simRevisionEntry(int revision)
 {

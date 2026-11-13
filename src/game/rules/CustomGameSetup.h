@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "TeamCapacity.h"
+#include "AIImplementationId.h"
 #include "EngineTiming.h"
 #include "GameHeader.h"
 #include "GenerationRequest.h"
@@ -30,11 +32,11 @@ struct CustomGameSetup
 	struct Colony
 	{
 		Controller controller = Computer;
-		AI::ImplementationID ai = AI::NUMBI;
+		AIImplementationIds::ImplementationID ai = AIImplementationIds::NUMBI;
 		std::string aiLibraryId;
 		int alliance = 0;
 	};
-	std::array<Colony, Team::MAX_COUNT> colonies;
+	std::array<Colony, TEAM_MAX_COUNT> colonies;
 	GenerationRequest generator;
 	GenerationHistory generatorHistory;
 	int capacity;
@@ -52,10 +54,9 @@ struct CustomGameSetup
 	// matches the first sole prestige leader appeared 13-28 minutes in.
 	static constexpr std::array<int, 5> suddenDeathMinuteChoices = {0, 30, 45, 60, 90};
 	int suddenDeathMinutes = 0;
-	// Confidence at which the fitted win probability model ends the game (0 = off,
-	// the default -- a normal game plays exactly as before). Measured on the AI
-	// tournament, 970 called the eventual winner in over 99% of the games it
-	// ended; 950 ends more of them and is wrong rather more often.
+	// Confidence at which the fitted win probability model ends the game (0 = off).
+	// Ordinary GUI games default off; tournament CLI games default to 950. See
+	// docs/ai/architecture/win-probability-model.md for calibration and tradeoffs.
 	static constexpr std::array<int, 4> winProbabilityChoices = {0, 950, 970, 990};
 	int winProbabilityPermille = 0;
 	// The ruleset the rules started from (data/rulesets.json). Edits do not change it: what
@@ -65,9 +66,9 @@ struct CustomGameSetup
 	unsigned mapRevision = 0;
 	CustomGameSetup()
 	{
-		generator.setMethodDefaults(GeneratorRegistry::builtins().methods(false).front());
+		generator.setMethodDefaults(GeneratorRegistry::builtins().defaultMethod(false));
 		capacity = generator.nbTeams;
-		for (int i = 0; i < Team::MAX_COUNT; ++i)
+		for (int i = 0; i < TEAM_MAX_COUNT; ++i)
 			colonies[i].alliance = i;
 		colonies[0].controller = Human;
 	}
@@ -104,12 +105,12 @@ struct CustomGameSetup
 			return false;
 		const auto old = colonies;
 		if (c == Human || c == Shared)
-			for (int i = 0; i < Team::MAX_COUNT; ++i)
+			for (int i = 0; i < TEAM_MAX_COUNT; ++i)
 				if (i != index &&
 					(colonies[i].controller == Human || colonies[i].controller == Shared))
 					colonies[i].controller = Computer;
 		colonies[index].controller = c;
-		if (controllerCount() > Team::MAX_COUNT)
+		if (controllerCount() > TEAM_MAX_COUNT)
 		{
 			colonies = old;
 			return false;
@@ -118,7 +119,7 @@ struct CustomGameSetup
 	}
 	void setCapacity(int n)
 	{
-		if (n >= 1 && n <= Team::MAX_COUNT && n != capacity)
+		if (n >= 1 && n <= TEAM_MAX_COUNT && n != capacity)
 		{
 			capacity = n;
 			++mapRevision;
@@ -194,7 +195,7 @@ struct CustomGameSetup
 	std::string rulesetTitle(bool room = false) const;
 	std::string validation() const
 	{
-		if (capacity < 1 || capacity > Team::MAX_COUNT)
+		if (capacity < 1 || capacity > TEAM_MAX_COUNT)
 			return "Invalid colony count.";
 		if (random)
 		{
@@ -209,7 +210,7 @@ struct CustomGameSetup
 			if (!error.empty())
 				return error;
 		}
-		if (controllerCount() > Team::MAX_COUNT)
+		if (controllerCount() > TEAM_MAX_COUNT)
 			return "Shared control needs a free controller slot (maximum %0).";
 		if (activeColonies() < 1)
 			return "Open at least one colony to start a match.";
@@ -217,7 +218,7 @@ struct CustomGameSetup
 	}
 	void writeHeader(GameHeader &header, const std::string &username) const
 	{
-		for (int i = 0; i < Team::MAX_COUNT; ++i)
+		for (int i = 0; i < TEAM_MAX_COUNT; ++i)
 			header.getBasePlayer(i) = BasePlayer();
 		int count = 0;
 		// Keep the real local controller first for existing save/load paths.
@@ -237,7 +238,7 @@ struct CustomGameSetup
 			}
 		}
 		header.setNumberOfPlayers(count);
-		for (int i = 0; i < Team::MAX_COUNT; ++i)
+		for (int i = 0; i < TEAM_MAX_COUNT; ++i)
 			header.setAllyTeamNumber(i, colonies[i].alliance + 1);
 		header.setAllyTeamsFixed(locked);
 		header.setMapDiscovered(revealed);

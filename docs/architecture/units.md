@@ -6,7 +6,7 @@ or selection interface. Their IDs are permanently 0, 1 and 2. Additional IDs are
 local to an immutable catalog and must be resolved from stable keys at setup.
 Catalogs contain at most 1,024 definitions; game state allocates by actual count.
 
-`UnitCatalog` reads `data/units/registry.json`. Authored entries may extend an
+`UnitCatalog` reads `content/data/units/registry.json`. Authored entries may extend an
 existing definition and override its behavior fields, four ability-level tables,
 material production cost and presentation identity. Parsing validates the whole
 catalog before publication. Missing installed data falls back to baked legacy
@@ -226,6 +226,15 @@ count as ability training.
 
 ## Cargo and production
 
+Completed replenishing buildings, including inns, swarms and towers, keep assigned
+couriers on their current delivery trips when inventory demand falls. Recruitment
+still uses the current material-demand cap, so an excess crew does not trigger
+new hires. After unloading, a courier leaves if the crew still exceeds that cap;
+if consumption has restored demand, it can make another trip. Multi-packet loads
+finish their useful unloading before this check. Player staffing reductions take
+effect immediately. Construction, repair and upgrades retain finite-demand
+staffing, and medical departures and route failures keep their usual behavior.
+
 Cargo capacity counts raw transport packets, including fractional supplier
 packets. Default workers carry one inline packet. Larger inventories use a
 game-owned sidecar keyed by unit identity; snapshots copy its values. Additional
@@ -253,6 +262,54 @@ rows once per immutable catalog; replacing a catalog invalidates these derived
 rows even when its number of definitions is unchanged. Live catalog setup rejects
 resizing while projectiles retain launch-time damage rows. Save loading replaces
 the discarded game's sectors before restoring its own projectile rows.
+
+### Resource claims
+
+Without claims, every worker fetching a material follows the same shared
+gradient to the nearest stock, so a late-game crowd converges on one farm tile
+and most of it arrives to find the stock already taken. New games use material
+claims instead: a claim reserves one unit of natural stock (a resource cell or a pooled
+farm tile) for one worker and routes that worker to it, so a crowd
+spreads over the stock that is actually there. The policy, `contention-v2`, is
+fixed in `src/map/claims/ClaimPolicy.h`; changing it changes the simulation.
+
+- **Contention trigger.** A worker without a claim moves exactly as with claims
+  off. It switches to claim selection only for a decision on which at least two
+  same-team workers fetching the same material (itself included) target cells
+  within three tiles of its own target. Uncrowded workers keep the cheaper
+  gradient movement.
+- **Selection.** The worker walks a learned 24-entry search pattern
+  (`final-r32-exact24-assembled-v1`, `ClaimPattern.h`), oriented towards its
+  nearest destination, and takes the first claimable candidate. Candidates in a
+  different terrain component, or more than 2.5 times the distance to the
+  nearest destination plus four tiles away, are skipped.
+- **Pursuit.** Routes are searched off the owner thread and published on the next
+  tick; meanwhile the worker takes the ordinary gradient step. On a route blocked
+  by traffic it sidesteps along the route, and after eight waits it replans
+  around the units it sees. Pursuit keeps adaptive gradient refresh demand alive.
+  A claimed worker re-runs selection every 24 decisions and takes the first
+  claimable entry in pattern order, which may be the claim it already holds.
+  Adjacent claimable stock can replace a distant claim.
+- **Nothing to claim.** A crowded worker that finds nothing to claim gives up its
+  job, as an idle worker would, and is free to be hired elsewhere. Failed routes
+  go through bounded recovery: four remembered unreachable accesses, at most four
+  route attempts per 64 ticks and a 16-tick backoff (`ClaimRecovery.h`).
+- **Hiring.** Before a team's hiring phase, each free worker on a fetch shortlist
+  runs the same claim search it would run once hired, as a pure read of the
+  frozen state (in parallel for large passes). Hiring skips a worker with nothing
+  claimable, or one carrying another material, since it would only be released
+  again.
+
+Claims bind claimers only. The ledger is shared by all teams, so one team's
+claims block another team's claimers. An unclaimed worker of any team can still
+harvest claimed stock; the stock drop then evicts the claims it no longer covers,
+highest owner ID first.
+
+Saved games store whether they use claims, together with the ledger, routes,
+selection cadence and recovery state, and continue as they were. Saves from
+before format 213 continue without claims. `game run --resource-claims off`
+starts a claims-off baseline; see
+[resource claims in tournaments](../tools/tournaments.md#resource-claims).
 
 ## Presentation and persistence
 

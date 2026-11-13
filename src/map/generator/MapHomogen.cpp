@@ -4,10 +4,9 @@
 // The resource-fraying pass the random generators share. Kept out of
 // MapTerrain.cpp on purpose: smoothResources needs globalContainer's resource types, and the test
 // build links MapTerrain.cpp against a stripped server-mode libgag that has no globalContainer
-// (test/SConstruct).
+// (test/tests.py).
 #include "GlobalContainer.h"
 #include "Map.h"
-#include "Game.h"
 #include "MapInternal.h"
 #include "Unit.h"
 #include "Utilities.h"

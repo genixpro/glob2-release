@@ -23,7 +23,9 @@
 #include <unistd.h>
 #endif
 
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "HeadlessGame.h"
 #include "Environment.h"
 #include "ScopedEnvironment.h"
 
@@ -68,6 +70,7 @@
 #include "TurnLockstep.h"
 #include "Utilities.h"
 #include "VerifyMatch.h"
+#include "Building.h"
 
 namespace fs = std::filesystem;
 
@@ -87,7 +90,7 @@ std::uint64_t wallMs()
 
 std::string mapPath()
 {
-	return (glob2test::sourceRoot() / "maps" / "FourSquares1.map.gz").string();
+	return (glob2test::contentRoot() / "maps" / "FourSquares1.map.gz").string();
 }
 
 std::uint16_t testPort()
@@ -605,7 +608,7 @@ TEST_SUITE("LanMatchHarness")
             customID=int(snapshot["variants"].size());
             variant["id"]=customID;variant["key"]="network.custom";
             variant["properties"]["type"]="network-custom";
-            variant["properties"]["hpMax"]=431;
+            variant["properties"]["hpInit"]=431;variant["properties"]["hpMax"]=431;
             variant["previous"]="";variant["next"]="";
             variant["semantics"]["placeable"]=true;variant["semantics"]["instantPlacement"]=true;
             variant["semantics"]["repairable"]=false;variant["requiredExperiment"]="network-fixture";
@@ -1022,14 +1025,16 @@ TEST_SUITE("LanMatchHarness")
 		}
 	}
 
-	// A short name: the case name is part of the artifact path, and the guest's map
-	// cache below it must stay under Windows' 260-character path limit.
-	GLOB2_TEST_CASE("an idle LAN host sleeps and wakes at once for guests and the host", "[network][artifacts]")
+	// A threaded LAN host with one guest that has the map, in a short artifact
+	// directory: the guest's map cache below it must stay under Windows'
+	// 260-character path limit.
+	template <typename Body>
+	void withIdleRoom(const char* name, Body&& body)
 	{
 		glob2test::HeadlessGlobals globals(harnessGlobals());
 		glob2test::ScopedEnvironment address("GLOB2_LAN_ADDRESS", "127.0.0.1");
 		LanMatch m;
-		m.directory = glob2test::artifactDir() / "wait";
+		m.directory = glob2test::artifactDir() / name;
 		fs::remove_all(m.directory);
 		fs::create_directories(m.directory);
 		m.players.push_back(std::make_unique<LanPlayer>("Host", hostRoom(testPort(), m.directory), 301));
@@ -1039,56 +1044,85 @@ TEST_SUITE("LanMatchHarness")
 		REQUIRE(host.threaded());
 		auto* guest = m.players[1]->room->guestSide();
 		REQUIRE(m.runUntil(15000, [&] { return host.state().members.size() == 2 && guest->hasMap(); }));
+		body(m, host, *guest);
+	}
 
-		// Idle room: the worker no longer wakes every millisecond (1000 per second),
-		// only for its idle bound and the guest's keep-alives.
-		m.runFor(300);
-		const std::uint64_t before = host.workerWakeups();
-		m.runFor(1000);
-		const std::uint64_t idle = host.workerWakeups() - before;
-		MESSAGE("LAN host worker wake-ups in one idle second: " << idle);
+	// A short name: the case name is part of the artifact path.
+	GLOB2_TEST_CASE("an idle LAN host sleeps and still serves guests and the host", "[network][artifacts]")
+	{
+		withIdleRoom("wait", [](LanMatch& m, auto& host, auto& guest) {
+			// Idle room: the worker no longer wakes every millisecond (1000 per second),
+			// only for its idle bound and the guest's keep-alives. A slower machine
+			// can only count fewer wake-ups.
+			m.runFor(300);
+			const std::uint64_t before = host.workerWakeups();
+			m.runFor(1000);
+			const std::uint64_t idle = host.workerWakeups() - before;
+			MESSAGE("LAN host worker wake-ups in one idle second: " << idle);
 #ifndef _WIN32
-		// Windows sockets complete through completion ports, which a readiness poll
-		// cannot see: there the worker keeps polling every millisecond (NetWait.h).
-		CHECK(idle < 60);
+			// Windows sockets complete through completion ports, which a readiness poll
+			// cannot see: there the worker keeps polling every millisecond (NetWait.h).
+			CHECK(idle < 60);
 #endif
 
-		// A guest's message wakes the host at once, and so does the host's own action
-		// made on another thread (its change reaches the guest). Best of three, so a
-		// scheduling hiccup on a loaded machine does not decide it.
-		using Clock = std::chrono::steady_clock;
-		const auto elapsedMs = [](Clock::time_point since) {
-			return static_cast<long long>(
-				std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
-		};
-		const int guestSeat = host.state().members.at(1).seat;
-		REQUIRE(guestSeat > 0);
-		long long guestToHost = 1 << 30, hostToGuest = 1 << 30;
-		const AI::ImplementationID castor = static_cast<AI::ImplementationID>(AINames::parseAIName("castor"));
-		for (int attempt = 0; attempt < 3; ++attempt)
-		{
+			// The sleeping host still takes a guest's change, and its own changes made on
+			// another thread still reach the guest. How fast is the benchmark below; the
+			// deadlines here are hang guards.
+			const int guestSeat = host.state().members.at(1).seat;
+			REQUIRE(guestSeat > 0);
 			const int team = host.state().setup.seats.at(guestSeat).team == 1 ? 2 : 1;
-			auto started = Clock::now();
 			m.players[1]->room->changeTeam(guestSeat, team);
-			REQUIRE(m.runUntil(5000, [&] { return host.state().setup.seats.at(guestSeat).team == team; }));
-			guestToHost = std::min(guestToHost, elapsedMs(started));
-
-			const std::size_t seats = guest->state()->setup.seats.size();
-			started = Clock::now();
-			host.addAI(castor);
-			REQUIRE(m.runUntil(5000, [&] {
-				return guest->state()->setup.seats.size() == seats + 1 && !guest->state()->setup.seats.back().human;
+			REQUIRE(m.runUntil(30000, [&] { return host.state().setup.seats.at(guestSeat).team == team; }));
+			const std::size_t seats = guest.state()->setup.seats.size();
+			host.addAI(static_cast<AI::ImplementationID>(AINames::parseAIName("castor")));
+			REQUIRE(m.runUntil(30000, [&] {
+				return guest.state()->setup.seats.size() == seats + 1 && !guest.state()->setup.seats.back().human;
 			}));
-			hostToGuest = std::min(hostToGuest, elapsedMs(started));
-			started = Clock::now();
 			host.kickSeat(static_cast<int>(seats));
-			REQUIRE(m.runUntil(5000, [&] { return guest->state()->setup.seats.size() == seats; }));
-			hostToGuest = std::min(hostToGuest, elapsedMs(started));
-		}
-		MESSAGE("guest to host: " << guestToHost << " ms, host to guest: " << hostToGuest << " ms (best of three)");
-		// Far below the 100 ms idle bound: they did not wait for a timer.
-		CHECK(guestToHost < 50);
-		CHECK(hostToGuest < 50);
+			REQUIRE(m.runUntil(30000, [&] { return guest.state()->setup.seats.size() == seats; }));
+		});
+	}
+
+	GLOB2_TEST_CASE("an idle LAN host wakes at once for guests and the host", "[network][benchmark][artifacts]")
+	{
+		withIdleRoom("wake", [](LanMatch& m, auto& host, auto& guest) {
+			// A guest's message wakes the host at once, and so does the host's own action
+			// made on another thread (its change reaches the guest). Best of three, so a
+			// scheduling hiccup on a loaded machine does not decide it.
+			using Clock = std::chrono::steady_clock;
+			const auto elapsedMs = [](Clock::time_point since) {
+				return static_cast<long long>(
+					std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - since).count());
+			};
+			const int guestSeat = host.state().members.at(1).seat;
+			REQUIRE(guestSeat > 0);
+			long long guestToHost = 1 << 30, hostToGuest = 1 << 30;
+			const AI::ImplementationID castor = static_cast<AI::ImplementationID>(AINames::parseAIName("castor"));
+			for (int attempt = 0; attempt < 3; ++attempt)
+			{
+				const int team = host.state().setup.seats.at(guestSeat).team == 1 ? 2 : 1;
+				auto started = Clock::now();
+				m.players[1]->room->changeTeam(guestSeat, team);
+				REQUIRE(m.runUntil(5000, [&] { return host.state().setup.seats.at(guestSeat).team == team; }));
+				guestToHost = std::min(guestToHost, elapsedMs(started));
+
+				const std::size_t seats = guest.state()->setup.seats.size();
+				started = Clock::now();
+				host.addAI(castor);
+				REQUIRE(m.runUntil(5000, [&] {
+					return guest.state()->setup.seats.size() == seats + 1 && !guest.state()->setup.seats.back().human;
+				}));
+				hostToGuest = std::min(hostToGuest, elapsedMs(started));
+				started = Clock::now();
+				host.kickSeat(static_cast<int>(seats));
+				REQUIRE(m.runUntil(5000, [&] { return guest.state()->setup.seats.size() == seats; }));
+				hostToGuest = std::min(hostToGuest, elapsedMs(started));
+			}
+			MESSAGE("guest to host: " << guestToHost << " ms, host to guest: " << hostToGuest << " ms (best of three)");
+			// Far below the 100 ms idle bound: they did not wait for a timer.
+			CHECK(guestToHost < 50);
+			CHECK(hostToGuest < 50);
+		});
 	}
 
 	GLOB2_TEST_CASE("LAN input delay on loopback and delayed links", "[network][slow][benchmark][artifacts]")

@@ -1,20 +1,31 @@
 # Terrain materials
 
-Detailed terrain rendering uses `data/terrain/tileset.json`. Gameplay continues to
+Detailed terrain rendering uses the terrain catalog, stored one file per terrain:
+`content/data/terrain/tileset.json` holds the shared tables and lists the materials
+in catalog order, and `content/data/terrain/materials/<key>.json` holds each
+material's block. `tools/terrain_catalog.py` and `TerrainVisual::loadCatalogDocument`
+read them back as one document. Gameplay continues to
 use stable `TerrainType` identities and properties. Visual material handles, masks,
 texture choices and composed pages are transient; they never enter saves, orders,
 checksums or the synchronized random stream.
 
 ## Add artwork
 
-A version-3 catalog contains `profiles`, `materials`, `bindings` and optional
-`pair_treatments`. Version-1 packs remain readable with their original five-point
+A version-4 catalog contains `border_classes`, `profiles`, `materials`, `bindings`
+and optional `pair_treatments`. Each `materials` entry is a key naming a material
+file, or an inline block (as map bundles and test catalogs use). Version-1 packs remain readable with their original five-point
 contours and sampling behavior; version 2 adds denser contours, edge softness and
 world-space bends; version 3 adds per-profile displacement amplitude, pebble
-speckle, diagonal bridging and up to sixty-four curves per profile. Version-2
+speckle, diagonal bridging and up to sixty-four curves per profile; version 4 adds
+border classes, profile precedence and coasts, and smooth contours (see
+[Boundary rules](terrain-rendering.md#boundary-rules)). Custom terrain bundled in
+map files names a profile key but no class. A version-4 catalog's `bundle_profiles`
+maps each retired or class-bearing key to a current `profile` and `class`, so older
+maps keep loading; any other bundled key keeps its profile and becomes `solid`. Keep
+an entry for every profile key a released catalog has shipped. Version-2
 packs parse unchanged and render through the current resolver, which rounds
 corners and reads each curve mirrored and negated. Material keys are unique strings. Bindings map semantic terrain
-names to material keys. Every paintable built-in terrain in `src/map/TerrainTypeTable.h`
+names to material keys. Every paintable built-in terrain in `src/map/TerrainCatalog.cpp`
 requires a binding: the five legacy names (water, sand, grass, ice and road) plus the
 terrain-catalogue names, which `tools/terrain_builtin_names.json` mirrors for the Python
 validator. Several names may bind the same material. The catalogue materials behind those
@@ -28,15 +39,27 @@ used by the compositor.
 
 Each material supplies:
 
-- `key`, a stable authoring name, and `sprite`, a `data/`-relative sprite prefix;
+- `key`, a stable authoring name, and `sprite`, a `content/data/`-relative sprite prefix;
 - `variants`, an array of `{ "frame": 272, "weight": 1 }` entries;
-- `profile`, the key of its boundary family, and `preview`, three overview RGB channels;
+- `profile`, the key of its edge profile, and `preview`, three overview RGB channels;
+- `class` (version 4), the key of its border class;
 - optional `minimap` RGB channels for minimaps and thumbnails (defaults to `preview`);
-- optional `animation_frames`, `animation_ticks`, and `animation_stride`;
+- optional `animation_frames`, `animation_ticks`, `animation_stride` and
+  `animation_blend_steps`;
 - optional `edges` (`blend` or `periodic`, see [Periodic edges](terrain-production.md#periodic-edges))
   and `variant_grid`, see [Positional variants](terrain-production.md#positional-variants);
+- optional `variant_blocks` for interchangeable interiors and `variant_block_group`
+  for materials that share layout selection, see [Interchangeable blocks](terrain-production.md#interchangeable-blocks);
+- optional `stones` (version 4, with `variant_grid`), the data path of a laid
+  path's stone map, so its borders keep or drop whole stones; see
+  [Whole-stone edges](terrain-rendering.md#whole-stone-edges);
 - optional `seam` (version 3) with `height`, `cast_q8`, `cast_width_q8`, `fringe`,
   `fringe_q8` and `fringe_width_q8`, see [Seams](terrain-rendering.md#seams).
+- optional `shore_wash_q8` (version 3, 0–256, default 256), how far a liquid's
+  wash runs and swings where it meets this material, see [Surf](terrain-rendering.md#surf);
+- optional `surf` (version 3) with `period`, `ticks`, `reach_q8`, `shallow`, `shallow_q8`,
+  `shallow_width_q8`, `wet_q8`, `wet_width_q8`, `foam`, `foam_q8` and
+  `foam_width_q8`, see [Surf](terrain-rendering.md#surf).
 
 Every material, regular water included, is an ordinary opaque tile set. The
 retired `ocean` and `backdrop` keys are rejected: water used to be a transparent
@@ -54,24 +77,25 @@ material. To replace its appearance, add a material and change the corresponding
 binding. These edits require no new renderer switch statement or save migration.
 The shipped catalog reuses the existing sixteen interior variants per terrain. The
 `road` binding is terrain ID 4, now named Trail by the engine. This pack retains
-the requested cobblestone appearance in `data/gfx/terrain-cobblestone0…15.png`,
+the requested cobblestone appearance in `content/data/gfx/terrain-cobblestone0…15.png`,
 copied unchanged from frames 288–303 at revision
 `e1634ecda9a2a2d31f47dfe766ddbcb40e364791`. The engine's newer dirt Trail textures
 remain in those original saved-frame slots. To use them visually, set the `road`
-material's sprite back to `data/gfx/terrain` and its variants to frames 288–303;
+material's sprite back to `content/data/gfx/terrain` and its variants to frames 288–303;
 no engine, save or renderer change is needed.
 
 ### Example: change ice artwork without adding gameplay rules
 
-Add `data/gfx/tundra0.png` and `data/gfx/tundra1.png`, both 32×32 RGBA images.
+Add `content/data/gfx/tundra0.png` and `content/data/gfx/tundra1.png`, both 32×32 RGBA images.
 Append this entry to the catalog's `materials` array, reusing the existing
-`fractured` profile key:
+`frozen` edge profile and the `solid` border class:
 
 ```json
 {
   "key": "tundra",
-  "sprite": "data/gfx/tundra",
-  "profile": "fractured",
+  "sprite": "content/data/gfx/tundra",
+  "profile": "frozen",
+  "class": "solid",
   "preview": [155, 205, 220],
   "minimap": [170, 210, 225],
   "variants": [
@@ -93,12 +117,13 @@ Material keys and profile keys must be nonempty and unique in their respective
 arrays. Frame indices are 0–65535; individual weights are 1–1,000,000 and their sum
 must not exceed 1,000,000,000. RGB channels are integers 0–255. The compiler checks
 all required and additional bindings against the registered materials. Paths must
-remain under `data/`, with forward slashes, canonical segments (no empty, `.` or
+remain under `content/data/`, with forward slashes, canonical segments (no empty, `.` or
 `..` segments), and no drive prefixes.
 
 For animation, a variant's effective frame is `frame + phase * animation_stride`.
 `animation_frames` is 1–256, `animation_ticks` is a positive integer duration in the
-renderer's animation clock, and the stride must be positive when there is more
+renderer's animation clock (steps of 1/60 s of real time, whatever the frame rate;
+see `src/render/AnimationClock.h`), and the stride must be positive when there is more
 than one phase. Every effective frame must exist and remain below 65536.
 All cells of a material share the phase, so a texture that moves must move the
 same way in every variant. Between phases the renderer linearly crossfades the
@@ -108,6 +133,14 @@ blended texture per variant, without adding sprite frames. The existing visual
 clock and pause behavior are unchanged. Materials with a one-tick phase duration
 still select a discrete frame.
 
+`animation_blend_steps` (1 to `animation_ticks`, animated materials only) rounds
+the crossfade down to that many weights per phase, each held for an equal share
+of the phase: with `animation_ticks 8` and 4 steps the blend moves every second
+tick. Every step recomposes the terrain pages that show the material, so fewer
+steps trade crossfade smoothness for less page work. 1 cuts between phases
+without blending. Omitting the field blends on every tick, as before. Custom map
+artwork bundles do not accept the field.
+
 ## Validate and inspect
 
 ```sh
@@ -115,7 +148,6 @@ python3 tools/terrain_tileset.py --check
 python3 tools/terrain_tileset.py --output artifacts/terrain/compiled --page-size 256
 python3 tools/terrain_profile_curves.py --write
 python3 -m unittest discover -s tools -p test_terrain_tileset.py
-"$(python3 tools/package_assets.py --encoder-python)" tools/artwork/terrain_synth.py --check
 "$(python3 tools/package_assets.py --encoder-python)" tools/artwork/validate_material.py --all
 python3 test/run_tests.py --filter 'TerrainMaterials/*'
 python3 test/run_tests.py --filter 'TerrainPresentation/*'
@@ -127,7 +159,10 @@ The pipeline has three responsibilities:
 1. **Catalog/compiler:** validate the schema and native sources, prepare common
    variant borders, then emit paged texture metadata, contour tables and source
    provenance. Page sizes are powers of two from 64 to 8192; the default is 1024.
-   Each 32×32 source has four pixels of padding and three exported mip levels.
+   Only frames whose shared border the compiler blends are packed: periodic
+   materials and decor keep their native pixels, so the runtime reads those
+   sources directly instead of shipping a second copy. Each packed 32×32 source
+   has four pixels of padding on a single full-resolution page level.
 2. **Runtime asset exporter:** encode the game's sprite sources, generate the
    terrain pack and audit all output files. It records fingerprints of the actual
    decoded runtime sources, including lossy WebP and sheet frames, separately
@@ -135,12 +170,11 @@ The pipeline has three responsibilities:
 3. **Runtime compositor:** verify native source fingerprints, read prepared texture
    regions lazily from CPU pages, resolve coverage and compose visible terrain.
    It computes coverage directly from normalized profile controls. Exported
-   contour tables and source mips are validation/packaging data; runtime source
-   extraction currently reads mip 0. Composed view pages supply their own GPU
-   mipmaps and respect the device texture limit.
+   contour tables are validation/packaging data. Composed view pages supply their
+   own GPU mipmaps and respect the device texture limit.
 
 `compiled_pack` names `atlas.json` in its own data subdirectory, such as
-`data/terrain/my-pack/atlas.json`. An absent pack,
+`content/data/terrain/my-pack/atlas.json`. An absent pack,
 an edited catalog, a pack without source fingerprints, or native source pixels
 that differ from the recorded runtime export use normal sprite preparation.
 This includes user artwork overrides already loaded when the renderer starts.

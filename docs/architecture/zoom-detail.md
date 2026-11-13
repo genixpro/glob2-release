@@ -14,10 +14,10 @@ it is saved, checksummed or read by the simulation.
   (`32 * zoom / logicalUnitsPerPoint()`), so thresholds mean the same on a phone, a
   high-density display and a desktop. Every threshold is a named constant there; each
   ramp is a smoothstep between two tile sizes, so representations cross-fade.
-  `Game::drawMap` computes it once per frame into `MapRenderState::detail`.
+  `MapDrawer::drawMap` computes it once per frame into `MapRenderState::detail`.
   The map has two looks, the detailed map and the strategic overview. Everything
   that differs between them (terrain, unit and building sprites, flags, zone
-  outlines, status pips, the territory wash) cross-fades inside one narrow window,
+  outlines, status badges, the territory wash) cross-fades inside one narrow window,
   from 9 down to 7 points per tile, so each look is undistorted over a range of
   zooms either side of it. Keep new representations on that window.
   A small map cannot zoom out far enough to reach the overview by tile size,
@@ -32,13 +32,21 @@ it is saved, checksummed or read by the simulation.
   size. Passes queue them at a map position while the map transform is active;
   `drawMap` flushes once after the air units (under clouds and fog) and once on
   return (flags), inside one `beginScreenOverlay` scope. Bars therefore draw above
-  every unit and building rather than interleaved with them. `Game::anchorBars` names
+  every unit and building rather than interleaved with them. `MapDrawer::anchorBars` names
   the map point a bar keeps fixed while its size changes.
 - Bars hold their 100% size from 48 down to 20 points per tile and change slowly
   outside that. Between 20 and 16 points every bar fades together. From there down
-  to the overview a status pip marks what needs attention (a starving unit or one at
-  60% health or less; a damaged building, one with under half its workers, an inn
-  without food, a tower without ammunition).
+  to the overview a status badge marks what needs attention: a disc, red for harm
+  and amber for a missing supply, carrying an icon of the problem. A unit shows
+  hurt (60% health or less) before hungry (starving), beside its top right so the
+  badge, larger on screen than a unit this far out, does not cover it. A building
+  shows, at its top right and in this order of precedence, damaged, a tower without
+  ammunition, an inn without food (the hungry icon) and under half its workers.
+  Badges are 9 points across, shrinking with the other overlays to no less than 8;
+  on a HiDPI display the icon keeps about 12 pixels.
+  Their icons (`MapOverlayQueue::StatusIcon`) come from the SVGs in
+  `content-src/icons/status/`, rasterised by the same script as the map icons into
+  `content/data/gfx/statusicon*.png` at sizes from 8 pixels.
 - Zones cross-fade from pattern sprites with an outline to a flat translucent tint
   without one: an area keeps its shape at any scale where a one-pixel line cannot.
   `GraphicContext::drawMapFill` snaps fill edges to target pixels so translucent
@@ -49,12 +57,44 @@ it is saved, checksummed or read by the simulation.
   renderers place sprites at exact fractions, and a snapped fill beside them
   leaves hairline seams.
   The outline stroke stops thickening at two points.
-- In the cross-fade `Game::drawMapOverview` fades in terrain palette colours sampled
+- In the cross-fade `MapDrawer::drawMapOverview` fades in terrain palette colours sampled
   from the detailed compositor's material coverage of each cell's corners. Four samples per tile axis keep coastlines aligned
   during the fade; resource minimap colours tint their gameplay cells over that
   ground. In the overview this replaces the water, terrain and resource passes.
   The reusable image stretches over the map in a single draw, avoiding thousands
-  of translucent fills.
+  of translucent fills. A stationary view reuses the image and its texture
+  while its terrain, resources and discovery inputs are unchanged.
+  When detailed resources come into view, installed resource sprites are
+  requested on demand through the asset loader. The resource marker is used
+  while its sprite is pending. Tiled captures and cached editor swatches wait
+  for their artwork before storing the resulting image.
+  Legacy OpenGL streams a compact native terrain atlas in interactive views
+  at or below native raster density. Mixed coverage is filled in visible
+  order, with the overview beneath tiles that are still pending, including
+  during the first frames after load.
+  Above native density, enabling HD artwork selects the page compositor. Legacy
+  OpenGL admits at most one visible page composition or upload per frame and
+  draws the native atlas in regions that are still missing. The HD page density
+  accounts for the largest number of pages the view can touch at its current
+  size. It applies the regular terrain density budget to that count, so a pan
+  across a page boundary keeps the same sampling density and avoids expensive
+  density changes.
+  If the full view cannot fit at native page density, the atlas covers the view.
+  Uploaded pages can wait for animation or artwork refreshes while terrain and discovery
+  still match. Zooming back out reuses the native atlas. The page compositor also handles editor
+  views, tiled captures and maps that exceed the atlas limits.
+  Overview pages compose only visible cells and sample palette weights
+  without preparing shoreline distance or shading data.
+  Animation and artwork updates reuse existing page recipes while the terrain
+  revision and seed match. Newly discovered cells compute their own recipes.
+  Surf steps invalidate pages with a shoreline. Open-water pages refresh when
+  their source artwork changes.
+  Interactive HD views on Legacy OpenGL draw animated terrain and complete
+  shoreline cells in a separate shader pass. The pass blends streamed HD phase
+  endpoints every frame, while static cells keep their cached pages. Its source
+  atlas uses at most 16 MiB plus a material table and shares the native atlas's
+  map metadata, discovery and coverage. Shore calming fades wave contrast over
+  two tiles from land.
 - Units cross-fade to team-coloured markers (dot worker, triangle warrior, diamond
   explorer). Bullets, explosions, death animations, the magic effect and the
   level-up number go with the unit sprites. Building sprites cross-fade to chips in the
@@ -64,14 +104,15 @@ it is saved, checksummed or read by the simulation.
   and all are drawn, including when they overlap. Higher-priority icons draw on
   top (damaged, flags, towers, hives, the rest), with equal priorities retaining
   their original draw order. The icons are
-  generated from `data/gfx/mapicon*.png` sources and loaded as WebP in the runtime
+  generated from `content/data/gfx/mapicon*.png` sources and loaded as WebP in the runtime
   tree. The sources are rasterised at seven pixel sizes from the SVGs in
-  `datasrc/icons/map/` by `python3 tools/icons/export_map_icons.py` (needs
+  `content-src/icons/map/` by `python3 tools/icons/export_map_icons.py` (needs
   `rsvg-convert`); the renderer draws the largest frame that fits, pixel for pixel.
   Frame order is shared between that script and `MapOverlayQueue.cpp`.
-- In the overview `Game::drawMapTerritory` washes the land around each team's
+- In the overview `MapDrawer::drawMapTerritory` washes the land around each team's
   visible buildings in its colour, inside a solid border two points wide. The
-  team colour is brought up to a common brightness first, so a dark colour reads
+  renderer walks 4 × 4 tile ownership cells and draws runs with shared edges.
+  The team colour is brought up to a common brightness first, so a dark colour reads
   as well as a light one. An under-attack event raises the same pulsing mark as a
   player's ping.
 - The torus view draws its map texture through the same map transform at the

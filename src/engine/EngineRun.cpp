@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <PresentationWork.h>
+#include "gradient/MapRouting.h"
 #include "OwnerTickProfile.h"
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <GameplayRecording.h>
 #include <PerformanceTelemetry.h>
+#include <RenderDevice.h>
 #include <EventQueue.h>
 #include <ApplicationHost.h>
 #include <Toolkit.h>
@@ -18,7 +20,10 @@
 #include "tutorial/TutorialModel.h"
 #include "sim/snapshot/SnapshotChecksum.h"
 #include "hive/HiveClient.h"
+#include "hive/LocalCommander.h"
+#include "hive/HiveDialog.h"
 #include "GameDiagnostics.h"
+#include "WarriorTacticsTrace.h"
 #include <utility>
 #include "EngineTiming.h"
 #include "Game.h"
@@ -43,12 +48,17 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdlib>
+#include <cstring>
 #include <chrono>
 #include "Version.h"
 #include "sim/SimulationRunner.h"
 #include "sim/presentation/ScenePreparation.h"
 #include "scripting/javascript/ScriptRuntime.h"
 #include <stdexcept>
+#include "Unit.h"
+#include "Building.h"
+#include "MapScript.h"
+#include "render/MapRenderState.h"
 #ifdef __EMSCRIPTEN__
 #include "AIJavaScript.h"
 #endif
@@ -331,13 +341,97 @@ void Engine::drawFrame(MainLoopState& st, bool everyFrame, const PresentationFra
             throw;
         }
         auto &perf = PerformanceTelemetry::collector();
-        if (scene && scene->tickTime)
+		PerformanceTelemetry::Scope telemetryTime(PerformanceTelemetry::Id::Stats);
+		if (scene && scene->tickTime)
         {
             const auto now = SDL_GetTicks();
             perf.record(PerformanceTelemetry::Id::SceneAge,
                         (now >= scene->tickTime ? now - scene->tickTime : 0) * 1000000ULL);
         }
-        perf.presented();
+		if (auto *device = globalContainer->gfx->renderDevice())
+		{
+			GAGCore::GpuTimingResult gpuResult;
+			while (device->pollTiming(gpuResult))
+				perf.gpuResult(gpuResult.frame, gpuResult.startedNs, gpuResult.durationNs,
+							   gpuResult.renderPasses);
+			const auto counters = device->telemetry();
+			const std::array<std::uint64_t, 16> values{counters.packets,
+													   counters.batches,
+													   counters.uploadBytes,
+													   counters.captureDrops,
+													   counters.cpuSubmitNanoseconds,
+													   counters.cpuPresentNanoseconds,
+													   counters.cpuCaptureNanoseconds,
+													   counters.captureLatencyNanoseconds,
+													   counters.captureCompletions,
+													   0,
+													   0,
+													   0,
+													   0,
+													   0,
+													   counters.gpuSkipped,
+													   counters.gpuInvalid};
+			static constexpr PerformanceTelemetry::Id ids[]{
+				PerformanceTelemetry::Id::RenderPackets, PerformanceTelemetry::Id::RenderBatches,
+				PerformanceTelemetry::Id::RenderUploads, PerformanceTelemetry::Id::CaptureDrops,
+				PerformanceTelemetry::Id::DeviceSubmit,  PerformanceTelemetry::Id::DevicePresent,
+				PerformanceTelemetry::Id::DeviceCapture, PerformanceTelemetry::Id::CaptureLatency,
+				PerformanceTelemetry::Id::CaptureCount};
+			const bool sameDevice = perf.renderDevice == reinterpret_cast<std::uintptr_t>(device);
+			const bool same = sameDevice && perf.renderGeneration == device->generation();
+			if (sameDevice)
+				for (unsigned i = 0; i < std::size(ids); ++i)
+					if (values[i] >= perf.renderCounters[i])
+					{
+						const auto delta = values[i] - perf.renderCounters[i];
+						perf.record(ids[i], delta);
+						perf.window[unsigned(ids[i])].selfComplete = false;
+					}
+			if (sameDevice)
+			{
+				if (values[14] > perf.renderCounters[14])
+					perf.record(PerformanceTelemetry::Id::GPUSkipped,
+								values[14] - perf.renderCounters[14]);
+				if (values[15] > perf.renderCounters[15])
+					perf.record(PerformanceTelemetry::Id::GPUInvalid,
+								values[15] - perf.renderCounters[15]);
+			}
+			if (!same && perf.renderDevice)
+				perf.windowFlags |= PerformanceTelemetry::RendererChanged;
+			if (!same && perf.output)
+			{
+				const auto caps = device->capabilities();
+				std::cout << "GLOB2_PERF_RENDERER session=" << perf.session
+						  << " elapsed_ns=" << perf.clock() - perf.started << " backend="
+						  << GAGCore::rendererBackendName(
+								 globalContainer->gfx->backendSwitchStatus().active)
+						  << " generation=" << device->generation()
+						  << " gpu_timing_available=" << caps.gpuTiming
+						  << " asynchronous_capture=" << caps.asynchronousCapture
+						  << " max_texture_size=" << caps.maximumTextureSize << '\n';
+			}
+			perf.renderCounters = values;
+			perf.renderDevice = reinterpret_cast<std::uintptr_t>(device);
+			perf.renderGeneration = device->generation();
+			perf.record(PerformanceTelemetry::Id::RenderMemory, counters.resourceBytes);
+		}
+		else if (perf.renderDevice)
+		{
+			perf.windowFlags |= PerformanceTelemetry::RendererChanged;
+			perf.renderDevice = 0;
+		}
+		if (globalContainer->gfx->presentedDeviceFrame())
+		{
+			const auto displayedTick = scene ? scene->tick : gui.game.stepCounter;
+			if (perf.displayedSceneTick == displayedTick)
+				perf.record(PerformanceTelemetry::Id::SceneReused, 1);
+			perf.displayedSceneTick = displayedTick;
+			if (perf.lastPresentation && perf.clock() - perf.lastPresentation > 2000000000ULL)
+				perf.windowFlags |= PerformanceTelemetry::PresentationGap;
+			perf.presented();
+		}
+		else
+			perf.record(PerformanceTelemetry::Id::RenderDeferred, 1);
 	}
 
 }
@@ -379,8 +473,10 @@ SimulationSnapshot::Handle Engine::establishObservation(bool present)
     collectChecksums();
     const auto world=[&] {
         OwnerTickProfile::Scope ownerCapture(OwnerTickProfile::Phase::CaptureWorld);
-        return gui.game.observeCompletedWorld(options);
+		PERF_SCOPE_TIME(CaptureWorld);
+		return gui.game.observeCompletedWorld(options);
     }();
+    if(warriorTactics) warriorTactics->capture(world);
     {
         OwnerTickProfile::Scope ownerSubmit(OwnerTickProfile::Phase::SubmitChecksum);
         checksumPipeline->submit(world,turn ? turn->turn().executedTick() : world.tick,routineMapChecksums());
@@ -395,7 +491,8 @@ SimulationSnapshot::Handle Engine::establishObservation(bool present)
     const auto presentation=present ? admitPresentation(worldAdvanced) : std::optional<SceneRequest>{};
     {
         OwnerTickProfile::Scope ownerAI(OwnerTickProfile::Phase::AdmitAI);
-        gui.game.admitAIOrders(observationPlayers(session ? session->wasReadyLastTick : true),
+		PERF_SCOPE_TIME(AIAdmission);
+		gui.game.admitAIOrders(observationPlayers(session ? session->wasReadyLastTick : true),
             paused || globalContainer->replaying, diagnostics, world);
     }
     if (presentation) publishPresentation(world,*presentation);
@@ -430,6 +527,7 @@ void Engine::flushChecksums()
     collectChecksums(true);
     // The normal stop path may leave its terminal completed world unobserved.
     const auto& world=gui.game.observeCompletedWorld();
+    if(warriorTactics) warriorTactics->capture(world);
     checksumPipeline->submit(world,turn ? turn->turn().executedTick() : world.tick,routineMapChecksums());
     collectChecksums(true);
 }
@@ -907,21 +1005,26 @@ void Engine::printTeamTimeline()
 // stays alive for a possible reload.
 void Engine::teardownSession()
 {
-    // Complete private jobs before session-owned telemetry/diagnostic sinks
+	gui.hiveCards.reset();
+	gui.localHive.reset();
+	// Complete private jobs before session-owned telemetry/diagnostic sinks
     // close. Logical deadlines and queued commands remain game-owned.
     flushChecksums();
     gui.game.drainAI();
     gui.waitForAutosave();
-    if (std::getenv("GLOB2_TEAM_TIMELINE")) {
-        // Summary snapshots use existing synchronization; trace export requires
-        // a drained lifecycle boundary and never reads a running stream.
-        auto& executor = gui.game.map.computeExecutor();
-        if (executor.telemetryMode() == ComputeTelemetryMode::Trace) {
-            gui.game.map.finishGradientPipeline({JoinReason::Teardown, ComputeTelemetry::NoTick});
-            gui.game.map.finishResourceGrowth({JoinReason::Teardown, ComputeTelemetry::NoTick});
-            executor.cancelPresentationAndWait();
-            executor.joinAll({JoinReason::Teardown, ComputeTelemetry::NoTick});
-        }
+	// Retire outstanding computation before final statistics, even when no
+	// optional diagnostics/export is enabled. Joining does not publish future
+	// simulation outcomes; their owning pipelines retain their result buffers.
+	auto &executor = gui.game.map.computeExecutor();
+	executor.setWorkerOnly({});
+	executor.cancelPresentationAndWait();
+	if (executor.telemetryMode() == ComputeTelemetryMode::Trace)
+	{
+		gui.game.map.routing().finishGradientPipeline({JoinReason::Teardown, ComputeTelemetry::NoTick});
+		gui.game.map.finishResourceGrowth({JoinReason::Teardown, ComputeTelemetry::NoTick});
+	}
+	executor.joinAll({JoinReason::Teardown, ComputeTelemetry::NoTick});
+	if (std::getenv("GLOB2_TEAM_TIMELINE")) {
         std::cout << "GLOB2_COMPUTE_SUMMARY ";
         ComputeTelemetry::writeJson(std::cout, executor.telemetrySnapshot(executor.telemetryMode() == ComputeTelemetryMode::Trace));
         std::cout << std::endl;
@@ -1024,7 +1127,7 @@ void Engine::reloadTurnInitialState()
         auto writer = std::make_unique<ReplayWriter>();
         writer->setSaveObserver(globalContainer->replayWriter->getSaveObserver());
         globalContainer->replayWriter = std::move(writer);
-		globalContainer->replayWriter->init(state.replayPath, gui);
+		gui.startReplay(*globalContainer->replayWriter, state.replayPath);
 	}
 	if (checksumSidecar)
 	{
@@ -1074,7 +1177,9 @@ void Engine::reloadTurnInitialState()
 void Engine::beginSession(Uint64 now)
 {
     if (session) throw std::logic_error("Engine session is already active");
-    if (!net) throw std::logic_error("Engine session requires an initialized game");
+	if (PerformanceTelemetry::collector().history)
+		PerformanceTelemetry::collector().reset();
+	if (!net) throw std::logic_error("Engine session requires an initialized game");
 	if (!globalContainer->structuredHeadless || turn)
 		{
             globalContainer->configureExecutionResources();
@@ -1096,7 +1201,16 @@ void Engine::beginSession(Uint64 now)
     st.startTime = now;
     teamEliminatedTick.clear();
     session = st;
-    automaticGameStartTick = now;
+#ifndef __EMSCRIPTEN__
+	if (!turn && !globalContainer->replaying && !globalContainer->liveSpectating &&
+		!gui.game.gameHeader.hasNetworkPlayer() &&
+		gui.localPlayer >= 0 && gui.localPlayer < gui.game.gameHeader.getNumberOfPlayers() &&
+		gui.game.players[gui.localPlayer] &&
+		gui.game.players[gui.localPlayer]->type == BasePlayer::P_LOCAL &&
+		!gui.game.players[gui.localPlayer]->ai)
+		gui.localHive = std::make_shared<Hive::LocalCommander>(gui);
+#endif
+	automaticGameStartTick = now;
 	if (!globalContainer->runNoX)
 		GAGCore::Recording::recorder().beginMatch(
 			globalContainer->replaying ? "replay" : (turn ? "multiplayer" : "single_player"),
@@ -1120,13 +1234,17 @@ void Engine::beginSession(Uint64 now)
 #else
 		metadata << " compiler=unknown";
 #endif
-		metadata << " pointer_bits=" << sizeof(void *) * 8;
+		metadata << " pointer_bits=" << sizeof(void *) * 8
+				 << " compute_participants=" << globalContainer->resourcePlan.computeParticipants
+				 << " hardware_threads_hint=" << std::thread::hardware_concurrency();
 		if (const char *label = std::getenv("GLOB2_PERF_BUILD_LABEL"))
 			metadata << " build=" << std::quoted(label);
 		perf.describe(metadata.str());
 	}
 	printTurnTelemetrySession();
-    establishObservation(!globalContainer->runNoX);
+	// Establish loaded-session coverage before a simulation thread can publish.
+	configureSessionTelemetry(*session, perf);
+	establishObservation(!globalContainer->runNoX);
 
 }
 
@@ -1228,7 +1346,22 @@ bool Engine::serialClientFrame(Uint64 now, const std::vector<SDL_Event>& events,
 void Engine::clientStep(const std::vector<SDL_Event>& events)
 {
     if (!session) throw std::logic_error("No active engine session");
-    // Headless sessions never run the GUI step; they only take the notices.
+	if (gui.localHive)
+	{
+		gui.localHive->update();
+		if (!gui.hiveCards && gui.localHive->available() &&
+			!gui.localHive->standingOrders().empty() && !globalContainer->runNoX)
+		{
+			gui.hiveCards = std::make_unique<Hive::Dialog>(gui.localHive);
+			gui.hiveCards->attach(*globalContainer->gfx);
+		}
+		if (gui.hiveCards)
+		{
+			gui.hiveCards->invalidate();
+			gui.hiveCards->update(SDL_GetTicks());
+		}
+	}
+	// Headless sessions never run the GUI step; they only take the notices.
     if (globalContainer->runNoX)
         gui.consumeClientEvents();
     else
@@ -1259,6 +1392,17 @@ void Engine::clientStep(const std::vector<SDL_Event>& events)
 #endif
 }
 
+namespace
+{
+void capturePerformanceWindow(PerformanceTelemetry::Collector &perf, Uint64 tick,
+							  ComputeExecutor &executor)
+{
+	if (tick / 512 == perf.lastTick / 512 && perf.clock() - perf.windowStart < 1000000000ULL)
+		return;
+	executor.absorbPerformance(perf);
+	perf.capture(tick, true);
+}
+} // namespace
 void Engine::configureSessionTelemetry(MainLoopState& st, PerformanceTelemetry::Collector& perf)
 {
 	const bool paused = gui.gamePaused || gui.hardPause;
@@ -1275,12 +1419,14 @@ void Engine::configureSessionTelemetry(MainLoopState& st, PerformanceTelemetry::
         : (1000000000ULL + fps - 1) / fps;
     const auto frameBudget = gui.simulationThreaded ? renderBudget
         : std::max(renderBudget, budget * renderRatio);
-	perf.configure(gui.game.stepCounter, budget, frameBudget,
-				   paused                       ? "paused"
-				   : globalContainer->runNoX    ? "headless"
-				   : globalContainer->replaying ? "replay"
-				   : !st.wasReadyLastTick       ? "waiting"
-												: "live");
+	const char *mode = paused                       ? "paused"
+					   : globalContainer->runNoX    ? "headless"
+					   : globalContainer->replaying ? "replay"
+					   : !st.wasReadyLastTick       ? "waiting"
+													: "live";
+	if (perf.mode != mode || perf.budgetNs != budget || perf.presentationBudgetNs != frameBudget)
+		gui.game.map.computeExecutor().absorbPerformance(perf);
+	perf.configure(gui.game.stepCounter, budget, frameBudget, mode);
 }
 
 void Engine::absorbSimulationTelemetry()
@@ -1289,14 +1435,24 @@ void Engine::absorbSimulationTelemetry()
     // Headless runs admit no presentation frames. Their telemetry clock comes
     // from the owner mailbox, without retaining or capturing a render world.
     const auto& scene=gui.drawnScene();
-    const auto tick = globalContainer->runNoX ? runner->latestTelemetryTick() : scene.tick;
-    const auto fps=globalContainer->settings.targetRenderFps;
+	const auto previousPhase = perf.phase;
+	const auto previousBudget = perf.budgetNs;
+	const auto tick = runner->absorbTelemetry(perf);
+	const auto fps=globalContainer->settings.targetRenderFps;
     const auto frameBudget=globalContainer->runNoX || fps==0 ? 0ULL : (1000000000ULL+fps-1)/fps;
-    perf.configure(tick, globalContainer->runNoX ? 0ULL : std::uint64_t(scene.tickInterval)*1000000ULL, frameBudget,
-        gui.gamePaused || gui.hardPause ? "paused" : globalContainer->runNoX ? "headless" :
-        globalContainer->replaying ? "replay" : gui.clientEvents.waitingMask() ? "waiting" : "live");
-    runner->absorbTelemetry(perf);
-    perf.capture(tick);
+	const auto budget =
+		globalContainer->runNoX ? 0ULL : std::uint64_t(scene.tickInterval) * 1000000ULL;
+	const char *mode = gui.gamePaused || gui.hardPause  ? "paused"
+					   : globalContainer->runNoX        ? "headless"
+					   : globalContainer->replaying     ? "replay"
+					   : gui.clientEvents.waitingMask() ? "waiting"
+														: "live";
+	if (perf.mode != mode || perf.budgetNs != budget || perf.presentationBudgetNs != frameBudget)
+		gui.game.map.computeExecutor().absorbPerformance(perf);
+	perf.configure(tick, budget, frameBudget, mode);
+	capturePerformanceWindow(perf, tick, gui.game.map.computeExecutor());
+	if (perf.phase != previousPhase || perf.budgetNs != previousBudget)
+		runner->configureTelemetry(perf);
 }
 
 bool Engine::advanceSession(Uint64 now, const std::function<void()>& clientWork, bool handleExit)
@@ -1314,7 +1470,20 @@ bool Engine::advanceSession(Uint64 now, const std::function<void()>& clientWork,
     { OwnerTickProfile::Scope phase(OwnerTickProfile::Phase::Ending);pollAutomaticEndingConditions(now); }
     { OwnerTickProfile::Scope phase(OwnerTickProfile::Phase::Client);clientWork(); }
 
-    { OwnerTickProfile::Scope phase(OwnerTickProfile::Phase::Turn);pumpTurnSession(now); }
+	const auto advanceTick = gui.game.stepCounter;
+	const auto joinCostsBefore = gui.game.map.computeExecutor().requiredJoinCosts();
+	static constexpr PerformanceTelemetry::Id tickPhases[]{
+		PerformanceTelemetry::Id::Orders,       PerformanceTelemetry::Id::Units,
+		PerformanceTelemetry::Id::Buildings,    PerformanceTelemetry::Id::Map,
+		PerformanceTelemetry::Id::Stats,        PerformanceTelemetry::Id::AI,
+		PerformanceTelemetry::Id::CaptureWorld, PerformanceTelemetry::Id::Replay};
+	std::array<std::uint64_t, 8> phaseWallBefore{};
+	for (unsigned i = 0; i < 8; ++i)
+	{
+		phaseWallBefore[i] = perf.window[unsigned(tickPhases[i])].time.total;
+	}
+	const auto advanceStart = perf.clock();
+	{ OwnerTickProfile::Scope phase(OwnerTickProfile::Phase::Turn);pumpTurnSession(now); }
     { OwnerTickProfile::Scope phase(OwnerTickProfile::Phase::Commander);gui.updateCommander(turn && turn->turn().tickIntervalMicros()!=0); }
     bool readyNow = st.wasReadyLastTick;
     if (!gui.hardPause) {
@@ -1374,11 +1543,50 @@ bool Engine::advanceSession(Uint64 now, const std::function<void()>& clientWork,
         // immediately, with the timestamp and receipts belonging to that tick.
         establishObservation(!globalContainer->runNoX);
     }
-    workTime.stop();
+	const auto advanceEnd = perf.clock();
+	if (gui.game.stepCounter != advanceTick)
+	{
+		const auto duration = advanceEnd - advanceStart;
+		// Add the observation directly: a temporary Metric would zero and merge
+		// all histogram buckets for a single sample on every advancing tick.
+		auto &metric = perf.window[unsigned(PerformanceTelemetry::Id::OwnerAdvance)];
+		++metric.calls;
+		metric.time.add(duration);
+		metric.selfComplete = false;
+		const auto tickBudget = globalContainer->runNoX ? 0ULL : st.speedNs;
+		if (perf.lastTickBudget != tickBudget)
+		{
+			perf.tickBudget.streak = perf.totalTickBudget.streak = 0;
+			perf.lastTickBudget = tickBudget;
+		}
+		perf.tickBudget.add(duration, tickBudget);
+		perf.totalTickBudget.add(duration, tickBudget);
+		const auto costs = gui.game.map.computeExecutor().requiredJoinCosts();
+		const auto joins = costs.lock - joinCostsBefore.lock + costs.wait - joinCostsBefore.wait +
+						   costs.owner - joinCostsBefore.owner;
+		perf.record(PerformanceTelemetry::Id::OutsideJoin, duration - std::min(duration, joins));
+		if (costs.wait > joinCostsBefore.wait)
+			perf.record(PerformanceTelemetry::Id::TickWaited, 1);
+		PerformanceTelemetry::SlowTick slow{advanceTick,
+											duration,
+											0,
+											costs.wait - joinCostsBefore.wait,
+											costs.owner - joinCostsBefore.owner,
+											costs.lock - joinCostsBefore.lock};
+		for (unsigned i = 0; i < 8; ++i)
+		{
+			slow.phaseWall[i] =
+				perf.window[unsigned(tickPhases[i])].time.total - phaseWallBefore[i];
+		}
+		perf.slowTick(slow);
+	}
+	workTime.stop();
     loopTime.stop();
-    if (!gui.simulationThreaded)
-        perf.capture(gui.game.stepCounter);
-    return gui.isRunning;
+	if (!gui.simulationThreaded)
+	{
+		capturePerformanceWindow(perf, gui.game.stepCounter, gui.game.map.computeExecutor());
+	}
+	return gui.isRunning;
 }
 
 bool Engine::advancePendingSave(const std::vector<SDL_Event>& events)
@@ -1406,17 +1614,31 @@ std::optional<Engine::PendingLoad> Engine::finishSessionForHost()
     if (!session) throw std::logic_error("No active engine session");
     stopSimulationThread();
     if (gui.isRunning) throw std::logic_error("Cannot finish a running engine session");
+	gui.game.map.computeExecutor().absorbPerformance(PerformanceTelemetry::collector());
+	// Capture the partial interval on the owner, after joining it. Results
+    // screens only read history. The structured driver does this after writing
+    // continuation saves, so a report endpoint cannot change resumed sampling.
+    if (!globalContainer->structuredHeadless) gui.game.winProbabilitySyncStep(true);
     if (globalContainer->automaticEndingGame) printAutomaticEndingSummary();
     const auto &scene=gui.drawnScene();
     const auto lesson=scene.world.session ? Tutorial::view(*scene.world.session) : gui.game.mapscript.tutorialView();
     const bool campaign=lesson && lesson->restartMap==gui.toLoadGameFileName;
     teardownSession();
     auto &perf = PerformanceTelemetry::collector();
+	gui.game.map.computeExecutor().absorbPerformance(perf);
 	// Structured runs may still write their requested final save after run().
 	if (!globalContainer->structuredHeadless)
 	{
+		if (auto *device = globalContainer->gfx ? globalContainer->gfx->renderDevice() : nullptr)
+		{
+			GAGCore::GpuTimingResult result;
+			while (device->pollTiming(result))
+				perf.gpuResult(result.frame, result.startedNs, result.durationNs,
+							   result.renderPasses);
+			if (device->capabilities().gpuTiming)
+				perf.record(PerformanceTelemetry::Id::GPUUnresolved, device->pendingTimings());
+		}
 		perf.capture(gui.game.stepCounter, true, true);
-		perf.reset();
 	}
 
     if (diagnostics) diagnostics->drain();
@@ -1438,9 +1660,19 @@ bool Engine::finishSession()
     return (request->replay ? loadReplay(request->filename) : request->campaign ? initCampaign(request->filename) : initCustom(request->filename)) == EE_NO_ERROR;
 }
 
+void Engine::beginIntroCover()
+{
+    // GLOB2_INTRO_COVER=0 opens games without the cover. The browser shell sets it
+    // under automation, whose scripted input would otherwise only skip the cover.
+    const char *cover = std::getenv("GLOB2_INTRO_COVER");
+    if (!globalContainer->runNoX && !(cover && std::strcmp(cover, "0") == 0))
+        gui.beginIntroCover(SDL_GetTicks());
+}
+
 void Engine::runOneGameSession(bool& doRunOnceAgain)
 {
     beginSession(SDL_GetTicks());
+    beginIntroCover();
     if (startSimulationThread(SDL_GetTicks()))
     {
         // The simulation runs on its own thread; this thread handles input and draws
@@ -1468,7 +1700,7 @@ void Engine::runOneGameSession(bool& doRunOnceAgain)
             else
             {
                 if (globalContainer->gfx->beginRenderFrame()) drawSession();
-                GAGCore::ApplicationHost::wait(std::min(Uint32(8), globalContainer->gfx->renderFrameWait()));
+                GAGCore::ApplicationHost::wait(GAGCore::pacedScreenWait(globalContainer->gfx->renderFrameWait()));
             }
         }
         doRunOnceAgain = finishSession();

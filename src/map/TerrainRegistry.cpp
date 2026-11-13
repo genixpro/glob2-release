@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "TerrainRegistry.h"
+#include "TerrainBuiltins.h"
+#include "field/TerrainMovementCosts.h"
+#include "field/PreparedTerrainCosts.h"
+#include "TerrainProperties.h"
 #include "FileFormatVersions.h"
+#include "TerrainCatalog.h"
+#include "io/TerrainFormatHistory.h"
 #include "online/Sha256.h"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -35,10 +41,10 @@ std::string text(const Json &j, const char *key,
 }
 TerrainType preset(const std::string &name)
 {
-	// Every paintable built-in is a preset; legacy corner shores are not.
-	for (unsigned i = 0; i < TERRAIN_COUNT; ++i)
-		if (terrainPaintable(TerrainType(i)) && name == TerrainPresentations[i].name)
-			return TerrainType(i);
+	// Every paintable built-in is a preset, also under a legacy name; legacy corner
+	// shores are not.
+	if (const auto type = terrainTypeByName(name); type && terrainPaintable(*type))
+		return *type;
 	throw std::invalid_argument("Unknown built-in terrain preset: " + name);
 }
 void validKey(const std::string &key)
@@ -102,13 +108,14 @@ template <class T> void property(const Json &j, const char *key, T &value, bool 
 	X(growthQ8) \
 	X(fertilityQ8) \
 	X(inhibitionQ8) \
-	X(shoreSupportQ8) \
 	X(allowedResources)
 // clang-format on
 TerrainProperties readProperties(const Json &j, TerrainProperties p, bool complete = false)
 {
 #define NAME(f) #f,
-	fields(j, {TERRAIN_FIELDS(NAME) "farmMaterial", "farmCrop"});
+	// shoreSupportQ8 is retired: algae now regrows near any coast, a derived
+	// property. Saves and sets written before still carry it; it is ignored.
+	fields(j, {TERRAIN_FIELDS(NAME) "farmMaterial", "farmCrop", "shoreSupportQ8"});
 #undef NAME
 #define READ(f) property(j, #f, p.f, complete);
 	TERRAIN_FIELDS(READ)
@@ -334,12 +341,45 @@ unsigned TerrainRegistry::savedBuiltinCount(int versionMinor)
 {
 	return versionMinor < FILE_FORMAT_VERSION_TERRAIN_CATALOGUE ? TERRAIN_COUNT_BEFORE_CATALOGUE
 		 : versionMinor < FILE_FORMAT_VERSION_VERTEX_TERRAIN	   ? TERRAIN_COUNT_BEFORE_VERTEX
+		 : versionMinor < FILE_FORMAT_VERSION_GROUND_LOOKS	   ? TERRAIN_COUNT_BEFORE_GROUND_LOOKS
+		 : versionMinor < FILE_FORMAT_VERSION_SANDSTONE_PUMICE ? TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE
+		 : versionMinor < FILE_FORMAT_VERSION_WIND_SWEPT_SNOW  ? TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW
+		 : versionMinor < FILE_FORMAT_VERSION_WEATHERED_SANDSTONE ? TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE
+		 : versionMinor < FILE_FORMAT_VERSION_WINDY_SAND_DUNE ? TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE
+		 : versionMinor < FILE_FORMAT_VERSION_HARDPAN		  ? TERRAIN_COUNT_BEFORE_HARDPAN
+		 : versionMinor < FILE_FORMAT_VERSION_TUNDRA		  ? TERRAIN_COUNT_BEFORE_TUNDRA
+		 : versionMinor < FILE_FORMAT_VERSION_VOLCANIC_ASH ? TERRAIN_COUNT_BEFORE_VOLCANIC_ASH
+		 : versionMinor < FILE_FORMAT_VERSION_GLACIER_ICE ? TERRAIN_COUNT_BEFORE_GLACIER_ICE
+		 : versionMinor < FILE_FORMAT_VERSION_OVERGROWN_ROAD ? TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD
+		 : versionMinor < FILE_FORMAT_VERSION_LATERITE ? TERRAIN_COUNT_BEFORE_LATERITE
+		 : versionMinor < FILE_FORMAT_VERSION_CLIFFS ? TERRAIN_COUNT_BEFORE_CLIFFS
+		 : versionMinor < FILE_FORMAT_VERSION_MOLTEN_LAVA_POOL ? TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL
+		 : versionMinor < FILE_FORMAT_VERSION_ROCK_PATHS ? TERRAIN_COUNT_BEFORE_ROCK_PATHS
+		 : versionMinor < FILE_FORMAT_VERSION_ICE_PATHS ? TERRAIN_COUNT_BEFORE_ICE_PATHS
+		 : versionMinor < FILE_FORMAT_VERSION_ARCTIC_TUNDRA ? TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA
+		 : versionMinor < FILE_FORMAT_VERSION_GLACIER ? TERRAIN_COUNT_BEFORE_GLACIER
+		 : versionMinor < FILE_FORMAT_VERSION_ICEFALL ? TERRAIN_COUNT_BEFORE_ICEFALL
+		 : versionMinor < FILE_FORMAT_VERSION_STEPPE_GRASS ? TERRAIN_COUNT_BEFORE_STEPPE_GRASS
 																   : unsigned(TERRAIN_COUNT);
 }
 std::optional<unsigned> TerrainRegistry::currentTerrainId(unsigned savedBuiltins, unsigned saved)
 {
 	if (savedBuiltins == TERRAIN_COUNT)
 		return saved;
+	// Formats 146 to 197 kept every built-in ID (ending at CHASM, PALE_SAND,
+	// FROZEN_LAKE, WIND_SWEPT_SNOW, WEATHERED_SANDSTONE, WINDY_SAND_DUNE, HARDPAN, TUNDRA,
+	// then VOLCANIC_ASH); custom IDs follow the built-ins.
+	if (savedBuiltins == TERRAIN_COUNT_BEFORE_GROUND_LOOKS || savedBuiltins == TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW || savedBuiltins == TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE || savedBuiltins == TERRAIN_COUNT_BEFORE_HARDPAN ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_TUNDRA || savedBuiltins == TERRAIN_COUNT_BEFORE_VOLCANIC_ASH ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_GLACIER_ICE || savedBuiltins == TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_LATERITE || savedBuiltins == TERRAIN_COUNT_BEFORE_CLIFFS ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL || savedBuiltins == TERRAIN_COUNT_BEFORE_ROCK_PATHS ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_ICE_PATHS || savedBuiltins == TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_GLACIER || savedBuiltins == TERRAIN_COUNT_BEFORE_ICEFALL ||
+		savedBuiltins == TERRAIN_COUNT_BEFORE_STEPPE_GRASS)
+		return saved < savedBuiltins ? saved : saved - savedBuiltins + TERRAIN_COUNT;
 	// Older files: the classic five keep their IDs; 5 and 6 were the shores.
 	if (saved <= TRAIL)
 		return saved;
@@ -354,7 +394,23 @@ std::shared_ptr<const TerrainRegistry> TerrainRegistry::deserialize(std::string_
 																			  unsigned savedBuiltinCount)
 {
 	if (savedBuiltinCount != TERRAIN_COUNT_BEFORE_CATALOGUE && savedBuiltinCount != TERRAIN_COUNT_BEFORE_VERTEX &&
-		savedBuiltinCount != TERRAIN_COUNT)
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_GROUND_LOOKS &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_HARDPAN && savedBuiltinCount != TERRAIN_COUNT_BEFORE_TUNDRA &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_VOLCANIC_ASH &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_GLACIER_ICE &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_LATERITE && savedBuiltinCount != TERRAIN_COUNT_BEFORE_CLIFFS &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_ROCK_PATHS &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_ICE_PATHS &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_GLACIER &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_ICEFALL &&
+		savedBuiltinCount != TERRAIN_COUNT_BEFORE_STEPPE_GRASS && savedBuiltinCount != TERRAIN_COUNT)
 		throw std::invalid_argument("Unsupported saved terrain built-in count");
 	auto j = parse(source);
 	if (j.at("terrains").empty())
@@ -423,7 +479,7 @@ void TerrainRegistry::Movement::prepare()
 		std::array<gradient_kernel::EntrySteps, N> costs;
 		costs.fill(profiles.front());
 		std::copy(profiles.begin(), profiles.end(), costs.begin());
-		prepared = gradient_kernel::PreparedTerrainCosts<N>(costs);
+		prepared = std::make_shared<const Prepared>(std::in_place_type<gradient_kernel::PreparedTerrainCosts<N>>, costs);
 	};
 	if (profiles.size() <= 8)
 		make.template operator()<8>();
@@ -512,5 +568,14 @@ std::optional<TerrainType> TerrainRegistry::find(std::string_view key) const
 	for (unsigned i = 0; i < size(); ++i)
 		if (keys_[i] == key)
 			return TerrainType(i);
-	return std::nullopt;
+	// Built-ins renamed since a file or script was written. Custom keys carry a
+	// namespace, so they can never be one of these.
+	return terrainTypeByName(key);
+}
+
+const TerrainProperties& builtinTerrainProperties(TerrainType type) { return terrainProperties(type); }
+
+std::shared_ptr<const TerrainRegistry> TerrainRegistry::deserialize(std::string_view source)
+{
+	return deserialize(source, TERRAIN_COUNT);
 }

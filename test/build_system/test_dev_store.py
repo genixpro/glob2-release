@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scons"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "buildsys"))
 import dev_store as store
 from tool_archives import install
 
@@ -31,13 +31,13 @@ class StoreTests(unittest.TestCase):
         self.b = self.base / "b"
         for root in (self.a, self.b):
             shutil.copytree(
-                ROOT / "mobile",
-                root / "mobile",
+                ROOT / "platforms/mobile",
+                root / "platforms/mobile",
                 ignore=shutil.ignore_patterns("__pycache__"),
             )
             shutil.copytree(
-                ROOT / "browser",
-                root / "browser",
+                ROOT / "platforms/web",
+                root / "platforms/web",
                 ignore=shutil.ignore_patterns("node_modules", "__pycache__"),
             )
 
@@ -64,7 +64,7 @@ class StoreTests(unittest.TestCase):
 
     def test_manifest_changes_coexist(self):
         previous = store.mobile_tools(self.a, False)
-        with (self.b / "mobile/toolchain.json").open("a") as output:
+        with (self.b / "platforms/mobile/toolchain.json").open("a") as output:
             output.write("\n")
         self.assertNotEqual(previous, store.mobile_tools(self.b, False))
         self.assertEqual(previous, store.mobile_tools(self.a, False))
@@ -131,9 +131,9 @@ class StoreTests(unittest.TestCase):
             before, store.dependency_key(self.a, identity, "compiler-b")
         )
         for name in (
-            "mobile/vcpkg.json",
-            "mobile/triplets/mobile-common.cmake",
-            "mobile/sdl-java.json",
+            "platforms/mobile/vcpkg.json",
+            "platforms/mobile/triplets/mobile-common.cmake",
+            "platforms/mobile/sdl-java.json",
         ):
             target = self.a / name
             old = target.read_text()
@@ -145,7 +145,7 @@ class StoreTests(unittest.TestCase):
 
     def test_dependency_keys_invalidate_changed_added_and_removed_overlay_files(self):
         identity = {"target": "ios", "arch": "arm64", "environment": "simulator", "mode": "release"}
-        port = self.a / "scons/vcpkg-ports/sdl3"
+        port = self.a / "buildsys/vcpkg-ports/sdl3"
         port.mkdir(parents=True)
         recipe = port / "portfile.cmake"
         recipe.write_text('camera on')
@@ -199,7 +199,7 @@ class StoreTests(unittest.TestCase):
         path.mkdir(parents=True)
         code = "import sys;sys.path.insert(0,sys.argv[1]);from dev_store import Lease;Lease(sys.argv[2],exclusive=True,blocking=False)"
         command = subprocess.run(
-            [sys.executable, "-c", code, str(ROOT / "scons"), str(path)],
+            [sys.executable, "-c", code, str(ROOT / "buildsys"), str(path)],
             check=False,
             capture_output=True,
             text=True,
@@ -211,7 +211,7 @@ class StoreTests(unittest.TestCase):
         path = store.cache(self.a, "active")
         code = "import sys;sys.path.insert(0,sys.argv[1]);from dev_store import Lease;Lease(sys.argv[2],blocking=False)"
         command = subprocess.run(
-            [sys.executable, "-c", code, str(ROOT / "scons"), str(path)],
+            [sys.executable, "-c", code, str(ROOT / "buildsys"), str(path)],
             check=False,
             capture_output=True,
             text=True,
@@ -239,7 +239,7 @@ class StoreTests(unittest.TestCase):
         )
         code = "import sys;from pathlib import Path;sys.path.insert(0,sys.argv[1]);import dependencies;dependencies.ROOT=Path(sys.argv[2]);dependencies.discover=lambda *args:{'fingerprint':'compiler'};sys.argv=['dependencies.py','--release'];sys.exit(dependencies.main())"
         command = subprocess.run(
-            [sys.executable, "-c", code, str(ROOT / "mobile"), str(self.a)],
+            [sys.executable, "-c", code, str(ROOT / "platforms/mobile"), str(self.a)],
             capture_output=True,
             text=True,
             check=False,
@@ -299,7 +299,7 @@ class StoreTests(unittest.TestCase):
             sys.executable,
             "-c",
             code,
-            str(ROOT / "scons"),
+            str(ROOT / "buildsys"),
             str(destination),
             json.dumps(artifact),
             str(self.base / "downloads"),
@@ -319,7 +319,7 @@ class StoreTests(unittest.TestCase):
         )
 
     def test_dependency_bundle_rejects_changed_archives(self):
-        sys.path.insert(0, str(ROOT / "mobile"))
+        sys.path.insert(0, str(ROOT / "platforms/mobile"))
         from dependencies import validate_bundle
 
         prefix = self.base / "bundle"
@@ -359,7 +359,7 @@ class StoreTests(unittest.TestCase):
     def test_java_sources_available_without_dependency_buildtrees(self):
         import tarfile
 
-        sys.path.insert(0, str(ROOT / "mobile"))
+        sys.path.insert(0, str(ROOT / "platforms/mobile"))
         import dependencies
 
         java = (
@@ -372,7 +372,7 @@ class StoreTests(unittest.TestCase):
         with tarfile.open(archive, "w:gz") as tar:
             tar.add(self.base / "SDL-release-test", arcname="SDL-release-test")
         checksum = hashlib.sha512(archive.read_bytes()).hexdigest()
-        (self.a / "mobile/sdl-java.json").write_text(
+        (self.a / "platforms/mobile/sdl-java.json").write_text(
             json.dumps(
                 {
                     "version": "test",
@@ -383,7 +383,7 @@ class StoreTests(unittest.TestCase):
             )
         )
         vcpkg = self.base / "vcpkg"
-        port = self.a / "scons/vcpkg-ports/sdl3"
+        port = self.a / "buildsys/vcpkg-ports/sdl3"
         port.mkdir(parents=True)
         (port / "portfile.cmake").write_text("SHA512 " + checksum)
         (port / "vcpkg.json").write_text(json.dumps({"version": "test"}))
@@ -499,7 +499,7 @@ class StoreTests(unittest.TestCase):
         spec.loader.exec_module(cli)
         target = store.browser_sdk(self.a, lease=False)
         target.mkdir(parents=True)
-        manifest = self.a / "browser/toolchain.json"
+        manifest = self.a / "platforms/web/toolchain.json"
         (target / ".glob2-toolchain.json").write_text(manifest.read_text())
         local = self.a / "tools/browser-emsdk"
         for sdk in (local, target):
@@ -609,7 +609,7 @@ class StoreTests(unittest.TestCase):
         import mobile_toolchain
         from build_layout import build_identity
 
-        lock = json.loads((ROOT / "mobile/toolchain.json").read_text())
+        lock = json.loads((ROOT / "platforms/mobile/toolchain.json").read_text())
         sdk = self.base / "sdk"
         ndk = sdk / "ndk" / lock["android"]["ndk"]
         ndk.mkdir(parents=True)

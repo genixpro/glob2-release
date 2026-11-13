@@ -1,5 +1,5 @@
 // Exercise public AI registration and the normal game/save loading path.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
 #include <string>
 #include "GlobalContainer.h"
 #include "Engine.h"
@@ -13,6 +13,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include "Game.h"
 
 namespace
 {
@@ -21,7 +22,6 @@ static std::vector<Uint32> state(Game& game)
 {
     std::vector<Uint32> result,buildings,units;
     game.checkSum(&result,&buildings,&units,true);
-    result.erase(result.begin()); // Loading updates the saved map header.
     result.insert(result.end(),buildings.begin(),buildings.end());
     result.insert(result.end(),units.begin(),units.end());
     return result;

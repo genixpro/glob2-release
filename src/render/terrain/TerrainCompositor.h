@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "TerrainMaterials.h"
+#include "TerrainBuiltins.h"
+#include "TerrainStones.h"
 #include "TerrainType.h"
+#include "map/MapAssetBundle.h"
 #include "render/MapAssetSprites.h"
 #include <SDLGraphicContext.h>
 #include <memory>
+#include <mutex>
 #include <span>
 
 class SceneMap;
@@ -36,10 +40,18 @@ class Compositor
   public:
 	explicit Compositor(Catalog catalog, std::shared_ptr<const MapAssetBundle> assets = MapAssetBundle::empty());
 	const Catalog &catalog() const { return definitions; }
-	bool contextualBorders() const { return hasContextualProfiles; }
+	// Contextual and smooth profiles read one vertex of halo around each cell.
+	bool neighborhoodBorders() const { return hasNeighborhoodProfiles; }
 	std::pair<GAGCore::Sprite *, unsigned> editorIcon(TerrainType type) const;
 	void prepare(bool hd, int time);
+    // Retain only requested variants; immutable CPU snapshots remain usable.
+    void prepareForRecipes(bool hd, int time, std::span<const Recipe> recipes);
+    // Inclusive world-cell bounds, wrapped to the map. HD streams asynchronously
+    // with native sources as fallback until each requested frame is available.
+    void prepareVisible(bool hd, int time, const SceneMap &, int left, int top, int right, int bottom,
+                        bool nativeComposition = false);
 	Recipe describe(const SceneMap &, int x, int y) const;
+	Recipe describeOverview(const SceneMap &, int x, int y) const;
 	// Coverage of one mixed cell at one sampling scale. It depends on the cell's
 	// geometry, never on the animation phase, so a page can keep it and re-blend
 	// only the textures when an animated material changes phase.
@@ -65,7 +77,13 @@ class Compositor
 	// A uniform recipe ignores the mask; a mixed one composes from it when given.
 	void compose(const Recipe &, SDL_Surface *target, int x, int y, int scale,
 				 const CellMask *mask = nullptr) const;
-	bool animated(MaterialId id) const { return definitions.materials[id].animationFrames > 1; }
+	// Animated textures or surf: either changes this material's composed pixels over time.
+	bool animated(MaterialId id) const
+	{
+		const auto &m = definitions.materials[id];
+		return m.animationFrames > 1 || m.surf.period > 0;
+	}
+	unsigned surfTime() const { return preparedTime; }
 	// Subtile palette samples share the detailed renderer's material partition.
 	static constexpr int OverviewSamples = 4;
 	// Per corner (Recipe::corners order), an overview colour replacing the
@@ -73,14 +91,62 @@ class Compositor
 	using CornerColors = std::array<const std::array<unsigned char, 3> *, 4>;
 	void composeOverview(const Recipe &, SDL_Surface *target, int x, int y,
 						 const CornerColors *cornerColors = nullptr) const;
-	// The shared decor sprite (every decor block names the same one), or null
-	// when the catalog has no decor; the renderer batches decor like resources.
+	// The shared sprite supports cached row batching; mixed custom sprites use
+	// the ordinary renderer. Material lookup also serves editor swatches.
 	GAGCore::Sprite *decorSprite() const { return sharedDecorSprite; }
     GAGCore::Sprite *decorSprite(MaterialId id) const { return decorSprites.at(id); }
-    GAGCore::Sprite *decorSprite(const SceneMap &map, int x, int y) const;
-	// Decor frame drawn over cell (x, y), or -1. Cells with a neighbour of a
-	// different appearance use the smaller edge frames.
-	int decorFrame(const SceneMap &, int x, int y) const;
+	// How far the largest decor frame reaches past its cell, for view culling.
+	DecorReach decorReach() const { return reach; }
+	// Terraces of tiered masses. TierField holds, per map vertex, how many
+	// vertices deep it lies inside its mass (capped); it is presentation only,
+	// built once per terrain revision and shared, so per-cell queries are a few
+	// array reads with no locking. tierField returns null when no material is
+	// tiered; callers fetch it once per draw and pass it to decorLayers.
+	struct TierField
+	{
+		std::uint64_t revision = 0;
+		const void *registry = nullptr;
+		int w = 0, h = 0;
+		std::uint32_t seed = 0;
+		std::vector<std::uint8_t> depth;
+	};
+	std::shared_ptr<const TierField> tierField(const SceneMap &) const;
+	// A cell's raised decor, one frame per slot, drawn in slot order: the
+	// connected masses that stand on open ground (cliffs, icefall, glacier...),
+	// connected foliage (hedge and thicket, which join one another), every other
+	// obstacle, then the terraces of tiered masses. Masses take slots 0 and 1,
+	// and a third and fourth the slots after them; foliage beside three masses
+	// moves to slot 3, where no obstacle draws. Each slot draws only from
+	// its own corners, so masses keep their walls against foliage and crags.
+	// Where an open-edged mass meets another connected material it stands back
+	// from it (connected_foreign), so the two show their own rims and walls
+	// across a valley half a cell wide; the mass with more north corners draws
+	// first. An undecorated corner suppresses the foliage and obstacle slots;
+	// within those, mixed materials choose one by presentation hashing,
+	// weighted by corner count. Terrace slot k draws decorSlotRise higher.
+	static constexpr unsigned TierSlot = 4;
+	static constexpr unsigned DecorSlots = TierSlot + MaxDecorTiers;
+	static constexpr int decorSlotRise(unsigned slot)
+	{
+		return slot >= TierSlot ? int(slot - TierSlot + 1) * DecorTierRise : 0;
+	}
+	struct DecorLayer
+	{
+		GAGCore::Sprite *sprite = nullptr;
+		int frame = -1;
+	};
+	std::array<DecorLayer, DecorSlots> decorLayers(const SceneMap &, int x, int y,
+		const TierField *tiers = nullptr) const;
+	// The frame of terrace `tier` (1..MaxDecorTiers) over a cell, or -1.
+	int decorTierFrame(const SceneMap &, const TierField &, int x, int y, int tier) const;
+	// Flat animated overlays (fertile glints), drawn under decor. A cell draws
+	// one only when all four corners carry an overlay. `time` is the presentation
+	// clock that animates lava and water (MapRenderState::animationTime), not the
+	// simulation tick, so glints twinkle in the editor and pause with the game.
+	GAGCore::Sprite *overlaySprite() const { return sharedOverlaySprite; }
+	GAGCore::Sprite *overlaySprite(MaterialId id) const { return overlaySprites.at(id); }
+	GAGCore::Sprite *overlaySprite(const SceneMap &map, int x, int y) const;
+	int overlayFrame(const SceneMap &, int x, int y, int time, bool *animated = nullptr) const;
     struct PreparedMaterialView
     {
         unsigned variant = 0;
@@ -95,6 +161,20 @@ class Compositor
     // Published material revisions own only composition data. A later prepare
     // can replace animated pixels without invalidating a running CPU batch.
     using MaterialPixels = std::vector<std::array<unsigned char, 4>>;
+    // A single immutable animation phase, prepared with the reference variant edges.
+    MaterialPixels nativeMaterialPixels(MaterialId id, unsigned variant, unsigned phase);
+    // Individual source endpoints for GPU crossfades. Stamps include deferred HD
+    // publication and edits; phasePixels applies the same shared variant edges
+    // as the CPU compositor without blending the two animation endpoints.
+    struct PhaseSource
+    {
+        std::uint64_t identity, revision;
+        int size;
+        std::uint64_t edgeIdentity, edgeRevision;
+        bool operator==(const PhaseSource &) const = default;
+    };
+    PhaseSource phaseSource(MaterialId id, unsigned variant, unsigned phase) const;
+    MaterialPixels phasePixels(MaterialId id, unsigned variant, unsigned phase);
     struct CpuScratch
     {
         CellMask mask;
@@ -108,9 +188,11 @@ class Compositor
             std::shared_ptr<const MaterialPixels> pixels;
         };
         std::shared_ptr<const Catalog> definitions;
+        std::shared_ptr<const StoneMaps> stones;
         std::vector<std::vector<Texture>> textures;
         std::vector<char> included;
         std::size_t bytes = 0;
+        unsigned surfTime = 0; // Animation time of the surf phase, as prepared.
         // Every recipe corner must be included in this immutable snapshot.
         void compose(const Recipe &, SDL_Surface *, int scale, const CellMask * = nullptr) const;
         void compose(const Recipe &, SDL_Surface *, int scale, CpuScratch &,
@@ -119,8 +201,17 @@ class Compositor
     };
     std::shared_ptr<const CpuMaterials> cpuMaterials(std::span<const MaterialId> needed = {});
     std::size_t cpuMaterialBytes(std::span<const MaterialId> needed = {}) const;
-	std::uint64_t materialRevision(MaterialId id) const { return materialRevisions[id]; }
+    std::shared_ptr<const CpuMaterials> cpuMaterialsForRecipes(std::span<const Recipe> recipes);
+    std::size_t cpuMaterialBytesForRecipes(std::span<const Recipe> recipes) const;
+	std::uint64_t textureRevision(MaterialId id) const { return textureRevisions[id]; }
 	int scale() const { return resolution; }
+    // Diagnostic: HD preparations, and those that drew a native source for a
+    // material whose HD frames had already appeared (streaming fallback).
+    struct HighResolutionCoverage { std::uint64_t prepares = 0, fallbacks = 0; };
+    HighResolutionCoverage highResolutionCoverage() const { return coverage; }
+    // Look-ahead phases kept resident for streamed animated HD materials, beyond
+    // the current and next phase that every animation requires.
+    static constexpr std::size_t AnimationLookaheadBytes = 64u * 1024 * 1024;
 	std::size_t sourceBytes() const;
 
   private:
@@ -136,21 +227,36 @@ class Compositor
       std::vector<CpuPublication> publishedPixels;
       std::weak_ptr<const Catalog> publishedCatalog;
       std::size_t cpuPublicationBytes() const;
-      static void composePixels(const Catalog &, const Recipe &, SDL_Surface *, int, int, int,
-                                std::span<const PreparedMaterialView>, const CellMask *);
-      static void buildMask(const Catalog &, const Recipe &, int, CellMask &);
+      static void composePixels(const Catalog &, const StoneMaps &, const Recipe &, SDL_Surface *, int, int, int,
+                                std::span<const PreparedMaterialView>, const CellMask *,
+                                unsigned surfTime);
+      static void buildMask(const Catalog &, const StoneMaps &, const Recipe &, int, CellMask &);
 	struct Texture
 	{
 		GAGCore::DrawableSurface *source = nullptr;
 		std::uint64_t identity = 0, revision = 0;
 		int size = 0;
+		bool opaque = false; // Every pixel has full alpha.
 		std::vector<std::array<unsigned char, 4>> pixels;
 	};
+	static void markOpaque(Texture &);
 	Catalog definitions;
-	bool hasContextualProfiles = false;
+	bool hasNeighborhoodProfiles = false;
     MapAssetSprites customSprites;
     MaterialId materialFor(const SceneMap&, TerrainType type) const;
-    std::pair<MaterialId, unsigned> decorMaterial(const SceneMap&, int x, int y) const;
+    // Detailed recipes add shore calm and whole-stone path edges.
+    Recipe describe(const SceneMap &, int x, int y, bool detailed) const;
+    Recipe describeCell(const SceneMap &, int x, int y, bool shoreCalm) const;
+	void describeShoreCalm(const SceneMap&, Recipe &) const;
+	void describeStones(const SceneMap &, Recipe &) const;
+	void describeHalo(const SceneMap &, Recipe &) const;
+	std::shared_ptr<const StoneMaps> stoneMaps;
+	std::uint64_t instance = 0; // Distinguishes compositors in shared presentation caches.
+    unsigned decorSlot(MaterialId) const;
+	// Whether a connected open-ground mass vertex lies within `reach` vertices
+	// of cell (x,y)'s corners (Decor::clearOfMasses).
+	bool massWithin(const SceneMap &, int x, int y, int reach) const;
+	MaterialId overlayMaterial(const SceneMap &, int x, int y, bool &found) const;
 	std::shared_ptr<CompiledPack> pack;
 	std::map<std::uint64_t, std::uint64_t> cleanSources;
 	std::array<MaterialId, TERRAIN_COUNT> terrainBindings{};
@@ -158,6 +264,13 @@ class Compositor
 	std::vector<GAGCore::Sprite *> decorSprites;
     GAGCore::Sprite *sharedDecorSprite = nullptr;
     bool mixedDecorSprites = false;
+    bool tieredDecor = false;
+    mutable std::mutex tierMutex;
+    mutable std::shared_ptr<const TierField> tierCache;
+	DecorReach reach;
+	std::vector<GAGCore::Sprite *> overlaySprites;
+	GAGCore::Sprite *sharedOverlaySprite = nullptr;
+	bool mixedOverlaySprites = false;
 	static void readTexture(Texture &, GAGCore::DrawableSurface *);
 	std::vector<std::vector<Texture>> textures;
 	struct AnimationTextures
@@ -166,8 +279,23 @@ class Compositor
 		unsigned blend = ~0u;
 	};
 	std::vector<AnimationTextures> animationTextures;
-	bool prepareMaterial(unsigned id, bool hd, int phase, std::vector<Texture> &target);
-	std::vector<std::uint64_t> materialRevisions;
+	using Usage = std::vector<std::vector<unsigned char>>;
+#ifdef __EMSCRIPTEN__
+    void requestMapTerrain(const SceneMap&);
+    Uint64 requestedMapIdentity = 0;
+    std::vector<std::string> requestedTerrainPackages;
+#endif
+    void prepareSelected(bool hd, int time, const Usage *usage, bool nativeComposition = false);
+    Usage recipeUsage(std::span<const Recipe> recipes) const;
+    std::size_t cpuMaterialBytesSelected(std::span<const MaterialId>, const Usage *) const;
+    std::shared_ptr<const CpuMaterials> cpuMaterialsSelected(std::span<const MaterialId>, const Usage *);
+    bool publishedSubset = false;
+    bool prepareMaterial(unsigned id, bool hd, int phase, std::vector<Texture> &target,
+                         const std::vector<unsigned char> *wanted);
+	std::vector<std::uint64_t> textureRevisions;
+	std::vector<int> highResolutionSizes; // Largest source size seen per material.
+	HighResolutionCoverage coverage;
 	int resolution = 1;
+	unsigned preparedTime = 0;
 };
 } // namespace TerrainVisual

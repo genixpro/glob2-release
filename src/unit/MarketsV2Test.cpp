@@ -1,6 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Material.h"
-#include "EngineFixtures.h"
+#include "Building.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "Continuation.h"
+#include "SimulationInvariants.h"
+#include "DrawFixtures.h"
 #include "GradientFixture.h"
 #include "MapInternal.h"
 #include "gradient/GradientRuntime.h"
@@ -13,6 +20,7 @@
 #include <TextStream.h>
 #include <StreamBackend.h>
 #include <iomanip>
+#include <optional>
 #include <chrono>
 #include <ctime>
 #include <Environment.h>
@@ -20,41 +28,31 @@
 #include <SDL3/SDL.h>
 #include "GameGUITouch.h"
 #include <sstream>
+#include "Unit.h"
 
 namespace
 {
-std::vector<Uint32> simulation(Game &game, bool legacy152Representation=false)
-{
-	std::vector<Uint32> state, buildings, units;
-	game.checkSum(&state, &buildings, &units, true,legacy152Representation);
-	state.erase(state.begin()); // file version changes on save, not simulation
-	state.insert(state.end(), buildings.begin(), buildings.end());
-	state.insert(state.end(), units.begin(), units.end());
-	return state;
-}
+using glob2test::simulationComponents;
 // Historical goldens compare the accepted version152 representation. Current
 // save/resume checks below continue to use complete new simulation components.
-std::vector<Uint32> historicalGoldenState(Game& game) { return simulation(game,true); }
-
-std::string save(Game &game, bool text)
+std::vector<Uint32> historicalGoldenState(Game& game) { return simulationComponents(game,true); }
+// Binary saves, or text saves to exercise the text stream format.
+std::string save(Game &game, bool text) { return glob2test::saveGameBytes(game, "Markets V2 test", text); }
+// Cherries held anywhere: building and team stock, and carried packets in stock units.
+Sint64 cherriesOnHand(Game &game)
 {
-	auto *backend = new GAGCore::MemoryStreamBackend;
-	std::unique_ptr<GAGCore::OutputStream> out(text
-		? static_cast<GAGCore::OutputStream *>(new GAGCore::TextOutputStream(backend))
-		: static_cast<GAGCore::OutputStream *>(new GAGCore::BinaryOutputStream(backend)));
-	game.save(out.get(), false, "Markets V2 test"); out->flush();
-	return backend->takeContents();
+	const auto census = glob2test::takeMaterialCensus(game);
+	glob2test::StockAmount total{census.stock[CHERRY], 1};
+	total += census.carried[CHERRY];
+	REQUIRE(total.denominator == 1);
+	return total.numerator;
 }
-bool load(Game &game, const std::string &bytes, bool text)
+Uint64 cherriesEaten(Game &game)
 {
-    auto backend=std::make_unique<GAGCore::MemoryStreamBackend>();
-    backend->write(bytes.data(),bytes.size()); backend->seekFromStart(0);
-    // TextInputStream parses synchronously and does not own its backend;
-    // BinaryInputStream owns and deletes the backend handed to it.
-    if(text) {
-        GAGCore::TextInputStream input(backend.get()); return game.load(&input);
-    }
-    GAGCore::BinaryInputStream input(backend.release()); return game.load(&input);
+	Uint64 eaten = 0;
+	for (int t = 0; t < game.mapHeader.getNumberOfTeams(); ++t)
+		eaten += std::as_const(game.teams[t]->stats).events().consumed[GameplayMeasurements::MEAL][CHERRY];
+	return eaten;
 }
 }
 
@@ -62,7 +60,10 @@ TEST_SUITE("MarketsV2")
 {
 // Historical checksums remain a separate migration comparison. Current runs also
 // verify delivery and save continuation under both routing configurations.
-std::string marketTrace(bool enabled, bool report=false)
+// fed: keep the workers sated every tick (the recorded traces); otherwise they start
+// hungry and eat at the inn, which takes cherries from the market.
+// reload: save and load the game at tick 750 and play on from the loaded copy.
+std::string marketTrace(bool enabled, bool report=false, bool fed=true, bool reload=true)
 {
 	glob2test::HeadlessGlobals globals;
 	std::ostringstream trace;
@@ -78,7 +79,7 @@ std::string marketTrace(bool enabled, bool report=false)
 		(void)enabled;
 #endif
 		g.gameHeader.setResourceGrowthDisabled(true);
-		g.map.configureGradientPipeline(pipeline ? 2 : 0, 3);
+		g.map.routing().configureGradientPipeline(pipeline ? 2 : 0, 3);
 		auto *inn = world.addBuilding("inn", 6, 6, 1);
 		auto *market = world.addBuilding("market", 20, 20);
 		auto *second = world.addBuilding("market", 40, 40, 0, 1);
@@ -95,29 +96,49 @@ std::string marketTrace(bool enabled, bool report=false)
 		inn->maxUnitWorking = 3;
 		inn->setMaterial(WHEAT, inn->type->maxMaterial[WHEAT] - 1);
 		market->setMaterial(CHERRY, 100);
+		// Unfed workers eat from the start, so give the inn fruit before the market delivers.
+		if (!fed) inn->setMaterial(CHERRY, 20);
 		second->setMaterial(ORANGE, 100);
 		g.map.setResourceByIndex(5, 10, WHEAT, 0);
 		for (int i=0; i<6; ++i) world.addUnit(WORKER, 4+i, 4, 0, 1);
 		inn->updateCallLists();
+		// Fruit is only moved and eaten: there are no cherry tiles and growth is off.
+		std::optional<glob2test::MaterialLedger> ledger; // from the first step on
+		const Sint64 initialCherries = cherriesOnHand(g);
+		CHECK(initialCherries == (fed ? 100 : 120));
+		const auto scriptedDelivery = [&](int material) {
+			const Sint64 before = market->material(material);
+			market->addMaterialIntoBuilding(material);
+			REQUIRE(ledger);
+			ledger->credit(material, market->material(material) - before);
+		};
 		for (int tick=0; tick<1500; ++tick)
 		{
 			// Identical scripted deliveries on both builds exercise stock transitions.
-			if (tick==500) market->addMaterialIntoBuilding(ORANGE);
-			if (tick==1000) market->addMaterialIntoBuilding(PRUNE);
+			if (tick==500) scriptedDelivery(ORANGE);
+			if (tick==1000) scriptedDelivery(PRUNE);
 			for (int i=0; i<6; ++i)
 			{
 				auto *u = world.team->myUnits[i];
-				u->hungry = Unit::HUNGRY_MAX; u->medical = Unit::MED_FREE;
+				if (fed) u->hungry = Unit::HUNGRY_MAX;
+				else if (tick%400==0) u->hungry = 0; // once the inn holds fruit, meals take it
+				u->medical = Unit::MED_FREE;
 			}
 			world.step();
+			{
+				CAPTURE(pipeline); CAPTURE(tick);
+				CHECK(cherriesOnHand(g) + Sint64(cherriesEaten(g)) == initialCherries);
+				if (!ledger) ledger.emplace(g);
+				else ledger->check("markets tick " + std::to_string(tick+1));
+			}
 			Uint32 hash=2166136261u;
 			for (Uint32 value : historicalGoldenState(g)) hash=(hash ^ value)*16777619u;
 			trace << pipeline << ' ' << tick+1 << ' ' << std::hex << hash << std::dec << '\n';
-			if (tick==749)
+			if (tick==749 && reload)
 			{
-				const auto state=simulation(g);
+				const auto state=simulationComponents(g);
                 const auto checkCheckpoint=[&](const std::string& phase) {
-                    const auto actual=simulation(g);
+                    const auto actual=simulationComponents(g);
                     CAPTURE(phase); CAPTURE(pipeline);
                     REQUIRE(actual.size()==state.size());
                     for (size_t component=0;component<state.size();++component) {
@@ -129,7 +150,7 @@ std::string marketTrace(bool enabled, bool report=false)
                 checkCheckpoint("save"); // Finishing private jobs cannot publish them.
 				if (!glob2test::artifactDir().empty()) glob2test::writeFile(glob2test::artifactDir()/(pipeline ? "midgame.txt" : "midgame.bin"),bytes);
 				const auto marketId=market->gid, secondId=second->gid, innId=inn->gid;
-				REQUIRE(load(g,bytes,pipeline));
+				REQUIRE(glob2test::loadGameBytes(g,bytes,pipeline));
                 checkCheckpoint("load");
 				world.team=g.teams[0];
 				market=world.team->myBuildings[Building::GIDtoID(marketId)];
@@ -141,52 +162,126 @@ std::string marketTrace(bool enabled, bool report=false)
         // delivery; ownExchangeBuilding is retained only for old saved journeys.
         CHECK(inn->material(CHERRY) > 0);
 		CHECK(market->material(CHERRY) < 100);
+		if (!fed) CHECK(cherriesEaten(g) > 0);
+		REQUIRE(ledger);
+		{
+			INFO(ledger->inexactReasons());
+			CHECK(ledger->colonyExact());
+		}
 #if VERSION_MINOR >= 135
 		std::size_t fields=0;
 		for (int t=0;t<Team::MAX_COUNT;++t) for (int r=0;r<MaterialSlotCount;++r) for (int sw=0;sw<SWIM_CLASS_COUNT;++sw)
-			fields += g.map.marketMaterialGradients[t][r][sw]!=nullptr;
+			fields += g.map.routing().marketMaterialGradients[t][r][sw]!=nullptr;
 		if (!enabled) CHECK(fields==0);
 		if (report) std::printf("markets-v2=%d pipeline=%d: %zu resource fields, %zu bytes in resource fields\n",enabled,pipeline,fields,fields*g.map.getW()*g.map.getH()*sizeof(Uint16));
 #else
 		(void)report;
 #endif
 	}
-	if (!glob2test::artifactDir().empty()) glob2test::writeFile(glob2test::artifactDir()/"checksums.txt",trace.str());
 	return trace.str();
 }
 
-TEST_CASE("disabled fruit deliveries have a stable per-tick trace and save continuation [golden][save-format][artifacts]")
+// The browser determinism spec collects exactly these two cases' traces.
+static void exportTrace(const std::string& trace)
 {
-	glob2test::expectGolden("markets-v2/disabled-checksums.txt", marketTrace(false));
+	glob2test::writeFile(glob2test::artifactDir()/"checksums.txt",trace);
 }
 
-TEST_CASE("legacy workers already travelling to markets continue after migration [golden][save-format]")
+// A save and load at tick 750 leaves every later tick of the trace unchanged: the
+// loaded game plays on exactly as the uninterrupted one. The trace with the reload
+// goes to sim-diff.
+TEST_CASE("disabled fruit deliveries continue identically after a mid-game save [sim-trace][save-format][artifacts]")
+{
+	const auto trace = marketTrace(false);
+	CHECK(trace == marketTrace(false, false, true, false));
+	exportTrace(trace);
+	glob2test::recordSimTrace("markets-v2/disabled-checksums.txt", trace);
+}
+
+// The oracle the recorded traces stand for: across both routing configurations and
+// a save and load, cherries held in buildings and carried by workers plus those
+// eaten always equal what the market and inn started with, and every material's
+// ledger balances.
+TEST_CASE("market cherries are conserved apart from what was eaten [save-format]")
+{
+	marketTrace(false, false, false);
+#if VERSION_MINOR >= 135
+	marketTrace(true, false, false);
+#endif
+}
+
+// The format-133 save holds a worker on its way to a market under the old
+// exchange path. Loaded today, it reaches the market, takes a cherry packet and
+// heads back to its inn; cherries are neither created nor lost, every
+// material's ledger balances, and a re-save in the current format continues
+// identically. The per-tick trace goes to sim-diff.
+TEST_CASE("legacy workers already travelling to markets continue after migration [sim-trace][save-format]")
 {
 	glob2test::HeadlessGlobals globals;
 	glob2test::HeadlessGame world({.header=true});
-	REQUIRE(load(world.game,glob2test::readFile(glob2test::fixture("markets-v2/legacy-133-market.bin")),false));
+	REQUIRE(glob2test::loadGameBytes(world.game,glob2test::readFile(glob2test::fixture("markets-v2/legacy-133-market.bin"))));
 	world.team=world.game.teams[0];
 	#if VERSION_MINOR >= 135
 	CHECK_FALSE(world.game.gameHeader.hasExperiment(ExperimentId::MarketsV2));
 	#endif
-	CHECK(world.team->myUnits[0]->ownExchangeBuilding!=nullptr);
+	Unit* traveller=world.team->myUnits[0];
+	REQUIRE(traveller);
+	Building* const market=traveller->ownExchangeBuilding;
+	Building* const inn=traveller->attachedBuilding;
+	REQUIRE(market!=nullptr);
+	REQUIRE(inn!=nullptr);
+	CHECK(traveller->targetBuilding==market);
+	CHECK_FALSE(traveller->hasCarriedMaterial(CHERRY));
+	const auto distanceToInn=[&] { return std::max(std::abs(traveller->posX-inn->posX),std::abs(traveller->posY-inn->posY)); };
+	const Sint64 initialCherries=cherriesOnHand(world.game);
+	const Uint64 initialEaten=cherriesEaten(world.game);
+	const auto feed=[](Game& game) {
+		for (int i=0;i<6;++i) { game.teams[0]->myUnits[i]->hungry=Unit::HUNGRY_MAX; game.teams[0]->myUnits[i]->medical=Unit::MED_FREE; }
+	};
+	std::optional<glob2test::MaterialLedger> ledger; // from the first step on
+	int pickedUp=-1, distanceAtPickup=0;
 	std::ostringstream trace;
 	for (int tick=750;tick<1000;++tick)
 	{
-		for (int i=0;i<6;++i) { world.team->myUnits[i]->hungry=Unit::HUNGRY_MAX; world.team->myUnits[i]->medical=Unit::MED_FREE; }
+		feed(world.game);
 		world.step();
+		{
+			CAPTURE(tick);
+			CHECK(cherriesOnHand(world.game) + Sint64(cherriesEaten(world.game) - initialEaten) == initialCherries);
+			if (!ledger) ledger.emplace(world.game);
+			else ledger->check("legacy market tick " + std::to_string(tick+1));
+		}
+		if (pickedUp<0 && traveller->hasCarriedMaterial(CHERRY)) { pickedUp=tick+1; distanceAtPickup=distanceToInn(); }
 		Uint32 hash=2166136261u;
 		for (Uint32 value : historicalGoldenState(world.game)) hash=(hash^value)*16777619u;
 		trace << "0 " << tick+1 << ' ' << std::hex << hash << std::dec << '\n';
 	}
-	glob2test::expectGolden("markets-v2/legacy-133-checksums.txt",trace.str());
+	CAPTURE(pickedUp);
+	CHECK_FALSE(traveller->isDead);
+	CHECK(pickedUp>0);
+	// Carrying the packet home: bound for the inn and closer to it than at the market.
+	CHECK(traveller->hasCarriedMaterial(CHERRY));
+	CHECK(traveller->targetBuilding==inn);
+	CHECK(distanceToInn()<distanceAtPickup);
+	REQUIRE(ledger);
+	{
+		INFO(ledger->inexactReasons());
+		CHECK(ledger->colonyExact());
+	}
+	const auto result=glob2test::expectContinuation(world.game, {.ticks=64,
+		.step=[&](Game& game) { feed(game); glob2test::stepEngine(game); return std::vector<std::string>{}; },
+		.name="legacy market continuation"});
+	CHECK(result.matched);
+	glob2test::recordSimTrace("markets-v2/legacy-133-checksums.txt",trace.str());
 }
 #if VERSION_MINOR >= 135
-TEST_CASE("enabled supply networks repeat deterministically with save continuation [golden][save-format][artifacts]")
+TEST_CASE("enabled supply networks repeat deterministically and continue identically after a mid-game save [sim-trace][save-format][artifacts]")
 {
 	const auto trace=marketTrace(true);
 	CHECK(trace==marketTrace(true));
-	glob2test::expectGolden("markets-v2/enabled-checksums.txt",trace);
+	CHECK(trace==marketTrace(true,false,true,false));
+	exportTrace(trace);
+	glob2test::recordSimTrace("markets-v2/enabled-checksums.txt",trace);
 }
 TEST_CASE("world teardown and map reuse discard derived supplier ledgers")
 {
@@ -197,18 +292,18 @@ TEST_CASE("world teardown and map reuse discard derived supplier ledgers")
     auto* market=world.addBuilding("market",8,8);
     REQUIRE(market);
     market->setMaterial(CHERRY,1);
-    auto& targets=world.game.map.gradientRuntime->marketTargets;
-    world.game.map.ensureGradientMarketTargets(0,CHERRY);
+    auto& targets=world.game.map.routing().gradientRuntime->marketTargets;
+    world.game.map.routing().ensureGradientMarketTargets(0,CHERRY);
     REQUIRE(targets.initialized(0,CHERRY));
     REQUIRE_FALSE(targets.inverse.empty());
     // A live-world reset cancels jobs, not the target history of serving fields.
     // The very next stock transition must still see the previous membership.
-    auto& policy=world.game.map.gradientRuntime->adaptive;
+    auto& policy=world.game.map.routing().gradientRuntime->adaptive;
     const GradientFieldKey key{GradientFieldFamily::Markets,0,0,CHERRY};
     policy.enroll(key);
     const auto beforeReset=policy.currentTargets(key);
     const auto beforeFootprint=targets.ledgers.at(GradientMarketTargets::key(0,CHERRY)).cells;
-    world.game.map.resetGradientPipeline();
+    world.game.map.routing().resetGradientPipeline();
     REQUIRE(targets.initialized(0,CHERRY));
     CHECK(targets.ledgers.at(GradientMarketTargets::key(0,CHERRY)).cells==beforeFootprint);
     CHECK(policy.currentTargets(key)==beforeReset);
@@ -229,10 +324,10 @@ TEST_CASE("world teardown and map reuse discard derived supplier ledgers")
     // Map::clear is also a standalone reuse boundary. Seed it with the actual
     // old-world derived cache independently of Game's already-tested teardown.
     Map reused;
-    reused.gradientRuntime->marketTargets=previousWorld;
+    reused.routing().gradientRuntime->marketTargets=previousWorld;
     reused.clear();
-    CHECK(reused.gradientRuntime->marketTargets.ledgers.empty());
-    CHECK(reused.gradientRuntime->marketTargets.inverse.empty());
+    CHECK(reused.routing().gradientRuntime->marketTargets.ledgers.empty());
+    CHECK(reused.routing().gradientRuntime->marketTargets.inverse.empty());
 }
 TEST_CASE("identical market workloads report routing cost [benchmark]")
 {
@@ -257,11 +352,11 @@ TEST_CASE("identical gradient refresh workloads report CPU and memory [benchmark
 		for (int r=0;r<MaterialCount;++r)
 		{
 			world.game.map.setResourceByIndex(20+r*2,20,r,0);
-			for (int sw=0;sw<SWIM_CLASS_COUNT;++sw) world.game.map.getMaterialGradientSlot(0,r,sw,true);
+			for (int sw=0;sw<SWIM_CLASS_COUNT;++sw) world.game.map.routing().getMaterialGradientSlot(0,r,movementAccessFromLegacy(sw),true);
 		}
 		const auto wall=std::chrono::steady_clock::now(); const auto cpu=std::clock();
 		for (int repeat=0;repeat<16;++repeat) for (int r=0;r<MaterialCount;++r) for (int sw=0;sw<SWIM_CLASS_COUNT;++sw)
-			world.game.map.updateMaterialGradient(0,r,sw,true);
+			world.game.map.routing().updateMaterialGradient(0,r,movementAccessFromLegacy(sw),true);
 		std::printf("markets-v2=%d: %d 64x64 resource refreshes, CPU=%.6fs wall=%.6fs market-field-bytes=%d\n",
 			enabled,16*MaterialCount*SWIM_CLASS_COUNT,double(std::clock()-cpu)/CLOCKS_PER_SEC,
 			std::chrono::duration<double>(std::chrono::steady_clock::now()-wall).count(),
@@ -276,17 +371,17 @@ TEST_CASE("disabled gate blocks explicit fetch APIs and upgrade execution")
 	auto *market=world.addBuilding("market",8,8);
 	REQUIRE(market);
 	market->setMaterial(CHERRY, 20);
-	CHECK_FALSE(g.map.marketsV2Enabled());
+	CHECK_FALSE(g.map.routing().marketsV2Enabled());
 	CHECK_FALSE(market->isUpgradeAvailable());
 	for (int sw=0; sw<SWIM_CLASS_COUNT; ++sw)
 	{
-		glob2test::awaitGradient(g,[&] { return g.map.getMaterialGradientSlot(0,CHERRY,sw); });
-		CHECK(g.map.getMaterialGradientSlot(0,CHERRY,sw,true)==g.map.getMaterialGradientSlot(0,CHERRY,sw));
-		CHECK(g.map.marketMaterialGradients[0][CHERRY][sw]==nullptr);
-		g.map.dirtyMarketGradientsSlot(0,CHERRY);
-		CHECK(g.map.marketMaterialGradients[0][CHERRY][sw]==nullptr); // No market field is enrolled while disabled.
+		glob2test::awaitGradient(g,[&] { return g.map.routing().getMaterialGradientSlot(0,CHERRY,movementAccessFromLegacy(sw)); });
+		CHECK(g.map.routing().getMaterialGradientSlot(0,CHERRY,movementAccessFromLegacy(sw),true)==g.map.routing().getMaterialGradientSlot(0,CHERRY,movementAccessFromLegacy(sw)));
+		CHECK(g.map.routing().marketMaterialGradients[0][CHERRY][sw]==nullptr);
+		g.map.routing().dirtyMarketGradientsSlot(0,CHERRY);
+		CHECK(g.map.routing().marketMaterialGradients[0][CHERRY][sw]==nullptr); // No market field is enrolled while disabled.
 	}
-	CHECK_FALSE(g.map.isStockedMarketTile(market->gid,0,CHERRY));
+	CHECK_FALSE(g.map.routing().isStockedMarketTile(market->gid,0,CHERRY));
 	CHECK_FALSE(g.isBuildingTypeAvailable(51));
 	CHECK(g.addBuilding(20,20,52,0)==nullptr);
 	OrderConstruction order(market->gid,1,1);
@@ -294,13 +389,13 @@ TEST_CASE("disabled gate blocks explicit fetch APIs and upgrade execution")
 	market->launchConstruction(1,1);
 	CHECK(market->typeNum==50);
 	CHECK(market->constructionResultState==Building::NO_CONSTRUCTION);
-	const auto &scene=glob2test::sceneOf(g, Game::ViewState{.selectedBuilding=market});
+	const auto &scene=glob2test::sceneOf(g, ViewState{.selectedBuilding=market});
 	CHECK_FALSE(scene.panels.building.hardSpaceForUpgrade);
     CHECK(scene.panels.building.showLevel);
     // Presentation is explicit even when upgrades are experiment-gated.
     market->type->presentation.showLevel=false;
     g.snapshots().invalidateCatalog(); // The fixture edits the type table directly.
-    CHECK_FALSE(glob2test::sceneOf(g,Game::ViewState{.selectedBuilding=market}).panels.building.showLevel);
+    CHECK_FALSE(glob2test::sceneOf(g,ViewState{.selectedBuilding=market}).panels.building.showLevel);
 }
 
 TEST_CASE("each market level accepts only its resources across all swim classes")
@@ -324,14 +419,14 @@ TEST_CASE("each market level accepts only its resources across all swim classes"
 			for (int sw=waterOnly?SWIM_CLASS_COUNT-1:0; sw<(waterOnly?SWIM_CLASS_COUNT:SWIM_CLASS_COUNT-1); ++sw)
 			{
 				bool accepts=market->type->maxMaterial[r]>0;
-				CHECK(g.map.isStockedMarketTile(market->gid,0,r)==accepts);
-				CHECK_FALSE(g.map.isStockedMarketTile(market->gid,1,r));
-				glob2test::awaitGradient(g,[&] { return g.map.getMaterialGradientSlot(1,r,sw,true); });
-				glob2test::awaitGradient(g,[&] { return g.map.getMaterialGradientSlot(0,r,sw,true); });
-				glob2test::awaitGradient(g,[&] { return g.map.getMaterialGradientSlot(0,r,sw,false); });
-				CHECK_FALSE(g.map.materialAvailableSlot(1,r,sw,6,6,true));
-				CHECK(g.map.materialAvailableSlot(0,r,sw,6,6,true)==accepts);
-				CHECK_FALSE(g.map.materialAvailableSlot(0,r,sw,6,6));
+				CHECK(g.map.routing().isStockedMarketTile(market->gid,0,r)==accepts);
+				CHECK_FALSE(g.map.routing().isStockedMarketTile(market->gid,1,r));
+				glob2test::awaitGradient(g,[&] { return g.map.routing().getMaterialGradientSlot(1,r,movementAccessFromLegacy(sw),true); });
+				glob2test::awaitGradient(g,[&] { return g.map.routing().getMaterialGradientSlot(0,r,movementAccessFromLegacy(sw),true); });
+				glob2test::awaitGradient(g,[&] { return g.map.routing().getMaterialGradientSlot(0,r,movementAccessFromLegacy(sw),false); });
+				CHECK_FALSE(g.map.routing().materialAvailableSlot(1,r,movementAccessFromLegacy(sw),6,6,true));
+				CHECK(g.map.routing().materialAvailableSlot(0,r,movementAccessFromLegacy(sw),6,6,true)==accepts);
+				CHECK_FALSE(g.map.routing().materialAvailableSlot(0,r,movementAccessFromLegacy(sw),6,6));
 			}
 	}
 }
@@ -350,8 +445,8 @@ TEST_CASE("market routes respect forbidden ground and water across swim classes"
             if(world.game.map.getBuilding(x,y)==NOGBID)world.game.map.paintCell(x,y,WATER);
 	for (int y=7;y<=8+market->type->height;++y) for (int x=7;x<=8+market->type->width;++x) world.game.map.addForbidden(x,y,0);
 	for (int sw=waterOnly?SWIM_CLASS_COUNT-1:0;sw<(waterOnly?SWIM_CLASS_COUNT:SWIM_CLASS_COUNT-1);++sw) {
-        glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(0,CHERRY,sw,true); });
-        CHECK_FALSE(world.game.map.materialAvailableSlot(0,CHERRY,sw,5,5,true));
+        glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(0,CHERRY,movementAccessFromLegacy(sw),true); });
+        CHECK_FALSE(world.game.map.routing().materialAvailableSlot(0,CHERRY,movementAccessFromLegacy(sw),5,5,true));
     }
 	for (int y=7;y<=8+market->type->height;++y) for (int x=7;x<=8+market->type->width;++x)
 	{ world.game.map.removeForbidden(x,y,0); world.game.map.paintCell(x, y, WATER); }
@@ -359,16 +454,17 @@ TEST_CASE("market routes respect forbidden ground and water across swim classes"
 	for (int sw=waterOnly?SWIM_CLASS_COUNT-1:0;sw<(waterOnly?SWIM_CLASS_COUNT:SWIM_CLASS_COUNT-1);++sw)
 	{
 		std::vector<Uint16> expected(world.game.map.cellCount());
-		world.game.map.seedMaterialGradient(0,CHERRY,sw,expected.data(),true);
-		world.game.map.propagateGradient(expected.data(),sw);
-		world.game.map.updateMaterialGradient(0,CHERRY,sw,true);
+		const int cost=world.game.map.routing().preparationCostClass(0,accessClass(movementAccessFromLegacy(sw)));
+        world.game.map.routing().seedMaterialGradient(0,CHERRY,cost,expected.data(),true);
+		world.game.map.routing().propagateGradient(expected.data(),cost);
+		world.game.map.routing().updateMaterialGradient(0,CHERRY,movementAccessFromLegacy(sw),true);
 		// An older in-flight refresh may publish first. Wait for the generation
 		// captured after painting rather than treating any pointer swap as fresh.
 		glob2test::awaitGradient(world.game,[&] {
-			const auto* field=world.game.map.getMaterialGradientSlot(0,CHERRY,sw,true);
+			const auto* field=world.game.map.routing().getMaterialGradientSlot(0,CHERRY,movementAccessFromLegacy(sw),true);
 			return field && std::equal(expected.begin(),expected.end(),field) ? field : nullptr;
 		});
-		CHECK(world.game.map.materialAvailableSlot(0,CHERRY,sw,5,5,true)==(sw>0));
+		CHECK(world.game.map.routing().materialAvailableSlot(0,CHERRY,movementAccessFromLegacy(sw),5,5,true)==(sw>0));
 	}
     }
 }
@@ -382,20 +478,20 @@ TEST_CASE("explicit market refresh publishes depletion and restocking after the 
     world.game.gameHeader.setResourceGrowthDisabled(true);
     auto* market=world.addBuilding("market",8,8);
     REQUIRE(market);
-    map.configureGradientPipeline(2,3);
+    map.routing().configureGradientPipeline(2,3);
     market->setMaterial(CHERRY,20);
-    glob2test::awaitGradient(world.game,[&] { return map.getMaterialGradientSlot(0,CHERRY,0,true); });
-    CHECK(map.materialAvailableSlot(0,CHERRY,0,5,5,true));
+    glob2test::awaitGradient(world.game,[&] { return map.routing().getMaterialGradientSlot(0,CHERRY,MovementAccess::Land,true); });
+    CHECK(map.routing().materialAvailableSlot(0,CHERRY,MovementAccess::Land,5,5,true));
     for (bool stocked:{false,true}) {
         market->setMaterial(CHERRY,stocked ? 1 : 0);
-        map.dirtyMarketGradientsSlot(0,CHERRY);
+        map.routing().dirtyMarketGradientsSlot(0,CHERRY);
         world.game.stepCounter+=AdaptiveGradientState::MinimumInterval;
-        map.updateMaterialGradient(0,CHERRY,0,true);
+        map.routing().updateMaterialGradient(0,CHERRY,MovementAccess::Land,true);
         glob2test::awaitGradient(world.game,[&] {
-            const auto* field=map.getMaterialGradientSlot(0,CHERRY,0,true);
-            return map.materialAvailableSlot(0,CHERRY,0,5,5,true)==stocked ? field : nullptr;
+            const auto* field=map.routing().getMaterialGradientSlot(0,CHERRY,MovementAccess::Land,true);
+            return map.routing().materialAvailableSlot(0,CHERRY,MovementAccess::Land,5,5,true)==stocked ? field : nullptr;
         });
-        CHECK(map.materialAvailableSlot(0,CHERRY,0,5,5,true)==stocked);
+        CHECK(map.routing().materialAvailableSlot(0,CHERRY,MovementAccess::Land,5,5,true)==stocked);
     }
 }
 TEST_CASE("upgrading cancelling and completing preserve shared stock and gate")
@@ -417,9 +513,9 @@ TEST_CASE("upgrading cancelling and completing preserve shared stock and gate")
 		CHECK(market->type->level==1);
 		CHECK(world.team->teamMaterials[CHERRY]==100);
 		GameGUI resumed;
-		REQUIRE(load(resumed.game,save(g,text),text));
+		REQUIRE(glob2test::loadGameBytes(resumed.game,save(g,text),text));
 		CHECK(resumed.game.gameHeader.hasExperiment(ExperimentId::MarketsV2));
-		CHECK(simulation(resumed.game)==simulation(g));
+		CHECK(simulationComponents(resumed.game)==simulationComponents(g));
 		market->cancelConstruction(1);
 		CHECK(market->typeNum==50);
 		CHECK(market->material(CHERRY)==100);

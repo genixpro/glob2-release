@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise real terrain edits and resource clearing without a window.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "ProfileNeeds.h"
+#include "HeadlessGame.h"
+#include "Continuation.h"
 #include "Version.h"
 #include "FileFormatVersions.h"
 #include "Building.h"
@@ -9,6 +12,8 @@
 #include "GlobalContainer.h"
 #include "IntBuildingType.h"
 #include "Map.h"
+#include "gradient/MapRouting.h"
+#include "GenerationWorld.h"
 #include "generator/shared/ResourceSemantics.h"
 #include "generator/shared/BalancedStarts.h"
 #include "generator/shared/Pipeline.h"
@@ -23,6 +28,7 @@
 #include <fstream>
 #include <sstream>
 #include <locale>
+#include <bit>
 #include "online/Sha256.h"
 #include <vector>
 
@@ -39,9 +45,9 @@ CHECK_MAP_ID_ARGUMENT(HarvestArgument,MaterialId,ResourceId,map.takeHarvest(0,0,
 CHECK_MAP_ID_ARGUMENT(MaterialHabitatArgument,MaterialId,ResourceId,map.terrainSupportsMaterialAt(0,0,id));
 CHECK_MAP_ID_ARGUMENT(MaterialGrowthArgument,MaterialId,ResourceId,map.materialGrowthRateAt(0,id));
 CHECK_MAP_ID_ARGUMENT(MaterialExpansionArgument,MaterialId,ResourceId,map.materialExpansionRateAt(0,id));
-CHECK_MAP_ID_ARGUMENT(MaterialGradientArgument,MaterialId,ResourceId,map.getMaterialGradient(0,id,0));
-CHECK_MAP_ID_ARGUMENT(MaterialAvailabilityArgument,MaterialId,ResourceId,map.materialAvailable(0,id,0,0,0));
-CHECK_MAP_ID_ARGUMENT(MaterialDistanceArgument,MaterialId,ResourceId,map.materialAvailable(0,id,0,0,0,static_cast<int*>(nullptr)));
+CHECK_MAP_ID_ARGUMENT(MaterialGradientArgument,MaterialId,ResourceId,map.routing().getMaterialGradient(0,id,MovementAccess::Land));
+CHECK_MAP_ID_ARGUMENT(MaterialAvailabilityArgument,MaterialId,ResourceId,map.routing().materialAvailable(0,id,MovementAccess::Land,0,0));
+CHECK_MAP_ID_ARGUMENT(MaterialDistanceArgument,MaterialId,ResourceId,map.routing().materialAvailable(0,id,MovementAccess::Land,0,0,static_cast<int*>(nullptr)));
 CHECK_MAP_ID_ARGUMENT(ResourceIncrementArgument,ResourceId,MaterialId,map.incResource(0,0,id,0));
 CHECK_MAP_ID_ARGUMENT(ResourceSetArgument,ResourceId,MaterialId,map.setResource(0,0,id,0));
 CHECK_MAP_ID_ARGUMENT(ResourcePropertiesArgument,ResourceId,MaterialId,map.resourceProperties(id));
@@ -363,26 +369,15 @@ TEST_CASE("resource identities above byte range preserve compound stocks through
     map.setMaterialAmount(at,MaterialId::Food,0);
     map.setMaterialAmount(at,MaterialId::Wood,4);
     CHECK(map.getResource(at).amount==4);
-    auto* bytes=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(bytes);
-    original.game.save(&output,false,"Compound resource continuation");
-    output.flush();
-    auto* copy=new GAGCore::MemoryStreamBackend(*bytes);
-    copy->seekFromStart(0);
-    GAGCore::BinaryInputStream input(copy);
-    glob2test::HeadlessGame restored({.loadDefaultRace=true,.header=true});
-    REQUIRE(restored.game.load(&input));
-    auto& loaded=restored.game.map;
-    CHECK(loaded.resourceRegistry().digest()==map.resourceRegistry().digest());
-    CHECK(loaded.getResource(at).type==resourceIndex(id));
-    CHECK(loaded.materialStocksAt(at)==map.materialStocksAt(at));
-    CHECK(loaded.checkSum(true)==map.checkSum(true));
-    for (int tick=0;tick<32;++tick)
-    {
-        { auto random=original.game.bindRandom(); original.game.step(0); }
-        { auto random=restored.game.bindRandom(); restored.game.step(0); }
-        CHECK(original.game.checkSum(nullptr,nullptr,nullptr,true)==restored.game.checkSum(nullptr,nullptr,nullptr,true));
-    }
+    const auto result=glob2test::expectContinuation(original.game,{.ticks=32,.name="Compound resource continuation",
+        .afterLoad=[&](Game&,Game& restored) {
+            auto& loaded=restored.map;
+            CHECK(loaded.resourceRegistry().digest()==map.resourceRegistry().digest());
+            CHECK(loaded.getResource(at).type==resourceIndex(id));
+            CHECK(loaded.materialStocksAt(at)==map.materialStocksAt(at));
+            CHECK(loaded.checkSum(true)==map.checkSum(true));
+        }});
+    CHECK(result.matched);
 }
 
 TEST_CASE("landscape scavenge sites start full, deplete per material and vanish when empty")
@@ -456,24 +451,13 @@ TEST_CASE("a half-harvested scavenge site survives save and continues identicall
     REQUIRE(map.takeHarvest(11,12,1,0,MaterialId::Wood,1));
     CHECK(map.materialAmountAt(at,MaterialId::Wood)==3);
     CHECK(map.materialAmountAt(at,MaterialId::Metal)==2);
-    auto* bytes=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(bytes);
-    original.game.save(&output,false,"Landscape scavenge continuation");
-    output.flush();
-    auto* copy=new GAGCore::MemoryStreamBackend(*bytes);
-    copy->seekFromStart(0);
-    GAGCore::BinaryInputStream input(copy);
-    glob2test::HeadlessGame restored({.loadDefaultRace=true,.header=true});
-    REQUIRE(restored.game.load(&input));
-    auto& loaded=restored.game.map;
-    CHECK(loaded.getResource(at).type==resourceIndex(*ruins));
-    CHECK(loaded.materialStocksAt(at)==map.materialStocksAt(at));
-    for (int tick=0;tick<32;++tick)
-    {
-        { auto random=original.game.bindRandom(); original.game.step(0); }
-        { auto random=restored.game.bindRandom(); restored.game.step(0); }
-        CHECK(original.game.checkSum(nullptr,nullptr,nullptr,true)==restored.game.checkSum(nullptr,nullptr,nullptr,true));
-    }
+    const auto result=glob2test::expectContinuation(original.game,{.ticks=32,.name="Landscape scavenge continuation",
+        .afterLoad=[&](Game&,Game& restored) {
+            CHECK(restored.map.getResource(at).type==resourceIndex(*ruins));
+            CHECK(restored.map.materialStocksAt(at)==map.materialStocksAt(at));
+        }});
+    CHECK(result.matched);
+    auto& loaded=result.loaded->game.map;
     REQUIRE(loaded.takeHarvest(11,12,1,0,MaterialId::Metal,1));
     CHECK(loaded.materialAmountAt(at,MaterialId::Metal)==1);
 }
@@ -610,15 +594,15 @@ TEST_CASE("shared starting supply checks accept material sources above resource 
     }
     GenerationRequest request; request.nbTeams=2; request.nbWorkers=4;
     GenerationContext builtinContext(request), customContext(request);
-    REQUIRE(MapGeneration::chooseBalancedStarts(game,builtinContext,64));
-    for(int y : {8,24}) for(int x : {8,24})
+	REQUIRE(MapGeneration::chooseBalancedStarts(GenerationWorld(game).ref(), builtinContext, 64));
+	for(int y : {8,24}) for(int x : {8,24})
     {
         map.replaceResource(x,y,Resource{}); map.replaceResource(x+2,y,Resource{});
         REQUIRE(map.incResource(x,y,foodId,0));
         REQUIRE(map.incResource(x+2,y,woodId,0));
     }
-    REQUIRE(MapGeneration::chooseBalancedStarts(game,customContext,64));
-    CHECK(customContext.bootX==builtinContext.bootX);
+	REQUIRE(MapGeneration::chooseBalancedStarts(GenerationWorld(game).ref(), customContext, 64));
+	CHECK(customContext.bootX==builtinContext.bootX);
     CHECK(customContext.bootY==builtinContext.bootY);
     fixture.addUnit(WORKER,7,8);
     const std::vector<MapGeneration::MaterialAccessRule> rules={{MaterialId::Food,4,"food"},{MaterialId::Wood,4,"wood"}};
@@ -653,8 +637,9 @@ TEST_CASE("starting crop guarantees and adjacent supply use live material yields
     GenerationRequest request; request.nbTeams=1;
     GenerationContext context(request); context.bootX[0]=8; context.bootY[0]=8;
     const auto before=map.materialStocksAt(at);
-    MapGeneration::guaranteeStartingResources(fixture.game,context,12,12,0);
-    CHECK(context.namedStreams().empty());
+	MapGeneration::guaranteeStartingResources(GenerationWorld(fixture.game).ref(), context, 12, 12,
+											  0);
+	CHECK(context.namedStreams().empty());
     CHECK(map.materialStocksAt(at)==before);
     // A retained deposit and another positive yield must not disguise exhausted food.
     map.setMaterialAmount(at,MaterialId::Food,0);
@@ -662,8 +647,9 @@ TEST_CASE("starting crop guarantees and adjacent supply use live material yields
     CHECK_FALSE(crops.food); CHECK(crops.wood);
     CHECK(crops.missing()=="cannot walk to food.");
     CHECK_FALSE(map.hasMaterialSource(MaterialId::Food));
-    MapGeneration::guaranteeStartingResources(fixture.game,context,12,12,0);
-    CHECK(map.hasMaterialSource(MaterialId::Food));
+	MapGeneration::guaranteeStartingResources(GenerationWorld(fixture.game).ref(), context, 12, 12,
+											  0);
+	CHECK(map.hasMaterialSource(MaterialId::Food));
     CHECK(map.getResource(at).type==resourceIndex(id));
     CHECK(map.materialAmountAt(at,MaterialId::Wood)==before[materialIndex(MaterialId::Wood)]);
 }
@@ -687,8 +673,9 @@ TEST_CASE("bounded starter crop replacement uses surplus materials and respects 
         GenerationContext context(request); context.bootX[0]=8; context.bootY[0]=8;
         std::vector<unsigned char> allowed(size_t(map.getW())*map.getH(),0);
         allowed[map.coordToIndex(9,8)]=1;
-        MapGeneration::guaranteeStartingResources(fixture.game,context,12,12,0,nullptr,&allowed);
-        CHECK(map.hasMaterialSource(MaterialId::Food)==clearable);
+		MapGeneration::guaranteeStartingResources(GenerationWorld(fixture.game).ref(), context, 12,
+												  12, 0, nullptr, &allowed);
+		CHECK(map.hasMaterialSource(MaterialId::Food)==clearable);
         CHECK((map.getResource(9,8).type==resourceIndex(id))==!clearable);
     }
 }
@@ -750,12 +737,14 @@ TEST_CASE("start diagnostics distinguish configured renewal from spreading press
     custom["yields"]={{"food",{{"capacity",4},{"initial",4},{"growthRate",0},{"consumption","one"}}},
                       {"wood",{{"capacity",4},{"initial",2},{"growthRate",0},{"consumption","one"}}}};
     const auto install=[&] { map.installResourceDefinitions(Json{{"schemaVersion",1},{"resources",Json::array({custom})}}.dump()); };
-    const auto diagnose=[&] {
-        auto report=MapGeneration::diagnoseStarts(fixture.game,1);
-        REQUIRE(report.measured); REQUIRE(report.colonies.size()==1);
+	const auto diagnose = [&]
+	{
+		auto report = MapGeneration::diagnoseStarts(GenerationWorld(fixture.game).ref(), 1);
+		REQUIRE(report.measured);
+		REQUIRE(report.colonies.size() == 1);
         return report.colonies.front();
-    };
-    install();
+	};
+	install();
     const auto id=*map.resourceRegistry().find("test:diagnostic-supply");
     map.setResource(10,8,id,1);
     auto metrics=diagnose();
@@ -1035,7 +1024,7 @@ TEST_CASE("farm harvest uses the touched material policy before pooling neighbor
 // previously cached default registry cannot make this regression pass.
 TEST_CASE("embedded resource save starts with an invalid installed catalog" * doctest::test_suite("RuntimeResources"))
 {
-    const auto frozen = ResourceRegistry::loadFile((glob2test::sourceRoot() / "data/resources/registry.json").string());
+    const auto frozen = ResourceRegistry::loadFile((glob2test::contentRoot() / "data/resources/registry.json").string());
     const auto directory = glob2test::profileDir() / "data/resources";
     std::filesystem::create_directories(directory);
     const auto path = directory / "registry.json";
@@ -1150,7 +1139,7 @@ TEST_CASE("renamed deposits and sprite variants preserve stochastic stock trajec
 }
 }
 
-TEST_CASE("frozen seeded resource compositions preserve invariants and exact simulation continuation [golden]" * doctest::test_suite("RuntimeResources"))
+TEST_CASE("frozen seeded resource compositions preserve invariants and exact simulation continuation [sim-trace]" * doctest::test_suite("RuntimeResources"))
 {
     glob2test::HeadlessGlobals globals;
     using Json=nlohmann::json;
@@ -1158,12 +1147,13 @@ TEST_CASE("frozen seeded resource compositions preserve invariants and exact sim
     std::ostringstream trace;
     trace.imbue(std::locale::classic());
     const auto record=[&](Uint32 seed,Game& game) {
+        const auto checksum=game.checkSum(nullptr,nullptr,nullptr,true);
         std::ostringstream randomState;
         randomState.imbue(std::locale::classic());
         randomState << game.syncRandom;
+        const auto randomDigest=Online::Sha256::hex(randomState.str());
         trace << seed << ' ' << game.stepCounter << ' '
-              << game.checkSum(nullptr,nullptr,nullptr,true) << ' '
-              << Online::Sha256::hex(randomState.str()) << '\n';
+              << checksum << ' ' << randomDigest << '\n';
     };
     for (const auto seed:seeds)
     {
@@ -1318,31 +1308,23 @@ TEST_CASE("frozen seeded resource compositions preserve invariants and exact sim
         };
         record(seed,original.game);
         for(unsigned tick=0;tick<17;++tick) { advance(original.game,tick); record(seed,original.game); }
-        auto* memory=new GAGCore::MemoryStreamBackend;
-        GAGCore::BinaryOutputStream output(memory);
-        original.game.save(&output,false,"Frozen generated resource composition"); output.flush();
-        auto* copied=new GAGCore::MemoryStreamBackend(*memory); copied->seekFromStart(0);
-        GAGCore::BinaryInputStream input(copied);
-        glob2test::HeadlessGame restored(options);
-        REQUIRE(restored.game.load(&input));
-        CHECK(restored.game.map.resourceRegistry().digest()==map.resourceRegistry().digest());
-        for(unsigned tick=17;tick<49;++tick)
-        {
-            CAPTURE(tick);
-            advance(original.game,tick); advance(restored.game,tick);
-            REQUIRE(original.game.checkSum(nullptr,nullptr,nullptr,true)==restored.game.checkSum(nullptr,nullptr,nullptr,true));
-            CHECK(original.game.syncRandom==restored.game.syncRandom);
-            record(seed,original.game);
-        }
+        // Both games replay the same scripted harvests on continuation ticks 17..48.
+        unsigned originalTick=17,loadedTick=17;
+        const auto result=glob2test::expectContinuation(original.game,{.ticks=32,
+            .step=[&](Game& game) { advance(game,&game==&original.game ? originalTick++ : loadedTick++); return std::vector<std::string>{}; },
+            .name="Frozen generated resource composition",
+            .afterLoad=[&](Game&,Game& loaded) { CHECK(loaded.map.resourceRegistry().digest()==map.resourceRegistry().digest()); },
+            .each=[&](Game& reference,Game&,int tick) { if(tick>=0) record(seed,reference); }});
+        REQUIRE(result.matched);
     }
     glob2test::writeFile(glob2test::artifactDir()/"seeded-compositions.trace",trace.str());
-    glob2test::expectGolden("resources/seeded-compositions-units.trace",trace.str());
+    glob2test::recordSimTrace("resources/seeded-compositions-units.trace",trace.str());
 }
 
 TEST_CASE("frozen resource saves ignore reordered modified installed defaults in a fresh process" * doctest::test_suite("RuntimeResources"))
 {
     using Json=nlohmann::json;
-    auto installed=Json::parse(ResourceRegistry::loadFile((glob2test::sourceRoot()/"data/resources/registry.json").string())->serialize());
+    auto installed=Json::parse(ResourceRegistry::loadFile((glob2test::contentRoot()/"data/resources/registry.json").string())->serialize());
     std::reverse(installed["resources"].begin(),installed["resources"].end());
     for(auto& resource:installed["resources"])
         if(resource["key"]=="trees") resource["properties"]["growthRate"]=0;
@@ -1389,8 +1371,8 @@ TEST_CASE("custom ground and air obstruction independently govern routes across 
             {
                 if(x==8 && y==8) return true;
                 int dx=0,dy=0;
-                const bool found=air ? map.pathfindAirPointToPoint(x,y,8,8,&dx,&dy)
-                    : map.pathfindPointToPoint(x,y,8,8,&dx,&dy,0,1,32);
+                const bool found=air ? map.routing().pathfindAirPointToPoint(x,y,8,8,&dx,&dy)
+                    : map.routing().pathfindPointToPoint(x,y,8,8,&dx,&dy,MovementAccess::Land,1,32);
                 if(!found) return false;
                 REQUIRE((dx || dy));
                 const int nx=(x+dx+map.getW())%map.getW(),ny=(y+dy+map.getH())%map.getH();
@@ -1409,7 +1391,7 @@ TEST_CASE("custom ground and air obstruction independently govern routes across 
 }
 
 
-TEST_CASE("released terrain-seed format 138 retains legacy resource and material continuation" * doctest::test_suite("RuntimeResources"))
+TEST_CASE("released terrain-seed format 138 retains legacy resource and material continuation" * glob2test::needs({"ai:cortex"}) * doctest::test_suite("RuntimeResources"))
 {
     glob2test::HeadlessGlobals globals;
     const auto manifest = nlohmann::json::parse(glob2test::readFile(
@@ -1488,7 +1470,7 @@ TEST_CASE("released terrain-seed format 138 retains legacy resource and material
     CHECK(restored.game.checkSum(nullptr,nullptr,nullptr,true) == legacy.game.checkSum(nullptr,nullptr,nullptr,true));
 }
 
-TEST_CASE("released observation format 139 imports legacy stocks and preserves current save continuation" * doctest::test_suite("RuntimeResources"))
+TEST_CASE("released observation format 139 imports legacy stocks and preserves current save continuation" * glob2test::needs({"ai:cortex"}) * doctest::test_suite("RuntimeResources"))
 {
     glob2test::HeadlessGlobals globals;
     const auto bytes=glob2test::readFile(glob2test::inflated("resources/observation139.game.gz"));
@@ -1497,7 +1479,7 @@ TEST_CASE("released observation format 139 imports legacy stocks and preserves c
     REQUIRE(Online::Sha256::hex(bytes)==manifest["decompressed_sha256"].get<std::string>());
     GAGCore::BinaryInputStream legacyInput(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));
     legacyInput.seekFromStart(0);
-    GameGUI original(false),restored(false);
+    GameGUI original(false);
     REQUIRE(original.game.load(&legacyInput));
     REQUIRE(original.game.mapHeader.getVersionMinor()==139);
     REQUIRE(original.game.stepCounter==8193);
@@ -1513,21 +1495,10 @@ TEST_CASE("released observation format 139 imports legacy stocks and preserves c
                     CHECK(building->material(material)==0);
     }
     REQUIRE(pendingHarvests>0);
-    auto* memory=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(memory);
-    original.game.save(&output,false,original.game.mapHeader.getMapName()); output.flush();
-    auto* copy=new GAGCore::MemoryStreamBackend(*memory); copy->seekFromStart(0);
-    GAGCore::BinaryInputStream currentInput(copy);
-    REQUIRE(restored.game.load(&currentInput));
-    REQUIRE(restored.game.mapHeader.getVersionMinor()==VERSION_MINOR);
-    // File-format versions contribute to checksums but are not simulation state.
-    // Verify the remaining header metadata before normalizing only that boundary.
-    REQUIRE(original.game.mapHeader==restored.game.mapHeader);
-    original.game.mapHeader=restored.game.mapHeader;
-    for(unsigned tick=0;tick<32;++tick)
-    {
-        CHECK(original.game.checkSum(nullptr,nullptr,nullptr,true)==restored.game.checkSum(nullptr,nullptr,nullptr,true));
-        original.game.step(0); restored.game.step(0);
-    }
-    CHECK(original.game.checkSum(nullptr,nullptr,nullptr,true)==restored.game.checkSum(nullptr,nullptr,nullptr,true));
+    const auto result=glob2test::expectContinuation(original.game,{.ticks=32,.name=original.game.mapHeader.getMapName(),
+        .afterLoad=[](Game& original,Game& restored) {
+            REQUIRE(restored.mapHeader.getVersionMinor()==VERSION_MINOR);
+            REQUIRE(original.mapHeader==restored.mapHeader);
+        }});
+    CHECK(result.matched);
 }

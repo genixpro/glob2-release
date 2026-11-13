@@ -2,9 +2,11 @@
 #pragma once
 #include <SDLGraphicContext.h>
 #include "terrain/TerrainCompositor.h"
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <tuple>
 #include <vector>
 
@@ -18,6 +20,12 @@ class SoftwareTerrainCache
 {
   public:
 	static constexpr int ChunkTiles = 16, ChunkPixels = ChunkTiles * 32;
+	// Vertices beyond a page's corners that its cells read: contextual borders
+	// need one, shore calm searches ShoreCalmSearch toward land and whole-stone
+	// path edges StoneSearch.
+	static constexpr int SourceHalo =
+		std::max({1, TerrainVisual::ShoreCalmSearch, TerrainVisual::StoneSearch});
+	static constexpr int SourceSpan = ChunkTiles + 1 + 2 * SourceHalo;
 	static constexpr std::size_t Budget = 32u * 1024u * 1024u, GPUBudget = 128u * 1024u * 1024u;
 	// Preserve the existing density/GPU allowance; keep inactive zoom pixels
 	// in an additional bounded CPU reserve rather than recomposing them.
@@ -58,8 +66,9 @@ class SoftwareTerrainCache
 	{
 		int x = 0, y = 0, scale = 1, downsample = 1;
 		Uint32 seed = 0; // Map terrain seed the page was composed with.
-		// Corner vertices and one-vertex halo used by contextual borders.
-		std::array<Uint32, (ChunkTiles + 3) * (ChunkTiles + 3)> sources{};
+		Uint64 recipeTerrainRevision = 0;
+		// Corner vertices and the SourceHalo used by contextual borders and shore calm.
+		std::array<Uint32, SourceSpan * SourceSpan> sources{};
 		std::array<Tile, ChunkTiles * ChunkTiles> tiles{};
 		// Empty cells expose only the separately drawn ocean and submit no software blit.
 		std::array<bool, ChunkTiles * ChunkTiles> opaque{}, empty{};
@@ -72,7 +81,9 @@ class SoftwareTerrainCache
 		bool valid = false;
 		// Device-composed pages have no matching pixels in image/parked.
 		bool cpuComposed = true;
-		// Only materials present in discovered recipes invalidate this page.
+		// Texture changes and shoreline animation invalidate independently.
+		unsigned surfTime = 0;
+		bool hasShoreline = false;
 		std::vector<std::pair<TerrainVisual::MaterialId, std::uint64_t>> materialRevisions;
 		std::uint64_t used = 0;
 		std::uint64_t textureUsed = 0;
@@ -91,7 +102,8 @@ class SoftwareTerrainCache
 
   private:
     bool tryBuildCpuPage(Chunk&, const std::array<Tile, ChunkTiles*ChunkTiles>&,
-        TerrainVisual::Compositor&, SDL_Surface*, bool wasValid, std::size_t budget);
+        TerrainVisual::Compositor&, SDL_Surface*, bool wasValid, std::size_t budget,
+        bool nativeAvailable = false);
 	bool prepareAtResolution(const SceneMap &, GAGCore::Sprite &, int left, int top, int right,
 							 int bottom, int vx, int vy, Uint32 visibleTeams, bool wholeMap,
 							 int animationTime, int preferredResolution, bool tiledCapture = false,
@@ -139,6 +151,8 @@ class SoftwareTerrainCache
 							 int animationTime = 0, FallbackMode mode = FallbackMode::StreamPages,
 							 bool tiledCapture = false);
 	bool enabled = true;
+	// Benchmark override for comparing stable page density with adaptive sampling.
+	int benchmarkDownsample = 0;
 	bool prepare(const SceneMap &, GAGCore::Sprite &, int left, int top, int right, int bottom,
 				 int vx, int vy, Uint32 visibleTeams, bool wholeMap, int animationTime = 0,
 				 bool tiledCapture = false);

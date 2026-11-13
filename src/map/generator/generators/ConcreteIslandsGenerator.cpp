@@ -3,12 +3,11 @@
 // Copyright (C) 2008 Bradley Arsenault
 #include "ConcreteIslandsGenerator.h"
 #include "Distances.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "GeneratorDefinition.h"
 #include "GlobalContainer.h"
 #include "HeightMap.h"
-#include "Map.h"
 #include "Pipeline.h"
 #include "Regions.h"
 #include "Resources.h"
@@ -56,7 +55,7 @@ using namespace MapGeneration;
 // Colonies get equal-weight islands but not equal shapes; fairness is statistical (the lobby keeps
 // the best-scoring seed), with openStartsBuriedByResources as the backstop at any amount and
 // validateWorld rerolling a seed that still leaves a colony below the starting floor.
-static bool generate(Game &game, GenerationContext &context)
+static bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "layout";
 	const ConcreteIslandsOptions options(context.request);
@@ -170,7 +169,7 @@ static bool generate(Game &game, GenerationContext &context)
 	// At the default amount the cut-off is 10: only the boundary tiles of a width-5 channel (23
 	// before noise) reach it, and only where the noise dips by 13 or more, so algae is a broken
 	// thread down the channel's middle. Wider channels dig deeper and grow more of it. Algae needs
-	// sand within reach to regrow, which a channel a few tiles wide always has.
+	// a coast within reach to regrow, which a channel a few tiles wide always has.
 	const int algaeDepth = int(scaledCount(10, options.algae));
 	for (int x = 0; x < game.map.getW() && options.algae > 0; ++x)
 	{
@@ -260,7 +259,7 @@ static bool generate(Game &game, GenerationContext &context)
 	// Initialize final team info
 	for (int i = 0; i < context.request.nbTeams; ++i)
 	{
-		game.teams[i]->createLists();
+		game.finishTeam(i);
 	}
 	return true;
 }
@@ -269,7 +268,7 @@ static bool generate(Game &game, GenerationContext &context)
 // room to build on it. Wood only has to be reachable at all: on a crowded archipelago the nearest
 // stand can be a long walk round the channels (see the review of 2026-09-16), which is a question
 // about this landscape's economy rather than a world the service should throw away.
-static std::string validateWorld(const Game &game, const GenerationContext &context)
+static std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	return startingFloorFailure(game.map, context.request.nbTeams, 24, kReachableAnywhere);
 }

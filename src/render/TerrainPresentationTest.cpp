@@ -2,7 +2,12 @@
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
 #endif
-#include "EngineFixtures.h"
+#include "TerrainGroupTable.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "TerrainBuiltins.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include <Environment.h>
 #include "ScopedEnvironment.h"
 #include <optional>
@@ -11,12 +16,15 @@
 #include "TerrainRegistry.h"
 #include "TerrainCornerPresentation.h"
 #include "terrain/TerrainCompositor.h"
+#include "terrain/DirectTerrain.h"
 #include "terrain/TerrainCatalogIO.h"
 #include "scene/SceneMap.h"
 #include "SoftwareTerrainCache.h"
 #include "OverviewTerrainCache.h"
 #include <Toolkit.h>
 #include "MapRenderState.h"
+#include "ResourceRowCache.h"
+#include "ResourceSprites.h"
 #include "MapThumbnail.h"
 #include "MapImage.h"
 #include "GenerationRequest.h"
@@ -25,6 +33,7 @@
 #include "StreamBackend.h"
 #include <SDL3_image/SDL_image.h>
 #include <RenderBackend.h>
+#include <RenderBatch.h>
 #include <RenderDevice.h>
 #include <RendererSelection.h>
 #ifdef HAVE_OPENGL
@@ -35,6 +44,9 @@
 #endif
 #endif
 #include <algorithm>
+#include <set>
+#include <cstdio>
+#include <filesystem>
 #include <cstring>
 #include <cmath>
 #include <string_view>
@@ -42,6 +54,41 @@
 
 namespace
 {
+// Four panels: cliffs on the left of each, against thicket, hedge, rock
+// spires and basalt columns, along a stepped border with a cliff spur and a
+// pocket of the neighbour, all inside a grass margin.
+template <class Map>
+void paintCliffPanels(Map &map)
+{
+	const TerrainType neighbours[4] = {THICKET, HEDGE, RIDGE_ROCK, OUTCROP};
+	for (int panel = 0; panel < 4; ++panel)
+	{
+		const int ox = (panel & 1) * 16, oy = (panel >> 1) * 16;
+		for (int y = 2; y <= 13; ++y)
+			for (int x = 1; x <= 14; ++x)
+			{
+				static constexpr int border[12] = {6, 6, 7, 8, 8, 7, 6, 5, 5, 6, 7, 7};
+				bool cliff = x < border[y - 2];
+				if (y >= 5 && y <= 6 && x >= 9 && x <= 11) cliff = true;  // spur
+				if (y >= 10 && y <= 11 && x >= 2 && x <= 3) cliff = false; // pocket
+				map.setVertexTerrain(ox + x, oy + y, cliff ? CLIFFS : neighbours[panel]);
+			}
+	}
+}
+// The one raised frame a cell draws, or -1; a cell drawing several slots fails.
+int onlyDecorFrame(const TerrainVisual::Compositor &compositor, const SceneMap &map, int x, int y)
+{
+	int frame = -1, drawn = 0;
+	for (const auto &layer : compositor.decorLayers(map, x, y))
+		if (layer.frame >= 0)
+		{
+			frame = layer.frame;
+			++drawn;
+			CHECK(layer.sprite);
+		}
+	CHECK(drawn <= 1);
+	return frame;
+}
 // Keep the real accelerated device, sampling, upload path and presentation
 // surface while selecting the existing CPU compositor as the reference.
 class CPUCompositionDevice : public GAGCore::RenderDevice
@@ -261,6 +308,10 @@ std::filesystem::path highResolutionFixture()
 	frames << "GLOB2_HIGHRES 1\n";
 	for (int variant = 0; variant < 16; ++variant)
 		frames << "terrain" << variant << " 32 32 4 grass.webp -\n";
+	// Catalogue grass, sand and ice draw from their own 8x8-block banks.
+	for (const char *bank : {"terrain-grass", "terrain-sand", "terrain-ice"})
+		for (int variant = 0; variant < 256; ++variant)
+			frames << bank << variant << " 32 32 4 grass.webp -\n";
 	return directory;
 }
 
@@ -307,8 +358,20 @@ void layeredCache(bool gpu, bool hd = false)
 	bool memoryRecorded = false;
 	const auto compare = [&]
 	{
+		// Each path declares its visible HD window on a draw; stream it, then
+		// draw once more so both have adopted the published frames before the
+		// measured draws (the game path adopts them a frame later).
+		const auto drawBoth = [&]
+		{
+			clear();
+			MapDrawer::drawMapTerrain(0, 0, 19, 14, 29, 30, 0, Game::DRAW_WHOLE_MAP, scene);
+			cache.prepare(scene, *globals->terrain, 0, 0, 19, 14, 29, 30, fixture.team->me, true);
+		};
+		drawBoth();
+		GAGCore::Sprite::finishHighResolution();
+		drawBoth();
 		clear();
-		game.drawMapTerrain(0, 0, 19, 14, 29, 30, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapTerrain(0, 0, 19, 14, 29, 30, 0, Game::DRAW_WHOLE_MAP, scene);
 		const auto expected = terrainPixels(gpu);
 		clear();
 		const auto gpuBefore = GAGCore::DrawableSurface::allocatedTextureBytes();
@@ -397,6 +460,25 @@ void layeredCache(bool gpu, bool hd = false)
 } // namespace
 TEST_SUITE("TerrainPresentation")
 {
+	TEST_CASE("resource artwork requests are lazy and captures can wait for them [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		const auto registry = ResourceRegistry::builtins();
+		const auto gold = registry->find("gold-ore");
+		const auto iron = registry->find("iron-ore");
+		REQUIRE(gold);
+		REQUIRE(iron);
+		const auto &goldPath = registry->presentation(*gold).sprite;
+		const auto &ironPath = registry->presentation(*iron).sprite;
+		auto &artwork = ResourceSprites::resolve(registry, MapAssetBundle::empty());
+		REQUIRE_FALSE(GAGCore::Toolkit::findSprite(goldPath));
+		CHECK_FALSE(artwork.sprite(*gold));
+		auto *ready = artwork.sprite(*gold, /*waitForLoad=*/true);
+		REQUIRE(ready);
+		CHECK(artwork.sprite(*gold) == ready);
+		CHECK_FALSE(GAGCore::Toolkit::findSprite(ironPath));
+	}
+
     GLOB2_TEST_CASE("GPU terrain pages match CPU composition through edits wrapping recovery and live switches", "[display][isolated][artifacts][writes-preferences]")
     {
         using namespace GAGCore;
@@ -410,6 +492,8 @@ TEST_SUITE("TerrainPresentation")
         glob2test::HeadlessGame fixture({.wDec=5,.hDec=5,.discovered=true});auto &map=fixture.game.map;
         for(int y=0;y<32;++y)for(int x=0;x<32;++x)
             map.setVertexTerrain(x,y,((x+y)%5==0)?WATER:((x*3+y)%7==0)?SAND:GRASS);
+        // A dark water pool: its waves and its wash against the shore, on both paths.
+        for(int y=10;y<14;++y)for(int x=20;x<24;++x)map.setVertexTerrain(x,y,DARK_WATER);
         SceneMap scene;glob2test::observeMap(map,scene);
         SoftwareTerrainCache retained;
         unsigned comparisons=0;
@@ -604,7 +688,7 @@ TEST_SUITE("TerrainPresentation")
 		render.detail.terrainOverview = .5f;
 		map.setResourceByIndex(9, 9, WHEAT, 1);
 		glob2test::observeMap(map,scene);
-		Game::drawMapOverview(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, render);
+		MapDrawer::drawMapOverview(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, render);
 		REQUIRE(render.overview->getW() == overview.getW());
 		REQUIRE(render.overview->getH() == overview.getH());
 		const auto& tint = map.resourceRegistry().presentation(static_cast<ResourceId>(WHEAT)).minimap;
@@ -632,14 +716,14 @@ TEST_SUITE("TerrainPresentation")
 		const auto evidence = glob2test::artifactDir() / "overview-alignment";
 		std::filesystem::create_directories(evidence);
 		CHECK(IMG_SavePNG(enlarged.getSDLSurface(), (evidence / "overview.png").string().c_str()));
-		Game::drawMapTerrain(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
-		Game::drawMapResources(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapTerrain(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
 		GAGCore::Sprite::flushBatches(globals->gfx);
 		if (globals->gfx->renderer)
 			globals->gfx->renderer->flush();
 		CHECK(IMG_SavePNG(globals->gfx->getSDLSurface(),
 						  (evidence / "detailed.png").string().c_str()));
-		Game::drawMapOverview(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, render);
+		MapDrawer::drawMapOverview(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, render);
 		GAGCore::Sprite::flushBatches(globals->gfx);
 		if (globals->gfx->renderer)
 			globals->gfx->renderer->flush();
@@ -777,8 +861,11 @@ TEST_SUITE("TerrainPresentation")
 	{
 		layeredCache(true);
 	}
+	// Every version-4 border is drawn with the smooth field (#1466), so
+	// composing these HD pages takes two to three minutes in optimized builds:
+	// over the display timeout in the -O0 coverage build.
 	TEST_CASE("HD material pages and fractional zoom preserve cached pixels with missing optional "
-			  "atlas [display][artifacts]")
+			  "atlas [display][artifacts][slow]")
 	{
 		layeredCache(true, true);
 	}
@@ -834,7 +921,7 @@ TEST_SUITE("TerrainPresentation")
 					const auto expected = terrainPixels(gpu);
 					const auto gpuBefore = GAGCore::DrawableSurface::allocatedTextureBytes();
 					begin();
-					fixture.game.drawMapTerrain(0, 0, 7, 7, vx, vy, 0, Game::DRAW_WHOLE_MAP, scene);
+					MapDrawer::drawMapTerrain(0, 0, 7, 7, vx, vy, 0, Game::DRAW_WHOLE_MAP, scene);
 					globals->gfx->endMapTransform();
 					CHECK(terrainPixels(gpu) == expected);
 					CHECK(GAGCore::DrawableSurface::allocatedTextureBytes() == gpuBefore);
@@ -926,7 +1013,7 @@ TEST_SUITE("TerrainPresentation")
 		OverviewTerrainCache cache;
 		const auto check = [&](int vx, int vy, bool wholeMap = true)
 		{
-			cache.copy(scene, -3, -2, 36, 21, vx, vy, fixture.team->me, wholeMap, actual.getSDLSurface());
+			cache.update(scene, -3, -2, 36, 21, vx, vy, fixture.team->me, wholeMap, actual);
 			for (int y = -2; y <= 21; ++y)
 				for (int x = -3; x <= 36; ++x)
 					compositor.composeOverview(compositor.describe(scene, x + vx, y + vy),
@@ -936,20 +1023,29 @@ TEST_SUITE("TerrainPresentation")
 		};
 		check(29, 30);
 		const auto cold = cache.composedCells();
+		const auto originalRevision = actual.contentRevision();
 		check(29, 30);
 		check(-3, -2);
 		CHECK(cache.composedCells() == cold);
+		CHECK(actual.contentRevision() == originalRevision);
+		// Resizing back to the same extent replaces the pixel storage.
+		actual.setRes(8 * samples, 8 * samples);
+		actual.setRes(40 * samples, 24 * samples);
+		check(29, 30);
+		CHECK(cache.composedCells() == cold);
 		map.setVertexTerrain(31, 0, GRASS); // Halo edit across both page and map seams.
 		glob2test::observeMap(map, scene);
+		const auto resizedRevision = actual.contentRevision();
 		check(29, 30);
 		CHECK(cache.composedCells() > cold);
+		CHECK(actual.contentRevision() > resizedRevision);
 		map.setTerrainSeed(197);
 		glob2test::observeMap(map, scene);
 		check(29, 30);
 		const auto seeded = cache.composedCells();
 		map.setResourceByIndex(9, 9, WHEAT, 1);
 		glob2test::observeMap(map, scene);
-		cache.copy(scene, -3, -2, 36, 21, 29, 30, fixture.team->me, true, actual.getSDLSurface());
+		cache.update(scene, -3, -2, 36, 21, 29, 30, fixture.team->me, false, actual);
 		CHECK(cache.composedCells() == seeded + 1);
 		CHECK(std::memcmp(actual.getSDLSurface()->pixels, expected.getSDLSurface()->pixels,
 			actual.getSDLSurface()->pitch * actual.getH()) != 0);
@@ -959,14 +1055,270 @@ TEST_SUITE("TerrainPresentation")
 		glob2test::observeMap(map, scene);
 		check(29, 30, false);
 		CHECK(cache.composedCells() == seeded + 2);
-		cache.copy(scene, -3, -2, 36, 21, 29, 30, fixture.team->me, true, actual.getSDLSurface());
+		cache.update(scene, -3, -2, 36, 21, 29, 30, fixture.team->me, true, actual);
 		CHECK(cache.composedCells() == seeded + 3);
 		map.setNoResource(9, 9, 1);
 		glob2test::observeMap(map, scene);
 		check(29, 30);
 		CHECK(cache.composedCells() == seeded + 4);
+
+		// A narrow view composes just its visible cells. Panning within the
+		// same page builds one newly exposed column and reuses the overlap.
+		OverviewTerrainCache partial;
+		GAGCore::DrawableSurface small(4 * samples, 4 * samples);
+		partial.update(scene, 0, 0, 3, 3, 0, 0, fixture.team->me, true, small);
+		CHECK(partial.composedCells() == 16);
+		partial.update(scene, 0, 0, 3, 3, 1, 0, fixture.team->me, true, small);
+		CHECK(partial.composedCells() == 20);
+		partial.update(scene, 0, 0, 3, 3, 0, 0, fixture.team->me, true, small);
+		CHECK(partial.composedCells() == 20);
 	}
 #if defined(HAVE_OPENGL) && !defined(GLOB2_WEBGL2)
+
+	TEST_CASE("Legacy GL single pass animates water and shores and hides undiscovered terrain [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true, .width = 640, .height = 480,
+			.screenFlags = Uint32(GAGCore::GraphicContext::USEGPU),
+			.beforeLoad = [](GlobalContainer &g) { g.settings.rendererBackend = GAGCore::RendererBackend::LegacyGL; }});
+		auto &gfx = *globals->gfx;
+		REQUIRE(gfx.isLegacyGLScreen());
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = WATER, .discovered = true});
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		GAGCore::Sprite::setHighResolution(true);
+		struct Restore { ~Restore() { GAGCore::Sprite::setHighResolution(false); } } restore;
+		DirectTerrain atlas;
+		gfx.beginMapTransform(.76f, 0, 0, 0, 0, 640, 480);
+		const auto prepare = [&](int time, bool whole, int attempts)
+		{
+			bool ready = false;
+			for (int attempt = 0; attempt < attempts && !ready; ++attempt)
+				ready = atlas.prepare(gfx, scene, 0, 0, 31, 15, 0, 0, fixture.team->me, whole, time);
+			return ready;
+		};
+		REQUIRE(prepare(0, true, 200));
+		REQUIRE_FALSE(atlas.preparedRegions().empty());
+		GAGCore::Sprite::finishHighResolution();
+		// Water's crossfade changes the pixels every frame, from the one pass.
+		std::vector<Uint8> previous;
+		for (int time = 0; time < 9; ++time)
+		{
+			CAPTURE(time);
+			gfx.drawFilledRect(0, 0, 640, 480, 11, 23, 37);
+			REQUIRE(prepare(time, true, 1));
+			atlas.drawPrepared(gfx, 0, 0, true, time);
+			const auto pixels = terrainPixels(true);
+			if (time > 0) CHECK(pixels != previous);
+			previous = pixels;
+		}
+
+		// A shoreline: land and water cells draw together and keep animating.
+		for (int y = 0; y < 32; ++y)
+			for (int x = 12; x <= 20; ++x)
+				fixture.game.map.setVertexTerrain(x, y, GRASS);
+		glob2test::observeMap(fixture.game.map, scene);
+		REQUIRE(prepare(0, true, 300));
+		REQUIRE_FALSE(atlas.preparedRegions().empty());
+		GAGCore::Sprite::finishHighResolution();
+		for (int time = 0; time < 9; ++time)
+		{
+			gfx.drawFilledRect(0, 0, 640, 480, 11, 23, 37);
+			REQUIRE(prepare(time, true, 1));
+			atlas.drawPrepared(gfx, 0, 0, true, time);
+			const auto pixels = terrainPixels(true);
+			if (time > 0) CHECK(pixels != previous);
+			previous = pixels;
+		}
+
+		// Changing discovery hides land and water alike.
+		fixture.game.map.unsetMapDiscovered();
+		glob2test::observeMap(fixture.game.map, scene);
+		for (int i = 0; i < 3; ++i)
+		{
+			gfx.drawFilledRect(0, 0, 2048, 2048, 11, 23, 37);
+			const auto hidden = terrainPixels(true);
+			REQUIRE(prepare(9, false, 1));
+			CHECK(atlas.preparedRegions().empty());
+			atlas.drawPrepared(gfx, 0, 0, false, 9);
+			CHECK(terrainPixels(true) == hidden);
+		}
+		gfx.endMapTransform();
+	}
+
+	TEST_CASE("Legacy GL zoom keeps each cell's old mask until its new density lands [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true, .width = 640, .height = 480,
+			.screenFlags = Uint32(GAGCore::GraphicContext::USEGPU),
+			.beforeLoad = [](GlobalContainer &g) { g.settings.rendererBackend = GAGCore::RendererBackend::LegacyGL; }});
+		auto &gfx = *globals->gfx;
+		REQUIRE(gfx.isLegacyGLScreen());
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = WATER, .discovered = true});
+		// Blocks of grass, sand and water: most cells are mixed.
+		const TerrainType kinds[] = {WATER, GRASS, SAND};
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 64; ++x)
+				fixture.game.map.setVertexTerrain(x, y, kinds[((x / 3) * 7 + (y / 3) * 5) % 3]);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		DirectTerrain atlas;
+		const auto settle = [&](float scale, int right, int bottom)
+		{
+			gfx.beginMapTransform(scale, 0, 0, 0, 0, 640, 480);
+			for (int attempt = 0; attempt < 2000; ++attempt)
+			{
+				const bool ready = atlas.prepare(gfx, scene, 0, 0, right, bottom, 0, 0, fixture.team->me, true, 0);
+				if (ready && !atlas.preparing() && !atlas.pendingHdMasks()) break;
+				SDL_Delay(1);
+			}
+			REQUIRE_FALSE(atlas.pendingHdMasks());
+			gfx.endMapTransform();
+		};
+		const auto frame = [&](float scale, int right, int bottom)
+		{
+			gfx.beginMapTransform(scale, 0, 0, 0, 0, 640, 480);
+			gfx.drawFilledRect(0, 0, 640, 480, 11, 23, 37);
+			atlas.drawPrepared(gfx, 0, 0, true, 0);
+			auto pixels = terrainPixels(true);
+			gfx.endMapTransform();
+			return pixels;
+		};
+		// 32-texel masks at this zoom, then 64-texel masks at twice it.
+		settle(.76f, 26, 19);
+		gfx.beginMapTransform(1.6f, 0, 0, 0, 0, 640, 480);
+		REQUIRE(atlas.prepare(gfx, scene, 0, 0, 12, 9, 0, 0, fixture.team->me, true, 0));
+		gfx.endMapTransform();
+		const auto pending = atlas.pendingHdMasks();
+		REQUIRE(pending > 20); // The new density has barely started.
+		const auto stepped = frame(1.6f, 12, 9);
+		settle(1.6f, 12, 9);
+		const auto built = frame(1.6f, 12, 9);
+		// Old masks differ from new ones only in contour detail. A cell drawn
+		// from its first material alone would differ across whole cells.
+		std::size_t differing = 0;
+		for (std::size_t i = 0; i + 3 < built.size(); i += 4)
+		{
+			int largest = 0;
+			for (int k = 0; k < 3; ++k) largest = std::max(largest, std::abs(int(built[i + k]) - int(stepped[i + k])));
+			differing += largest > 48;
+		}
+		const double share = double(differing) / double(built.size() / 4);
+		CAPTURE(pending);
+		CAPTURE(share);
+		CHECK(share < .03);
+	}
+
+	TEST_CASE("Legacy GL cells never seen draw their whole-map base mask until their own lands [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true, .width = 640, .height = 480,
+			.screenFlags = Uint32(GAGCore::GraphicContext::USEGPU),
+			.beforeLoad = [](GlobalContainer &g) { g.settings.rendererBackend = GAGCore::RendererBackend::LegacyGL; }});
+		auto &gfx = *globals->gfx;
+		REQUIRE(gfx.isLegacyGLScreen());
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = WATER, .discovered = true});
+		const TerrainType kinds[] = {WATER, GRASS, SAND};
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 64; ++x)
+				fixture.game.map.setVertexTerrain(x, y, kinds[((x / 3) * 7 + (y / 3) * 5) % 3]);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		DirectTerrain atlas;
+		// The left half at 32-texel masks, until the base covers the whole map.
+		gfx.beginMapTransform(.76f, 0, 0, 0, 0, 640, 480);
+		for (int attempt = 0; attempt < 4000; ++attempt)
+		{
+			const bool ready = atlas.prepare(gfx, scene, 0, 0, 26, 19, 0, 0, fixture.team->me, true, 0);
+			if (ready && !atlas.preparing() && !atlas.pendingHdMasks() && !atlas.pendingBaseMasks()) break;
+			SDL_Delay(1);
+		}
+		REQUIRE_FALSE(atlas.pendingHdMasks());
+		REQUIRE_FALSE(atlas.pendingBaseMasks());
+		// The right half has never been shown: its first frame draws the base.
+		REQUIRE(atlas.prepare(gfx, scene, 0, 0, 26, 19, 32, 0, fixture.team->me, true, 0));
+		const auto pending = atlas.pendingHdMasks();
+		REQUIRE(pending > 20);
+		const auto frame = [&]
+		{
+			gfx.drawFilledRect(0, 0, 640, 480, 11, 23, 37);
+			atlas.drawPrepared(gfx, 32, 0, true, 0);
+			return terrainPixels(true);
+		};
+		const auto first = frame();
+		for (int attempt = 0; attempt < 4000 && atlas.pendingHdMasks(); ++attempt)
+		{
+			atlas.prepare(gfx, scene, 0, 0, 26, 19, 32, 0, fixture.team->me, true, 0);
+			SDL_Delay(1);
+		}
+		REQUIRE_FALSE(atlas.pendingHdMasks());
+		const auto built = frame();
+		gfx.endMapTransform();
+		std::size_t differing = 0;
+		for (std::size_t i = 0; i + 3 < built.size(); i += 4)
+		{
+			int largest = 0;
+			for (int k = 0; k < 3; ++k) largest = std::max(largest, std::abs(int(built[i + k]) - int(first[i + k])));
+			differing += largest > 48;
+		}
+		const double share = double(differing) / double(built.size() / 4);
+		CAPTURE(pending);
+		CAPTURE(share);
+		CHECK(share < .05);
+	}
+
+	TEST_CASE("Legacy GL mixed cells split between their corners until any mask lands [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true, .width = 640, .height = 480,
+			.screenFlags = Uint32(GAGCore::GraphicContext::USEGPU),
+			.beforeLoad = [](GlobalContainer &g) { g.settings.rendererBackend = GAGCore::RendererBackend::LegacyGL; }});
+		auto &gfx = *globals->gfx;
+		REQUIRE(gfx.isLegacyGLScreen());
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = WATER, .discovered = true});
+		const TerrainType kinds[] = {WATER, GRASS, SAND};
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 64; ++x)
+				fixture.game.map.setVertexTerrain(x, y, kinds[((x / 3) * 7 + (y / 3) * 5) % 3]);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		DirectTerrain atlas;
+		gfx.beginMapTransform(.76f, 0, 0, 0, 0, 640, 480);
+		const auto frame = [&]
+		{
+			gfx.drawFilledRect(0, 0, 640, 480, 11, 23, 37);
+			atlas.drawPrepared(gfx, 0, 0, true, 0);
+			return terrainPixels(true);
+		};
+		// The first frame after the tables: no mask at any density yet, and
+		// the base atlas is still empty.
+		bool ready = false;
+		for (int attempt = 0; attempt < 2000 && !ready; ++attempt)
+			ready = atlas.prepare(gfx, scene, 0, 0, 26, 19, 0, 0, fixture.team->me, true, 0);
+		REQUIRE(ready);
+		const auto pending = atlas.pendingHdMasks();
+		REQUIRE(pending > 100);
+		const auto first = frame();
+		for (int attempt = 0; attempt < 4000 && atlas.pendingHdMasks(); ++attempt)
+		{
+			atlas.prepare(gfx, scene, 0, 0, 26, 19, 0, 0, fixture.team->me, true, 0);
+			SDL_Delay(1);
+		}
+		REQUIRE_FALSE(atlas.pendingHdMasks());
+		const auto built = frame();
+		gfx.endMapTransform();
+		// The split differs from the built masks only near the contours. Mixed
+		// cells drawn whole in their top-left material differ in about 28% of
+		// the view here; the split in about 8%.
+		std::size_t differing = 0;
+		for (std::size_t i = 0; i + 3 < built.size(); i += 4)
+		{
+			int largest = 0;
+			for (int k = 0; k < 3; ++k) largest = std::max(largest, std::abs(int(built[i + k]) - int(first[i + k])));
+			differing += largest > 48;
+		}
+		const double share = double(differing) / double(built.size() / 4);
+		CAPTURE(pending);
+		CAPTURE(share);
+		CHECK(share < .14);
+	}
+
 	TEST_CASE("generated terrain mip uploads stay uncompressed across animation updates [display]")
 	{
 		glob2test::HeadlessGlobals globals({.display = true, .width = 256, .height = 256,
@@ -1031,6 +1383,9 @@ TEST_SUITE("TerrainPresentation")
 		glob2test::observeMap(fixture.game.map,scene);
 		// An independently sized strip fits HD pages, unlike its whole capture.
 		SoftwareTerrainCache independent;
+		// Interactive pages show native art until the declared HD window streams.
+		independent.prepare(scene, *globals->terrain, 0, 0, 6, 63, 0, 0, fixture.team->me, true);
+		GAGCore::Sprite::finishHighResolution();
 		REQUIRE(independent.prepare(scene, *globals->terrain, 0, 0, 6, 63, 0, 0, fixture.team->me,
 									true));
 		CHECK(globals->terrainCompositor().scale() == 4);
@@ -1072,6 +1427,8 @@ TEST_SUITE("TerrainPresentation")
 			backend.largestTexture = 0;
 			CHECK(globals->gfx->maximumTextureSize() == limit);
 			SoftwareTerrainCache cache;
+			cache.prepare(scene, *globals->terrain, 0, 0, 7, 7, 0, 0, fixture.team->me, true);
+			GAGCore::Sprite::finishHighResolution();
 			const bool admitted =
 				cache.prepare(scene, *globals->terrain, 0, 0, 7, 7, 0, 0, fixture.team->me, true);
 			CHECK(globals->terrainCompositor().scale() == 4);
@@ -1566,7 +1923,8 @@ TEST_SUITE("TerrainPresentation")
 		CHECK(map.vertexTerrainAt(7, 8) == WATER);
 		CHECK(map.vertexTerrainAt(8, 7) == WATER);
 		CHECK(map.vertexTerrainAt(7, 7) == WATER);
-		CHECK(map.terrainPropertiesAt(7, 7).walkable);
+		CHECK_FALSE(map.terrainPropertiesAt(7, 7).walkable);
+		CHECK(map.terrainPropertiesAt(7, 7).swimmable);
 		CHECK_FALSE(map.terrainPropertiesAt(6, 6).walkable);
 		CHECK(map.vertexTerrainAt(0, 10) == ICE);
 		CHECK(map.vertexTerrainAt(63, 10) == WATER);
@@ -1576,7 +1934,6 @@ TEST_SUITE("TerrainPresentation")
 		CHECK_FALSE(map.terrainPropertiesAt(19, 10).buildable);
 		CHECK(map.vertexTerrainAt(30, 30) == DARK_WATER);
 		CHECK(map.vertexTerrainAt(34, 30) == WATER);
-		CHECK(map.requiredTerrainExperiments().has(ExperimentId::DeepWaterTerrain));
 		// An ordinary grass/water boundary still receives a sand beach.
 		CHECK(map.vertexTerrainAt(15, 5) == SAND);
 		CHECK(map.vertexTerrainAt(16, 5) == SAND);
@@ -1586,7 +1943,8 @@ TEST_SUITE("TerrainPresentation")
 		glob2test::HeadlessGlobals globals({.display = true});
 		auto &compositor = globals->terrainCompositor();
 		const auto minimap = TerrainVisual::minimapPalette(compositor.catalog());
-		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .teams = 0});
+		// Wide enough for one row holding every non-classic paintable type.
+		glob2test::HeadlessGame fixture({.wDec = 7, .hDec = 5, .teams = 0});
 		auto &map = fixture.game.map;
 		std::vector<TerrainType> painted;
 		for (unsigned i = 0; i < TERRAIN_COUNT; ++i)
@@ -1606,6 +1964,7 @@ TEST_SUITE("TerrainPresentation")
 			map.paintCell(int(painted.size()) + 1, 1, type);
 			painted.push_back(type);
 		}
+		REQUIRE(painted.size() + 1 < std::size_t(map.getW()));
 		(void)minimap;
 		const auto filename = (glob2test::artifactDir() / "terrain-catalogue-colors.png").string();
 		exportMapImage(fixture.game, filename);
@@ -1652,13 +2011,925 @@ TEST_SUITE("TerrainPresentation")
 }
 #include <fstream>
 #include <chrono>
+#include "MapDrawer.h"
 TEST_SUITE("TerrainValidation")
 {
-	TEST_CASE("terrain catalogue gallery renders every group beside grass, sand and water [display][artifacts]")
+	GLOB2_TEST_CASE("decorated borders match cached and ordinary rendering",
+					"[display][isolated][artifacts][writes-preferences]")
+	{
+		using namespace GAGCore;
+		glob2test::HeadlessGlobals globals(
+			{.display = true,
+			 .width = 512,
+			 .height = 512,
+			 .beforeLoad = [](GlobalContainer &container)
+			 { container.settings.rendererBackend = RendererBackend::Software; }});
+		glob2test::HeadlessGame fixture({.wDec = 4, .hDec = 4, .discovered = true});
+		auto &map = fixture.game.map;
+		{
+			auto edit = map.editTerrain();
+			for (int y = 0; y < 16; ++y)
+				for (int x = 0; x < 16; ++x)
+					map.setVertexTerrain(x, y,
+										 y >= 9   ? (x < 7 ? HEDGE : THICKET)
+										 : x < 5  ? RIDGE_ROCK
+										 : x < 9  ? OUTCROP
+										 : x < 12 ? GRASS
+												  : WATER);
+			// Cliffs touching ridge rock, outcrop, hedge and grass: cells that
+			// draw a cliff edge and the hedge in separate decor slots. Crags
+			// beside the cliffs keep clear of them and draw nothing.
+			for (int y = 6; y <= 11; ++y)
+				for (int x = 3; x <= 9; ++x)
+					if (x <= 6 || y <= 7)
+						map.setVertexTerrain(x, y, CLIFFS);
+		}
+		for (const auto [x, y] : {std::pair{3, 5}, std::pair{5, 5}, std::pair{6, 10}})
+			map.setResourceByIndex(x, y, WOOD, 3);
+		auto &gfx = *globals->gfx;
+		std::vector<RendererBackend> backends{RendererBackend::Software};
+		std::ofstream backendEvidence(glob2test::artifactDir() / "rendering-backends.txt");
+		REQUIRE(backendEvidence.good());
+		for (const auto &choice : gfx.rendererAvailability())
+		{
+			backendEvidence << rendererBackendName(choice.backend)
+							<< " available=" << choice.available << " reason=" << choice.reason
+							<< '\n';
+			if (choice.available && (choice.backend == RendererBackend::SDLGPU ||
+									 choice.backend == RendererBackend::ProgrammableGL))
+				backends.push_back(choice.backend);
+		}
+		if (backends.size() == 1)
+			MESSAGE("Decor GPU parity coverage unavailable: no accelerated backend");
+		const auto draw = [&](const SceneMap &scene, bool whole, int zoom, int viewport)
+		{
+			gfx.setClipRect();
+			gfx.drawFilledRect(0, 0, 512, 512, 17, 29, 41);
+			gfx.beginMapTransform(float(zoom), 0, 0, 0, 0, 512, 512);
+			MapDrawer::drawMapTerrain(0, 0, 15, 15, viewport, viewport, 0, Game::DRAW_WHOLE_MAP,
+										scene);
+			MapDrawer::drawMapResources(0, 0, 15, 15, viewport, viewport, 0,
+										  whole ? Game::DRAW_WHOLE_MAP : 0, scene);
+			GAGCore::Sprite::flushBatches(&gfx);
+			gfx.endMapTransform();
+			if (gfx.renderer)
+				gfx.renderer->flush();
+			// Software mode can draw directly to its surface without a backend.
+			std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> captured(
+				gfx.renderer ? gfx.renderer->capture() : SDL_DuplicateSurface(gfx.getSDLSurface()),
+				SDL_DestroySurface);
+			REQUIRE(captured);
+			std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> rgba(
+				SDL_ConvertSurface(captured.get(), SDL_PIXELFORMAT_RGBA32), SDL_DestroySurface);
+			REQUIRE(rgba);
+			std::vector<Uint8> pixels(size_t(rgba->w) * rgba->h * 4);
+			for (int row = 0; row < rgba->h; ++row)
+				std::memcpy(pixels.data() + size_t(row) * rgba->w * 4,
+							static_cast<Uint8 *>(rgba->pixels) + row * rgba->pitch, rgba->w * 4);
+			if (whole)
+				REQUIRE(IMG_SavePNG(
+					rgba.get(),
+					(glob2test::artifactDir() /
+					 ("decorated-borders-" +
+					  std::string(rendererBackendName(gfx.backendSwitchStatus().active)) + "-" +
+					  std::to_string(zoom) + "x-view" + std::to_string(viewport) + ".png"))
+						.string()
+						.c_str()));
+			gfx.nextFrame();
+			return pixels;
+		};
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		for (const auto backend : backends)
+		{
+			CAPTURE(int(backend));
+			REQUIRE(gfx.requestBackendSwitch(backend));
+			gfx.nextFrame();
+			REQUIRE(gfx.backendSwitchStatus().phase == RendererSwitchPhase::Complete);
+			REQUIRE(gfx.backendSwitchStatus().active == backend);
+			const auto identity = gfx.renderingIdentity();
+			backendEvidence << "tested=" << identity.backend << " glVendor=" << identity.glVendor
+							<< " glRenderer=" << identity.glRenderer << '\n';
+			for (const auto [zoom, viewport] : {std::pair{1, 0}, std::pair{1, 15}, std::pair{3, 3}})
+			{
+				CAPTURE(zoom);
+				CAPTURE(viewport);
+				const auto ordinary = draw(scene, false, zoom, viewport);
+				CHECK(draw(scene, true, zoom, viewport) == ordinary);
+				CHECK(draw(scene, true, zoom, viewport) == ordinary); // warmed geometry
+			}
+			// Changing corner membership can change the selected material/frame;
+			// the row cache must adopt that deterministic selection. The vertex
+			// is clear of the cliffs, so its crags draw (clear_of_masses).
+			map.setVertexTerrain(5, 2, RIDGE_ROCK);
+			glob2test::observeMap(map, scene);
+			const auto ordinary = draw(scene, false, 1, 0);
+			CHECK(draw(scene, true, 1, 0) == ordinary);
+			map.setVertexTerrain(5, 2, OUTCROP);
+			glob2test::observeMap(map, scene);
+		}
+		backendEvidence.flush();
+		REQUIRE(backendEvidence.good());
+	}
+
+	TEST_CASE("decorated borders choose one material and suppress undecorated corners [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		glob2test::HeadlessGame fixture({.wDec = 4, .hDec = 4, .discovered = true});
+		auto &map = fixture.game.map;
+		importBeforeMatch(fixture.game, R"({"schemaVersion":1,"terrains":[
+            {"key":"test:raised","name":"Raised","base":"grass","properties":{},"appearance":"grass"},
+            {"key":"test:plain","name":"Plain","base":"grass","properties":{},"appearance":"outcrop"},
+            {"key":"test:ridge-alias","name":"Ridge alias","base":"grass","properties":{},"appearance":"ridge_rock"}
+        ]})");
+		auto catalog = TerrainVisual::loadCatalog();
+		auto custom = catalog.materials[catalog.find("outcrop")];
+		custom.key = "test:raised";
+		const auto customId = TerrainVisual::MaterialId(catalog.materials.size());
+		catalog.materials.push_back(custom);
+		catalog.bindings[custom.key] = customId;
+		catalog.bindings["test:plain"] = catalog.find("grass");
+		TerrainVisual::Compositor compositor(std::move(catalog));
+		const auto &definitions = compositor.catalog();
+		const auto raised = *map.terrainRegistry().find("test:raised");
+		const auto plain = *map.terrainRegistry().find("test:plain");
+		const auto alias = *map.terrainRegistry().find("test:ridge-alias");
+		const auto random = fixture.game.syncRandom;
+		const auto frameFor = [&](std::array<TerrainType, 4> corners)
+		{
+			for (unsigned k = 0; k < 4; ++k)
+				map.setVertexTerrain(4 + int(k & 1), 4 + int(k >> 1), corners[k]);
+			SceneMap scene;
+			glob2test::observeMap(map, scene);
+			const int frame = onlyDecorFrame(compositor, scene, 4, 4);
+			CHECK(onlyDecorFrame(compositor, scene, 4, 4) == frame);
+			CHECK(onlyDecorFrame(compositor, scene, 20, 20) == frame); // wrapped coordinates
+			return frame;
+		};
+		for (const auto pair : {std::pair{OUTCROP, RIDGE_ROCK}, std::pair{HEDGE, THICKET},
+								std::pair{raised, RIDGE_ROCK}})
+			for (unsigned mask = 0; mask < 16; ++mask)
+			{
+				CAPTURE(pair.first);
+				CAPTURE(pair.second);
+				CAPTURE(mask);
+				std::array<TerrainType, 4> corners;
+				for (unsigned k = 0; k < 4; ++k)
+					corners[k] = mask & (1u << k) ? pair.first : pair.second;
+				const int frame = frameFor(corners);
+				const auto first =
+					pair.first == raised
+						? customId
+						: definitions.find(pair.first == HEDGE ? "hedge" : "outcrop");
+				const auto second =
+					definitions.find(pair.second == THICKET ? "thicket" : "ridge_rock");
+				const bool foliage = pair.first == HEDGE;
+				const auto expected = [&](TerrainVisual::MaterialId id, unsigned ownMask)
+				{
+					return definitions.decorFrame(
+						id, 4, 4, ownMask != 15, map.terrainSeed(), foliage ? 15 : ownMask,
+						TerrainVisual::cornerColours(4, 4, 15, 15, map.terrainSeed()));
+				};
+				CHECK(((mask != 0 && frame == expected(first, mask)) ||
+					   (mask != 15 && frame == expected(second, 15 ^ mask))));
+			}
+		// Foliage and the other obstacles draw separate slots, each from its own
+		// corners: the hedge corner as a foliage edge, one rock among the rest.
+		for (unsigned k = 0; k < 4; ++k)
+			map.setVertexTerrain(4 + int(k & 1), 4 + int(k >> 1),
+								 std::array{OUTCROP, RIDGE_ROCK, BOULDERS, HEDGE}[k]);
+		SceneMap fourScene;
+		glob2test::observeMap(map, fourScene);
+		const auto four = compositor.decorLayers(fourScene, 4, 4);
+		const auto colours = TerrainVisual::cornerColours(4, 4, 15, 15, map.terrainSeed());
+		CHECK(four[0].frame == -1);
+		CHECK(four[1].frame == -1);
+		CHECK(four[2].frame == definitions.decorFrame(definitions.find("hedge"), 4, 4, true,
+													  map.terrainSeed(), 8, colours));
+		const std::array<TerrainVisual::MaterialId, 3> rocks{
+			definitions.find("outcrop"), definitions.find("ridge_rock"), definitions.find("boulders")};
+		bool valid = false;
+		for (unsigned k = 0; k < 3; ++k)
+			valid |= four[3].frame == definitions.decorFrame(rocks[k], 4, 4, true, map.terrainSeed(),
+															 1u << k, colours);
+		CHECK(valid);
+		for (const auto undecorated : {GRASS, SAND, WATER, plain})
+			CHECK(frameFor({OUTCROP, RIDGE_ROCK, OUTCROP, undecorated}) == -1);
+		CHECK(frameFor({RIDGE_ROCK, alias, alias, RIDGE_ROCK}) ==
+			  definitions.decorFrame(
+				  definitions.find("ridge_rock"), 4, 4, false, map.terrainSeed(), 15,
+				  TerrainVisual::cornerColours(4, 4, 15, 15, map.terrainSeed())));
+		for (unsigned minorityCorners : {1u, 2u})
+		{
+			for (int y = 0; y < 16; y += 2)
+				for (int x = 0; x < 16; x += 2)
+					for (unsigned k = 0; k < 4; ++k)
+						map.setVertexTerrain(x + int(k & 1), y + int(k >> 1),
+											 k >= 4 - minorityCorners ? RIDGE_ROCK : OUTCROP);
+			unsigned minority = 0, total = 0;
+			for (unsigned seed = 1; seed <= 32; ++seed)
+			{
+				map.setTerrainSeed(seed);
+				SceneMap scene;
+				glob2test::observeMap(map, scene);
+				for (int y = 0; y < 16; y += 2)
+					for (int x = 0; x < 16; x += 2)
+					{
+						const int frame = onlyDecorFrame(compositor, scene, x, y);
+						const auto &frames =
+							definitions.materials[definitions.find("ridge_rock")].decor.edge;
+						minority += std::find(frames.begin(), frames.end(), frame) != frames.end();
+						++total;
+					}
+			}
+			const double share = double(minority) / total;
+			CHECK(share > double(minorityCorners) / 4 - .08);
+			CHECK(share < double(minorityCorners) / 4 + .08);
+		}
+		CHECK(fixture.game.syncRandom == random);
+	}
+
+	TEST_CASE("connected foliage corners strips and filled patches [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		for (int panel = 0; panel < 2; ++panel)
+		{
+			const auto type = panel ? THICKET : HEDGE;
+			for (unsigned mask = 0; mask < 16; ++mask)
+			{
+				const int x = panel * 16 + 1 + int(mask % 4) * 3, y = 1 + int(mask / 4) * 3;
+				for (unsigned k = 0; k < 4; ++k)
+					map.setVertexTerrain(x + (k & 1), y + (k >> 1), mask & (1u << k) ? type : GRASS);
+			}
+			for (int y = 14; y < 23; ++y)
+				for (int x = 1; x < 15; ++x)
+					if (y == 14 || (y >= 16 && !(x >= 6 && x <= 8 && y >= 18 && y <= 20)))
+						map.setVertexTerrain(panel * 16 + x, y, type);
+		}
+		// A connected patch crossing both toroidal seams uses the same masks.
+		for (int y : {31, 0})
+			for (int x : {31, 0}) map.setVertexTerrain(x, y, HEDGE);
+		for (int y = 26; y <= 29; ++y)
+			for (int x = 4; x <= 27; ++x) map.setVertexTerrain(x, y, x < 16 ? HEDGE : THICKET);
+
+		for (int panel = 0; panel < 2; ++panel)
+		{
+			map.setResourceByIndex(panel * 16 + 7, 19, WOOD, 0);
+			for (int x : {5, 7, 9}) map.setResourceByIndex(panel * 16 + x, 24, WOOD, 0);
+		}
+
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		for (int panel = 0; panel < 2; ++panel)
+			for (unsigned mask = 0; mask < 16; ++mask)
+			{
+				const int x = panel * 16 + 1 + int(mask % 4) * 3, y = 1 + int(mask / 4) * 3;
+				const auto id = catalog.find(panel ? "thicket" : "hedge");
+				CHECK(onlyDecorFrame(compositor, scene, x, y) ==
+					  (mask == 15 ? catalog.decorFrame(id, x, y, false, scene.terrainSeed(), mask,
+													   TerrainVisual::cornerColours(
+														   x, y, 31, 31, scene.terrainSeed()))
+								  : -1));
+			}
+		for (const auto [x, y] : {std::pair{31, 31}})
+			CHECK(onlyDecorFrame(compositor, scene, x, y) ==
+				  catalog.decorFrame(
+					  catalog.find("hedge"), x, y, false, scene.terrainSeed(), 15,
+					  TerrainVisual::cornerColours(x, y, 31, 31, scene.terrainSeed())));
+		const int border = onlyDecorFrame(compositor, scene, 15, 27);
+		const auto colours = TerrainVisual::cornerColours(15, 27, 31, 31, scene.terrainSeed());
+		CHECK((border == catalog.decorFrame(catalog.find("hedge"), 15, 27, true,
+											scene.terrainSeed(), 15, colours) ||
+			   border == catalog.decorFrame(catalog.find("thicket"), 15, 27, true,
+											scene.terrainSeed(), 15, colours)));
+
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "connected-foliage-ground.png").string().c_str()));
+
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "connected-foliage.png").string().c_str()));
+	}
+
+	GLOB2_TEST_CASE("fertile glints follow the presentation clock while the simulation tick stands still",
+					"[display][isolated][writes-preferences]")
+	{
+		// The editor never steps the simulation, so a glint keyed to the scene
+		// tick would freeze there. Overlays take the clock that animates lava
+		// and water instead, through both resource drawing paths.
+		glob2test::HeadlessGlobals globals(
+			{.display = true,
+			 .width = 512,
+			 .height = 512,
+			 .seed = 7331,
+			 .beforeLoad = [](GlobalContainer &container)
+			 { container.settings.rendererBackend = RendererBackend::Software; }});
+		glob2test::HeadlessGame fixture({.wDec = 4, .hDec = 4, .discovered = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 16; ++y)
+			for (int x = 0; x < 16; ++x)
+				map.paintCell(x, y, LOAM);
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		REQUIRE(scene.tick == 0);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		const auto id = catalog.find("loam");
+		const auto &overlay = catalog.materials[id].overlay;
+		REQUIRE(!overlay.cycles.empty());
+		const int period = overlay.ticks * int(overlay.cycles.front().size());
+		// With the tick fixed, the frame still moves with the presentation time
+		// and matches the catalog's choice for that time.
+		unsigned moving = 0;
+		for (int y = 0; y < 16; ++y)
+			for (int x = 0; x < 16; ++x)
+			{
+				std::set<int> frames;
+				for (int time = 0; time < period; time += overlay.ticks)
+				{
+					const int frame = compositor.overlayFrame(scene, x, y, time);
+					CHECK(frame == catalog.overlayFrame(id, x, y, std::uint32_t(time), scene.terrainSeed()));
+					frames.insert(frame);
+				}
+				moving += frames.size() > 1;
+			}
+		CHECK(moving > 0);
+		// The cached rows refresh their glints when only the presentation clock
+		// advances, and keep them when it stands still. Only the legacy GL
+		// context owns the geometry batch the row cache draws through.
+		auto &gfx = *globals->gfx;
+		const auto availability = gfx.rendererAvailability();
+		if (!std::any_of(availability.begin(), availability.end(), [](const auto &choice)
+						 { return choice.available && choice.backend == RendererBackend::LegacyGL; }))
+		{
+			MESSAGE("Row cache coverage omitted: legacy GL unavailable");
+			return;
+		}
+		REQUIRE(gfx.requestBackendSwitch(RendererBackend::LegacyGL));
+		gfx.nextFrame();
+		INFO(gfx.backendSwitchStatus().reason);
+		REQUIRE(gfx.backendSwitchStatus().phase == RendererSwitchPhase::Complete);
+		REQUIRE(gfx.backendSwitchStatus().active == RendererBackend::LegacyGL);
+		MapRenderState render;
+		const auto draw = [&]
+		{
+			// Rows are cached only inside a frame's draw batch, as MapDrawer::drawMap opens one.
+			GAGCore::FrameDrawBatch frameBatch(&gfx);
+			REQUIRE(gfx.getRenderBatch());
+			gfx.setClipRect();
+			gfx.beginMapTransform(1, 0, 0, 0, 0, 512, 512);
+			MapDrawer::drawMapTerrain(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, render.animationTime);
+			MapDrawer::drawMapResources(0, 0, 15, 15, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene, &render);
+			GAGCore::Sprite::flushBatches(&gfx);
+			gfx.endMapTransform();
+			if (gfx.renderer)
+				gfx.renderer->flush();
+			gfx.nextFrame();
+		};
+		// The cached rows also need the resource sprite and the shared decor
+		// and overlay sprites.
+		REQUIRE(globalContainer->resources);
+		REQUIRE(compositor.decorSprite());
+		REQUIRE(compositor.overlaySprite());
+		draw();
+		REQUIRE(render.resourceRows);
+		const auto revisions = [&]
+		{
+			std::vector<std::uint64_t> out;
+			for (const auto &row : render.resourceRows->rows)
+				out.push_back(row.overlay.revision);
+			return out;
+		};
+		const auto frames = [&]
+		{
+			std::vector<int> out;
+			for (const auto &row : render.resourceRows->rows)
+				out.insert(out.end(), row.overlay.frames.begin(), row.overlay.frames.end());
+			return out;
+		};
+		const auto before = revisions();
+		const auto framesBefore = frames();
+		bool animated = false;
+		for (const auto &row : render.resourceRows->rows)
+			animated |= !row.overlay.animated.empty();
+		REQUIRE(animated);
+		draw();
+		CHECK(revisions() == before);
+		CHECK(frames() == framesBefore);
+		render.animationTime += overlay.ticks;
+		draw();
+		CHECK(revisions() != before);
+		CHECK(frames() != framesBefore);
+		for (int y = 0; y < 16; ++y)
+			for (int x = 0; x < 16; ++x)
+				CHECK(render.resourceRows->rows[y].overlay.frames[x] ==
+					  compositor.overlayFrame(scene, x, y, render.animationTime));
+	}
+
+	TEST_CASE("raised cliffs corners strips a hole and their walls [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		// Every corner mask on its own, as in the foliage panels.
+		for (unsigned mask = 0; mask < 16; ++mask)
+		{
+			const int x = 1 + int(mask % 4) * 3, y = 1 + int(mask / 4) * 3;
+			for (unsigned k = 0; k < 4; ++k)
+				map.setVertexTerrain(x + (k & 1), y + (k >> 1), mask & (1u << k) ? CLIFFS : GRASS);
+		}
+		// A plateau with a hole, a thin strip and a spur, so south, east and west
+		// faces, inner corners and single-cell widths all show.
+		for (int y = 2; y <= 12; ++y)
+			for (int x = 17; x <= 30; ++x)
+				if (!(x >= 21 && x <= 24 && y >= 6 && y <= 9))
+					map.setVertexTerrain(x, y, CLIFFS);
+		for (int x = 2; x <= 13; ++x)
+			map.setVertexTerrain(x, 16, CLIFFS);
+		for (int y = 15; y <= 22; ++y)
+			map.setVertexTerrain(20, y, CLIFFS);
+		// Cliffs against hedge: each keeps its own edge, so the cliff shows its wall.
+		for (int y = 26; y <= 29; ++y)
+			for (int x = 4; x <= 27; ++x)
+				map.setVertexTerrain(x, y, x < 16 ? CLIFFS : HEDGE);
+
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		const auto id = catalog.find("cliffs");
+		REQUIRE(!catalog.materials[id].decor.connected.empty());
+		// Cliffs draw their edges on open ground: every corner mask, alone on the
+		// grass, shows its own frame (foliage would draw nothing there).
+		for (unsigned mask = 0; mask < 16; ++mask)
+		{
+			const int x = 1 + int(mask % 4) * 3, y = 1 + int(mask / 4) * 3;
+			CAPTURE(mask);
+			CHECK(onlyDecorFrame(compositor, scene, x, y) ==
+				  (mask ? catalog.decorFrame(id, x, y, mask != 15, scene.terrainSeed(), mask,
+											 TerrainVisual::cornerColours(x, y, 31, 31, scene.terrainSeed()))
+						: -1));
+		}
+		// Where cliffs meet hedge, each draws its own corners in its own slot,
+		// the cliffs standing back from the hedge across a valley.
+		{
+			const auto layers = compositor.decorLayers(scene, 15, 27);
+			const auto colours = TerrainVisual::cornerColours(15, 27, 31, 31, scene.terrainSeed());
+			CHECK(layers[0].frame == catalog.decorForeignFrame(id, 5, 10, colours));
+			CHECK(layers[0].frame >= 0);
+			CHECK(layers[1].frame == -1);
+			CHECK(layers[2].frame == catalog.decorFrame(catalog.find("hedge"), 15, 27, true,
+														scene.terrainSeed(), 10, colours));
+			CHECK(layers[3].frame == -1);
+		}
+		// Where cliffs, hedge and grass meet, the cliffs still draw their edge
+		// on the open ground but the hedge, beside grass, draws nothing.
+		map.setVertexTerrain(15, 25, GRASS);
+		SceneMap mixed;
+		glob2test::observeMap(map, mixed);
+		const auto mixedLayers = compositor.decorLayers(mixed, 15, 25);
+		CHECK(mixedLayers[0].frame >= 0);
+		CHECK(mixedLayers[2].frame == -1);
+		// The plateau's frames come from the cliffs set: 20 native pixels of raised
+		// top above the cell and 16 of shadow below it, 68 in all.
+		const int inside = onlyDecorFrame(compositor, scene, 18, 3);
+		REQUIRE(inside >= 0);
+		CHECK(compositor.decorLayers(scene, 18, 3)[0].sprite->getH(inside) == 68);
+
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "raised-cliffs.png").string().c_str()));
+	}
+
+	TEST_CASE("cliffs beside foliage and crags [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		paintCliffPanels(map);
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		const char *keys[4] = {"thicket", "hedge", "ridge_rock", "outcrop"};
+		for (int panel = 0; panel < 4; ++panel)
+		{
+			// The cell straddling the border's first row: cliffs on its left
+			// corners, the neighbour on its right ones. Foliage draws its own
+			// edge there; crags keep clear of the cliffs (clear_of_masses).
+			const int x = (panel & 1) * 16 + 5, y = (panel >> 1) * 16 + 2;
+			const auto layers = compositor.decorLayers(scene, x, y);
+			const auto colours = TerrainVisual::cornerColours(x, y, 31, 31, scene.terrainSeed());
+			const auto neighbour = catalog.find(keys[panel]);
+			CAPTURE(keys[panel]);
+			// Against foliage the cliffs stand back across a valley; against
+			// crags they draw their plain edge.
+			const auto cliffs = catalog.find("cliffs");
+			CHECK(layers[0].frame == (panel < 2 ? catalog.decorForeignFrame(cliffs, 5, 10, colours) :
+				  catalog.decorFrame(cliffs, x, y, true, scene.terrainSeed(), 5, colours)));
+			CHECK(layers[2].frame == (panel < 2 ?
+				  catalog.decorFrame(neighbour, x, y, true, scene.terrainSeed(), 10, colours) : -1));
+			CHECK(layers[3].frame == -1);
+			// Away from the cliffs, beyond the spur and the pocket, the crags draw.
+			const int fx = (panel & 1) * 16 + 12, fy = (panel >> 1) * 16 + 11;
+			if (panel >= 2)
+				CHECK(onlyDecorFrame(compositor, scene, fx, fy) ==
+					  catalog.decorFrame(neighbour, fx, fy, false, scene.terrainSeed(), 15,
+										 TerrainVisual::cornerColours(fx, fy, 31, 31, scene.terrainSeed())));
+		}
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "cliffs-beside-obstacles.png").string().c_str()));
+	}
+
+	TEST_CASE("spires and pillars keep clear of mass rims [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		// Outcrop in the north half, stone pillars in the south, crossed by a
+		// cliff band three vertices wide (x 10..12), and a glacier column at
+		// x 31 and row at y 31, which the torus puts beside x 0 and y 0.
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+				map.setVertexTerrain(x, y, x >= 10 && x <= 12 ? CLIFFS : x == 31 || y == 31 ? GLACIER :
+									 y < 16 ? OUTCROP : BOULDERS);
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		const auto colours = [&](int x, int y) { return TerrainVisual::cornerColours(x, y, 31, 31, scene.terrainSeed()); };
+		for (const auto [y, key] : {std::pair{6, "outcrop"}, std::pair{24, "boulders"}})
+		{
+			CAPTURE(key);
+			const auto id = catalog.find(key);
+			REQUIRE(catalog.materials[id].decor.clearOfMasses == 0);
+			const auto drawn = [&](int x)
+			{ return catalog.decorFrame(id, x, y, false, scene.terrainSeed(), 15, colours(x, y)); };
+			// Cell x spans vertices x..x+1; only a mass on its own corners hides it, so
+			// spires run right up to a cliff's foot (x 8 and 13) and to the glacier
+			// across the wrap (x 0 and 29).
+			for (const int x : {0, 1, 3, 7, 8, 13, 14, 28, 29})
+			{
+				CAPTURE(x);
+				CHECK(drawn(x) >= 0);
+				CHECK(onlyDecorFrame(compositor, scene, x, y) == drawn(x));
+			}
+			// Cells with mass corners still draw the mass's rim, alone.
+			for (const int x : {9, 12, 30})
+			{
+				CAPTURE(x);
+				const auto layers = compositor.decorLayers(scene, x, y);
+				CHECK(layers[0].frame >= 0);
+				CHECK(layers[1].frame == -1);
+				CHECK(layers[3].frame == -1);
+			}
+		}
+		// Across the vertical wrap: row 30 touches the glacier row and draws only its
+		// rim; rows 0 and 29 stop just short of it and keep their outcrop.
+		const auto outcrop = catalog.find("outcrop");
+		const auto boulders = catalog.find("boulders");
+		CHECK(onlyDecorFrame(compositor, scene, 3, 0) ==
+			  catalog.decorFrame(outcrop, 3, 0, false, scene.terrainSeed(), 15, colours(3, 0)));
+		CHECK(onlyDecorFrame(compositor, scene, 3, 29) ==
+			  catalog.decorFrame(boulders, 3, 29, false, scene.terrainSeed(), 15, colours(3, 29)));
+		CHECK(compositor.decorLayers(scene, 3, 30)[1].frame == -1);
+
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "obstacles-clear-of-masses.png").string().c_str()));
+	}
+
+	TEST_CASE("icefall and other masses stand apart across valleys [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+				map.setVertexTerrain(x, y, DEEP_SNOW);
+		// An icefall with a hole, a strip and a lone vertex on the snow.
+		for (int y = 2; y <= 12; ++y)
+			for (int x = 2; x <= 15; ++x)
+				if (!(x >= 7 && x <= 9 && y >= 6 && y <= 8))
+					map.setVertexTerrain(x, y, ICEFALL);
+		for (int x = 2; x <= 9; ++x)
+			map.setVertexTerrain(x, 15, ICEFALL);
+		map.setVertexTerrain(13, 15, ICEFALL);
+		// Icefall against cliffs and against glacier along straight borders, and
+		// against hedge along a ragged one.
+		for (int y = 2; y <= 12; ++y)
+			for (int x = 18; x <= 29; ++x)
+				map.setVertexTerrain(x, y, x < 23 ? ICEFALL : y < 7 ? CLIFFS : GLACIER);
+		for (int y = 17; y <= 27; ++y)
+			for (int x = 4; x <= 27; ++x)
+				map.setVertexTerrain(x, y, x < 15 + (y % 2) ? ICEFALL : HEDGE);
+		// Three masses and a hedge meeting at one cell, then four masses.
+		map.setVertexTerrain(25, 29, ICEFALL);
+		map.setVertexTerrain(26, 29, CLIFFS);
+		map.setVertexTerrain(25, 30, HEDGE);
+		map.setVertexTerrain(26, 30, GLACIER);
+		map.setVertexTerrain(29, 29, ICEFALL);
+		map.setVertexTerrain(30, 29, CLIFFS);
+		map.setVertexTerrain(29, 30, GLACIER);
+		map.setVertexTerrain(30, 30, OBSIDIAN_RIDGE);
+
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto &catalog = compositor.catalog();
+		const auto icefall = catalog.find("icefall"), cliffs = catalog.find("cliffs");
+		REQUIRE(!catalog.materials[icefall].decor.connected.empty());
+		CHECK(catalog.materials[icefall].decor.connectedOpen);
+		CHECK(catalog.materials[icefall].decor.connectedTiers);
+		const auto colours = [&](int x, int y) { return TerrainVisual::cornerColours(x, y, 31, 31, scene.terrainSeed()); };
+		// A plain icefall cell draws one mass frame.
+		CHECK(onlyDecorFrame(compositor, scene, 4, 4) ==
+			  catalog.decorFrame(icefall, 4, 4, false, scene.terrainSeed(), 15, colours(4, 4)));
+		// Where icefall meets cliffs, each draws its own corners and stands back
+		// from the other: cell (22, 3) has icefall on its west corners. Both hold
+		// one north corner and two in all, so the lower material id draws first.
+		const auto layers = compositor.decorLayers(scene, 22, 3);
+		const int ice = catalog.decorForeignFrame(icefall, 0b0101, 0b1010, colours(22, 3));
+		const int rock = catalog.decorForeignFrame(cliffs, 0b1010, 0b0101, colours(22, 3));
+		CHECK(ice >= 0);
+		CHECK(rock >= 0);
+		CHECK(std::minmax(layers[0].frame, layers[1].frame) == std::minmax(ice, rock));
+		// Where three or four masses meet, every one draws, or a missing one
+		// would end in a square notch along the neighbouring cells' edges. Each
+		// stands back from every other corner, all masses or foliage here. Masses
+		// rank by more north corners, then more corners, then lower material id,
+		// and take slots 0 onward in that order.
+		const auto glacier = catalog.find("glacier"), obsidian = catalog.find("obsidian_ridge");
+		const auto apart = [&](auto id, unsigned own, int x, int y) {
+			const int frame = catalog.decorForeignFrame(id, own, 15u ^ own, colours(x, y));
+			CHECK(frame >= 0);
+			return frame;
+		};
+		// Cell (22, 6): icefall on the west corners, cliffs north-east, glacier
+		// south-east.
+		{
+			const auto three = compositor.decorLayers(scene, 22, 6);
+			CHECK(three[0].frame == apart(icefall, 0b0101, 22, 6));
+			CHECK(three[1].frame == apart(cliffs, 0b0010, 22, 6));
+			CHECK(three[2].frame == apart(glacier, 0b1000, 22, 6));
+			CHECK(three[3].frame == -1);
+		}
+		// Cell (25, 29): icefall north-west, cliffs north-east, hedge south-west,
+		// glacier south-east. The hedge draws after all three masses, in slot 3.
+		{
+			const auto mixed = compositor.decorLayers(scene, 25, 29);
+			const auto own = [&](auto id) { return id == icefall ? 0b0001u : 0b0010u; };
+			const auto first = std::min(icefall, cliffs), second = std::max(icefall, cliffs);
+			CHECK(mixed[0].frame == apart(first, own(first), 25, 29));
+			CHECK(mixed[1].frame == apart(second, own(second), 25, 29));
+			CHECK(mixed[2].frame == apart(glacier, 0b1000, 25, 29));
+			const int hedge = catalog.decorFrame(catalog.find("hedge"), 25, 29, true, scene.terrainSeed(), 0b0100,
+				colours(25, 29));
+			CHECK(hedge >= 0);
+			CHECK(mixed[3].frame == hedge);
+		}
+		// Cell (29, 29): one mass on each corner.
+		{
+			const auto four = compositor.decorLayers(scene, 29, 29);
+			const auto own = [&](auto id) {
+				return id == icefall ? 0b0001u : id == cliffs ? 0b0010u : id == glacier ? 0b0100u : 0b1000u;
+			};
+			const auto expect = [&](auto id) { return apart(id, own(id), 29, 29); };
+			CHECK(four[0].frame == expect(std::min(icefall, cliffs)));
+			CHECK(four[1].frame == expect(std::max(icefall, cliffs)));
+			CHECK(four[2].frame == expect(std::min(glacier, obsidian)));
+			CHECK(four[3].frame == expect(std::max(glacier, obsidian)));
+		}
+		// Hedge and thicket still join each other: one foliage frame, no mass.
+		map.setVertexTerrain(6, 30, HEDGE);
+		map.setVertexTerrain(7, 30, HEDGE);
+		map.setVertexTerrain(6, 31, THICKET);
+		map.setVertexTerrain(7, 31, THICKET);
+		SceneMap foliage;
+		glob2test::observeMap(map, foliage);
+		const auto joined = compositor.decorLayers(foliage, 6, 30);
+		CHECK(joined[0].frame == -1);
+		CHECK(joined[1].frame == -1);
+
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "raised-icefall.png").string().c_str()));
+	}
+
+	TEST_CASE("large barrier masses terrace toward their middle [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+				map.setVertexTerrain(x, y, GRASS);
+		// A broad granite massif, a narrow sandstone ridge, and an obsidian patch
+		// touching the granite: terraces, a single tier and a valley all show.
+		for (int y = 2; y <= 17; ++y)
+			for (int x = 2; x <= 19; ++x)
+				if ((x - 10) * (x - 10) + (y - 9) * (y - 9) * 2 < 90)
+					map.setVertexTerrain(x, y, GRANITE_TORS);
+		for (int y = 21; y <= 23; ++y)
+			for (int x = 3; x <= 28; ++x)
+				map.setVertexTerrain(x, y, SANDSTONE_BENCHES);
+		for (int y = 4; y <= 15; ++y)
+			for (int x = 20; x <= 29; ++x)
+				map.setVertexTerrain(x, y, OBSIDIAN_RIDGE);
+
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto &compositor = globals->terrainCompositor();
+		const auto field = compositor.tierField(scene);
+		REQUIRE(field);
+		using TerrainVisual::Compositor;
+		// The massif's middle stands at least two terraces up; its rim and the
+		// three-vertex-wide ridge stay on the ground tier.
+		CHECK(compositor.decorTierFrame(scene, *field, 10, 9, 1) >= 0);
+		CHECK(compositor.decorTierFrame(scene, *field, 10, 9, 2) >= 0);
+		CHECK(compositor.decorTierFrame(scene, *field, 2, 9, 1) == -1);
+		CHECK(compositor.decorTierFrame(scene, *field, 12, 21, 1) == -1);
+		// decorLayers places them in the terrace slots.
+		const auto middle = compositor.decorLayers(scene, 10, 9, field.get());
+		CHECK(middle[Compositor::TierSlot].frame == compositor.decorTierFrame(scene, *field, 10, 9, 1));
+		CHECK(middle[Compositor::TierSlot + 1].frame == compositor.decorTierFrame(scene, *field, 10, 9, 2));
+		// Terraces nest: a cell never has a higher terrace without the lower one.
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+				for (int k = 2; k <= TerrainVisual::MaxDecorTiers; ++k)
+					if (compositor.decorTierFrame(scene, *field, x, y, k) >= 0)
+						CHECK(compositor.decorTierFrame(scene, *field, x, y, k - 1) >= 0);
+		// Foliage never terraces.
+		for (int y = 26; y <= 31; ++y)
+			for (int x = 0; x < 32; ++x)
+				map.setVertexTerrain(x, y, HEDGE);
+		SceneMap hedged;
+		glob2test::observeMap(map, hedged);
+		const auto hedgeField = compositor.tierField(hedged);
+		REQUIRE(hedgeField);
+		CHECK(compositor.decorTierFrame(hedged, *hedgeField, 10, 28, 1) == -1);
+
+		MapDrawer::drawMapTerrain(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 31, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		GAGCore::Sprite::flushBatches(globals->gfx);
+		REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(),
+			(glob2test::artifactDir() / "terraced-masses.png").string().c_str()));
+	}
+
+	// Draws eight-tile views of a painted 32x32 map at 4x with HD frames on
+	// programmable OpenGL, terrain and decor as the game draws them, and saves
+	// each as <name>-hd.png. Skips where programmable OpenGL is unavailable.
+	struct HdView
+	{
+		const char *name;
+		int x, y;
+	};
+	template <class Paint>
+	void captureHd(Paint paint, std::initializer_list<HdView> views)
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 1024,
+			 .screenFlags = Uint32(GAGCore::GraphicContext::USEGPU), .seed = 7331});
+		auto &gfx = *globals->gfx;
+		bool programmable = false;
+		for (const auto &choice : gfx.rendererAvailability())
+			programmable |= choice.backend == RendererBackend::ProgrammableGL && choice.available;
+		if (!programmable)
+		{
+			MESSAGE("No programmable OpenGL: HD capture skipped");
+			return;
+		}
+		REQUIRE(gfx.requestBackendSwitch(RendererBackend::ProgrammableGL));
+		gfx.nextFrame();
+		REQUIRE(gfx.backendSwitchStatus().active == RendererBackend::ProgrammableGL);
+		REQUIRE(gfx.renderer);
+		GAGCore::Sprite::setHighResolution(true);
+		struct Restore
+		{
+			~Restore() { GAGCore::Sprite::setHighResolution(false); }
+		} restore;
+		globals->terrainCompositor().prepare(true, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true,
+			.loadDefaultRace = true, .header = true, .seed = 7331});
+		paint(fixture.game.map);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		for (const auto &view : views)
+		{
+			MapRenderState render;
+			{
+				GAGCore::FrameDrawBatch frameBatch(&gfx);
+				gfx.setClipRect();
+				gfx.beginMapTransform(4, 0, 0, 0, 0, 1024, 1024);
+				MapDrawer::drawMapTerrain(0, 0, 7, 7, view.x, view.y, 0, Game::DRAW_WHOLE_MAP, scene, 0);
+				MapDrawer::drawMapResources(0, 0, 7, 7, view.x, view.y, 0, Game::DRAW_WHOLE_MAP, scene, &render);
+				GAGCore::Sprite::flushBatches(&gfx);
+				gfx.endMapTransform();
+			}
+			gfx.renderer->flush();
+			std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> captured(gfx.renderer->capture(),
+																				 SDL_DestroySurface);
+			REQUIRE(captured);
+			CHECK(IMG_SavePNG(captured.get(),
+				(glob2test::artifactDir() / (std::string(view.name) + "-hd.png")).string().c_str()));
+			gfx.nextFrame();
+		}
+	}
+
+	// Switching to programmable OpenGL saves the renderer choice.
+	GLOB2_TEST_CASE("cliffs beside foliage and crags in HD",
+					"[display][isolated][artifacts][writes-preferences]")
+	{
+		// The stepped border of the thicket and rock-spire panels.
+		captureHd([](auto &map) { paintCliffPanels(map); },
+				  {{"cliffs-beside-thicket", 2, 1}, {"cliffs-beside-crags", 2, 17}});
+	}
+
+	GLOB2_TEST_CASE("paths along staircases and corners in HD",
+					"[display][isolated][artifacts][writes-preferences]")
+	{
+		captureHd(
+			[](auto &map)
+			{
+				for (int y = 0; y < 32; ++y)
+					for (int x = 0; x < 32; ++x)
+					{
+						// A brick path three vertices wide along a 45-degree
+						// staircase, and a trail plaza with a notch and a bump.
+						const int d = x - y;
+						if (y >= 2 && y <= 28 && d >= -12 && d < -9)
+							map.setVertexTerrain(x, y, BRICK_PATH);
+						if (x >= 18 && x <= 28 && y >= 4 && y <= 12 && !(x == 28 && y == 8))
+							map.setVertexTerrain(x, y, TRAIL);
+					}
+				map.setVertexTerrain(17, 8, TRAIL);
+			},
+			{{"brick-path-staircase", 0, 12}, {"trail-plaza-corner", 15, 2}});
+	}
+
+	GLOB2_TEST_CASE("stone paths end on whole stones in HD",
+					"[display][isolated][artifacts][writes-preferences]")
+	{
+		// Four stone paths, each a staircase beside a block with a notch and a bump.
+		static constexpr TerrainType paths[4] = {SANDSTONE, SLATE_ASHLAR, OVERGROWN_ROAD, MOONSTONE_LOZENGE};
+		captureHd(
+			[](auto &map)
+			{
+				for (int panel = 0; panel < 4; ++panel)
+				{
+					const int ox = (panel & 1) * 16, oy = (panel >> 1) * 16;
+					for (int y = 1; y <= 14; ++y)
+						for (int x = 1; x <= 14; ++x)
+						{
+							const bool stairs = x - y >= -1 && x - y < 2 && x <= 7;
+							const bool block = x >= 9 && x <= 14 && y >= 2 && y <= 8 && !(x == 14 && y == 5);
+							if (stairs || block || (x == 8 && y == 4))
+								map.setVertexTerrain(ox + x, oy + y, paths[panel]);
+						}
+				}
+			},
+			{{"sandstone", 3, 0}, {"slate-ashlar", 19, 0}, {"mossy-setts", 3, 16}, {"moonstone-lozenge", 19, 16}});
+	}
+
+	TEST_CASE("shoreline surf animation frames around an island [display][artifacts]")
 	{
 		glob2test::HeadlessGlobals globals(
 			{.display = true, .width = 1024, .height = 768, .seed = 7331});
-		globals->terrainCompositor().prepare(false, 0);
+		auto &compositor = globals->terrainCompositor();
+		compositor.prepare(false, 0);
 		glob2test::HeadlessGame fixture({.wDec = 5,
 										 .hDec = 5,
 										 .discovered = true,
@@ -1666,8 +2937,91 @@ TEST_SUITE("TerrainValidation")
 										 .header = true,
 										 .seed = 7331});
 		auto &map = fixture.game.map;
-		// Ocean and a sand beach on the left, as in the mixed gallery.
+		// A sand-rimmed grass island with an irregular coast, a deep-water
+		// channel and a dark-water pool, all in open water.
 		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+			{
+				const double dx = x - 15.5, dy = (y - 11.5) * 1.3;
+				const double angle = std::atan2(dy, dx), distance = std::sqrt(dx * dx + dy * dy);
+				const double coast = 9 + 1.6 * std::sin(3 * angle) + 0.9 * std::cos(5 * angle + 1);
+				map.paintCell(x, y, distance < coast ? (distance < coast - 3 ? GRASS : SAND)
+													 : x > 27 ? DEEP_WATER : WATER);
+				if (x >= 2 && x < 5 && y >= 17 && y < 21)
+					map.paintCell(x, y, DARK_WATER);
+				if (x >= 5 && x < 7 && y >= 17 && y < 21)
+					map.paintCell(x, y, SAND);
+			}
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		const auto &catalog = compositor.catalog();
+		const int period = catalog.materials[catalog.find("water")].surf.period;
+		REQUIRE(period > 0);
+		const auto directory = glob2test::artifactDir() / "surf";
+		std::filesystem::create_directories(directory);
+		constexpr int frames = 24;
+		for (int frame = 0; frame < frames; ++frame)
+		{
+			MapDrawer::drawMapTerrain(0, 0, 31, 23, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene,
+										frame * period / frames);
+			char name[32];
+			std::snprintf(name, sizeof name, "surf-%02d.png", frame);
+			REQUIRE(IMG_SavePNG(globals->gfx->getSDLSurface(), (directory / name).string().c_str()));
+		}
+	}
+	TEST_CASE("shore calm before and after along a coastline [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 768, .seed = 7331});
+		auto &compositor = globals->terrainCompositor();
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true, .seed = 7331});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+			{
+				const double coast = 11 + 2.5 * std::sin(y * 0.45) + 1.2 * std::cos(y * 1.3);
+				map.paintCell(x, y, x < coast - 3 ? GRASS : x < coast ? SAND : x > 24 ? DEEP_WATER : WATER);
+			}
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		const auto directory = glob2test::artifactDir() / "shore-calm";
+		std::filesystem::create_directories(directory);
+		// HD cells, as accelerated renderers draw them, over a stretch of coast.
+		constexpr int scale = 4, x0 = 6, y0 = 4, w = 14, h = 9, n = 32 * scale;
+		const int time = 77;
+		compositor.prepare(true, time);
+		unsigned calmed = 0;
+		for (bool calm : {false, true})
+		{
+			GAGCore::DrawableSurface image(w * n, h * n);
+			for (int y = 0; y < h; ++y)
+				for (int x = 0; x < w; ++x)
+				{
+					auto recipe = compositor.describe(scene, x0 + x, y0 + y);
+					calmed += calm && recipe.calmed();
+					if (!calm)
+						recipe.calm = {};
+					compositor.compose(recipe, image.getSDLSurface(), x * n, y * n, scale);
+				}
+			REQUIRE(IMG_SavePNG(image.getSDLSurface(),
+								(directory / (calm ? "after.png" : "before.png")).string().c_str()));
+		}
+		CHECK(calmed > 0);
+	}
+	TEST_CASE("terrain catalogue gallery renders every group beside grass, sand and water [display][artifacts]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .width = 1024, .height = 2048, .seed = 7331});
+		globals->terrainCompositor().prepare(false, 0);
+		glob2test::HeadlessGame fixture({.wDec = 5,
+										 .hDec = 6,
+										 .discovered = true,
+										 .loadDefaultRace = true,
+										 .header = true,
+										 .seed = 7331});
+		auto &map = fixture.game.map;
+		// Ocean and a sand beach on the left, as in the mixed gallery.
+		for (int y = 0; y < 64; ++y)
 			for (int x = 0; x < 32; ++x)
 			{
 				if (x < 5)
@@ -1676,15 +3030,17 @@ TEST_SUITE("TerrainValidation")
 					map.paintCell(x, y, WATER);
 			}
 		// Every catalogue type as a 3x3 island on grass with a detached diagonal cell,
-		// five per row, so interior variants, boundaries and seams are all visible.
+		// five per row on a four-cell pitch, so interior variants, boundaries and seams
+		// are all visible in the 64 rendered rows (room for 80 types).
 		std::vector<TerrainType> types;
 		for (unsigned i = BOULDERS; i < TERRAIN_COUNT; ++i)
 			if (terrainPaintable(TerrainType(i)))
 				types.push_back(TerrainType(i));
-		REQUIRE(types.size() == 24);
+		REQUIRE(types.size() == TERRAIN_COUNT - BOULDERS);
+		REQUIRE(types.size() <= 80);
 		for (std::size_t n = 0; n < types.size(); ++n)
 		{
-			const int ox = 6 + int(n % 5) * 5, oy = int(n / 5) * 5; // rows 0..23 are rendered
+			const int ox = 6 + int(n % 5) * 5, oy = int(n / 5) * 4; // rows 0..63 are rendered
 			for (int dy = 0; dy < 3; ++dy)
 				for (int dx = 0; dx < 3; ++dx)
 					map.paintCell(ox + dx, oy + dy, types[n]);
@@ -1704,15 +3060,15 @@ TEST_SUITE("TerrainValidation")
 			map.paintCell(4, y, VOID_HOLE);
 		SceneMap scene;
 		glob2test::observeMap(map,scene);
-		fixture.game.drawMapTerrain(0, 0, 31, 23, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapTerrain(0, 0, 31, 63, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
 		// Raised obstacle decor is drawn with the resources, row by row.
-		fixture.game.drawMapResources(0, 0, 31, 23, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapResources(0, 0, 31, 63, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
 		GAGCore::Sprite::flushBatches(globals->gfx);
 		REQUIRE(IMG_SavePNG(
 			globals->gfx->getSDLSurface(),
 			(glob2test::artifactDir() / "terrain-catalogue-gallery.png").string().c_str()));
-		// Obstacle islands carry decor: cells with four obstacle corners use full
-		// frames, cells with two or three the smaller edge frames; open ground has none.
+		// Obstacle islands carry decor: connected foliage follows corner masks;
+		// other obstacles choose full/edge clusters. Open ground has none.
 		auto &compositor = globals->terrainCompositor();
 		REQUIRE(compositor.decorSprite());
 		const auto &catalog = compositor.catalog();
@@ -1720,30 +3076,35 @@ TEST_SUITE("TerrainValidation")
 		{ return std::find(frames.begin(), frames.end(), frame) != frames.end(); };
 		for (std::size_t n = 0; n < types.size(); ++n)
 		{
-			const int ox = 6 + int(n % 5) * 5, oy = int(n / 5) * 5;
+			const int ox = 6 + int(n % 5) * 5, oy = int(n / 5) * 4;
 			const auto &decor =
 				catalog.materials[catalog.bindings.at(terrainPresentation(types[n]).name)].decor;
 			INFO(terrainPresentation(types[n]).name);
 			if (decor.full.empty())
 			{
-				CHECK(compositor.decorFrame(scene, ox + 1, oy + 1) == -1);
+				CHECK(onlyDecorFrame(compositor, scene, ox + 1, oy + 1) == -1);
 				continue;
 			}
-			CHECK(contains(decor.full, compositor.decorFrame(scene, ox + 1, oy + 1)));
+			// Filled connected cells may also choose an alternative interior.
+			auto full = decor.connected.empty() ? decor.full : decor.connected;
+			full.insert(full.end(), decor.connectedInterior.begin(), decor.connectedInterior.end());
+			CHECK(contains(full, onlyDecorFrame(compositor, scene, ox + 1, oy + 1)));
 			// Painted cells cover vertices ox..ox+3, so the cells just outside
-			// the island have two of its corners.
-			CHECK(contains(decor.edge, compositor.decorFrame(scene, ox - 1, oy + 1)));
-			CHECK(contains(decor.edge, compositor.decorFrame(scene, ox + 3, oy + 1)));
+			// the island have two of its corners: only open-edged decor (cliffs)
+			// draws its edge there.
+			for (const int x : {ox - 1, ox + 3})
+			{
+				const int frame = onlyDecorFrame(compositor, scene, x, oy + 1);
+				if (decor.connectedOpen)
+					CHECK(contains(decor.connected, frame));
+				else
+					CHECK(frame == -1);
+			}
 		}
-		CHECK(compositor.decorFrame(scene, 5, 30) == -1);
-		// Painted islands keep their identity and the map declares every group painted.
+		CHECK(onlyDecorFrame(compositor, scene, 5, 30) == -1);
+		// Painted islands keep their identity.
 		for (std::size_t n = 0; n < types.size(); ++n)
-			CHECK(map.terrainTypeAt(6 + int(n % 5) * 5, int(n / 5) * 5) == types[n]);
-		const auto required = map.requiredTerrainExperiments();
-		for (auto type : types)
-			if (const auto experiment = terrainExperiment(type))
-				CHECK(required.has(*experiment));
-		CHECK(required.size() == 9);
+			CHECK(map.terrainTypeAt(6 + int(n % 5) * 5, int(n / 5) * 4) == types[n]);
 	}
 	TEST_CASE("catalogue materials load 4x HD frames and compose at 4x [display][artifacts]")
 	{
@@ -1765,9 +3126,9 @@ TEST_SUITE("TerrainValidation")
 		for (unsigned i = BOULDERS; i < TERRAIN_COUNT; ++i)
 			if (terrainPaintable(TerrainType(i)))
 				keys.push_back(terrainPresentation(TerrainType(i)).name);
-		REQUIRE(keys.size() == 24);
+		REQUIRE(keys.size() == TERRAIN_COUNT - BOULDERS);
 		// One 4x composed tile per catalogue material, six per row.
-		GAGCore::DrawableSurface sheet(6 * 128, 4 * 128);
+		GAGCore::DrawableSurface sheet(6 * 128, int((keys.size() + 5) / 6) * 128);
 		for (std::size_t n = 0; n < keys.size(); ++n)
 		{
 			INFO(keys[n]);
@@ -1781,6 +3142,39 @@ TEST_SUITE("TerrainValidation")
 				REQUIRE(hd);
 				CHECK(hd->getW() == 128);
 				CHECK(hd->getH() == 128);
+			}
+			if (!material.decor.connected.empty())
+			{
+				auto *decor = GAGCore::Toolkit::getSprite(material.decor.sprite);
+				REQUIRE(decor);
+				auto frames = material.decor.connected;
+				frames.insert(frames.end(), material.decor.connectedInterior.begin(),
+					material.decor.connectedInterior.end());
+				for (int frame : frames)
+				{
+					// Foliage stands one cell above its own; terraces stand taller.
+					auto *hd = decor->baseFrame(frame);
+					REQUIRE(hd);
+					CHECK(hd->getW() == 4 * decor->getW(frame));
+					CHECK(hd->getH() == 4 * decor->getH(frame));
+					CHECK(hd->getH() >= 256);
+				}
+			}
+			else if (material.key == "boulders")
+			{
+				// Tall boulders: 128x128 native frames, 512x512 in HD.
+				auto *decor = GAGCore::Toolkit::getSprite(material.decor.sprite);
+				REQUIRE(decor);
+				for (const auto &frames : {material.decor.full, material.decor.edge})
+					for (int frame : frames)
+					{
+						CHECK(decor->getW(frame) == TerrainVisual::MaximumDecorFrame);
+						CHECK(decor->getH(frame) == TerrainVisual::MaximumDecorFrame);
+						auto *hd = decor->baseFrame(frame);
+						REQUIRE(hd);
+						CHECK(hd->getW() == 512);
+						CHECK(hd->getH() == 512);
+					}
 			}
 			TerrainVisual::Recipe recipe;
 			recipe.corners.fill(id);
@@ -1830,7 +3224,7 @@ TEST_SUITE("TerrainValidation")
 		SceneMap scene;
 		glob2test::observeMap(map,scene);
 		auto *gfx = globals->gfx;
-		fixture.game.drawMapTerrain(0, 0, 31, 23, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
+		MapDrawer::drawMapTerrain(0, 0, 31, 23, 0, 0, 0, Game::DRAW_WHOLE_MAP, scene);
 		REQUIRE(IMG_SavePNG(gfx->getSDLSurface(),
 							(glob2test::artifactDir() / "terrain-gallery.png").string().c_str()));
 		SoftwareTerrainCache cache;

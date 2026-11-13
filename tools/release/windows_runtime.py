@@ -122,20 +122,22 @@ def stage_dlls(executable, runtime_dirs, destination, inspect=imports):
             pending.append(target)
 
 
-def stage_assets(source, destination, original_assets=False):
+def stage_assets(source, destination, original_assets=False, *, packing="legacy", jobs=None):
     source, destination = Path(source), Path(destination)
     for directory in ASSET_DIRS:
-        if not (source / directory).is_dir():
-            raise FileNotFoundError(source / directory)
+        if not (source / "content" / directory).is_dir():
+            raise FileNotFoundError(source / "content" / directory)
     with tempfile.TemporaryDirectory(prefix="glob2-assets-") as temporary:
         assets = Path(temporary) / "runtime"
         if original_assets:
             for path in source_files(source, "windows"):
-                target = assets / path.relative_to(source)
+                target = assets / path.relative_to(source / "content")
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, target)
         else:
-            export_assets(source, assets, platform="windows")
+            export_assets(source, assets, platform="windows", jobs=jobs,
+                          terrain_sheets=packing != "legacy", packed_hd_sprites=packing != "legacy",
+                          video_sprites=packing == "video")
         for directory in ASSET_DIRS:
             if (assets / directory).is_dir():
                 shutil.copytree(assets / directory, destination / directory)

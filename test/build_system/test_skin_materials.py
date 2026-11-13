@@ -7,7 +7,7 @@ import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'scons'))
+sys.path.insert(0, str(ROOT / 'buildsys'))
 import skin_materials  # noqa: E402
 
 
@@ -33,20 +33,20 @@ class SkinMaterialsTest(unittest.TestCase):
                 self.assertFalse(line.endswith('\\'), 'GLSL 1.20 has no line continuation')
 
     def test_shader_edits_rebake_sprites(self):
-        text = (ROOT / 'scons/skin_render.py').read_text()
+        text = (ROOT / 'buildsys/skin_render.py').read_text()
         for path in (skin_materials.REGISTRY, skin_materials.SHADER):
             self.assertIn("'%s'" % path.as_posix(), text, '%s must feed SKIN_RENDER_REVISION' % path)
 
     def test_web_studio_imports_the_shader(self):
-        module = (ROOT / 'platform/apps/web/src/skins/materialShader.ts').read_text()
-        self.assertIn("libgag/shaders/skin-material.glsl?raw'", module)
-        self.assertIn('COPY libgag/shaders', (ROOT / 'deploy/Dockerfile').read_text())
+        module = (ROOT / 'services/online/apps/web/src/skins/materialShader.ts').read_text()
+        self.assertIn("libs/gag/shaders/skin-material.glsl?raw'", module)
+        self.assertIn('COPY libs/gag/shaders', (ROOT / 'deploy/Dockerfile').read_text())
 
     def test_protocol_mirror(self):
         """The platform ships a copy of the registry; its vitest pins equality,
         this guards the copy from drifting in checkouts without node."""
         registry = json.loads((ROOT / skin_materials.REGISTRY).read_text())
-        text = (ROOT / 'platform/packages/protocol/src/skins.ts').read_text()
+        text = (ROOT / 'services/online/packages/protocol/src/skins.ts').read_text()
         for material in registry['materials']:
             self.assertRegex(text, r"\{ id: %d, key: '%s', name: '%s', group: '%s', shells: %s \}" % (
                 material['id'], material['key'], re.escape(material['name']), material['group'],

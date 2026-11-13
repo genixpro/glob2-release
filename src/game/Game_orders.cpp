@@ -5,8 +5,7 @@
 // Game class implementation.
 
 
-#include "AICastor.h"
-#include "AINicowar.h"
+#include "gradient/MapRouting.h"
 
 #include <assert.h>
 #include <string.h>
@@ -31,6 +30,9 @@
 #include "Brush.h"
 
 #include "ReplayWriter.h"
+#include "Building.h"
+#include "MapScript.h"
+#include "Team.h"
 
 namespace
 {
@@ -259,7 +261,7 @@ bool Game::executeCreate(const OrderCreate& oc, int localPlayer)
 				if (isLocalTeam(*this, localPlayer, oc.teamNumber))
 					map.displayedForbiddenView.set(map.coordToIndex(x, y), true);
 			}
-		map.updateForbiddenGradient(oc.teamNumber);
+		map.routing().updateForbiddenGradient(oc.teamNumber);
 		return true;
 	}
 
@@ -382,8 +384,8 @@ bool Game::executeMoveFlag(const OrderMoveFlag& omf, int localPlayer)
 		areaEffects.changed(b->gid);
 		if (b->type->runtimeSuppliesStock || b->type->runtimeSuppliesDirectStock)
 		{
-			map.invalidateSupplierLocations();
-			for (int resource=0; resource<MaterialCount; ++resource) map.dirtyMarketGradientsSlot(b->owner->teamNumber, resource);
+			map.routing().invalidateSupplierLocations();
+			for (int resource=0; resource<MaterialCount; ++resource) map.routing().dirtyMarketGradientsSlot(b->owner->teamNumber, resource);
 		}
 
 		if (b->type->zonableForbidden)
@@ -444,14 +446,14 @@ bool Game::executeAlterForbidden(const OrderAlterForbidden& oaa, int localPlayer
 						building->gradientGeneration[swim] = map.topologyGeneration;
 			}
 		}
-	map.carryPendingBuildingGenerations(oldGeneration, map.topologyGeneration);
+	map.routing().carryPendingBuildingGenerations(oldGeneration, map.topologyGeneration);
 	if (walkingChanged)
 	{
-		map.updateForbiddenGradient(oaa.teamNumber);
-		map.updateGuardAreasGradient(oaa.teamNumber);
+		map.routing().updateForbiddenGradient(oaa.teamNumber);
+		map.routing().updateGuardAreasGradient(oaa.teamNumber);
 	}
 	if (walkingChanged || clearingChanged)
-		map.updateClearAreasGradient(oaa.teamNumber);
+		map.routing().updateClearAreasGradient(oaa.teamNumber);
 
 	return true;
 }
@@ -499,7 +501,7 @@ bool Game::executeAlterGuardArea(const OrderAlterGuardArea& oaa, int localPlayer
 	if (!isValidAlterArea(oaa)) return false;
 	alterAreaMask(map, oaa, isLocalTeam(*this, localPlayer, oaa.teamNumber),
 		&Tile::guardArea, map.displayedGuardAreaView, anyTile);
-	map.updateGuardAreasGradient(oaa.teamNumber);
+	map.routing().updateGuardAreasGradient(oaa.teamNumber);
 
 	return true;
 }
@@ -509,7 +511,7 @@ bool Game::executeAlterClearArea(const OrderAlterClearArea& oaa, int localPlayer
 	if (!isValidAlterArea(oaa)) return false;
 	alterAreaMask(map, oaa, isLocalTeam(*this, localPlayer, oaa.teamNumber),
 		&Tile::clearArea, map.displayedClearAreaView, anyTile);
-	map.updateClearAreasGradient(oaa.teamNumber);
+	map.routing().updateClearAreasGradient(oaa.teamNumber);
 
 	return true;
 }
@@ -525,7 +527,7 @@ bool Game::executeAlterFarmArea(const OrderAlterFarmArea& oaa, int localPlayer)
 		&Tile::farmArea, map.displayedFarmAreaView,
 		[this](int x, int y) { return map.canPaintFarmArea(x, y); });
 	// A farm is a clearing goal for everything it does not grow.
-	map.updateClearAreasGradient(oaa.teamNumber);
+	map.routing().updateClearAreasGradient(oaa.teamNumber);
 
 	return true;
 }
@@ -625,7 +627,7 @@ bool Game::executeSetAlliance(const SetAllianceOrder& sao)
 	if (team >= static_cast<unsigned>(mapHeader.getNumberOfTeams()) || !teams[team]) return false;
 	const auto previousAllies=teams[team]->allies;
 	teams[team]->allies=sao.alliedMask;
-	map.gradientAlliancesChanged(team,previousAllies);
+	map.routing().gradientAlliancesChanged(team,previousAllies);
 	teams[team]->enemies=sao.enemyMask;
 	teams[team]->sharedVisionExchange=sao.visionExchangeMask;
 	teams[team]->sharedVisionFood=sao.visionFoodMask;

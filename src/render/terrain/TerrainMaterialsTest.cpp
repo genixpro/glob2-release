@@ -1,9 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "TerrainGroupTable.h"
+#include "TerrainBuiltins.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include "ScopedEnvironment.h"
 #include "ComputeExecutor.h"
 #include <PresentationWork.h>
 #include <cstring>
+#include <numeric>
 #include "TerrainMaterials.h"
 #include "TerrainCompositor.h"
 #include "TerrainCatalogIO.h"
@@ -11,6 +17,8 @@
 #include "render/scene/SceneMap.h"
 #include "TerrainCompiledPack.h"
 #include <FileManager.h>
+#include <Toolkit.h>
+#include <filesystem>
 #include <SDL3_image/SDL_image.h>
 #include <nlohmann/json.hpp>
 #include <fstream>
@@ -25,6 +33,18 @@ TerrainVisual::Catalog catalog()
 {
 	return TerrainVisual::loadCatalog();
 }
+// The checkout's catalog as one document, read without the file manager.
+nlohmann::json shippedCatalog()
+{
+	const auto read = [](const std::filesystem::path &path)
+	{
+		std::ifstream input(glob2test::contentRoot() / path);
+		REQUIRE(input);
+		return nlohmann::json::parse(input);
+	};
+	return TerrainVisual::assembleCatalog(read("data/terrain/tileset.json"), [&](const std::string &key)
+										  { return read("data/terrain/materials/" + key + ".json"); });
+}
 template <class Field>
 TerrainVisual::Recipe contextualRecipe(int x, int y, int size, Field field)
 {
@@ -38,15 +58,289 @@ TerrainVisual::Recipe contextualRecipe(int x, int y, int size, Field field)
 	r.corners = {r.neighborhood[5], r.neighborhood[6], r.neighborhood[9], r.neighborhood[10]};
 	return r;
 }
-std::array<unsigned, 64> materialWeights(const TerrainVisual::Coverage &coverage)
+// Dark water with its waves held on phase 0 and its wash advanced in six-tick
+// steps: the shipped waters all animate, so this stands in for a still,
+// surfed material. Synthetic animation has no compiled artifact.
+TerrainVisual::MaterialId stillSteppedWater(TerrainVisual::Catalog &definitions)
 {
-	std::array<unsigned, 64> weights{};
+	definitions.compiledPack.clear();
+	const auto id = definitions.find("dark_water");
+	auto &material = definitions.materials[id];
+	material.animationFrames = material.animationTicks = 1;
+	material.animationStride = 0;
+	material.surf.ticks = 6;
+	return id;
+}
+std::array<unsigned, 128> materialWeights(const TerrainVisual::Coverage &coverage)
+{
+	std::array<unsigned, 128> weights{};
 	for (unsigned k = 0; k < 4; ++k) weights[coverage.material[k]] += coverage.weight[k];
 	return weights;
 }
 } // namespace
 TEST_SUITE("TerrainMaterials")
 {
+	TEST_CASE("connected foliage selects the requested corner mask and keeps legacy decor")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		for (const auto *key : {"hedge", "thicket"})
+		{
+			const auto id = c.find(key);
+			const auto &frames = c.materials[id].decor.connected;
+			REQUIRE(frames.size() == 256);
+			const auto &interior = c.materials[id].decor.connectedInterior;
+			REQUIRE(c.materials[id].decor.connectedCorners);
+			REQUIRE(interior.size() == 16 * 7);
+			for (unsigned mask = 0; mask < 15; ++mask)
+				for (unsigned colours = 0; colours < 16; ++colours)
+				{
+					const int frame = c.decorFrame(id, 3, 5, true, 73, mask, colours);
+					if (!mask) CHECK(frame == -1);
+					else CHECK(frame == frames[mask * 16 + colours]);
+				}
+			// Filled cells pick among the colour's base frame and its interiors.
+			for (unsigned colours = 0; colours < 16; ++colours)
+			{
+				std::set<int> seen;
+				for (int y = 0; y < 16; ++y)
+					for (int x = 0; x < 16; ++x)
+					{
+						const int frame = c.decorFrame(id, x, y, false, 73, 15, colours);
+						seen.insert(frame);
+						const auto first = interior.begin() + colours * 7;
+						CHECK((frame == frames[15 * 16 + colours] || std::find(first, first + 7, frame) != first + 7));
+					}
+				CHECK(seen.size() == 8);
+			}
+		}
+		// Neighbouring cells read the same bit for each shared vertex, including
+		// across the toroidal seam, and both colours occur.
+		unsigned seen = 0;
+		for (unsigned seed : {0u, 73u})
+			for (int y = 0; y < 32; ++y)
+				for (int x = 0; x < 32; ++x)
+				{
+					const auto here = TerrainVisual::cornerColours(x, y, 31, 31, seed);
+					const auto right = TerrainVisual::cornerColours((x + 1) & 31, y, 31, 31, seed);
+					const auto below = TerrainVisual::cornerColours(x, (y + 1) & 31, 31, 31, seed);
+					CHECK(((here >> 1) & 5u) == (right & 5u));
+					CHECK(((here >> 2) & 3u) == (below & 3u));
+					seen |= 1u << here;
+				}
+		CHECK(seen == 0xffffu);
+		const auto id = c.find("boulders");
+		for (bool edge : {false, true})
+		{
+			const auto &frames = edge ? c.materials[id].decor.edge : c.materials[id].decor.full;
+			const auto frame = c.decorFrame(id, 3, 7, edge);
+			CHECK(std::find(frames.begin(), frames.end(), frame) != frames.end());
+		}
+	}
+
+	TEST_CASE("tall decor grows upward from its cell; frames up to 64 px stay centred")
+	{
+		using namespace TerrainVisual;
+		// Frames up to 64 px are centred on the 32 px cell, as before.
+		CHECK(decorOffsetX(64) == 16);
+		CHECK(decorOffsetY(64) == 16);
+		CHECK(decorOffsetY(48) == 8);
+		CHECK(decorOffsetY(32) == 0);
+		// Taller frames keep the 64 px frame's bottom, 16 px below the cell.
+		CHECK(decorOffsetY(96) == 48);
+		CHECK(decorOffsetY(MaximumDecorFrame) == 80);
+		CHECK(MaximumDecorFrame - 32 - decorOffsetY(MaximumDecorFrame) == 16);
+		CHECK(decorOffsetX(MaximumDecorFrame) == 48);
+		DecorReach reach;
+		reach.include(32, 64);
+		CHECK((reach.up == 16 && reach.down == 16 && reach.side == 0));
+		reach.include(128, 128);
+		CHECK((reach.up == 80 && reach.down == 16 && reach.side == 48));
+	}
+	TEST_CASE("connected foliage rejects incomplete corner groups")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto document = nlohmann::json::parse(catalog().serialized);
+		for (auto &material : document["materials"])
+			if (material["key"] == "hedge")
+			{
+				for (unsigned count : {0u, 1u, 15u, 17u, 272u})
+				{
+					material["decor"]["connected"] = std::vector<int>(count, 0);
+					CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+				}
+			}
+	}
+
+	TEST_CASE("fertile ground overlays glint sparsely, out of step and on its own cycle")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		for (const char *key : {"loam", "moss", "spring_meadow"})
+			CHECK_FALSE(c.materials[c.find(key)].overlay.cycles.empty());
+		for (const char *key : {"grass", "sand", "boulders", "lava"})
+			CHECK(c.materials[c.find(key)].overlay.cycles.empty());
+		CHECK(c.overlayFrame(c.find("grass"), 3, 4, 100) == -1);
+		const auto id = c.find("loam");
+		const auto &overlay = c.materials[id].overlay;
+		const auto period = std::uint32_t(overlay.ticks * overlay.cycles.front().size());
+		unsigned glinting = 0, lit = 0, startsAtZero = 0;
+		for (int y = 0; y < 64; ++y)
+			for (int x = 0; x < 64; ++x)
+			{
+				bool cellGlints = false;
+				for (std::uint32_t tick = 0; tick < period; tick += std::uint32_t(overlay.ticks))
+				{
+					const int frame = c.overlayFrame(id, x, y, tick, 9);
+					// A step holds for `ticks` scene ticks and the cycle repeats.
+					CHECK(c.overlayFrame(id, x, y, tick + std::uint32_t(overlay.ticks) - 1, 9) == frame);
+					CHECK(c.overlayFrame(id, x, y, tick + period, 9) == frame);
+					if (frame >= 0)
+					{
+						cellGlints = true;
+						++lit;
+					}
+				}
+				glinting += cellGlints;
+				startsAtZero += c.overlayFrame(id, x, y, 0, 9) == overlay.cycles.front().front();
+			}
+		// About density_q8 / 256 of the cells glint, and they do not all flash together.
+		const double share = glinting / 4096.0;
+		CHECK(std::abs(share - overlay.densityQ8 / 256.0) < 0.05);
+		CHECK(lit > glinting);
+		CHECK(startsAtZero < glinting / 4);
+		// A different map seed picks different cells.
+		unsigned moved = 0;
+		for (int x = 0; x < 256; ++x)
+			for (std::uint32_t tick = 0; tick < period; tick += std::uint32_t(overlay.ticks))
+				moved += (c.overlayFrame(id, x, 0, tick, 9) >= 0) != (c.overlayFrame(id, x, 0, tick, 10) >= 0);
+		CHECK(moved > 0);
+	}
+
+	TEST_CASE("overlays reject empty, all-dark and out-of-range cycles")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto original = nlohmann::json::parse(catalog().serialized);
+		for (const auto &cycles : {nlohmann::json::array(), nlohmann::json::array({nlohmann::json::array()}),
+								   nlohmann::json::array({nlohmann::json::array({-1, -1})}),
+								   nlohmann::json::array({nlohmann::json::array({-2})}),
+								   nlohmann::json::array({nlohmann::json::array({70000})})})
+		{
+			auto document = original;
+			for (auto &material : document["materials"])
+				if (material["key"] == "loam")
+					material["overlay"]["cycles"] = cycles;
+			CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+		}
+		auto document = original;
+		for (auto &material : document["materials"])
+			if (material["key"] == "loam")
+				material["overlay"]["density_q8"] = 0;
+		CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+	}
+
+	TEST_CASE("open-edged connected decor is a validated catalog flag")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto definitions = catalog();
+		CHECK(definitions.materials[definitions.find("cliffs")].decor.connectedOpen);
+		CHECK(definitions.materials[definitions.find("icefall")].decor.connectedOpen);
+		CHECK_FALSE(definitions.materials[definitions.find("hedge")].decor.connectedOpen);
+		auto document = nlohmann::json::parse(definitions.serialized);
+		for (auto &material : document["materials"])
+		{
+			if (material["key"] == "cliffs")
+			{
+				material["decor"]["connected_open"] = 1;
+				CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+				material["decor"]["connected_open"] = true;
+			}
+			if (material["key"] == "boulders")
+			{
+				// Object decor has no corner-mask edges to draw on open ground.
+				material["decor"]["connected_open"] = true;
+				CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+				material["decor"].erase("connected_open");
+			}
+		}
+		CHECK_NOTHROW(TerrainVisual::Catalog::parse(document));
+	}
+
+	TEST_CASE("free-standing obstacles keep clear of open-ground masses")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto definitions = catalog();
+		for (const char *key : {"boulders", "ridge_rock", "outcrop", "penitentes", "termite_mounds",
+								"hoodoos", "petrified_stumps"})
+		{
+			CAPTURE(key);
+			CHECK(definitions.materials[definitions.find(key)].decor.clearOfMasses == 0);
+		}
+		// Masses and foliage never use it.
+		for (const char *key : {"cliffs", "icefall", "hedge", "thicket"})
+		{
+			CAPTURE(key);
+			CHECK(definitions.materials[definitions.find(key)].decor.clearOfMasses == -1);
+		}
+		auto document = nlohmann::json::parse(definitions.serialized);
+		for (auto &material : document["materials"])
+		{
+			if (material["key"] == "boulders")
+			{
+				for (const auto bad : {nlohmann::json(-1), nlohmann::json(TerrainVisual::MaxDecorClearOfMasses + 1),
+									   nlohmann::json(true), nlohmann::json("1"), nlohmann::json(1.0)})
+				{
+					material["decor"]["clear_of_masses"] = bad;
+					CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+				}
+				material["decor"]["clear_of_masses"] = 1;
+				CHECK(TerrainVisual::Catalog::parse(document)
+						  .materials[definitions.find("boulders")].decor.clearOfMasses == 1);
+				material["decor"]["clear_of_masses"] = 0;
+			}
+			// Masses and connected foliage tile across cells, so skipping one
+			// would cut their surface.
+			if (material["key"] == "cliffs" || material["key"] == "hedge")
+			{
+				material["decor"]["clear_of_masses"] = 1;
+				CHECK_THROWS(TerrainVisual::Catalog::parse(document));
+				material["decor"].erase("clear_of_masses");
+			}
+		}
+		CHECK_NOTHROW(TerrainVisual::Catalog::parse(document));
+	}
+
+	TEST_CASE("connected canopy ground leaves contact shadows to the foliage [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		const auto c = catalog();
+		const auto grass = c.find("grass"), hedge = c.find("hedge");
+		auto unshadowed = c, legacy = c;
+		unshadowed.materials[hedge].seam.cast = 0;
+		legacy.materials[hedge].decor.connected.clear();
+		TerrainVisual::Compositor canopy(c), ground(unshadowed), oldGround(legacy);
+		canopy.prepare(false, 0); ground.prepare(false, 0); oldGround.prepare(false, 0);
+		TerrainVisual::Recipe r;
+		r.corners = {grass, hedge, grass, hedge}; r.width = r.height = 16;
+		GAGCore::DrawableSurface actual(32, 32), expected(32, 32), old(32, 32);
+		canopy.compose(r, actual.getSDLSurface(), 0, 0, 1);
+		ground.compose(r, expected.getSDLSurface(), 0, 0, 1);
+		oldGround.compose(r, old.getSDLSurface(), 0, 0, 1);
+		unsigned legacyDifferences = 0;
+		for (int y = 0; y < 32; ++y)
+		{
+			const auto row = [y](SDL_Surface *surface) {
+				return reinterpret_cast<const Uint32 *>(static_cast<const Uint8 *>(surface->pixels) + y * surface->pitch);
+			};
+			for (int x = 0; x < 32; ++x)
+			{
+				CHECK(row(actual.getSDLSurface())[x] == row(expected.getSDLSurface())[x]);
+				legacyDifferences += row(actual.getSDLSurface())[x] != row(old.getSDLSurface())[x];
+			}
+		}
+		CHECK(legacyDifferences > 0);
+	}
+
 	TEST_CASE("contextual borders preserve seams and normalization across both wrapped axes")
 	{
 		glob2test::HeadlessGlobals globals;
@@ -75,8 +369,11 @@ TEST_SUITE("TerrainMaterials")
 	TEST_CASE("contextual contours use their halo and leave ambiguous and sharp borders unchanged")
 	{
 		glob2test::HeadlessGlobals globals;
-		auto c = catalog(); c.boundaryWarp = {};
-		const auto a = c.find("sand"), b = c.find("water");
+		// Contextual geometry is the version 1-3 path; version 4 draws every
+		// contact with the smooth field (TerrainContinuity covers it).
+		auto c = catalog(); c.boundaryWarp = {}; c.version = 3;
+		// Both profiles opt in to contextual geometry under the version 3 rule.
+		const auto a = c.find("sand"), b = c.find("grass");
 		auto additional = c.materials[c.find("grass")];
 		additional.key = "fixture-natural";
 		c.materials.push_back(additional); // Sharp borders also remain sharp against new materials.
@@ -84,7 +381,7 @@ TEST_SUITE("TerrainMaterials")
 			for (auto sharp : {"road", "boardwalk", "lava", "ember_field", "void_hole", "chasm"})
 				CHECK_FALSE(c.contextualFor(c.find(sharp), c.find(material.key)));
 		auto old = c;
-		for (auto &profile : old.profiles) profile.contextual = false;
+		for (auto &profile : old.profiles) profile.shape = TerrainVisual::BoundaryShape::Patch;
 		auto r = contextualRecipe(3, 4, 16, [&](int x, int y) { return x + y < 8 ? a : b; });
 		auto changedHalo = r;
 		changedHalo.neighborhood[1] = b;
@@ -104,7 +401,7 @@ TEST_SUITE("TerrainMaterials")
 		CHECK(haloChanged > 0);
 		for (const auto corners : {std::array<TerrainVisual::MaterialId, 4>{a, b, b, a},
 			std::array<TerrainVisual::MaterialId, 4>{a, b, c.find("grass"), a},
-			std::array<TerrainVisual::MaterialId, 4>{c.find("road"), a, c.find("road"), a}})
+			std::array<TerrainVisual::MaterialId, 4>{c.find("boardwalk"), a, c.find("boardwalk"), a}})
 		{
 			r.corners = corners;
 			r.neighborhood[5] = corners[0]; r.neighborhood[6] = corners[1];
@@ -115,6 +412,60 @@ TEST_SUITE("TerrainMaterials")
 					CHECK(materialWeights(current.at(x * 256 + 128, y * 256 + 128)) ==
 						materialWeights(original.at(x * 256 + 128, y * 256 + 128)));
 		}
+	}
+	TEST_CASE("surf measures every land coast without its clasts")
+	{
+		// The wash front runs at a fixed distance inside the land contour. Were
+		// that contour to include a material's clasts, the front would curve
+		// round inside every rounded chip and draw a crescent of foam.
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		const auto water = c.find("water");
+		REQUIRE(c.materials[water].surf.period > 0);
+		const int N = 12;
+		const auto island = [](int x, int y)
+		{
+			const float dx = x - 5.5f, dy = y - 5.5f;
+			return dx * dx + dy * dy < 16.f + 3 * std::sin(x * 1.7f + y);
+		};
+		unsigned shedding = 0;
+		for (TerrainVisual::MaterialId land = 0; land < c.materials.size(); ++land)
+		{
+			if (c.materials[land].surf.period > 0)
+				continue;
+			auto plain = c;
+			auto &edge = plain.profiles[plain.materials[land].profile];
+			if (edge.clasts == TerrainVisual::Profile::Clasts::None || !edge.speckle)
+				continue;
+			edge.clasts = TerrainVisual::Profile::Clasts::None;
+			CAPTURE(c.materials[land].key);
+			++shedding;
+			unsigned compared = 0, chipped = 0;
+			for (int y = 0; y < N; ++y)
+				for (int x = 0; x < N; ++x)
+				{
+					const auto r = contextualRecipe(x, y, N, [&](int x, int y) { return island(x, y) ? land : water; });
+					if (std::all_of(r.corners.begin(), r.corners.end(), [&](auto id) { return id == r.corners[0]; }))
+						continue;
+					const TerrainVisual::PreparedCoverage with(c, r), without(plain, r);
+					for (int py = 0; py < 32; ++py)
+						for (int px = 0; px < 32; ++px)
+						{
+							const auto a = with.at(px * 256 + 128, py * 256 + 128);
+							const auto b = without.at(px * 256 + 128, py * 256 + 128);
+							const auto dominant = [](const TerrainVisual::Coverage &v)
+							{ return v.material[std::max_element(v.weight.begin(), v.weight.end()) - v.weight.begin()]; };
+							chipped += materialWeights(a) != materialWeights(b);
+							if (dominant(a) != land || dominant(b) != land || a.neighbor != water || b.neighbor != water)
+								continue;
+							++compared;
+							CHECK(a.margin == b.margin);
+						}
+				}
+			CHECK(compared > 1000);
+			CHECK(chipped > 0); // The material really does shed clasts here.
+		}
+		CHECK(shedding >= 10); // Rock, soil, frozen and sand families.
 	}
 	TEST_CASE("contextual cells retain every corner region at native and HD sample positions")
 	{
@@ -190,7 +541,9 @@ TEST_SUITE("TerrainMaterials")
 	TEST_CASE("straight contextual borders have seeded scallops without folding")
 	{
 		glob2test::HeadlessGlobals globals;
-		auto c = catalog(); c.boundaryWarp = {};
+		// Contextual geometry is the version 1-3 path; version 4 draws every
+		// contact with the smooth field (TerrainContinuity covers it).
+		auto c = catalog(); c.boundaryWarp = {}; c.version = 3;
 		const auto a = c.find("sand"), b = c.find("grass");
 		std::array<std::set<std::vector<int>>, 2> shapes;
 		for (unsigned seed : {0u, 19u, 73u, 291u})
@@ -277,12 +630,54 @@ TEST_SUITE("TerrainMaterials")
 		}
 	}
 
+	TEST_CASE("shore calm edits beyond the border halo invalidate the calmed page [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = WATER, .discovered = true});
+		// Page zero ends at vertex 16; land at vertex 18 still calms its water.
+		constexpr int land = SoftwareTerrainCache::ChunkTiles + TerrainVisual::ShoreCalmSearch;
+		REQUIRE(TerrainVisual::ShoreCalmSearch >= 2);
+		REQUIRE(SoftwareTerrainCache::SourceHalo >= TerrainVisual::ShoreCalmSearch);
+		fixture.game.map.setVertexTerrain(land, 8, SAND);
+		SceneMap scene;
+		SoftwareTerrainCache cache;
+		const auto prepare = [&]
+		{
+			glob2test::observeMap(fixture.game.map, scene);
+			REQUIRE(cache.prepare(scene, *globals->terrain, 0, 0, 15, 15, 0, 0, fixture.team->me, true, 0));
+			std::vector<Uint32> expected;
+			for (bool cached : {false, true})
+			{
+				globals->gfx->drawFilledRect(0, 0, 640, 480, GAGCore::Color(11, 22, 33));
+				if (cached) cache.draw(*globals->gfx);
+				else SoftwareTerrainCache::drawUncached(scene, *globals->terrain,
+					0, 0, 15, 15, 0, 0, fixture.team->me, true, 0);
+				const auto *surface = globals->gfx->getSDLSurface();
+				std::vector<Uint32> pixels;
+				for (int y = 0; y < surface->h; ++y)
+				{
+					const auto *row = reinterpret_cast<const Uint32 *>(
+						static_cast<const Uint8 *>(surface->pixels) + y * surface->pitch);
+					pixels.insert(pixels.end(), row, row + surface->w);
+				}
+				if (cached) CHECK(pixels == expected);
+				else expected = std::move(pixels);
+			}
+		};
+		prepare();
+		const auto before = cache.cacheRebuilds();
+		fixture.game.map.setVertexTerrain(land, 8, WATER);
+		prepare(); CHECK(cache.cacheRebuilds() == before + 1);
+		fixture.game.map.setVertexTerrain(land, 8, SAND);
+		prepare(); CHECK(cache.cacheRebuilds() == before + 2);
+	}
+
 	TEST_CASE("natural border visual fixture and cold composition timings [display] [artifacts]")
 	{
 		glob2test::HeadlessGlobals globals({.display = true, .width = 768, .height = 768});
 		auto current = catalog(); current.compiledPack.clear();
 		auto previous = current;
-		for (auto &profile : previous.profiles) profile.contextual = false;
+		for (auto &profile : previous.profiles) profile.shape = TerrainVisual::BoundaryShape::Patch;
 		const auto water = current.find("water"), sand = current.find("sand"), grass = current.find("grass");
 		const auto field = [&](int scenario, int x, int y) -> TerrainVisual::MaterialId
 		{
@@ -376,6 +771,54 @@ TEST_SUITE("TerrainMaterials")
 		log << "simulation_checksum=" << simulationChecksum << " unchanged after both presentations\n";
 	}
 
+	TEST_CASE("border gallery renders each kind of material contact [display] [artifacts]")
+	{
+		// Review fixture for boundary profiles: twelve 8x8-cell panels, each a
+		// material pair (or a junction) painted with the same island, diagonal
+		// shore, one-cell strip, bend and lone vertex.
+		glob2test::HeadlessGlobals globals({.display = true, .width = 1024, .height = 768});
+		auto c = catalog(); c.compiledPack.clear();
+		struct Panel { const char *a, *b, *c; };
+		const Panel panels[] = {
+			{"water", "deep_water", nullptr}, {"deep_water", "dark_water", nullptr},
+			{"water", "deep_water", "grass"}, {"water", "grass", nullptr},
+			{"water", "sand", nullptr}, {"ice", "water", nullptr},
+			{"lava", "grass", nullptr}, {"lava", "boulders", nullptr},
+			{"road", "grass", nullptr}, {"road", "boulders", nullptr},
+			{"brick_path", "heath", nullptr}, {"boardwalk", "water", nullptr}};
+		const auto shape = [](int x, int y)
+		{
+			const float dx = x - 2.5f, dy = y - 2.5f;
+			return dx * dx + dy * dy < 5.5f || x + y >= 11 || (x == 6 && y <= 3) || (x == 1 && y == 6);
+		};
+		std::ofstream log(glob2test::artifactDir() / "border-gallery.txt");
+		log << "Panels row-major (second material inside the shapes):\n";
+		for (const auto &panel : panels)
+			log << "  " << panel.a << " / " << panel.b << (panel.c ? std::string(" / ") + panel.c + " (top-right junction)" : "") << '\n';
+		TerrainVisual::Compositor compositor(c);
+		for (int scale : {1, 4})
+		{
+			compositor.prepare(scale > 1, 0);
+			GAGCore::DrawableSurface image(1024 * scale, 768 * scale);
+			for (unsigned index = 0; index < std::size(panels); ++index)
+			{
+				const auto &panel = panels[index];
+				const auto a = c.find(panel.a), b = c.find(panel.b);
+				const auto third = panel.c ? c.find(panel.c) : a;
+				for (int y = 0; y < 8; ++y)
+					for (int x = 0; x < 8; ++x)
+					{
+						const auto recipe = contextualRecipe(x, y, 8, [&](int x, int y)
+							{ return panel.c && x >= 5 && y <= 2 ? third : shape(x, y) ? b : a; });
+						compositor.compose(recipe, image.getSDLSurface(),
+							((index % 4) * 256 + x * 32) * scale, ((index / 4) * 256 + y * 32) * scale, scale);
+					}
+			}
+			CHECK(IMG_SavePNG(image.getSDLSurface(),
+				(glob2test::artifactDir() / ("border-gallery-" + std::to_string(scale) + ".png")).string().c_str()));
+		}
+	}
+
 	TEST_CASE("terrain crossfade preserves endpoints midpoint loop and paused revisions [display]")
 	{
 		glob2test::HeadlessGlobals globals({.display = true});
@@ -383,6 +826,8 @@ TEST_SUITE("TerrainMaterials")
 		definitions.compiledPack.clear();
 		const auto id = definitions.find("ice");
 		auto &ice = definitions.materials[id];
+		ice.sprite = "data/gfx/terrain";
+		ice.variantGrid = 0; ice.variantBlocks = 1;
 		ice.variants = {{272, 1}};
 		ice.totalWeight = 1;
 		ice.animationFrames = 2;
@@ -421,24 +866,166 @@ TEST_SUITE("TerrainMaterials")
 		};
 		CHECK(pixel(0) == 0xfff00000u);
 		CHECK(pixel(2) == 0xff780078u);
-		const auto revision = compositor.materialRevision(id);
+		const auto revision = compositor.textureRevision(id);
 		const auto bytes = compositor.sourceBytes();
 		CHECK(pixel(2) == 0xff780078u);
-		CHECK(compositor.materialRevision(id) == revision);
+		CHECK(compositor.textureRevision(id) == revision);
 		CHECK(pixel(4) == 0xff0000f0u);
 		CHECK(pixel(6) == 0xff780078u);
 		CHECK(pixel(8) == 0xfff00000u);
 		CHECK(compositor.sourceBytes() == bytes);
 		// Jump by a whole phase with the same blend fraction: swapped endpoints
 		// must still invalidate composed terrain pages.
-		const auto beforeJump = compositor.materialRevision(id);
+		const auto beforeJump = compositor.textureRevision(id);
 		CHECK(pixel(12) == 0xff0000f0u);
-		CHECK(compositor.materialRevision(id) == beforeJump + 1);
+		CHECK(compositor.textureRevision(id) == beforeJump + 1);
 		b->drawFilledRect(0, 0, 32, 32, 0, 240, 0);
 		CHECK(pixel(12) == 0xff00f000u);
 		REQUIRE(SDL_FillSurfaceRect(b->getSDLSurface(), nullptr, 0x0000ffffu));
 		b->markPixelsChanged();
 		CHECK(pixel(2) == 0x80f00000u); // Transparent cyan contributes no colour.
+	}
+	TEST_CASE("stepped crossfades hold each weight and its revision for several ticks [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		auto definitions = catalog();
+		definitions.compiledPack.clear();
+		const auto id = definitions.find("ice");
+		auto &ice = definitions.materials[id];
+		ice.sprite = "data/gfx/terrain";
+		ice.variantGrid = 0; ice.variantBlocks = 1;
+		ice.variants = {{272, 1}};
+		ice.totalWeight = 1;
+		ice.animationFrames = 2;
+		ice.animationStride = 1;
+		ice.animationTicks = 8;
+		ice.animationBlendSteps = 2;
+		ice.periodicEdges = true;
+		auto *a = globals->terrain->nativeFrame(272), *b = globals->terrain->nativeFrame(273);
+		std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> originalA(
+			SDL_DuplicateSurface(a->getSDLSurface()), SDL_DestroySurface),
+			originalB(SDL_DuplicateSurface(b->getSDLSurface()), SDL_DestroySurface);
+		REQUIRE(originalA);
+		REQUIRE(originalB);
+		a->drawFilledRect(0, 0, 32, 32, 240, 0, 0);
+		b->drawFilledRect(0, 0, 32, 32, 0, 0, 240);
+		{
+			TerrainVisual::Compositor compositor(definitions);
+			TerrainVisual::Recipe recipe;
+			recipe.width = recipe.height = 16;
+			recipe.corners.fill(id);
+			GAGCore::DrawableSurface result(32, 32);
+			const auto pixel = [&](int time)
+			{
+				compositor.prepare(false, time);
+				compositor.compose(recipe, result.getSDLSurface(), 0, 0, 1);
+				return static_cast<const Uint32 *>(result.getSDLSurface()->pixels)[0];
+			};
+			// Two steps per eight-tick phase: the endpoint, then the midpoint.
+			std::vector<std::uint64_t> revisions;
+			for (int time = 0; time < 17; ++time)
+			{
+				const Uint32 expected[] = {0xfff00000u, 0xff780078u, 0xff0000f0u, 0xff780078u};
+				CHECK(pixel(time) == expected[time / 4 % 4]);
+				revisions.push_back(compositor.textureRevision(id));
+			}
+			for (int time = 1; time < 17; ++time)
+				CHECK(revisions[time] == revisions[time - 1] + (time % 4 == 0));
+		}
+		for (auto [frame, original] : {std::pair{a, originalA.get()}, std::pair{b, originalB.get()}})
+		{
+			SDL_SetSurfaceBlendMode(original, SDL_BLENDMODE_NONE);
+			SDL_BlitSurface(original, nullptr, frame->getSDLSurface(), nullptr);
+			frame->markPixelsChanged();
+		}
+	}
+	TEST_CASE("animation_blend_steps is optional and bounded by the phase length")
+	{
+		const auto j = shippedCatalog();
+		std::size_t lava = 0, grass = 0;
+		while (j["materials"][lava]["key"] != "lava") ++lava;
+		while (j["materials"][grass]["key"] != "grass") ++grass;
+		const auto parsed = TerrainVisual::Catalog::parse(j);
+		// Shipped lava crossfades in four steps per phase; without the field it blends every tick.
+		CHECK(parsed.materials[parsed.find("lava")].animationBlendSteps == 4);
+		auto absent = j;
+		absent["materials"][lava].erase("animation_blend_steps");
+		const auto every = TerrainVisual::Catalog::parse(absent);
+		CHECK(every.materials[every.find("lava")].animationBlendSteps == 0);
+		const int ticks = j["materials"][lava]["animation_ticks"];
+		for (int steps : {1, ticks / 2, ticks})
+		{
+			auto valid = j;
+			valid["materials"][lava]["animation_blend_steps"] = steps;
+			const auto c = TerrainVisual::Catalog::parse(valid);
+			CHECK(c.materials[c.find("lava")].animationBlendSteps == steps);
+		}
+		for (const nlohmann::json steps : {nlohmann::json(0), nlohmann::json(ticks + 1), nlohmann::json("4")})
+		{
+			auto invalid = j;
+			invalid["materials"][lava]["animation_blend_steps"] = steps;
+			CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
+		}
+		auto still = j;
+		still["materials"][grass]["animation_blend_steps"] = 1; // Nothing to crossfade.
+		CHECK_THROWS(TerrainVisual::Catalog::parse(still));
+	}
+	TEST_CASE("streamed animated HD keeps later phases resident across advances [display]")
+	{
+		const auto directory = glob2test::artifactDir() / "animated-hd";
+		std::filesystem::create_directories(directory);
+		std::filesystem::copy_file(glob2test::sourceRoot() / "test/fixtures/image-assets/terrain-hd-solid.webp",
+			directory / "frame.webp", std::filesystem::copy_options::overwrite_existing);
+		{
+			std::ofstream frames(directory / "frames.txt");
+			frames << "GLOB2_HIGHRES 1\n";
+			for (int frame = 0; frame < 256; ++frame)
+				frames << "terrain-grass" << frame << " 32 32 4 frame.webp -\n";
+		}
+		glob2test::ScopedEnvironment hdPath("GLOB2_EXPERIMENT_TEXTURE_DIR", directory.string().c_str());
+		glob2test::HeadlessGlobals globals({.display = true, .width = 256, .height = 256,
+			.screenFlags = Uint32(GAGCore::GraphicContext::PORTABLEGPU)});
+		auto definitions = catalog();
+		definitions.compiledPack.clear();
+		const auto id = definitions.find("grass");
+		auto &grass = definitions.materials[id];
+		// Four phases borrow the bank's four layouts, one streamed HD frame each.
+		grass.variants.resize(64);
+		grass.totalWeight = 64;
+		grass.variantBlocks = 1;
+		grass.animationFrames = 4;
+		grass.animationStride = 64;
+		grass.animationTicks = 2;
+		GAGCore::Sprite::deferHighResolution(grass.sprite);
+		GAGCore::Sprite::setHighResolution(true);
+		struct Restore { ~Restore() { GAGCore::Sprite::setHighResolution(false); } } restore;
+		TerrainVisual::Compositor compositor(definitions);
+		std::vector<TerrainVisual::Recipe> recipes;
+		for (int y = 0; y < 2; ++y)
+			for (int x = 0; x < 2; ++x)
+			{
+				TerrainVisual::Recipe r;
+				r.x = x; r.y = y;
+				r.width = r.height = 16;
+				r.corners.fill(id);
+				recipes.push_back(r);
+			}
+		compositor.prepareForRecipes(true, 0, recipes);
+		GAGCore::Sprite::finishHighResolution();
+		compositor.prepareForRecipes(true, 0, recipes);
+		auto *sprite = GAGCore::Toolkit::getSprite(grass.sprite);
+		for (int phase = 0; phase < 4; ++phase)
+			for (int cell : {0, 1, 8, 9})
+				CHECK(sprite->baseFrame(cell + 64 * phase)->getW() == 128);
+		CHECK(compositor.scale() == 4);
+		// Cycle twice through every phase without streaming time: each advance
+		// reuses resident frames, so no preparation falls back to native art.
+		const auto before = compositor.highResolutionCoverage();
+		for (int time = 1; time < 17; ++time)
+			compositor.prepareForRecipes(true, time, recipes);
+		const auto after = compositor.highResolutionCoverage();
+		CHECK(after.prepares == before.prepares + 16);
+		CHECK(after.fallbacks == before.fallbacks);
 	}
 	TEST_CASE("animation invalidates only pages using that material [display]")
 	{
@@ -446,6 +1033,8 @@ TEST_SUITE("TerrainMaterials")
 		auto definitions = catalog();
 		definitions.compiledPack.clear(); // Synthetic animation has no compiled artifact.
 		auto &ice = definitions.materials[definitions.find("ice")];
+		ice.sprite = "data/gfx/terrain";
+		ice.variantGrid = 0; ice.variantBlocks = 1;
 		ice.variants = {{272, 1}};
 		ice.totalWeight = 1;
 		ice.animationFrames = 2;
@@ -476,12 +1065,42 @@ TEST_SUITE("TerrainMaterials")
 		prepare(0, 2);
 		CHECK(cache.cacheRebuilds() == iceRebuilds + 1);
 	}
+	TEST_CASE("surf steps rebuild shoreline pages but keep static open water resident [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		auto definitions = catalog();
+		const auto still = stillSteppedWater(definitions);
+		globals->terrainCompositor_ = std::make_unique<TerrainVisual::Compositor>(std::move(definitions));
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 5, .terrain = DARK_WATER, .discovered = true});
+		for (int y = 0; y < 32; ++y)
+			for (int x = 40; x < 48; ++x)
+				fixture.game.map.setVertexTerrain(x, y, SAND);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		SoftwareTerrainCache cache;
+		const auto prepare = [&](int x, int time) {
+			REQUIRE(cache.prepare(scene, *globals->terrain, 0, 0, 15, 15, x, 0,
+			                      fixture.team->me, true, time));
+		};
+		auto &compositor = globals->terrainCompositor(scene.frozenAssetBundle());
+		const int step = compositor.catalog().materials[still].surf.ticks;
+		prepare(0, 0);
+		prepare(32, 0);
+		const auto before = cache.cacheRebuilds();
+		prepare(0, step);
+		CHECK(cache.cacheRebuilds() == before);
+		prepare(32, step);
+		CHECK(cache.cacheRebuilds() == before + 1);
+	}
+
 	TEST_CASE("unequal variant weights affect deterministic texture selection")
 	{
 		glob2test::HeadlessGlobals globals;
 		auto definitions = catalog();
 		const auto id = definitions.find("ice");
 		auto &material = definitions.materials[id];
+		material.sprite = "data/gfx/terrain";
+		material.variantGrid = 0; material.variantBlocks = 1;
 		material.variants = {{272, 1}, {273, 9}};
 		material.totalWeight = 10;
 		unsigned frequent = 0;
@@ -500,8 +1119,7 @@ TEST_SUITE("TerrainMaterials")
 	TEST_CASE("compiled pages validate metadata and stale catalogs use source fallback [artifacts]")
 	{
 		glob2test::HeadlessGlobals globals;
-		std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-		auto j = nlohmann::json::parse(input);
+		auto j = shippedCatalog();
 		j["compiled_pack"] = "data/terrain/test-pack/atlas.json";
 		const auto root = glob2test::artifactDir();
 		const auto dir = root / "data/terrain/test-pack";
@@ -561,12 +1179,16 @@ TEST_SUITE("TerrainMaterials")
 	TEST_CASE("compositor preserves native artwork overridden before startup [display] [artifacts]")
 	{
 		glob2test::HeadlessGlobals globals({.display = true});
-		std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-		auto document = nlohmann::json::parse(input);
+		auto document = shippedCatalog();
 		document["compiled_pack"] = "data/terrain/startup-override/atlas.json";
 		for (auto &material : document["materials"])
 			if (material["key"] == "ice")
+			{
+				material["sprite"] = "data/gfx/terrain";
+				material.erase("variant_grid"); material.erase("variant_blocks"); material.erase("variant_block_group");
+				material.erase("stones"); // A stone map spans a variant block.
 				material["variants"] = {{{"frame", 272}, {"weight", 1}}};
+			}
 		const auto directory = glob2test::artifactDir() / "data/terrain/startup-override";
 		std::filesystem::create_directories(directory);
 		globals->fileManager->addDir(glob2test::artifactDir().string());
@@ -627,26 +1249,25 @@ TEST_SUITE("TerrainMaterials")
 				CHECK(row[x] == 0xffc917bdu);
 		}
 	}
-	TEST_CASE("an additional material and a 64-material catalog compose without renderer branches "
+	TEST_CASE("an additional material and a 96-material catalog compose without renderer branches "
 			  "[display]")
 	{
 		glob2test::HeadlessGlobals globals({.display = true});
-		std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-		auto j = nlohmann::json::parse(input);
-		// Pad the shipped catalog to 64 materials with grass clones.
-		for (auto i = j["materials"].size(); i < 64; ++i)
+		auto j = shippedCatalog();
+		// Pad the shipped catalog to 96 materials with grass clones.
+		for (auto i = j["materials"].size(); i < 96; ++i)
 		{
 			auto m = j["materials"][2];
 			m["key"] = "fixture-" + std::to_string(i);
 			j["materials"].push_back(m);
 		}
-		REQUIRE(j["materials"].size() == 64);
+		REQUIRE(j["materials"].size() == 96);
 		TerrainVisual::Compositor compositor(TerrainVisual::Catalog::parse(j));
 		compositor.prepare(false, 0);
 		TerrainVisual::Recipe r;
 		r.width = r.height = 16;
 		for (int i = 0; i < 4; ++i)
-			r.corners[i] = 60 + i;
+			r.corners[i] = 92 + i;
 		GAGCore::DrawableSurface result(32, 32);
 		compositor.compose(r, result.getSDLSurface(), 0, 0, 1);
 		CHECK(result.hasOpaquePixels());
@@ -707,6 +1328,244 @@ TEST_SUITE("TerrainMaterials")
 				CHECK(light[x] > plain[x] * 11 / 10);
 			}
 		}
+	}
+	TEST_CASE("surf washes a beach within eight pixels and repeats each period [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		auto definitions = catalog();
+		definitions.compiledPack.clear();
+		definitions.boundaryWarp = {}; // A straight water/sand edge at x = 16.
+		for (auto &profile : definitions.profiles)
+			profile.roughness = profile.speckle = 0;
+		const auto water = definitions.find("water"), sand = definitions.find("sand");
+		const auto surf = definitions.materials[water].surf;
+		REQUIRE(surf.period > 0);
+		REQUIRE(definitions.materials[sand].surf.period == 0);
+		TerrainVisual::Recipe r;
+		r.width = r.height = 16;
+		r.x = 3;
+		r.y = 5;
+		r.corners = {water, sand, water, sand};
+		using Columns = std::array<unsigned, 32>;
+		const auto render = [&](TerrainVisual::Compositor &compositor, int time)
+		{
+			compositor.prepare(false, time);
+			GAGCore::DrawableSurface result(32, 32);
+			compositor.compose(r, result.getSDLSurface(), 0, 0, 1);
+			Columns brightness{};
+			for (int y = 0; y < 32; ++y)
+			{
+				const auto *row = reinterpret_cast<const Uint32 *>(
+					static_cast<const unsigned char *>(result.getSDLSurface()->pixels) +
+					y * result.getSDLSurface()->pitch);
+				for (int x = 0; x < 32; ++x)
+					brightness[x] += (row[x] >> 16 & 255) + (row[x] >> 8 & 255) + (row[x] & 255);
+			}
+			return brightness;
+		};
+		auto still = definitions;
+		for (auto &material : still.materials)
+			material.surf = {};
+		TerrainVisual::Compositor surfCompositor(definitions), stillCompositor(still);
+		std::vector<Columns> frames;
+		int darker = 0, lighter = 0;
+		for (int step = 0; step < 8; ++step)
+		{
+			const int time = step * surf.period / 8;
+			// Water animates its texture as well, so compare at the same time.
+			const auto plain = render(stillCompositor, time);
+			const auto washed = render(surfCompositor, time);
+			for (int x = 0; x < 32; ++x)
+			{
+				INFO("time " << time << " x " << x);
+				if (x < 8 || x >= 24)
+					CHECK(washed[x] == plain[x]); // Bands end before the cell's edges.
+			}
+			CHECK(washed[12] > plain[12]); // Shallows lighten the water near the beach.
+			darker += washed[19] < plain[19];
+			lighter += washed[19] > plain[19];
+			frames.push_back(washed);
+		}
+		// Wet sand when the wash has drained; foam and a water sheet as it arrives.
+		CHECK(darker > 0);
+		CHECK(lighter > 0);
+		CHECK(std::count(frames.begin(), frames.end(), frames[0]) == 1); // It moves.
+		// After a whole surf period and a whole texture cycle the frame repeats.
+		const auto &textured = definitions.materials[water];
+		const int cycle = std::lcm(surf.period, textured.animationFrames * textured.animationTicks);
+		CHECK(render(surfCompositor, cycle + surf.period / 8) == frames[1]);
+		// Surf time advances independently of static source artwork.
+		auto stilled = definitions;
+		const auto dark = stillSteppedWater(stilled);
+		TerrainVisual::Compositor stillSurfCompositor(stilled);
+		REQUIRE(stilled.materials[dark].surf.period > 0);
+		CHECK(stillSurfCompositor.animated(dark));
+		// Still water keeps its artwork revision even when a surf step advances.
+		const auto &darkSurf = stilled.materials[dark].surf;
+		REQUIRE(darkSurf.ticks > 1);
+		const int step = 7 * darkSurf.ticks;
+		stillSurfCompositor.prepare(false, step);
+		const auto revision = stillSurfCompositor.textureRevision(dark);
+		stillSurfCompositor.prepare(false, step);
+		CHECK(stillSurfCompositor.textureRevision(dark) == revision);
+		stillSurfCompositor.prepare(false, step + darkSurf.ticks - 1);
+		CHECK(stillSurfCompositor.textureRevision(dark) == revision);
+		stillSurfCompositor.prepare(false, step + darkSurf.ticks);
+		CHECK(stillSurfCompositor.textureRevision(dark) == revision);
+		CHECK(stillSurfCompositor.surfTime() == unsigned(step + darkSurf.ticks));
+		// Within one step the composed wash is identical.
+		const auto washed = [&](int time)
+		{
+			std::vector<unsigned> result;
+			for (int margin = 0; margin < 2048; margin += 64)
+				for (bool surfSide : {false, true})
+				{
+					unsigned value[3] = {180, 160, 120};
+					TerrainVisual::applySurf(darkSurf, surfSide, margin, 5000, 9000, unsigned(time), value);
+					result.insert(result.end(), value, value + 3);
+				}
+			return result;
+		};
+		// Land with a calmer shore wash shortens the wash's reach and swing but
+		// keeps every band at full strength; the default full wash is unscaled.
+		const auto wash = [&](int land)
+		{
+			// Peak colour change, and the swing: the farthest land pixel whose
+			// colour changes over the period as the wash runs in and out.
+			unsigned peak = 0, reach = 0;
+			for (int margin = 0; margin < 2048; margin += 16)
+				for (bool surfSide : {false, true})
+				{
+					std::array<unsigned, 3> first{};
+					bool moves = false;
+					for (int time = 0; time < darkSurf.period; time += darkSurf.ticks)
+					{
+						unsigned value[3] = {180, 160, 120};
+						TerrainVisual::applySurf(darkSurf, surfSide, margin, 5000, 9000, unsigned(time), value, land);
+						const unsigned delta = unsigned(std::abs(int(value[0]) - 180) + std::abs(int(value[1]) - 160) +
+													   std::abs(int(value[2]) - 120));
+						peak = std::max(peak, delta);
+						if (!time)
+							first = {value[0], value[1], value[2]};
+						else
+							moves |= first != std::array<unsigned, 3>{value[0], value[1], value[2]};
+					}
+					if (moves && !surfSide) reach = std::max(reach, unsigned(margin));
+				}
+			return std::pair{peak, reach};
+		};
+		const auto full = wash(256), calm = wash(77), none = wash(0);
+		CHECK(calm.second < full.second);
+		CHECK(none.second <= calm.second);
+		// The foam and bands stay about as visible as on a beach; only a long run
+		// stacks the sheet over the wet band. Damping the bands too would leave
+		// the calm peak near 30% of the full one.
+		CHECK(calm.first * 4 >= full.first * 3);
+		CHECK(none.first * 4 >= full.first * 3);
+		for (int margin = 0; margin < 2048; margin += 64)
+		{
+			unsigned a[3] = {180, 160, 120}, b[3] = {180, 160, 120};
+			TerrainVisual::applySurf(darkSurf, false, margin, 5000, 9000, 40, a);
+			TerrainVisual::applySurf(darkSurf, false, margin, 5000, 9000, 40, b, 256);
+			CHECK(std::equal(a, a + 3, b));
+		}
+		// Laid paths take the calmer wash.
+		CHECK(definitions.materials[definitions.find("road")].shoreWash == 77);
+		CHECK(definitions.materials[definitions.find("grass")].shoreWash == 256);
+		bool moved = false;
+		for (int k = 0; k < darkSurf.period; k += darkSurf.ticks)
+		{
+			for (int t = 1; t < darkSurf.ticks; ++t)
+				CHECK(washed(k + t) == washed(k));
+			moved = moved || washed(k) != washed(k + darkSurf.ticks);
+		}
+		CHECK(moved);
+	}
+	TEST_CASE("shore calm quiets waves toward land without shifting the water's colour [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true});
+		using TerrainVisual::shoreCalmAt;
+		// Full calm at the shoreline, fading out within the reach and smoothly.
+		CHECK(shoreCalmAt(0) == 0);
+		CHECK(shoreCalmAt(1) == 215); // The adjacent water vertex is half a tile from shore.
+		CHECK(shoreCalmAt(1) > shoreCalmAt(2));
+		CHECK(shoreCalmAt(2) > 0);
+		CHECK(shoreCalmAt(4) == 40); // Waves still calm at one and a half tiles.
+		CHECK(shoreCalmAt(9) == 0); // Beyond the two-tile reach.
+		CHECK(TerrainVisual::shoreCalm({255, 255, 255, 255}, 37, 200) == 255);
+		CHECK(TerrainVisual::shoreCalm({}, 37, 200) == 0);
+		CHECK(TerrainVisual::shoreCalm({200, 0, 200, 0}, 0, 128) == 200);
+		CHECK(TerrainVisual::shoreCalm({200, 0, 200, 0}, 256, 128) == 0);
+
+		auto definitions = catalog();
+		definitions.compiledPack.clear();
+		TerrainVisual::Compositor compositor(definitions);
+		const auto &materials = compositor.catalog().materials;
+		const auto water = definitions.find("water"), deep = definitions.find("deep_water"),
+				   dark = definitions.find("dark_water");
+		CHECK(materials[water].shoreCalm);
+		CHECK(materials[deep].shoreCalm);
+		CHECK(materials[dark].shoreCalm);
+		CHECK_FALSE(materials[definitions.find("sand")].shoreCalm);
+		{
+			auto stilled = definitions;
+			const auto still = stillSteppedWater(stilled);
+			CHECK_FALSE(TerrainVisual::Compositor(stilled).catalog().materials[still].shoreCalm); // A still surface.
+		}
+		// Calm keeps the colour and cuts the wave contrast, at every phase.
+		for (const auto id : {water, deep, dark})
+			for (int time : {0, 37, 211})
+			{
+				CAPTURE(time);
+				compositor.prepare(false, time);
+				TerrainVisual::Recipe r;
+				r.width = r.height = 64;
+				r.x = 9;
+				r.y = 13;
+				r.corners = {id, id, id, id};
+				const auto statistics = [&](const TerrainVisual::Recipe &recipe)
+				{
+					GAGCore::DrawableSurface result(32, 32);
+					compositor.compose(recipe, result.getSDLSurface(), 0, 0, 1);
+					double sum[3] = {}, luma = 0, luma2 = 0;
+					for (int y = 0; y < 32; ++y)
+						for (int x = 0; x < 32; ++x)
+						{
+							const auto pixel = reinterpret_cast<const Uint32 *>(
+								static_cast<const unsigned char *>(result.getSDLSurface()->pixels) +
+								y * result.getSDLSurface()->pitch)[x];
+							const double rgb[3] = {double(pixel >> 16 & 255), double(pixel >> 8 & 255),
+												   double(pixel & 255)};
+							for (int k = 0; k < 3; ++k)
+								sum[k] += rgb[k] / 1024;
+							const double l = 0.299 * rgb[0] + 0.587 * rgb[1] + 0.114 * rgb[2];
+							luma += l / 1024;
+							luma2 += l * l / 1024;
+						}
+					return std::array<double, 4>{sum[0], sum[1], sum[2], std::sqrt(luma2 - luma * luma)};
+				};
+				const auto open = statistics(r);
+				r.calm = {255, 255, 255, 255};
+				const auto shore = statistics(r);
+				for (int k = 0; k < 3; ++k)
+					CHECK(std::abs(shore[k] - (open[k] + (materials[id].calmMean[k] - open[k]) * 0.75)) < 1.5);
+				CHECK(shore[3] < open[3] * 0.35);
+			}
+
+		// describe() derives the calm from the distance to land.
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .terrain = WATER, .discovered = true});
+		for (int y = 0; y < 32; ++y)
+			fixture.game.map.setVertexTerrain(16, y, SAND);
+		SceneMap scene;
+		glob2test::observeMap(fixture.game.map, scene);
+		auto &game = globals->terrainCompositor();
+		const auto at = [&](int x) { return game.describe(scene, x, 7); };
+		CHECK_FALSE(at(4).calmed()); // Open water keeps its waves.
+		CHECK(at(15).calm == std::array<std::uint8_t, 4>{at(15).calm[0], 255, at(15).calm[0], 255});
+		CHECK(at(15).calm[0] == shoreCalmAt(1));
+		CHECK(at(14).calm[1] == at(15).calm[0]); // Corners are shared, so the fade is continuous.
+		CHECK(at(14).calm[0] == shoreCalmAt(4));
+		CHECK(at(16).calm == std::array<std::uint8_t, 4>{255, at(15).calm[0], 255, at(15).calm[0]});
 	}
 	TEST_CASE("mixed cells compose exactly as a direct per-pixel coverage blend [display]")
 	{
@@ -783,7 +1642,8 @@ TEST_SUITE("TerrainMaterials")
 							int shade = 256, tint = 0;
 							if (mask.neighbor != mask.material[dominant])
 							{
-								if (other.cast && other.height > self.height && int(mask.margin) < other.castWidth)
+								if (c.materials[mask.neighbor].decor.connected.empty() && other.cast &&
+									other.height > self.height && int(mask.margin) < other.castWidth)
 									shade = 256 - other.cast * (other.castWidth - int(mask.margin)) / other.castWidth;
 								if (other.fringe && int(mask.margin) < other.fringeWidth)
 									tint = other.fringe * (other.fringeWidth - int(mask.margin)) / other.fringeWidth;
@@ -793,8 +1653,18 @@ TEST_SUITE("TerrainMaterials")
 								unsigned value = unsigned(alpha ? rgb[k] / alpha : 0) * shade >> 8;
 								return value + (unsigned(other.fringeColor[k]) - value) * tint / 256;
 							};
-							const Uint32 expected = ((alpha + 32768) / 65536 << 24) | (channel(0) << 16) |
-													(channel(1) << 8) | channel(2);
+							unsigned value[3] = {channel(0), channel(1), channel(2)};
+							const auto &selfSurf = c.materials[mask.material[dominant]].surf;
+							const auto &otherSurf = c.materials[mask.neighbor].surf;
+							if ((selfSurf.period > 0) != (otherSurf.period > 0))
+								TerrainVisual::applySurf(selfSurf.period ? selfSurf : otherSurf,
+														 selfSurf.period > 0, int(mask.margin),
+														 r.x * 8192 + (2 * x + 1) * 4096 / size,
+														 r.y * 8192 + (2 * y + 1) * 4096 / size, 0, value,
+														 c.materials[selfSurf.period ? mask.neighbor
+																					 : mask.material[dominant]].shoreWash);
+							const Uint32 expected = ((alpha + 32768) / 65536 << 24) | (value[0] << 16) |
+													(value[1] << 8) | value[2];
 							mismatches += pixels(actual, x, y) != expected;
 						}
 					INFO("seed " << seed << " scale " << scale << " corners " << corners[0] << ","
@@ -808,10 +1678,12 @@ TEST_SUITE("TerrainMaterials")
 		const auto c = catalog();
 		const auto grass = c.find("grass"), sand = c.find("sand");
 		unsigned differentVariants = 0;
+		const int grid = c.materials[grass].variantGrid;
 		for (int y = 0; y < 32; ++y)
 			for (int x = 0; x < 32; ++x)
-				differentVariants += c.variantIndex(grass, x, y, 1) != c.variantIndex(grass, x, y, 2);
-		CHECK(differentVariants > 700); // 15/16 of cells differ between independent seeds.
+				differentVariants += c.variantIndex(grass, x * grid, y * grid, 1) !=
+									c.variantIndex(grass, x * grid, y * grid, 2);
+		CHECK(differentVariants > 600); // Four independently seeded layouts.
 		CHECK(c.variantIndex(grass, 5, 6) == c.variantIndex(grass, 5, 6, 0));
 		TerrainVisual::Recipe r;
 		r.width = r.height = 16;
@@ -867,17 +1739,26 @@ TEST_SUITE("TerrainMaterials")
 			auto definitions = catalog();
 			if (legacy)
 			{
-				std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-				auto j = nlohmann::json::parse(input);
+				auto j = shippedCatalog();
 				j["version"] = 1;
 				j.erase("boundary_warp_q8");
+				j.erase("border_classes");
 				for (auto &material : j["materials"])
+				{
 					material.erase("seam");
+					material.erase("surf");
+					material.erase("class");
+					material.erase("stones");
+					material.erase("shore_wash_q8");
+				}
 				const int roughness[] = {256, 320, 192};
 				for (unsigned i = 0; i < j["profiles"].size(); ++i)
 				{
 					auto &p = j["profiles"][i];
-					for (const char *field : {"feather_q8", "amplitude_q8", "speckle_q8", "bridge_q8", "shape"})
+					for (const char *field : {"feather_q8", "amplitude_q8", "speckle_q8", "bridge_q8", "shape",
+							 "precedence", "coast", "wiggle_q8", "wiggle_period", "squareness_q8", "teeth_q8",
+							 "teeth_form", "facets", "clasts", "resistance_q8", "cohesion_q8", "grain_q8",
+							 "spread_q8"})
 						p.erase(field);
 					p["roughness_q8"] = roughness[i % std::size(roughness)];
 					p["contours_q12"] = {{0, 180, -120, 100, 0},
@@ -913,7 +1794,7 @@ TEST_SUITE("TerrainMaterials")
 			// Fingerprint the reviewed native/HD geometry. Intentional contour changes
 			// require a rendered comparison and an updated digest, not just a
 			// matching partition sum.
-			CHECK(digest == (legacy ? 15866489041356360345ull : 14215220908205104757ull));
+			CHECK(digest == (legacy ? 4747172408471892537ull : 8938740251159767833ull));
 		}
 	}
 	TEST_CASE("the Python validator's built-in name list mirrors the terrain table")
@@ -935,7 +1816,7 @@ TEST_SUITE("TerrainMaterials")
 	{
 		glob2test::HeadlessGlobals globals;
 		const auto definitions = catalog();
-		// One material per new profile: rock, soft, crisp and brush, beside grass.
+		// Reviewed representatives for rock, soil, crisp and the quiet canopy underlay.
 		const std::array<TerrainVisual::MaterialId, 4> samples{
 			definitions.find("boulders"), definitions.find("mud"), definitions.find("void_hole"),
 			definitions.find("hedge")};
@@ -963,8 +1844,11 @@ TEST_SUITE("TerrainMaterials")
 						}
 					}
 		}
-		// Intentional profile changes need a rendered comparison and a new digest.
-		CHECK(digest == 11045336540448780839ull);
+		// This hashes catalog IDs as well as coverage. The group-look catalog
+		// reordered mud (14 -> 12) and void_hole (27 -> 23) after the reviewed
+		// semantic-border update, preserving its profiles. Geometry changes still
+		// need a rendered comparison.
+		CHECK(digest == 12872139009941546255ull);
 	}
 	TEST_CASE("coverage partitions every binary shape and multi-material junction")
 	{
@@ -1183,34 +2067,47 @@ TEST_SUITE("TerrainMaterials")
 		const auto c = catalog();
 		for (unsigned id = 0; id < c.materials.size(); ++id)
 		{
+			const auto &material = c.materials[id];
+			INFO(material.key);
+			const int cycle = material.animationFrames * material.animationTicks;
 			std::set<int> seen;
 			for (int y = 0; y < 64; ++y)
 				for (int x = 0; x < 64; ++x)
 				{
 					auto frame = c.frame(id, x, y, 0);
 					seen.insert(frame);
-					CHECK(frame == c.frame(id, x, y, 100));
+					// The artwork may animate; its spatial variant stays the same
+					// at every matching phase, even a hundred cycles later.
+					for (int phase = 0; phase < material.animationFrames; ++phase)
+					{
+						const int time = phase * material.animationTicks;
+						const auto atPhase = c.frame(id, x, y, time);
+						if (phase > 0)
+							CHECK(atPhase == frame + phase * material.animationStride);
+						CHECK(atPhase == c.frame(id, x, y, time + 100 * cycle));
+					}
 				}
-			CHECK(seen.size() == 16);
+			CHECK(seen.size() == c.materials[id].variants.size());
 		}
 	}
 
 	TEST_CASE("grid variants repeat one positional block independent of the map seed")
 	{
 		glob2test::HeadlessGlobals globals;
-		const auto c = catalog();
+		auto c = catalog();
 		const auto water = c.find("water");
-		REQUIRE(c.materials[water].variantGrid == 4);
+		const unsigned grid = unsigned(c.materials[water].variantGrid);
+		c.materials[water].variantBlocks = 1;
+		c.materials[water].variants.resize(grid * grid);
 		for (std::uint32_t seed : {0u, 1u, 0xdeadbeefu})
 			for (int y = -4; y < 12; ++y)
 				for (int x = -4; x < 12; ++x)
 				{
 					INFO(seed << " " << x << " " << y);
-					CHECK(c.variantIndex(water, x, y, seed) == unsigned((y & 3) * 4 + (x & 3)));
+					CHECK(c.variantIndex(water, x, y, seed) == (unsigned(y) & (grid - 1)) * grid + (unsigned(x) & (grid - 1)));
 				}
 
-		std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-		const auto j = nlohmann::json::parse(input);
+		const auto j = shippedCatalog();
 		std::size_t index = 0;
 		while (j["materials"][index]["key"] != "water")
 			++index;
@@ -1218,30 +2115,96 @@ TEST_SUITE("TerrainMaterials")
 		invalid["materials"][index]["variant_grid"] = 3;
 		CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
 		invalid = j;
-		invalid["materials"][index]["variant_grid"] = 8; // 16 variants, not 64.
+		invalid["materials"][index]["variant_grid"] = 16; // Four complete8x8 layouts, not16x16.
 		CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
 		invalid = j;
 		invalid["materials"][index].erase("edges");
 		CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
 	}
 
+	TEST_CASE("interchangeable grid blocks select one seeded layout for every cell in a block")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		// The waters stay on one layout: every layout multiplies their sixteen phases.
+		// Lava and ember field have four layouts like static ground.
+		std::set<std::string> single;
+		for (const auto &material : c.materials)
+		{
+			const auto id = c.find(material.key);
+			if (c.materials[id].variantBlocks == 1)
+			{
+				CHECK(c.materials[id].animationFrames > 1);
+				CHECK(c.materials[id].variantGrid > 0);
+				single.insert(material.key);
+				continue;
+			}
+			REQUIRE(c.materials[id].variantBlocks == 4);
+			const int grid = c.materials[id].variantGrid;
+			const unsigned cells = unsigned(grid * grid);
+			REQUIRE(grid == 8);
+			std::set<unsigned> seen;
+			unsigned changed = 0;
+			for (int by = -4; by < 28; ++by)
+				for (int bx = -4; bx < 28; ++bx)
+				{
+					const unsigned layout = c.variantIndex(id, bx * grid, by * grid, 42) / cells;
+					seen.insert(layout);
+					changed += layout != c.variantIndex(id, bx * grid, by * grid, 43) / cells;
+					for (int y = 0; y < grid; ++y)
+						for (int x = 0; x < grid; ++x)
+						{
+							const unsigned index = c.variantIndex(id, bx * grid + x, by * grid + y, 42);
+							CHECK(index == layout * cells + unsigned(y * grid + x));
+							CHECK(index == c.variantIndex(id, bx * grid + x, by * grid + y, 42));
+						}
+				}
+			CHECK(seen.size() == 4);
+			CHECK(changed > 600);
+		}
+		CHECK(single == std::set<std::string>{"water", "deep_water", "dark_water"});
+		for (unsigned seed : {0u, 1u, 42u})
+			for (int y = -8; y < 64; ++y)
+				for (int x = -8; x < 64; ++x)
+					for (const char *depth : {"deep_water", "dark_water"})
+						CHECK(c.variantIndex(c.find("water"), x, y, seed) == c.variantIndex(c.find(depth), x, y, seed));
+		const auto document = shippedCatalog();
+		std::size_t index = 0;
+		while (document["materials"][index]["key"] != "scree") ++index;
+		for (const auto &value : {nlohmann::json(0), nlohmann::json(2), nlohmann::json(17), nlohmann::json("4")})
+		{
+			auto invalid = document;
+			invalid["materials"][index]["variant_blocks"] = value;
+			CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
+		}
+		for (const auto &value : {nlohmann::json(""), nlohmann::json(7), nlohmann::json(std::string(65, 'x'))})
+		{
+			auto invalid = document;
+			invalid["materials"][index]["variant_block_group"] = value;
+			CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
+		}
+		auto invalid = document;
+		invalid["materials"][index].erase("variant_grid");
+		CHECK_THROWS(TerrainVisual::Catalog::parse(invalid));
+	}
+
 	TEST_CASE("catalog rejects corrupt references and grows independently of gameplay IDs")
 	{
 		glob2test::HeadlessGlobals globals;
-		std::ifstream input(glob2test::sourceRoot() / "data/terrain/tileset.json");
-		auto j = nlohmann::json::parse(input);
-		for (auto i = j["materials"].size(); i < 64; ++i)
+		auto j = shippedCatalog();
+		for (auto i = j["materials"].size(); i < 96; ++i)
 		{
 			auto m = j["materials"][2];
 			m["key"] = "fixture-" + std::to_string(i);
 			j["materials"].push_back(m);
 		}
-		CHECK(TerrainVisual::Catalog::parse(j).materials.size() == 64);
+		CHECK(TerrainVisual::Catalog::parse(j).materials.size() == 96);
 		auto patchOnly = j;
-		for (auto &profile : patchOnly["profiles"]) profile.erase("shape");
+		for (auto &profile : patchOnly["profiles"])
+			if (profile.value("shape", "") == "contextual") profile.erase("shape");
 		const auto withoutShapes = TerrainVisual::Catalog::parse(patchOnly);
 		CHECK(std::none_of(withoutShapes.profiles.begin(), withoutShapes.profiles.end(),
-			[](const auto &profile) { return profile.contextual; }));
+			[](const auto &profile) { return profile.shape == TerrainVisual::BoundaryShape::Contextual; }));
 		auto legacy = j;
 		legacy.erase("boundary_warp_q8");
 		CHECK(TerrainVisual::Catalog::parse(legacy).boundaryWarp == std::array<int, 3>{});
@@ -1283,6 +2246,14 @@ TEST_SUITE("TerrainMaterials")
 			{nlohmann::json::json_pointer("/materials/3/seam/height"), -1},
 			{nlohmann::json::json_pointer("/materials/3/seam/fringe"), {0, 0}},
 			{nlohmann::json::json_pointer("/materials/3/seam/fringe_width_q8"), 2049},
+			{nlohmann::json::json_pointer("/materials/3/surf"), nlohmann::json::array()},
+			{nlohmann::json::json_pointer("/materials/3/surf"), {{"period", 0}}},
+			{nlohmann::json::json_pointer("/materials/3/surf"), {{"period", 60}, {"wet_q8", 257}}},
+			{nlohmann::json::json_pointer("/materials/3/surf"), {{"period", 60}, {"ticks", 0}}},
+			{nlohmann::json::json_pointer("/materials/3/surf"), {{"period", 60}, {"ticks", 61}}},
+			{nlohmann::json::json_pointer("/materials/3/surf"),
+			 {{"period", 60}, {"reach_q8", 1800}, {"foam_width_q8", 300}}},
+			{nlohmann::json::json_pointer("/materials/3/surf"), {{"period", 60}, {"shallow", {0, 0}}}},
 			{nlohmann::json::json_pointer("/boundary_warp_q8"), {0, 0}},
 			{nlohmann::json::json_pointer("/boundary_warp_q8"), {true, 0, 0}},
 			{nlohmann::json::json_pointer("/boundary_warp_q8"), {0, 1.5, 0}},
@@ -1307,6 +2278,22 @@ TEST_SUITE("TerrainMaterials")
 			{nlohmann::json::json_pointer("/bindings"), nlohmann::json::array()},
 			{nlohmann::json::json_pointer("/bindings/fixture"), "absent"},
 			{nlohmann::json::json_pointer("/pair_treatments"), nlohmann::json::object()},
+			{nlohmann::json::json_pointer("/border_classes"), nlohmann::json::array()},
+			{nlohmann::json::json_pointer("/border_classes/0/shoreline"), 1},
+			{nlohmann::json::json_pointer("/border_classes/1/key"), "cover"},
+			{nlohmann::json::json_pointer("/materials/0/class"), "absent"},
+			{nlohmann::json::json_pointer("/profiles/0/coast"), "absent"},
+			{nlohmann::json::json_pointer("/profiles/0/coast"), "canopy"},
+			{nlohmann::json::json_pointer("/profiles/0/precedence"), 256},
+			// Version 4 draws every profile smoothly, so a patch profile may meander,
+			// but its parameters keep their ranges.
+			{nlohmann::json::json_pointer("/profiles/0/wiggle_q8"), 2049},
+			{nlohmann::json::json_pointer("/profiles/0/detail_q8"), 1025},
+			{nlohmann::json::json_pointer("/profiles/0/detail_q8"), -1},
+			{nlohmann::json::json_pointer("/profiles/2/wiggle_period"), 48},
+			{nlohmann::json::json_pointer("/profiles/2/wiggle_q8"), 2049},
+			{nlohmann::json::json_pointer("/profiles/2/squareness_q8"), 257},
+			{nlohmann::json::json_pointer("/profiles/0/squareness_q8"), 257},
 		};
 		for (const auto &[field, value] : malformed)
 		{
@@ -1337,6 +2324,188 @@ TEST_SUITE("TerrainMaterials")
 				   b = TerrainVisual::Catalog::parse(reordered);
 		for (int x = 0; x < 128; ++x)
 			CHECK(a.frame(a.find("ice"), x, 7, 0) == b.frame(b.find("ice"), x, 7, 0));
+	}
+	TEST_CASE("border classes choose every contact from material semantics")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		REQUIRE(c.version == 4);
+		CHECK(c.treatments.empty());
+		const auto profile = [&](const char *a, const char *b)
+		{ return c.profiles[c.profileFor(c.find(a), c.find(b))].key; };
+		// Pooled liquids meet smoothly; land draws its own coast against them.
+		CHECK(profile("water", "deep_water") == "still");
+		CHECK(profile("deep_water", "dark_water") == "still");
+		CHECK(profile("water", "grass") == "shore");
+		CHECK(profile("dark_water", "moss") == "shore");
+		CHECK(profile("water", "sand") == "beach");
+		CHECK(profile("deep_water", "boulders") == "rock");
+		CHECK(profile("ice", "water") == "frozen");
+		// Flowing lava overruns natural ground and water alike.
+		for (const auto *other : {"grass", "boulders", "ridge_rock", "shale", "sand", "mud", "water"})
+			CHECK(profile("lava", other) == "molten");
+		// Built surfaces keep their own straight edges against everything natural.
+		for (const auto *other : {"grass", "boulders", "scree", "mud", "heath", "lava", "water"})
+		{
+			CHECK(profile("road", other) == "paved");
+			CHECK(profile("brick_path", other) == "paved");
+			CHECK(profile("boardwalk", other) == "crisp");
+		}
+		CHECK(profile("road", "boardwalk") == "crisp");
+		CHECK(profile("void_hole", "road") == "crisp");
+		CHECK(profile("chasm", "lava") == "crisp");
+		CHECK(profile("hedge", "void_hole") == "canopy");
+		CHECK(profile("thicket", "water") == "canopy");
+		// Natural ground: resistance ranks rock over ice over soil, brush and turf.
+		CHECK(profile("boulders", "mud") == "rock");
+		CHECK(profile("dirt", "grass") == "soil");
+		CHECK(profile("deep_snow", "ice") == "frozen");
+		CHECK(profile("sand", "grass") == "turf"); // Rooted turf holds its edge on loose sand.
+		CHECK(profile("heath", "grass") == "brush");
+		CHECK(profile("grass", "lush_grass") == "turf");
+		for (unsigned a = 0; a < c.materials.size(); ++a)
+			for (unsigned b = 0; b < c.materials.size(); ++b)
+				if (a != b)
+				{
+					const auto x = TerrainVisual::MaterialId(a), y = TerrainVisual::MaterialId(b);
+					CHECK(c.profileFor(x, y) == c.profileFor(y, x));
+					CHECK_FALSE((c.dominates(x, y) && c.dominates(y, x)));
+					CHECK(c.shapes(x, y) != c.shapes(y, x));
+				}
+		// Earlier catalogs keep the roughest-profile rule.
+		auto j = shippedCatalog();
+		j["version"] = 3;
+		j.erase("border_classes");
+		for (auto &m : j["materials"])
+		{
+			m.erase("class");
+			m.erase("stones"); // Whole-stone edges are version 4.
+		}
+		for (auto &p : j["profiles"])
+		{
+			p.erase("precedence"); p.erase("coast");
+			for (const char *field : {"teeth_q8", "teeth_form", "facets", "clasts", "resistance_q8", "cohesion_q8",
+					 "grain_q8", "spread_q8"})
+				p.erase(field);
+			if (p.value("shape", "") != "smooth") continue;
+			p.erase("shape"); p.erase("wiggle_q8"); p.erase("wiggle_period"); p.erase("squareness_q8");
+			p["roughness_q8"] = 0;
+			p["contours_q12"] = nlohmann::json::array({{0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}, {0, 0, 0, 0, 0}});
+		}
+		const auto legacy = TerrainVisual::Catalog::parse(j);
+		CHECK(legacy.profiles[legacy.profileFor(legacy.find("lava"), legacy.find("boulders"))].key == "rock");
+		CHECK(legacy.contextualFor(legacy.find("water"), legacy.find("grass")) == false);
+	}
+	TEST_CASE("smooth contacts keep their vertices, continue across tiles and do not jag")
+	{
+		glob2test::HeadlessGlobals globals;
+		const auto c = catalog();
+		const auto water = c.find("water"), deep = c.find("deep_water"), dark = c.find("dark_water"),
+				   grass = c.find("grass");
+		constexpr int size = 16;
+		// A seeded mix of liquids with a grass shore in one corner, so tiles
+		// cover full smooth shares, mixed shares and rough cells.
+		std::array<TerrainVisual::MaterialId, size * size> field{};
+		std::uint32_t state = 12345;
+		for (int y = 0; y < size; ++y)
+			for (int x = 0; x < size; ++x)
+			{
+				state = state * 1664525u + 1013904223u;
+				const unsigned pick = state >> 29;
+				field[y * size + x] = x < 4 && y < 4 ? grass : pick < 4 ? water : pick < 7 ? deep : dark;
+			}
+		const auto at = [&](int x, int y) { return field[((y + size) % size) * size + (x + size) % size]; };
+		std::vector<TerrainVisual::PreparedCoverage> tiles;
+		tiles.reserve(size * size);
+		for (int y = 0; y < size; ++y)
+			for (int x = 0; x < size; ++x)
+				tiles.emplace_back(c, contextualRecipe(x, y, size, at));
+		const auto weightOf = [](const TerrainVisual::Coverage &coverage, TerrainVisual::MaterialId material)
+		{
+			unsigned total = 0;
+			for (unsigned k = 0; k < 4; ++k)
+				if (coverage.material[k] == material) total += coverage.weight[k];
+			return total;
+		};
+		for (int y = 0; y < size; ++y)
+			for (int x = 0; x < size; ++x)
+			{
+				const auto &tile = tiles[y * size + x];
+				// Every vertex keeps its own material, wiggle and saddles included.
+				const int corner[4][2] = {{0, 0}, {8192, 0}, {0, 8192}, {8192, 8192}};
+				for (unsigned k = 0; k < 4; ++k)
+				{
+					const auto own = at(x + int(k & 1), y + int(k >> 1));
+					CHECK(weightOf(tile.at(corner[k][0], corner[k][1]), own) > 32768);
+				}
+				// Right and bottom edges match the neighbouring tile's samples.
+				const auto &right = tiles[y * size + (x + 1) % size], &below = tiles[((y + 1) % size) * size + x];
+				for (int s = 0; s <= 8192; s += 512)
+					for (const auto material : {water, deep, dark, grass})
+					{
+						INFO("tile " << x << "," << y << " offset " << s);
+						CHECK(std::abs(int(weightOf(tile.at(8192, s), material)) - int(weightOf(right.at(0, s), material))) <= 64);
+						CHECK(std::abs(int(weightOf(tile.at(s, 8192), material)) - int(weightOf(below.at(s, 0), material))) <= 64);
+					}
+			}
+		// A straight water/deep shore stays a single smooth line: its crossing
+		// moves by a fraction of a pixel per pixel row, never in steps.
+		const auto straight = [&](int x, int) { return x < 8 ? water : deep; };
+		std::vector<float> crossing;
+		for (int y = 0; y < size; ++y)
+		{
+			std::vector<TerrainVisual::PreparedCoverage> row;
+			for (int x = 6; x <= 8; ++x) row.emplace_back(c, contextualRecipe(x, y, size, straight));
+			for (int py = 128; py < 8192; py += 256)
+			{
+				float position = -1;
+				for (int sx = 0; sx < 3 * 8192 && position < 0; sx += 32)
+					if (weightOf(row[sx / 8192].at(sx % 8192, py), water) < 32768)
+						position = sx / 256.f;
+				REQUIRE(position >= 0);
+				crossing.push_back(position);
+			}
+		}
+		float steepest = 0, spread = 0;
+		for (unsigned i = 1; i < crossing.size(); ++i)
+			steepest = std::max(steepest, std::abs(crossing[i] - crossing[i - 1]));
+		const auto [low, high] = std::minmax_element(crossing.begin(), crossing.end());
+		spread = *high - *low;
+		CHECK(steepest < 1.f);
+		CHECK(spread > 1.f);  // It meanders...
+		CHECK(spread < 12.f); // ...within the profile's wiggle.
+		// Squareness: a 2x2 road block keeps a crisp corner where a round smooth
+		// profile cuts it with an arc. Sample just inside the corner.
+		const auto road = c.find("road");
+		auto round = c;
+		round.profiles[round.materials[road].profile].squareness = 0;
+		REQUIRE(c.profiles[c.materials[road].profile].squareness >= 192);
+		const auto block = [&](int x, int y) { return x >= 4 && x <= 5 && y >= 4 && y <= 5 ? road : grass; };
+		const auto recipe = contextualRecipe(3, 3, size, block);
+		const TerrainVisual::PreparedCoverage square(c, recipe), arc(round, recipe);
+		CHECK(weightOf(square.at(19 * 256, 19 * 256), road) > 32768);
+		CHECK(weightOf(arc.at(19 * 256, 19 * 256), road) < 32768);
+		// A 45-degree staircase of road vertices runs as one straight diagonal
+		// rather than square steps: along every pixel row, the road's far edge
+		// keeps a constant offset from the diagonal, apart from the meander.
+		const auto stairs = [&](int x, int y) { return ((x - y) % size + size) % size < 6 ? road : grass; };
+		std::vector<float> offset;
+		for (int y = 4; y < 10; ++y)
+		{
+			std::vector<TerrainVisual::PreparedCoverage> row;
+			for (int x = y + 3; x <= y + 7; ++x) row.emplace_back(c, contextualRecipe(x, y, size, stairs));
+			for (int py = 128; py < 8192; py += 256)
+			{
+				float position = -1;
+				for (int sx = 0; sx < 5 * 8192 && position < 0; sx += 32)
+					if (weightOf(row[sx / 8192].at(sx % 8192, py), road) < 32768)
+						position = sx / 256.f;
+				REQUIRE(position >= 0);
+				offset.push_back(position - py / 256.f);
+			}
+		}
+		const auto [nearest, farthest] = std::minmax_element(offset.begin(), offset.end());
+		CHECK(*farthest - *nearest < 4.f);
 	}
 	TEST_CASE("single vertices own their corner and animation does not reseed variants")
 	{
@@ -1374,6 +2543,120 @@ TEST_SUITE("TerrainMaterials")
 			CHECK(c.frame(c.find("ice"), 7, 9, t) ==
 				  c.frame(c.find("ice"), 7, 9, 0) + (t / 4) % 3 * 16);
 	}
+}
+
+TEST_CASE("selected terrain preparation bounds pixels and preserves retained snapshots [display]" *
+          doctest::test_suite("TerrainMaterials"))
+{
+    glob2test::HeadlessGlobals globals({.display = true});
+    globals->fileManager->addDir(glob2test::sourceRoot().string());
+    TerrainVisual::Compositor compositor(catalog());
+    const auto &c = compositor.catalog();
+    const auto grass = c.find("grass"), water = c.find("water");
+    const auto uniform = [&](TerrainVisual::MaterialId id)
+    {
+        return contextualRecipe(3, 7, 16, [=](int, int) { return id; });
+    };
+    const std::array grassRecipes{uniform(grass)}, waterRecipes{uniform(water)};
+    const auto retainedPixels = [](const auto &snapshot)
+    {
+        std::size_t pixels = 0, variants = 0;
+        for (const auto &material : snapshot->textures)
+            for (const auto &texture : material)
+                if (texture.pixels && !texture.pixels->empty())
+                {
+                    pixels += texture.pixels->size();
+                    ++variants;
+                }
+        return std::pair{pixels, variants};
+    };
+    for (bool hd : {false, true})
+    {
+        INFO("hd=" << hd);
+        const auto idleWaterRevision = compositor.textureRevision(water);
+        compositor.prepareForRecipes(hd, 0, grassRecipes);
+        const auto grassView = compositor.preparedMaterial(grassRecipes[0], grass);
+        REQUIRE(grassView.size > 0);
+        auto retained = compositor.cpuMaterials(std::array{grass});
+        const auto [pixelCount, variantCount] = retainedPixels(retained);
+        CHECK(variantCount == 1);
+        CHECK(pixelCount == std::size_t(grassView.size * grassView.size));
+        CHECK(retained->included[grass]);
+        CHECK_FALSE(retained->included[water]);
+        auto adjacentGrass = grassRecipes[0];
+        ++adjacentGrass.x;
+        const std::array twoGrassRecipes{grassRecipes[0], adjacentGrass};
+        compositor.prepareForRecipes(hd, 0, twoGrassRecipes);
+        const auto twoGrass = compositor.cpuMaterials(std::array{grass});
+        const auto [twoPixelCount, twoVariantCount] = retainedPixels(twoGrass);
+        CHECK(twoVariantCount == 2);
+        CHECK(twoPixelCount == pixelCount * 2);
+        const auto batch = compositor.cpuMaterialsForRecipes(grassRecipes);
+        const auto [batchPixels, batchVariants] = retainedPixels(batch);
+        CHECK(batchVariants == 1);
+        CHECK(batchPixels == pixelCount);
+        CHECK(batch->bytes == compositor.cpuMaterialBytesForRecipes(grassRecipes));
+        CHECK(batch->bytes < twoGrass->bytes);
+        CHECK(compositor.preparedMaterial(adjacentGrass, grass).size > 0);
+        const auto hidden = compositor.cpuMaterialsForRecipes({});
+        CHECK(retainedPixels(hidden).second == 0);
+        CHECK(twoGrass->bytes > retained->bytes);
+        CHECK(twoGrass->bytes <= retained->bytes +
+              pixelCount * sizeof(TerrainVisual::Compositor::MaterialPixels::value_type) + 4096);
+        compositor.prepareForRecipes(hd, 0, grassRecipes);
+        const auto selectedGrassRevision = compositor.textureRevision(grass);
+        const auto original = std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)>(
+            SDL_CreateSurface(32, 32, SDL_PIXELFORMAT_ARGB8888), SDL_DestroySurface);
+        const auto actual = std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)>(
+            SDL_CreateSurface(32, 32, SDL_PIXELFORMAT_ARGB8888), SDL_DestroySurface);
+        REQUIRE(original);
+        REQUIRE(actual);
+        retained->compose(grassRecipes[0], original.get(), 1);
+        compositor.prepareForRecipes(hd, 5, grassRecipes);
+        CHECK(compositor.textureRevision(grass) == selectedGrassRevision);
+        CHECK(compositor.textureRevision(water) == idleWaterRevision);
+
+        compositor.prepareForRecipes(hd, 0, waterRecipes);
+        const auto phase0View = compositor.preparedMaterial(waterRecipes[0], water);
+        REQUIRE_FALSE(phase0View.pixels.empty());
+        const TerrainVisual::Compositor::MaterialPixels phase0(phase0View.pixels.begin(), phase0View.pixels.end());
+        auto adjacentWater = waterRecipes[0];
+        ++adjacentWater.x;
+        const std::array twoWaterRecipes{waterRecipes[0], adjacentWater};
+        compositor.prepareForRecipes(hd, 0, twoWaterRecipes);
+        CHECK_FALSE(compositor.preparedMaterial(adjacentWater, water).pixels.empty());
+        const auto unchangedWater = compositor.preparedMaterial(waterRecipes[0], water);
+        CHECK(std::equal(phase0.begin(), phase0.end(), unchangedWater.pixels.begin(), unchangedWater.pixels.end()));
+        compositor.prepareForRecipes(hd, 6, waterRecipes);
+        const auto phase1View = compositor.preparedMaterial(waterRecipes[0], water);
+        const TerrainVisual::Compositor::MaterialPixels phase1(phase1View.pixels.begin(), phase1View.pixels.end());
+        compositor.prepareForRecipes(hd, 5, waterRecipes);
+        const auto blended = compositor.preparedMaterial(waterRecipes[0], water);
+        REQUIRE(blended.pixels.size() == phase0.size());
+        REQUIRE(blended.pixels.size() == phase1.size());
+        const unsigned weightB = (5u * 65536 + 3) / 6;
+        for (std::size_t p = 0; p < blended.pixels.size(); ++p)
+        {
+            REQUIRE(phase0[p][3] == 255);
+            REQUIRE(phase1[p][3] == 255);
+            for (unsigned channel = 0; channel < 3; ++channel)
+                CHECK(blended.pixels[p][channel] ==
+                      (phase0[p][channel] * (65536 - weightB) + phase1[p][channel] * weightB + 32768) >> 16);
+        }
+        auto selected = compositor.cpuMaterials();
+        const auto [selectedPixels, selectedVariants] = retainedPixels(selected);
+        CHECK(selectedVariants == 1);
+        CHECK(selectedPixels == std::size_t(blended.size * blended.size));
+        // The byte admission includes catalog metadata, but its live pixel payload
+        // is one chosen variant rather than the complete 256-variant bank.
+        CHECK(selected->bytes >= selectedPixels * sizeof(TerrainVisual::Compositor::MaterialPixels::value_type));
+        retained->compose(grassRecipes[0], actual.get(), 1);
+        for (int y = 0; y < 32; ++y)
+            CHECK(std::memcmp(static_cast<Uint8 *>(actual->pixels) + y * actual->pitch,
+                              static_cast<Uint8 *>(original->pixels) + y * original->pitch, 32 * 4) == 0);
+        // Evict water before the next HD mode so its idle revision is comparable.
+        compositor.prepareForRecipes(hd, 5, grassRecipes);
+    }
 }
 
 TEST_CASE("owned prepared materials survive animation and share unchanged revisions [display]" *

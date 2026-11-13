@@ -1,11 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Render production screens with disposable, offline review fixtures.
-// Build: scons release=1 mobile-gallery
+// Build: python3 tools/dev_build.py release=1 mobile-gallery
 // Run via tools/mobile_gallery/capture.py; see docs/mobile/development.md.
 // Stable capture names must also be documented in mobile_gallery/catalog.json.
 #include "ui/ThemeCatalog.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "Map.h"
+#include "Building.h"
 #include <Environment.h>
 #include "GlobalContainer.h"
+#include "Game.h"
 #include <cmath>
 #include <algorithm>
 #include "MainMenuScreen.h"
@@ -35,6 +39,7 @@
 #include "FrontendTheme.h"
 #include "Engine.h"
 #include "GameGUITouch.h"
+#include "InGameStatistics.h"
 #include "GameGUIDialog.h"
 #include "LoadSaveDialog.h"
 #include "GameGUIInternal.h"
@@ -60,11 +65,14 @@
 #include <Toolkit.h>
 #include "ConnectionOverlay.h"
 #include "OnlineUIFixtures.h"
-#include "SettingsScreen.h"
 #include <SDL3_net/SDL_net.h>
 #include <charconv>
 #include <stdexcept>
 #include <iostream>
+#include "SGSL.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
+#include "GameGUIToolManager.h"
 
 GlobalContainer *globalContainer = nullptr;
 namespace
@@ -706,7 +714,7 @@ class MobileGalleryGameplay
 		// Real simulation history avoids misleading empty chart captures. Each
 		// viewport starts from the same bundled map and executes the same ticks.
 		globalContainer->replayWriter = std::make_unique<ReplayWriter>();
-		globalContainer->replayWriter->init("", gui);
+		gui.startReplay(*globalContainer->replayWriter, "");
 		for (int tick = 0; tick < 4096; ++tick)
 		{
 			gui.game.step(0);
@@ -839,6 +847,23 @@ class MobileGalleryGameplay
 		gui.touch->lensOpen = true;
 		gui.touch->panelOpen = desktopPresentation || gui.touch->layout().persistentPanel;
 		capture("game-tactical-tools");
+		// Capture the real topic layout in every presentation before returning
+		// to the fixture's normal tools and overlay states.
+		gui.touch->lensOpen = false;
+		gui.touch->panelOpen = false;
+		gui.touch->statsOpen = !desktopPresentation;
+		for (const auto &[topic, name] : {
+			std::pair{InGameStatisticsPanel::Topic::Overview, "overview"},
+			std::pair{InGameStatisticsPanel::Topic::Colony, "colony"},
+			std::pair{InGameStatisticsPanel::Topic::Economy, "economy"},
+			std::pair{InGameStatisticsPanel::Topic::Military, "military"},
+			std::pair{InGameStatisticsPanel::Topic::World, "world"}})
+		{
+			gui.statistics().selectTopic(topic);
+			capture(std::string("game-statistics-topic-") + name);
+		}
+		gui.statistics().selectTopic(InGameStatisticsPanel::Topic::Overview);
+		gui.touch->statsOpen = false;
 		if (!desktopPresentation)
 		{
 			gui.touch->lensOpen = false;
@@ -1275,6 +1300,9 @@ class MobileGalleryGameplay
 			stackShot(stack, "game-results-filters");
 			view->inspectValue();
 			stackShot(stack, "game-results-value");
+			view->selectMetric(Stats::findMetric("win probability"));
+			stackShot(stack, "game-results-win-probability");
+			view->selectMetric(Stats::findMetric("population"));
 			// Online results: the rating card while verifying, verified, and a room match.
 			auto online = std::make_shared<Online::OnlineMatchResult>(
 				"https://app.glob2.online", "8f3k2q00-0000-4000-8000-000000000001",
@@ -1507,17 +1535,16 @@ class MobileGalleryGameplay
 		if (editor.dock)
 		{
 			// The desktop/tablet dock: a terrain brush, a resource brush with its
-			// placement rule, and a locked experiment group offering to enable it.
+			// placement rule, and the immediately available obstacle terrain group.
 			editor.dock->showTab(EditorDock::Tab::Terrain);
 			editor.performAction("select terrain water");
 			editCapture("editor-dock-terrain");
 			editor.dock->showTab(EditorDock::Tab::Resources);
 			editor.performAction("select resource wheat");
 			editCapture("editor-dock-resources");
-			// Bundled maps carry no foundation resources, so show a locked terrain
-			// group instead (the gallery runs with experiments off).
+			// Terrain groups are available with experiments off.
 			editor.performAction("open terrain palette obstacles");
-			editCapture("editor-dock-locked");
+			editCapture("editor-dock-obstacles");
 		}
 
 		// Existing-object inspection has its own composition, separate from the

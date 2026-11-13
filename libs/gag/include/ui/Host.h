@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#pragma once
+#include <GestureScroll.h>
+#include "Element.h"
+#include <ScrollPhysics.h>
+#include <TouchInput.h>
+#include <functional>
+#include <optional>
+#include <map>
+#include <unordered_map>
+
+namespace GAGGUI::ui
+{
+struct PopupSpec
+{
+	Rect anchor;
+	std::vector<std::string> options;
+	std::vector<bool> enabled;
+	// Optional, one per option.
+	std::vector<IconRef> icons;
+	int selected = 0;
+	std::string help;
+	std::function<void(int)> pick;
+	// Optional framework control whose current meaning owns this popup.
+	std::string ownerKey;
+};
+
+// Owns one element tree: rebuild on invalidation, measure/arrange, hit testing,
+// pointer capture, tap-versus-pan, keyboard focus, popups and text editing.
+class Host
+{
+  public:
+	using Builder = std::function<Element(const Presentation &)>;
+	using Available = std::function<Rect(const Presentation &, const Metrics &)>;
+	using Placement = std::function<Rect(Size measured, Rect available)>;
+
+	Host(const Theme &theme, Builder build);
+	~Host();
+
+	void setMeasurer(const TextMeasurer *measurer);
+	void setPresentation(const Presentation &presentation);
+	const Presentation &presentation() const { return current; }
+	const Metrics &metrics() const { return metricsValue; }
+	const Theme &theme() const { return themeValue; }
+	// Where the root may lay out and how its measured size is placed there.
+	void setAvailable(Available available) { availableFn = std::move(available); }
+	void setPlacement(Placement placement) { placeFn = std::move(placement); }
+	void setEscape(std::function<void()> handler) { escape = std::move(handler); }
+	// Called after every measure/arrange pass (tree or popup), for diagnostics.
+	void setLayoutListener(std::function<void()> listener) { layoutListener = std::move(listener); }
+	// Higher input owners obscure these logical surface regions. Overlapping
+	// interactive targets are conservatively blocked, including human input.
+	// Newly covered captures are cancelled; text drafts are never committed or cancelled.
+	void setBlockedRegions(std::vector<Rect> regions);
+	// Confines tooltips to this logical area, such as the panel a HUD-embedded
+	// host owns; empty (the default) allows the whole safe area.
+	void setTooltipArea(Rect area) { tooltipArea = area; }
+	// Raw domain canvases use point ownership rather than blocking their entire
+	// extent for a small card. Any popup owns input over the underlying canvas.
+	bool inputBlockedAt(Point point) const;
+
+	// Popup items ("popup/<i>") when a choice is open, else null.
+	Node *popupRoot() const;
+
+	// Rebuild from the model at the next layout.
+	void invalidate();
+	// Keep the tree; measure and arrange again.
+	void relayout() { needsLayout = true; }
+	void layoutIfNeeded();
+	bool event(const SDL_Event &event);
+	void update(Uint32 tick);
+	void paint(Canvas &canvas, Uint32 tick);
+	void cancelInput();
+	void dismissTooltip(const std::string &key);
+	// Drop captures and pans but keep a pending press (window resize, presentation change).
+	void cancelGestures();
+
+	// Services for nodes.
+	StateStore &states() { return store; }
+	NodeState &state(const std::string &key) { return store.get(key); }
+	void focus(const std::string &key, bool keyboard = false);
+	const std::string &focused() const { return focusKey; }
+	bool keyboardFocused() const { return keyboardFocus; }
+	void beginEditing(const std::string &key);
+	void endEditing(bool cancelled = false);
+	const std::string &editing() const { return editingKey; }
+	// Provisional IME text for the editing control; never part of its value.
+	const std::string &composition() const { return preedit; }
+	void openPopup(PopupSpec spec);
+	void closePopup();
+	bool popupOpen() const { return popup != nullptr; }
+	// A press, drag or popup is in progress; screens defer expensive rebuilds meanwhile.
+	bool interacting() const { return popup != nullptr || !pressedKey.empty() || !capturedKey.empty(); }
+	// Scrolled content is coasting or bouncing after a touch; screens shorten
+	// their frame budget while this holds so the motion stays smooth.
+	bool animating() const { return scrolling && (scrolling->axis.isAnimating() || (gestureScrolling && scrollGestureMotion.needsFrames())); }
+	void scrollIntoView(const std::string &key);
+	// Aligns the element's top with its scroll container's top (a section heading).
+	void scrollToTop(const std::string &key);
+
+	// Snapshot and dispatch are application-thread APIs. Inspecting never mutates the model.
+	SurfaceSnapshot inspect() const;
+	bool act(const std::string &key, const SemanticAction &action, std::string &error);
+	// Validate a domain's exact-shape human hit before invoking its shared callback.
+	// This uses the identical ownership/visibility/action checks as act(), without effects.
+	bool actionAllowed(const std::string &key, ActionKind kind, std::string &error);
+
+	// Queries, also for harnesses.
+	Node *root() const { return tree.get(); }
+	Node *find(const std::string &key) const;
+	Rect bounds(const std::string &key) const;
+	Rect rootBounds() const { return rootRect; }
+	std::vector<Node *> interactiveNodes() const;
+	std::vector<std::string> focusOrder() const;
+	// Synthesize a completed tap at a point (mouse semantics).
+	void tapAt(Point point);
+	bool debugOverlay = false;
+
+  private:
+	const std::uint64_t instance;
+	mutable std::uint64_t inspectionRevision = 0;
+	mutable std::map<std::string, ControlSnapshot> inspected;
+	mutable std::vector<ControlSnapshot> previousInspection;
+	const Theme &themeValue;
+	Builder build;
+	const TextMeasurer *measurer = nullptr;
+	Presentation current;
+	Metrics metricsValue;
+	std::optional<ControlSnapshot> actionTarget(const std::string &key, ActionKind kind,
+											  std::string &error);
+	std::vector<Rect> blockedRegions;
+	std::unordered_map<const Node *, Rect> effectiveBounds;
+	void refreshBlockedGeometry();
+	bool obscures(Rect visible) const;
+	bool externallyBlocked(const Node &node) const;
+	bool externallyBlockedAt(const Node &node, Point point) const;
+	Available availableFn;
+	Placement placeFn;
+	std::function<void()> escape, layoutListener;
+	Element tree;
+	Rect availableRect, rootRect;
+	bool dirty = true, needsLayout = true, built = false, rebuilt = false;
+	StateStore store;
+	std::string focusKey, editingKey, pressedKey, capturedKey, panKey, preedit;
+	Node *pressedNode = nullptr;
+	bool keyboardFocus = false, hoverValid = false, panning = false;
+	Point hover, downPoint;
+	GAGCore::TouchInput touch;
+	Uint32 lastTick = 0;
+	std::string tooltipKey, tooltipSuppressedKey;
+	Uint32 tooltipSince = 0;
+	Rect tooltipArea;
+	// The part of a node its clipping ancestors leave visible.
+	Rect visibleRect(const Node &target) const;
+	// The scrollable an inertial touch drag is moving, kept while it coasts or
+	// bounces. `lastWritten` detects content moved by something else meanwhile.
+	struct ActiveScroll
+	{
+		std::string key;
+		GAGCore::ScrollAxis axis;
+		int lastWritten = 0;
+	};
+	std::optional<ActiveScroll> scrolling;
+	GAGCore::GestureScrollController scrollGestureMotion;
+	Uint64 wheelGestureSequence = 0;
+	bool wheelGestureClaimed = false, gestureScrolling = false;
+	// A touch that stopped coasting content is not also a tap.
+	bool swallowTap = false;
+	void writeScroll();
+	void dropScroll();
+	void settleScroll(GAGCore::Ticks time);
+
+	struct Popup
+	{
+		PopupSpec spec;
+		Element tree;
+		Rect bounds;
+		int highlight = 0;
+		std::string scrollKey;
+		std::optional<ControlSnapshot> owner;
+	};
+	std::unique_ptr<Popup> popup;
+	std::uint64_t popupGeneration = 0;
+	void layoutPopup();
+	Element buildPopup(const PopupSpec &spec);
+	bool popupKey(const KeyEvent &key);
+	void pickPopup(int index);
+	std::optional<ControlSnapshot> popupOwner(const std::string &key) const;
+	void validatePopupOwner();
+
+	LayoutContext context() const;
+	void saveStates();
+	void restoreStates();
+	void pointer(PointerPhase phase, Point point, std::uint64_t device, std::uint64_t finger, GAGCore::Ticks time);
+	void apply(const std::vector<GAGCore::TouchAction> &actions, Point point, std::uint64_t device);
+	Node *interactiveAt(Point point) const;
+	Node *scrollableAt(Point point) const;
+	bool keyDown(const KeyEvent &key);
+	void moveFocus(int direction);
+	Node *focusedNode() const;
+	void activateShortcut(SDL_Keycode sym);
+	Node *activeRoot() const { return popup ? popup->tree.get() : tree.get(); }
+};
+} // namespace GAGGUI::ui

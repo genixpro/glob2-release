@@ -5,9 +5,9 @@
 namespace AIEngine { class AIWorldView; }
 
 #include "field/Frontier.h"
-#include "field/TerrainTravel.h"
+#include "field/TerrainTravelMode.h"
 #include "shared_runtime/Position.h"
-#include "Map.h"
+class Map;
 
 #include <memory>
 #include <queue>

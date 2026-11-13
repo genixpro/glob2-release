@@ -1,6 +1,10 @@
 #include <Environment.h>
+#include "ComputeTelemetry.h"
+#include "gradient/MapRouting.h"
+#include "ProfileNeeds.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "GameGUI.h"
 #include "FileFormatVersions.h"
 #include "ScopedEnvironment.h"
 #include "OrderMessages.h"
@@ -13,8 +17,14 @@
 #include <FileManager.h>
 #include <cstdio>
 #include <locale>
+#include <limits>
 #include <sstream>
 #include <TextStream.h>
+#include "Game.h"
+#include "Unit.h"
+#include "Building.h"
+#include "MapScript.h"
+#include "Team.h"
 
 TEST_CASE("JavaScript test environment scopes restore SDL and CRT readers" *
 		  doctest::test_suite("JavaScriptCompatibility"))
@@ -134,19 +144,21 @@ TEST_CASE("Current simulation rejects earlier replays and enforces acceptance bo
 	glob2test::GlobalsOptions options;
 	options.loadStrings = true;
 	glob2test::HeadlessGlobals globals(options);
-	// Per-team building admission requires current replay execution.
+	// Resource-claim checksum coverage requires the claims-format replay floor.
 	// Script save-format milestones remain independent of these current gates.
-	CHECK(REPLAY_MINIMUM_VERSION_MINOR == 186);
-	CHECK(VERSION_MINOR == 186);
+	CHECK(REPLAY_MINIMUM_VERSION_MINOR == FILE_FORMAT_VERSION_RESOURCE_CLAIMS);
+	REQUIRE(REPLAY_MINIMUM_VERSION_MINOR <= VERSION_MINOR);
+	REQUIRE(VERSION_MINOR < std::numeric_limits<Uint16>::max());
 
-	CHECK(NET_PROTOCOL_VERSION == 72);
+	CHECK(NET_PROTOCOL_VERSION == 75);
 	CHECK(FILE_FORMAT_VERSION_JAVASCRIPT == 125);
 	CHECK(FILE_FORMAT_VERSION_EXPERIMENTS == 124);
 	ReplayReader released;
 	CHECK_FALSE(
 		released.loadReplay(glob2test::inflated("javascript/released-v123.replay.gz").string()));
-	const Uint16 versions[] = {122, 123, 124, 125, 126, 127, 128, FILE_FORMAT_VERSION_CUSTOM_AI, FILE_FORMAT_VERSION_FARM_AREA, 133, 134, 135, FILE_FORMAT_VERSION_RUNTIME_TERRAIN, FILE_FORMAT_VERSION_BUILDING_CATALOG, FILE_FORMAT_VERSION_TERRAIN_SEED, 139, FILE_FORMAT_VERSION_RUNTIME_RESOURCES, FILE_FORMAT_VERSION_TERRAIN_CATALOGUE, FILE_FORMAT_VERSION_HAZARD_ROUTING, FILE_FORMAT_VERSION_AI_PIPELINE, FILE_FORMAT_VERSION_MAP_ASSETS, FILE_FORMAT_VERSION_BUILDING_ARTWORK, FILE_FORMAT_VERSION_VERTEX_TERRAIN, FILE_FORMAT_VERSION_GREEDY_FETCHING, FILE_FORMAT_VERSION_PRIVATE_RANDOM - 1, FILE_FORMAT_VERSION_PRIVATE_RANDOM, FILE_FORMAT_VERSION_UNIT_CATALOG, 164, 165, 166, 167, 168, 169, 170, REPLAY_MINIMUM_VERSION_MINOR - 1, VERSION_MINOR, VERSION_MINOR + 1};
-	for (Uint16 version : versions)
+	// Include every historical format and both edges of the current window,
+	// rather than pinning this boundary test to one release's latest format.
+	for (unsigned version = 0; version <= unsigned(VERSION_MINOR) + 1; ++version)
 	{
 		CAPTURE(version);
 		auto *memory = new GAGCore::MemoryStreamBackend;
@@ -166,7 +178,7 @@ TEST_CASE("Current simulation rejects earlier replays and enforces acceptance bo
 	}
 }
 
-TEST_CASE("JavaScript pass assigns valid identities to released saves" *
+TEST_CASE("JavaScript pass assigns valid identities to released saves" * glob2test::needs({"ai:castor"}) *
 		  doctest::test_suite("JavaScriptCompatibility"))
 {
 	glob2test::HeadlessGlobals globals;
@@ -205,7 +217,7 @@ TEST_CASE("JavaScript pass assigns valid identities to released saves" *
 	}
 }
 
-TEST_CASE("JavaScript upgrade retains genuine master124 experiments and continuation" *
+TEST_CASE("JavaScript upgrade retains genuine master124 experiments and continuation" * glob2test::needs({"ai:castor"}) *
 		  doctest::test_suite("JavaScriptCompatibility"))
 {
 	glob2test::HeadlessGlobals globals;
@@ -242,7 +254,7 @@ TEST_CASE("JavaScript upgrade retains genuine master124 experiments and continua
 		CHECK(buildings > 0);
 	};
 	checkIdentities(legacy.game);
-	legacy.game.map.finishGradientPipeline();
+	legacy.game.map.routing().finishGradientPipeline();
 	auto *storage = new GAGCore::MemoryStreamBackend;
 	GAGCore::BinaryOutputStream output(storage);
 	legacy.game.save(&output, false, "Master124 upgraded");

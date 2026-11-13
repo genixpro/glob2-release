@@ -1,6 +1,7 @@
 #include "MaximaObservationFixture.h"
 // Link with the game objects (excluding Glob2.cpp) to exercise the real runtime.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include <algorithm>
 #include <utility>
 #include <iterator>
@@ -857,6 +858,9 @@ static void strategyQueueRegression()
     ai.strategy.scheduling.explorer_attack_phase_offset_ticks=5000;
     ai.strategy.scheduling.defense_interval_ticks=10000;
     ai.strategy.scheduling.defense_phase_offset_ticks=5000;
+    // The queue order below reviews dirty plans at once; the spacing of
+    // event-triggered reviews is checked at the end.
+    ai.strategy.scheduling.strategy_review_min_gap_ticks=0;
     ai.last_farming_tick=62;
     ai.land_clearing_pending=true;
     ai.maintenance_clearing_pending=true;
@@ -899,6 +903,37 @@ static void strategyQueueRegression()
     REQUIRE(ai.preemptive_defense_pending);
     REQUIRE(ai.reactive_defense_pending);
     REQUIRE(ai.development_cycle_pending);
+    // A building event marks the plan dirty, but its review waits for the
+    // minimum gap after the last review while the periodic review keeps its slot.
+    ai.strategy.scheduling.strategy_review_min_gap_ticks=4;
+    const int reviewed=ai.snapshot.tick;
+    ai.director.invalidate();
+    while(ai.timer<reviewed+3)
+    {
+        ai.tick(c);
+        if(ai.timer%64!=0)REQUIRE(ai.snapshot.tick==reviewed);
+    }
+    REQUIRE(ai.director.dirty);
+    ai.tick(c);
+    REQUIRE(ai.snapshot.tick==reviewed+4);
+    REQUIRE_FALSE(ai.director.dirty);
+
+    // A reservation change re-plans maintenance clearing no sooner than the gap
+    // after the last plan; a farming update's request runs at the next free slot.
+    ai.strategy.scheduling.strategy_interval_ticks=100000;
+    ai.strategy.scheduling.maintenance_clearing_min_gap_ticks=6;
+    ai.land_clearing_pending=false;
+    ai.last_maintenance_clearing_tick=ai.timer;
+    ai.maintenance_clearing_pending=true;ai.maintenance_clearing_requested_by_farming=false;
+    const int planned=ai.last_maintenance_clearing_tick;
+    while(ai.timer<planned+5){ai.tick(c);REQUIRE(ai.maintenance_clearing_pending);}
+    ai.tick(c);
+    REQUIRE_FALSE(ai.maintenance_clearing_pending);
+    REQUIRE(ai.last_maintenance_clearing_tick==planned+6);
+    ai.maintenance_clearing_pending=true;ai.maintenance_clearing_requested_by_farming=true;
+    ai.tick(c);
+    REQUIRE_FALSE(ai.maintenance_clearing_pending);
+    REQUIRE(ai.last_maintenance_clearing_tick==planned+7);
 }
 
 // Current execution state round-trips; retired Maxima layouts are rejected
@@ -1080,6 +1115,61 @@ static void foodRelocationExecutorRegression()
     REQUIRE(ai.relocation_target_building==1);
     ai.budget.food_relocation_enabled=false; ai.update_food_relocation(c,world);
     REQUIRE((ai.relocation_target_building==-1&&ai.relocation_since.empty()));
+}
+
+static void operatingStaffingCeilings()
+{
+    for(int level=0;level<3;++level)
+    {
+        Game game(nullptr);game.map.setSize(6,6,GRASS);game.map.setGame(&game);
+        game.addTeam();game.teams[0]->race.loadDefault();
+        Player player;player.setTeam(game.teams[0]);
+        // Swarms have one tier; inns exercise all three completed variants.
+        Building* swarm=game.addBuilding(8,8,
+            globalContainer->buildingsTypes.getTypeNum("swarm",0,false),0);
+        Building* inn=game.addBuilding(32,32,
+            globalContainer->buildingsTypes.getTypeNum("inn",level,false),0);
+        REQUIRE(swarm);REQUIRE(inn);
+        AIMaxima::Maxima ai(&player);ai.ensure_strategy();auto& c=ai.context;c.initialize();
+        ai.strategy.staffing.new_inn_workers=20;
+        ai.strategy.staffing.new_swarm_workers=20;
+        glob2test::withMaximaObservation(c,[&]{ai.configure_development_planner();});
+        ai.budget.staffing_window_samples=1;ai.budget.staffing_cooldown_passes=0;
+        ai.budget.staffing_minimum_workers=1;ai.budget.staffing_maximum_workers=20;
+        ai.budget.staffing_slack=20;
+        const auto request=[&](int id) {
+            return glob2test::withMaximaObservation(c,[&]{return ai.update_staffing_request(c,id);});
+        };
+        // Saved requests and initial planner demand obey the same operating caps.
+        ai.staffing_control[0].request=ai.staffing_control[1].request=20;
+        auto world=ai.collect_development_world(c);
+        REQUIRE(world.buildings.size()==2);
+        REQUIRE(world.buildings[0].plannedCarriers==12);
+        REQUIRE(world.buildings[1].plannedCarriers==8);
+        REQUIRE(request(0)==12);REQUIRE(request(1)==8);
+        ai.staffing_control.clear();
+        world=ai.collect_development_world(c);
+        REQUIRE(world.buildings[0].plannedCarriers==12);
+        REQUIRE(world.buildings[1].plannedCarriers==8);
+        // Staffing remains dynamic: empty stores grow to their ceiling, while
+        // full stores release carriers instead of treating the cap as a target.
+        for(int pass=0;pass<40;++pass)
+        {
+            REQUIRE(request(0)<=12);REQUIRE(request(1)<=8);
+        }
+        REQUIRE(ai.staffing_control[0].request==12);
+        REQUIRE(ai.staffing_control[1].request==8);
+        for(Building* building:{swarm,inn})
+            for(int r=0;r<int(MaterialCount);++r)
+                building->setMaterial(r,building->type->maxMaterial[r]);
+        for(int pass=0;pass<40;++pass){request(0);request(1);}
+        REQUIRE(ai.staffing_control[0].request==1);
+        REQUIRE(ai.staffing_control[1].request==1);
+        // An explicitly lower common ceiling still wins over either role cap.
+        ai.strategy.staffing.control_maximum_workers=6;
+        ai.staffing_control[0].request=ai.staffing_control[1].request=20;
+        REQUIRE(request(0)==6);REQUIRE(request(1)==6);
+    }
 }
 
 static void innCompletionStaffingRegressions()
@@ -1865,6 +1955,7 @@ TEST_SUITE("Maxima.Implementation")
 	TEST_CASE("mission force regressions") { glob2test::HeadlessGlobals globals; missionForceRegressions(); }
 	TEST_CASE("economy staffing regressions") { glob2test::HeadlessGlobals globals; economyStaffingRegressions(); }
 	TEST_CASE("execution state save regression") { glob2test::HeadlessGlobals globals; executionStateSaveRegression(); }
+	TEST_CASE("operating staffing ceilings") { glob2test::HeadlessGlobals globals; operatingStaffingCeilings(); }
 	TEST_CASE("food relocation executor regression") { glob2test::HeadlessGlobals globals; foodRelocationExecutorRegression(); }
 	TEST_CASE("explorer swarm staffing regressions") { glob2test::HeadlessGlobals globals; explorerSwarmStaffingRegressions(); }
 	TEST_CASE("completed swarm budget regressions") { glob2test::HeadlessGlobals globals; completedSwarmBudgetRegressions(); }
@@ -1971,4 +2062,79 @@ TEST_CASE("prepared resource obstacles match scalar entity gradients" * doctest:
         Gradients::Gradient actual(info);actual.recalculate(*observed,0,frontier);
         CHECK(actual.values==expected);
     }
+}
+
+TEST_CASE("economic worker priorities rank each role and boost emergency inn sites" * doctest::test_suite("Maxima.Implementation"))
+{
+    glob2test::HeadlessGlobals globals;
+    Game game(nullptr);
+    game.map.setSize(6,6,GRASS);game.map.setGame(&game);
+    game.addTeam();game.teams[0]->race.loadDefault();
+    Player player;player.setTeam(game.teams[0]);
+    std::vector<Building*> buildings;
+    for(int i=0;i<9;++i)
+    {
+        const char* name=i==8 ? "hospital" : i>=3 && i<6 ? "swarm" : "inn";
+        auto* b=game.addBuilding(5+(i%4)*12,5+(i/4)*20,
+            globalContainer->buildingsTypes.getTypeNum(name,0,false),0);
+        REQUIRE(b);buildings.push_back(b);
+    }
+    AIMaxima::Maxima ai(&player);Context& c=ai.context;
+    c.initialize();c.activeAI=&ai;
+    glob2test::withMaximaObservation(c,[&]{ai.configure_development_planner();});
+    auto world=ai.collect_development_world(c);
+    REQUIRE(world.buildings.size()==9);
+    AIMaximaFoodLedger::Result ledger;
+    std::map<int,int> expected;
+    for(auto& b:world.buildings)
+    {
+        const auto it=std::find_if(buildings.begin(),buildings.end(),
+            [&](const auto* live){return live->gid==b.gid;});
+        REQUIRE(it!=buildings.end());
+        const int index=int(it-buildings.begin());
+        AIMaximaFoodLedger::ConsumerResult value;
+        value.key=b.id;
+        value.kind=index>=3 && index<6 ? AIMaximaFoodLedger::SwarmConsumer : AIMaximaFoodLedger::InnConsumer;
+        // Inn scores tie (ID breaks the tie); the last swarm has the worst route.
+        value.quality=index>=3 && index<6 ? index*100 : 100;
+        if(index==6 || index==7)b.site=true;
+        if(index==7)b.upgrading=true;
+        ledger.consumers.push_back(value);
+        expected[b.id]=index==5 ? -1 : index==6 ? 1 : 0;
+    }
+    int lowestInn=std::numeric_limits<int>::max();
+    for(const auto& value:ledger.consumers)
+        if(value.kind==AIMaximaFoodLedger::InnConsumer && !world.building(value.key)->site
+           && world.building(value.key)->gid!=buildings[8]->gid)
+            lowestInn=std::min(lowestInn,value.key);
+    expected[lowestInn]=-1;
+    // An upgrade's existing high priority must survive the economic review.
+    buildings[7]->priority=1;
+    for(const auto& b:world.buildings)if(b.gid==buildings[7]->gid)expected[b.id]=1;
+    ai.budget.food_emergency=true;
+    auto review=[&]
+    {
+        c.orders.clear();
+        ai.update_worker_priorities(c,world,ledger);
+        c.update_management_orders();
+        for(const auto& order:c.orders)
+            if(const auto change=std::dynamic_pointer_cast<OrderChangePriority>(order))
+                for(auto* b:buildings)if(b->gid==change->gid)b->priority=change->priority;
+        for(const auto& b:world.buildings)
+            for(const auto* live:buildings)if(live->gid==b.gid)
+                CHECK(live->priority==expected.at(b.id));
+    };
+    review();
+    // A settled review emits no redundant priority orders.
+    review();
+    for(const auto& order:c.orders)CHECK(!std::dynamic_pointer_cast<OrderChangePriority>(order));
+    ai.budget.food_emergency=false;
+    for(const auto& b:world.buildings)if(b.gid==buildings[6]->gid)expected[b.id]=0;
+    review();
+    // A lone completed building remains normal, even if it used to rank low.
+    auto lone=world;
+    lone.buildings.erase(std::remove_if(lone.buildings.begin(),lone.buildings.end(),
+        [&](const auto& b){return b.id!=lowestInn;}),lone.buildings.end());
+    world=std::move(lone);expected[lowestInn]=0;
+    review();
 }

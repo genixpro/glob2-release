@@ -2,10 +2,10 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "AITelemetryFields.h"
+#include "Building.h"
 #include "AINumbi.h"
 #include "NumbiQueries.h"
 #include "ai/engine/AIDecision.h"
-#include "Game.h"
 #include "Order.h"
 #include "Player.h"
 #include "Utilities.h"
@@ -243,7 +243,7 @@ bool AINumbi::findNewEmplacement(Intent intent, int typeNum, int *posX, int *pos
 			if (needs[resource])
 			{
 				int rx, ry, distance;
-				supplied = queries->resourceAvailableUpdate(teamNumber, resource, 0, px, py, &rx, &ry, &distance)
+				supplied = queries->resourceAvailableUpdate(teamNumber, resource, MovementAccess::Land, px, py, &rx, &ry, &distance)
 					&& distance <= AI_NUMBI_WHEAT_DISTANCE_BIAS + width*height;
 			}
 		if (!supplied) continue;

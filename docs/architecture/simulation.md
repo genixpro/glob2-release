@@ -45,8 +45,8 @@ reorders population membership.
 ## Routine desynchronization checksums
 
 Routine checks run from existing immutable world snapshots on the shared compute
-executor, with a one-tick delivery deadline. Their field selection and cheap
-XOR/rotate mixing follow the original routine path: selected entity state,
+executor, with a four-turn delivery deadline (`ChecksumDeliveryDelay`). Their
+field selection and cheap XOR/rotate mixing follow the original routine path: selected entity state,
 entity RNG fingerprints, relationship counts/presence and team facts. Immutable
 unit/resource/terrain catalog fingerprints contribute without definition walks.
 Pointers, padding and capture identities are excluded. Zero-worker configurations
@@ -168,7 +168,7 @@ checksum adapter remains available for diagnostic fixtures.
   requires the format-128 compact save reader. Older saves load into the current
   simulation.
 - `.map`/`.game` files are gzip level 6 by default (`FileManager::writeGzipAtomic`/
-  `writeGzipAtomically` in `libgag/src/FileManagerGzip.cpp`; the gzip header carries
+  `writeGzipAtomically` in `libs/gag/src/FileManagerGzip.cpp`; the gzip header carries
   a zero timestamp and OS=unknown, producing deterministic bytes with the same
   zlib encoder). This is a container change, not a save-format schema change: the bytes
   inside the gzip stream are exactly what today's serializer already writes, so it
@@ -196,11 +196,24 @@ checksum adapter remains available for diagnostic fixtures.
   Vertex (x,y) is the top-left corner of cell (x,y); `cellCorners(x, y)` returns the
   top-left, top-right, bottom-left and bottom-right corners. A cell's rules come
   from its corners through `combineCornerRules` (`TerrainPropertiesLayout.h`):
-  equal corners keep their terrain's exact profile; mixed corners are walkable when
-  any corner is, never swimmable or buildable, block projectiles and count as a
-  shoreline when any corner does, and are otherwise as permissive as their weakest
-  corner (speed and ground damage from the walkable corners). Mixed grass/sand and sand/water cells reproduce the retired shore
-  profiles exactly, which is why no shore terrain types exist.
+  corners with equal property profiles keep that exact profile. Otherwise, count
+  walking, swimming and blocked corners. Two or more blocked corners make the
+  cell impassable on the ground. Otherwise walking or swimming wins by count,
+  with walking winning a tie between the two. Thus three water corners and one
+  grass corner swim, two grass and two water corners walk, and three blocked
+  corners and one grass corner stay blocked. Different water profiles can join
+  without creating an impassable transition. All eight numeric modifiers use the
+  arithmetic mean of **all four corners**, independently of the movement vote:
+  ground and air speed, ground and air health, growth, fertility, inhibition and
+  shoreline support. Q8 values are summed in signed 32-bit integers and divided
+  by four, rounding toward zero. A 100%/200% speed boundary therefore has 125%,
+  150% and 175% cells when one, two or three corners have the higher speed. Damage and healing are signed
+  rates and can offset each other; fractions below one Q8 unit round to zero.
+  Mixed profiles are never buildable; flight and growth permissions require all
+  corners, while projectile blocking and shoreline flags require any corner.
+  Resource masks are intersected and mixed profiles have no automatic farming
+  material. Shore transitions blend ecology instead of using a fixed shore
+  profile, so partial inhibition and shoreline support affect nearby crop growth.
 - A per-map `CellRuleTable` (`src/map/CellRules.h`) compiles each corner combination
   once: properties, movement costs per swimming class, air costs and resource
   habitat. Cells store only a rule index; rule t is the uniform cell of type t, and
@@ -212,8 +225,8 @@ checksum adapter remains available for diagnostic fixtures.
   category. Write vertices with `setVertexTerrain`, `paintVertices`,
   `paintVertexSquare`, `assignVertexTerrain` or `fillTerrain`, and batch edits with
   `editTerrain()` so snapshots, topology and ecology caches stay consistent.
-- Grass directly against water is legal: the cells between are walkable and
-  unbuildable. Beaches are a painting and generation convention. `paintVertices`
+- Grass directly against water is legal: mixed cells are unbuildable and walk
+  with at least two grass corners, otherwise they swim. Beaches are a painting and generation convention. `paintVertices`
   (by default) and `paintVertexSquare` turn an opposite vertex next to painted
   grass or water into sand. `Map::layBeaches()` handles a whole map independently
   of scan order and turns both sides of every grass/water contact into sand, a
@@ -228,23 +241,60 @@ checksum adapter remains available for diagnostic fixtures.
   frames are skipped.
 - Detailed terrain rendering resolves shipped appearances through a
   presentation-only material catalog, corner coverage resolver and CPU compositor.
-  `data/terrain/tileset.json` defines those materials independently of gameplay
+  The catalog (`content/data/terrain/`, one file per material) defines them independently of gameplay
   IDs; `TerrainPresentation.h` retains semantic editor and image-interchange
   metadata. See [terrain material authoring](../assets/terrain-materials.md) for
   variants, boundary profiles, asset validation and cache behavior. Visual catalog
   changes must not change saved state or simulation RNG use.
 - Built-in terrain is table-driven. `TerrainGroup.h` defines one property profile per
-  gameplay group; `TerrainTypeTable.h` lists every `TerrainType` with its group, external
-  name, string-table label and semantic colours, and the `TerrainProperties.h`,
-  `TerrainPresentation.h` and `TerrainExperiments.h` tables derive from it. Members of a group are byte-identical
+  gameplay group; `TerrainGroupTable.h` gives every `TerrainType` its group as a
+  constexpr table, from which `TerrainProperties.h` derives the inline per-cell
+  profiles; `TerrainCatalog.cpp` holds each type's external name, string-table label
+  and semantic colours behind `TerrainCatalog.h` (`terrainTypeDefinition`,
+  `terrainTypeByName`) and defines `TerrainPresentations`. Editing a name or colour
+  therefore recompiles one file. Members of a group are byte-identical
   profiles, so the registry deduplicates them into one property index; use
   `terrainGroup(type)` for palette and reporting buckets, never for simulation rules.
-  Adding a type is one enumerator, one row, one label and one material binding;
-  adding a group is one profile and, when gated, one `ExperimentId`.
+  Adding a type is one enumerator, one group row, one catalogue row, one label and one
+  material binding, plus the format gate below; adding a group is one profile and,
+  when gated, one `ExperimentId`.
 - Format 141 raised the built-in count from 7 to 31; format 146 retired the two
-  shore types (IDs 5 and 6), moving the catalogue down by two to `TERRAIN_COUNT` 29.
-  `TerrainRegistry::savedBuiltinCount` gives a file's built-in count
-  (`TERRAIN_COUNT_BEFORE_CATALOGUE` or `TERRAIN_COUNT_BEFORE_VERTEX` for older files),
+  shore types (IDs 5 and 6), moving the catalogue down by two to 29; format 191
+  appended the grass and sand looks (`LUSH_GRASS`, `DRY_GRASS`, `DUNE_SAND`,
+  `PALE_SAND`, in the Grass and Sand groups) for 33; format 195 appended `SANDSTONE`
+  (Paths), `PUMICE` (Rough) and `FROZEN_LAKE` (Ice) for 36; format 196 appended
+  `WIND_SWEPT_SNOW` (snow and ice, like deep snow) for 37; format 197 appended
+  `WEATHERED_SANDSTONE` (Barren, like dirt) for 38; format 198 appended
+  `WINDY_SAND_DUNE` (Sand, like sand) for 39; format 199 appended `HARDPAN`
+  (Rough, like mud) for 40; format 200 appended `TUNDRA` (Barren, like dirt) for 41; format 201 appended `VOLCANIC_ASH` (Barren, like
+  dirt) for 42; format 202 appended `GLACIER_ICE` (Ice, like ice) for
+  43; format 203 appended `OVERGROWN_ROAD` (Paths, like road) for 44; format 204 appended `LATERITE` (Barren, like dirt) for 45; format 206 appended `CLIFFS`
+  (Obstacles, like hedge) for 46; format 207 appended `MOLTEN_LAVA_POOL` (Lava, like lava) for
+  47; format 208 appended `SLATE_ASHLAR`, `BASALT_CAUSEWAY` and `SCORIA_BLOCKS` (Paths, like
+  road) for 50; format 209 appended `RIME_ASHLAR`, `MOONSTONE_LOZENGE` and `FROST_PINWHEEL`
+  (Paths, like road) for 53; format 210 appended `ARCTIC_TUNDRA` (Barren, like dirt) for
+  54; format 211 appended `GLACIER` (Obstacles, like cliffs) for 55; format 212 appended `ICEFALL`,
+  `SANDSTONE_BENCHES`, `OBSIDIAN_RIDGE`, `GRANITE_TORS` and `TRAVERTINE_TERRACES` (Obstacles, like
+  cliffs) and `PENITENTES`, `TERMITE_MOUNDS`, `HOODOOS` and `PETRIFIED_STUMPS` (Ridges, like rock
+  spires) for 64; format 216 appended `STEPPE_GRASS` and `MOOR_GRASS` (Grass, like grass) for
+  `TERRAIN_COUNT` 66.
+  Built-in IDs only
+  ever grow at the end, but custom IDs follow the built-ins, so appending a type needs
+  a format gate. The `TerrainType` enum in `src/map/TerrainType.h` is closed at
+  these 64, because about half of the code includes it: a new built-in takes the
+  next ID as an `inline constexpr TerrainType` in `src/map/TerrainBuiltins.h`,
+  which also holds `TERRAIN_COUNT`, so adding a terrain rebuilds only the tables,
+  the catalogue and the code sized by the count. `TerrainRegistry::savedBuiltinCount` gives a file's built-in count
+  (from `src/map/io/TerrainFormatHistory.h`: `TERRAIN_COUNT_BEFORE_CATALOGUE`, `TERRAIN_COUNT_BEFORE_VERTEX`,
+  `TERRAIN_COUNT_BEFORE_GROUND_LOOKS`, `TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE`,
+  `TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW`, `TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE`,
+  `TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE`, `TERRAIN_COUNT_BEFORE_HARDPAN`,
+  `TERRAIN_COUNT_BEFORE_TUNDRA`,
+  `TERRAIN_COUNT_BEFORE_VOLCANIC_ASH`, `TERRAIN_COUNT_BEFORE_GLACIER_ICE`,
+  `TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD`, `TERRAIN_COUNT_BEFORE_LATERITE`, `TERRAIN_COUNT_BEFORE_CLIFFS`,
+  `TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL`, `TERRAIN_COUNT_BEFORE_ROCK_PATHS`,
+  `TERRAIN_COUNT_BEFORE_ICE_PATHS`, `TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA`, `TERRAIN_COUNT_BEFORE_GLACIER`,
+  `TERRAIN_COUNT_BEFORE_ICEFALL` or `TERRAIN_COUNT_BEFORE_STEPPE_GRASS` for older files),
   `TerrainRegistry::currentTerrainId` remaps its saved IDs, and
   `TerrainRegistry::deserialize` takes that count. Custom registries re-serialize
   with shifted IDs, so their digest changes and replays that embed one no longer
@@ -259,15 +309,11 @@ checksum adapter remains available for diagnostic fixtures.
   to the same material without scanning custom definitions. Render caches bind the
   registry snapshot and actual asset revisions. Saved custom colors remain
   authoritative for previews and minimaps; built-ins use catalog palettes.
-  Experimental authoring gates live in `TerrainExperiments.h`; maps carry required
-  experiments into matches, while saves retain them independently of user settings.
-  A runtime definition whose properties equal a gated built-in group's profile
-  requires that group's experiment too (`Map::requiredTerrainExperiments` compares
-  property indices); a definition with its own profile stays ungated.
-- Trail retains stable terrain ID `4` (`TRAIL`) and experiment position `3`
-  (`TrailTerrain`). Its external name, translation keys and serialized experiment
-  key remain `road` / `road-terrain` for scripting, reports, editor actions and
-  existing files. The material catalog chooses the detailed appearance for that ID.
+  All terrains are available to map authors without experiment flags. Terrain
+  properties apply unconditionally, including imported definitions.
+- Trail retains stable terrain ID `4` (`TRAIL`). Its external name and translation
+  keys remain `road` for scripting, reports, editor actions and existing files.
+  The material catalog chooses the detailed appearance for that ID.
 - Ecology caches terrain-only land and aquatic fields for the map's lifetime.
   Normal growth, harvesting, unit movement and building placement do not rebuild
   them. Map replacement invalidates them; terrain edits invalidate them only when
@@ -313,7 +359,7 @@ checksum adapter remains available for diagnostic fixtures.
   speed-adjusted cardinal cost once, round its weighted value to nearest integer,
   then derive the diagonal with the existing `cardinal*14/10` integer rule.
   Ice therefore costs 33 straight and 46 diagonal; grass remains 10/14. Healing
-  gives no discount. Ground profiles remain shared by swim class, independent of
+  gives no discount. Ground cost profiles remain shared by preparation cost, independent of
   unit type, current HP or hospital availability. Strategic travel/influence
   fields retain travel-only costs; route-derived distance estimates include the
   preference penalty and can consequently make long hazardous jobs less attractive.
@@ -321,8 +367,11 @@ checksum adapter remains available for diagnostic fixtures.
   fields and readable maps. Finite field range still limits very long costly routes.
   Idle units on safe ground never wander onto damaging terrain. Idle units already
   exposed follow a lazily built shared reverse escape field, allowing hazardous
-  intermediate steps. Ground fields are keyed by team, swim class and whether the
-  unit is escaping forbidden paint. Air safety fields ignore forbidden paint and
+  intermediate steps. Ground escape fields are keyed by team, movement access and
+  whether the unit is escaping forbidden paint. Amphibious preparation uses the
+  team's most common ratio. A ratio change rebuilds this synchronous derived field
+  on its next query, so eviction and save/load keep identical directions. Air
+  safety fields ignore forbidden paint and
   share across teams.
   Buildings, terrain and forbidden paint invalidate ground fields. Resource edits
   invalidate only the movement classes whose blocking properties changed; stock
@@ -337,7 +386,8 @@ checksum adapter remains available for diagnostic fixtures.
   separate air damage rate. These rules are preferences for travel, not
   guarantees against lethal crossings or overrides of explicit local combat moves.
 - Flyers use movement class 8 in the same material, building, guard, clearing and
-  forbidden gradients as ground units. Ground ratio IDs 0–7 remain unchanged;
+  forbidden gradients as ground units. Legacy ground IDs 0–7 remain readable;
+  live ground lookups use access IDs 0, 3 and 7;
   all flyers share one class regardless of speed or other capabilities. The air
   profile combines `airSpeedQ8` and `airHealthQ8` with the same damage preference,
   integer costs and scalar/SIMD/backend kernels. Flyable terrain and resource
@@ -380,8 +430,8 @@ checksum adapter remains available for diagnostic fixtures.
   field, because a too-small ring can alias a future cost layer. Keep validation out
   of cell/neighbor expansion; compact production snapshots bound it by distinct costs.
   Capability counters keep health, air and projectile shortcuts independent of
-  registry size. A* retains the historical built-in lower bound and lowers it only
-  for faster custom terrain actually present, preserving old route choices.
+  registry size. The point-to-point A* prices its octile heuristic at the cheapest
+  cardinal and diagonal entry among the cell rules present (`Map::routeStepFloor`).
   Map property queries use a derived two-byte index plane into deduplicated
   fixed-layout property structs, keeping equivalent custom IDs out of the hot
   property working set. Canonical tile IDs and persistence remain unchanged.
@@ -432,10 +482,11 @@ checksum adapter remains available for diagnostic fixtures.
 
   | Consumer | Observation input | Effective delay | Publication / first consumer |
   | --- | --- | --- | --- |
-  | AI | Shared AI view of T | max(1, configured 0–8) | T+delay into the ordered command schedule |
-  | Hiring | Shared entity and route views of T | 1, staggered refresh 4 | T+1 before capture; live worker assignment |
+  | AI | Shared AI view of T | max(1, configured 0–16), default 14 | T+delay into the ordered command schedule |
+  | Hiring | Shared entity and route views of T | 4, staggered refresh 8 (saves keep their rules) | T+4 before capture; live worker assignment |
   | Statistics | Shared statistics inputs of T | max(1, configured 0–8) | T+delay before capture; statistics and presentation |
-  | Targeting | Shared targeting view of T | configured positive delay, default 1 | T+delay before capture; live turret firing |
+  | Targeting | Shared targeting view of T | configured 1, 2 or 4, default 2 | T+delay before capture; live turret firing |
+  | Claim routes | Shared claim-route view of T | 8 (`--claim-route-delay` 1–8 for experiments) | T+delay before capture; live claim workers |
   | Periodic gradients | Shared gradient view of T | configured 1–16, default 8 | T+delay before capture; live routing |
   | Building gradients | Shared building-gradient view of T | initialization 1 tick; refresh configured 1–8 (default 8); standalone maps use synchronous live queries | T+delay before capture; live routing |
   | Resource growth | Shared growth view of T | configured 1–16, default 8 | T+delay before capture; live resources |
@@ -497,7 +548,7 @@ checksum adapter remains available for diagnostic fixtures.
   units over capture-relative offsets 8..127. Warm admissions for each exact
   field are at least 32 ticks apart, including reactive recovery; publication
   remains eight ticks after capture. Cold initialization remains immediate. A demanded field whose serving
-  capture reaches 1,024 ticks is eligible for a safety refresh, subject to
+  capture reaches 256 ticks is eligible for a safety refresh, subject to
   capacity and publication delay; idle fields remain idle. There is no
   round-robin filler or global one-field-per-tick quota. Cold initialization and
   explicit reactive recovery remain available without a model benefit prediction.
@@ -544,6 +595,15 @@ checksum adapter remains available for diagnostic fixtures.
   Consumer-specific ground material fields also refresh through this queue on stock or
   topology changes and at their existing 128-tick age, serving the previous field
   while replacement work waits.
+- Gradient identity uses movement access, not speed ratio. Amphibious units share
+  one field per destination and owner, prepared with that team's most common
+  walking/swimming ratio. Selection is deterministic at 512-tick boundaries.
+  Changing the selection leaves published guidance and adaptive refresh history
+  intact; the next ordinary preparation captures the new ratio. Allied building
+  visitors reuse the owner's field. Published and in-flight costs survive saving
+  independently of the current selection. See
+  [shared amphibious routing](../development/resource-gradient-model.md#shared-amphibious-routing)
+  for tie-breaking, legacy migration and independent strategic-field semantics.
 - For Pending ground material and area guidance, units retain targets, activities
   and reservations and wait with the existing zero-displacement movement state on their normal decision cadence.
   Hunger, health and local combat/adjacent interactions continue. This introduces
@@ -574,7 +634,10 @@ checksum adapter remains available for diagnostic fixtures.
   and script identity are unchanged.
   Material and area getters return borrowed const arrays for the current owner
   decision, not leases across publication or cache admission. Snapshot consumers
-  retain snapshot-owned planes; building worker consumers use
+  share published resource planes through per-plane leases instead of copies: a
+  buffer leaving its slot while a capture holds it is adopted, never rewritten, and
+  recycled when the last capture drops it. Code that frees or replaces a plane
+  slot's buffer must go through `MapRouting::freePlane` or `releasePlaneLease`; building worker consumers use
   `SharedBuildingGradient` leases, whose lock protects resumable values and queues. Workers never enqueue live requests: owner
   admission fixes request order and captures primitive inputs, executor jobs own
   private outputs, and only owner publication replaces a live generation.
@@ -592,6 +655,17 @@ checksum adapter remains available for diagnostic fixtures.
   the newest capture. Queueing before admission adds to the publication delay for
   both this metadata and the serving walking field. Team-wide resets and
   forbidden-area paints keep old fields serving until the refresh publishes.
+- A building's footprint field (the route units walk to the building) refreshes
+  on age alone, every `BUILDING_FIELD_REFRESH_TICKS` (1024, `EngineTiming.h`):
+  map changes elsewhere do not refresh it. A unit whose better neighbours are
+  all blocked by an obstacle the field does not know about, on a field at least
+  128 ticks old, requests a refresh and sidesteps until it publishes; units
+  standing in the way are traffic and request nothing. Flag routes (clearing
+  and combat) keep the any-change rule. A unit standing on a cell its field has
+  no distance for, but which the live map leaves open (usually a cell it stood
+  still on when the field was captured), steps to the best neighbouring cell
+  that has one (`MapRouting::staleCellStep`); building, material and area
+  routes share this step.
   First use after creation, idle eviction, movement, or a type/range change
   queues initialization with the same fixed one-tick publication delay after
   admission, including when a previously used field was evicted while idle.
@@ -615,7 +689,7 @@ checksum adapter remains available for diagnostic fixtures.
   to 16 bits for the larger per-team horizon; older byte counts remain readable.
   Maps without an active pipeline retain the
   synchronous fallback.
-  `Map::predictBuildingDepth` reads the production
+  `MapRouting::predictBuildingDepth` reads the production
   [depth model](../ai/architecture/building-gradient-depth-model.md) from the field's own past
   reader demand (its serving search's required cost and `settledCostHint`). It only moves
   search work between worker and owner. Experimental depth overrides are retired.
@@ -636,6 +710,35 @@ checksum adapter remains available for diagnostic fixtures.
   owner cache retains at most 32 MiB and 24 bytes per cell, with a direct fallback.
   No cached template retains snapshot buffers or reads the live mutable material
   cache. Immediate building seeding uses the same predicates as worker snapshots.
+- Building walking fields seed from owner-maintained templates
+  (`src/map/gradient/BuildingSeedTemplates.h`) instead of scanning the map, since
+  lazy initialization makes the seed most of a cold field's cost. Four planes, one
+  for each passability kind (walk, walk+swim, water-only, air), hold the
+  building-independent obstacles. Per-team bitsets hold forbidden paint and building
+  cells; a team's bitset is allocated at its first set bit. A seed copies its kind's
+  plane, then overlays the team's forbidden paint,
+  enemy buildings (combat routes), the goal disk (clearing and combat) or its own
+  footprint, keeping the scan's precedence of buildings over paint. The per-cell
+  rules in `SeedCells.h` are shared by both paths. `Map::resourceSeedChanged` keeps
+  the planes current cell by cell. Bulk edits invalidate them, and the next use
+  rebuilds them lazily, because a bulk edit's raw writes may still be in progress
+  when it invalidates. Every template change goes with a mark on one of the map's
+  tracked arrays, so Store boundary reuse stays correct without a tracker of its
+  own. The `BuildingSeeds` snapshot component, which `buildingGradientView()` leases
+  to building workers and to cold hiring routes, is the one optional component: it is
+  filled only at boundaries with building field requests queued or staged
+  (`MapRouting::buildingSeedDemand`), or reused while still current. The copy runs
+  on the simulation thread while the seeds it speeds up run on workers, so copying
+  at every boundary would cost the critical path more than it saves. Hiring does not
+  request templates; its cold routes use them when present and scan otherwise, as
+  does any reader of a capture without them. A fill copies only the 16x16 chunks
+  changed since its pooled buffer was last filled. `Store::Metrics` reports the
+  traffic as `buildingSeedBytesCopied` (`building_seed_bytes_copied` in AI metrics),
+  separately from map arrays. The output is bit-identical to the scan, and nothing is
+  saved. The footprint overlay assumes a building's occupancy matches its type
+  rectangle, as `Map::setBuilding` stamps it. `GLOB2_BUILDING_SEED_AUDIT` (set by
+  `test/run_tests.py`) recomputes every template-backed seed with the scan and
+  throws on any difference.
 
   Material and clearing precedence comes from the restricted unsigned-integer
   source `src/field/shaders/preparation-rules.json`; regenerate its C++, OpenCL
@@ -799,6 +902,7 @@ runs; backend defaults and algorithm choices are unchanged.
   | Ordered FIFO with payloads | `field::traverse` | Admit and enqueue neighbours; retain first-discovery payloads and stopping rules. |
   | Domain heap search | `field::traversePriority` | Own costs, comparator, stale-entry checks and parent ties, including zero-cost edges. |
   | Component stack/queue | `field::depthFirst` / `field::breadthFirst` | Own discovery and push order. |
+  | Point-to-point search | `astar::Workspace::search` / `searchGoals` | Supply a Domain that answers a cell's packed entry costs, or 0 when it cannot be entered. |
 
   `Grid::neighbors` supplies raw coordinates for bounds checks before wrapping;
   `Grid::neighborIndices` supplies wrapped indices. Both retain stencil order and
@@ -807,6 +911,25 @@ runs; backend defaults and algorithm choices are unchanged.
   and seed either workspace at the owning caller. An early stop preserves writes
   already made; grid traversal finishes the current neighbour stencil before
   visiting the next entry. Use `breadthFirst` for stops during expansion.
+- Point-to-point search (`src/field/astar/AStar.h`) serves unit movement toward
+  arbitrary targets, ground attack scans and claim routes. Its expansion order is
+  simulation state, fixed by an order contract that `AStarReference.h` writes out
+  plainly: f is g plus the octile distance to the goal set at the per-map step
+  floors, consistent by construction; the open set is a ring of f buckets popped
+  lowest first and, within one f, latest push first; a cell closes on its first pop,
+  and neighbours are visited and pushed in `field::Surrounding` order. A search
+  whose goal cells cannot be entered (and that does not start among them) is
+  unreachable after no expansions; many-goal searches drop such goals first. The window,
+  per-cell sampling, packed node words and the branchy, branchless scalar, SSE2 and
+  NEON kernels are implementation choices; tests and `tools/astar_benchmark.py run
+  --verify` require each to reproduce the reference expansion sequence exactly, so
+  changing them needs no sim version. Changing the contract does. Domains read
+  `MapState::View`, the same records on the live map (`MapAStar::UnitDomain`) and in
+  claim snapshots (`ResourceClaims::RouteDomain`). A ground unit's attack scan
+  resolves all its candidates with one `searchGoals` call. Goals are terminal, so
+  each candidate is reached at the same cost as by the separate searches it
+  replaced; the scan keeps their acceptance order and keeps a failed search's
+  zero step, while ties between equally cheap first steps follow `searchGoals`.
 - Influence has two distinct contracts in `src/field/Influence.h`: convergent
   maximum-contribution propagation and four directional sweeps. Castor requires
   the latter's staggered scan order and byte arithmetic; replacing it with
@@ -832,8 +955,8 @@ runs; backend defaults and algorithm choices are unchanged.
   the unit or engine binary is already in the job's single "Build glob2 and the
   regression harnesses" command and `test/run_tests.py` picks the new cases up on
   the next run, so no per-test step is needed. A harness that must stay a
-  separate program (two processes, a golden-table tool) gets a `PROGRAMS` entry
-  and one step that only runs it: a separate `scons` call per step re-reads the
+  separate program (two processes, a map fingerprint tool) gets a `PROGRAMS` entry
+  and one step that only runs it: a separate build call per step re-checks the
   whole build and compiles one file at a time. Builds that need other options
   (`role=relay`, `opengl=0`) belong in
   the `linux variants` job, and long CPU-bound checks in a job of their own, as the
@@ -845,9 +968,9 @@ runs; backend defaults and algorithm choices are unchanged.
   not repeat it.
   Browser checks follow the same rule: build once per job, pass outputs to the
   test jobs as artifacts, and shard long suites rather than lengthening one job.
-- A map generator's `revision` is enforced by `MapGeneratorGoldenTest`: a seed's map changing
-  while the revision stays fails the check, so bump the revision and run `--update` together
-  (see the framework reference). `--sweep` there is the first thing to run after touching
+- A map generator's `revision` changes with its maps: the sim-diff workflow reports every
+  generator fingerprint (`MapGeneratorGoldenTest --print`) that moved, so bump the revision of
+  each generator whose maps change (see the framework reference). `MapGeneratorGoldenTest --sweep` is the first thing to run after touching
   colony placement; a cell it fails is a "Generation failed" a player would see.
 - A cache or other retained state with no eviction policy needs an explicit bound —
   a count or a byte budget. "It would take an enormous game to reach" is not a bound.
@@ -898,7 +1021,7 @@ the lease instead of copying them. Observation only captures route inputs. Missi
 or stale fields keep the obstacle-free ranking estimate. After ranking and team coordination, the hiring
 worker prepares routes only for the primary candidates selected to fill demand;
 the fallback suffix stays on the list without explicit prewarming. Cold fields
-are seeded lazily on that worker and published with the shortlist one tick later,
+are seeded lazily on that worker and published with the shortlist four ticks later,
 provided the building incarnation, slot epoch and topology still match. Existing
 serving fields are reused, including stale generations, without changing their
 refresh schedule. A usable field can still extend during normal ranking, so a
@@ -920,12 +1043,14 @@ are persisted in the building-gradient draft format 174 and integrated format
 contain no such prepared results. The save compatibility
 floor is unchanged. Saves predating cached hiring start with empty
 state. Lists are a pure function of the snapshot, so game checksums omit them.
-Saves containing the previous four-tick hiring policy are no longer accepted.
+Saves record their hiring rules and continue with them: new games rank each team
+every eight ticks and publish four ticks later, while older saves keep the rules
+they were taken with (publication delay 1–4, refresh 1–16).
 
 ## Turret targeting
 
 Turrets consume ordered three-entry lists refreshed per team every two ticks and
-published one tick after observation. The first currently valid entry fires;
+published two ticks after observation. The first currently valid entry fires;
 owner-side ranking and fallback scans are absent. One pure background kernel
 preserves the original preferred target at the head and ranks alternatives.
 Capture joins the shared completed-tick snapshot union and existing compute pool.

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Generate the bundled colony and exercise the real simulation/presentation.
 #include "GlobalContainer.h"
+#include "Building.h"
+#include "gradient/MapRouting.h"
 #include <Environment.h>
 #include "FrontendTheme.h"
 #include "ui/ThemeCatalog.h"
@@ -49,6 +51,7 @@
 #include <cstdio>
 #include <iostream>
 #include <chrono>
+#include "SGSL.h"
 
 GlobalContainer *globalContainer = nullptr;
 using namespace GAGCore;
@@ -215,7 +218,7 @@ void generate(const char *path)
 	header.getWinningConditions().clear();
 	game.setGameHeader(header);
 	game.setAlliances();
-	game.map.getMaterialGradient(0, MaterialId::Food, 0);
+	game.map.routing().getMaterialGradient(0, MaterialId::Food, MovementAccess::Land);
 	game.teams[0]->color = Color(73, 191, 184);
 	for (int i = 0; i < 12000; ++i)
 	{
@@ -646,11 +649,15 @@ int main(int argc, char **argv)
 			{
 				FrontendScope gameplay(false);
 				require(GAGGUI::Style::style == style, "gameplay style");
+				require(!theme.colony->ready(), "gameplay releases the menu colony");
 				FrontendScope nested;
 				require(GAGGUI::Style::style == style, "gameplay dialog style");
 			}
 			require(GAGGUI::Style::style == &theme, "nested restoration");
+			theme.background(globals.gfx, false);
+			require(theme.colony->ready(), "menu paint reloads the released colony");
 		}
+		require(theme.colony->load(argv[2]), "reload colony fixture");
 		require(GAGGUI::Style::style == style &&
 					globals.standardFont->getStyle().color == font.color,
 				"theme/font restoration");
@@ -675,12 +682,12 @@ int main(int argc, char **argv)
 			require(gui.game.load(&in), "load real-game fixture");
 			std::istringstream state(in.readText("rng") + " ");
 			state >> gui.game.syncRandom;
-			gui.game.map.getMaterialGradient(0, MaterialId::Food, 0);
+			gui.game.map.routing().getMaterialGradient(0, MaterialId::Food, MovementAccess::Land);
 			gui.localTeamNo = 0;
 			gui.localPlayer = 0;
 			gui.adjustLocalTeam();
 			globals.replayWriter = std::make_unique<ReplayWriter>();
-			globals.replayWriter->init("", gui);
+			gui.startReplay(*globals.replayWriter, "");
 			for (int i = 0; i < 300; ++i)
 			{
 				if (background)

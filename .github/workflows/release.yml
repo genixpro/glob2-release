@@ -52,6 +52,7 @@ jobs:
       github.triggering_actor == 'genixpro' &&
       github.event_name == 'workflow_dispatch' &&
       github.ref == 'refs/heads/master'
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -87,14 +88,15 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
       - name: Validate Android release identity
-        run: python3 mobile/android_release.py ${{ inputs.tag && 'check' || 'check-candidate' }}
+        run: python3 platforms/mobile/android_release.py ${{ inputs.tag && 'check' || 'check-candidate' }}
       - name: Validate F-Droid listing for publication
-        run: python3 mobile/android_release.py check-listing
+        run: python3 platforms/mobile/android_release.py check-listing
       - name: Test Android release preflight and package checks
         run: python3 -m unittest discover -s test/build_system -p test_android_release.py -v
 
   source:
     needs: preflight
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -121,6 +123,7 @@ jobs:
 
   android-package:
     needs: preflight
+    timeout-minutes: 90
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -132,11 +135,11 @@ jobs:
           repository: ${{ inputs.tag && 'Globulation2/glob2' || github.repository }}
           ref: ${{ needs.preflight.outputs.revision }}
       - name: Install native build utilities
-        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends scons pkg-config nasm libva-dev unzip zip autoconf automake libtool cmake ninja-build
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends pkg-config nasm libva-dev unzip zip autoconf automake libtool cmake ninja-build
       - name: Install pinned Android toolchain
         run: |
-          python3 mobile/setup_ndk.py
-          python3 mobile/setup_tools.py
+          python3 platforms/mobile/setup_ndk.py
+          python3 platforms/mobile/setup_tools.py
           sdk="$(python3 tools/dev_environment.py paths --field android_sdk)"
           "$sdk/cmdline-tools/19.0/bin/sdkmanager" --sdk_root="$sdk" --licenses < <(yes)
           "$sdk/cmdline-tools/19.0/bin/sdkmanager" --sdk_root="$sdk" \
@@ -144,13 +147,13 @@ jobs:
       - name: Build source dependencies and release APK
         run: |
           set -o pipefail
-          code="$(python3 mobile/android_release.py code --arch '${{ matrix.arch }}')"
+          code="$(python3 platforms/mobile/android_release.py code --arch '${{ matrix.arch }}')"
           sdk="$(python3 tools/dev_environment.py paths --field android_sdk)"
-          python3 mobile/fdroid_build.py --version-code "$code" --android-sdk "$sdk" \
+          python3 platforms/mobile/fdroid_build.py --version-code "$code" --android-sdk "$sdk" \
             --android-ndk "$sdk/ndk/28.2.13676358" 2>&1 \
             | tee "build/android-${{ matrix.arch }}-build.log"
           apk="build/android/device/${{ matrix.arch }}/24/client/release/android-project/app/build/outputs/apk/release/app-release-unsigned.apk"
-          python3 mobile/android_release.py verify-apk --arch '${{ matrix.arch }}' --apk "$apk"
+          python3 platforms/mobile/android_release.py verify-apk --arch '${{ matrix.arch }}' --apk "$apk"
       - name: Load reviewed emulator smoke driver
         if: matrix.arch == 'x86_64'
         env:
@@ -160,26 +163,26 @@ jobs:
           set -euo pipefail
           # Validation follows the reviewed mirror driver; APK bytes remain tagged.
           git fetch --no-tags "https://github.com/$DRIVER_REPOSITORY.git" "$DRIVER_COMMIT"
-          git show FETCH_HEAD:mobile/smoke.py > "$RUNNER_TEMP/release-smoke.py"
-          cp "$RUNNER_TEMP/release-smoke.py" mobile/smoke.py
+          git show FETCH_HEAD:platforms/mobile/smoke.py > "$RUNNER_TEMP/release-smoke.py"
+          cp "$RUNNER_TEMP/release-smoke.py" platforms/mobile/smoke.py
       - name: Launch x86_64 release candidate in an emulator
         if: matrix.arch == 'x86_64'
         run: |
           sudo chmod a+rw /dev/kvm
-          python3 mobile/setup_tools.py --emulator
-          python3 mobile/emulator.py configure --arch x86_64
-          nohup python3 mobile/emulator.py adb-server > build/mobile-adb-server.log 2>&1 &
-          nohup python3 mobile/emulator.py run --arch x86_64 > build/mobile-emulator.log 2>&1 &
+          python3 platforms/mobile/setup_tools.py --emulator
+          python3 platforms/mobile/emulator.py configure --arch x86_64
+          nohup python3 platforms/mobile/emulator.py adb-server > build/mobile-adb-server.log 2>&1 &
+          nohup python3 platforms/mobile/emulator.py run --arch x86_64 > build/mobile-emulator.log 2>&1 &
           ready=0
           for attempt in $(seq 1 90); do
-            if python3 mobile/emulator.py status --arch x86_64 >/dev/null 2>&1; then ready=1; break; fi
+            if python3 platforms/mobile/emulator.py status --arch x86_64 >/dev/null 2>&1; then ready=1; break; fi
             sleep 5
           done
           test "$ready" -eq 1
-          python3 mobile/android.py sign --arch x86_64 --release --fdroid
-          python3 mobile/android.py install --arch x86_64 --release --fdroid --serial emulator-5580 --adb-port 15037
-          python3 mobile/smoke.py --serial emulator-5580 --avd glob2-api35-x64 --package org.globulation2.glob2
-          python3 mobile/emulator.py stop --arch x86_64
+          python3 platforms/mobile/android.py sign --arch x86_64 --release --fdroid
+          python3 platforms/mobile/android.py install --arch x86_64 --release --fdroid --serial emulator-5580 --adb-port 15037
+          python3 platforms/mobile/smoke.py --serial emulator-5580 --avd glob2-api35-x64 --package org.globulation2.glob2
+          python3 platforms/mobile/emulator.py stop --arch x86_64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         if: always()
         with:
@@ -196,6 +199,7 @@ jobs:
 
   linux-package:
     needs: preflight
+    timeout-minutes: 240
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -206,21 +210,21 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            g++ python3 python3-venv scons pkg-config nasm libva-dev cmake ninja-build libpng-dev libjpeg-dev libwebp-dev libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
+            g++ python3 python3-venv pkg-config nasm libva-dev cmake ninja-build libpng-dev libjpeg-dev libwebp-dev libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev \
             libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev \
             libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev \
             libpcre3-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
       - name: Build and stage Linux client
         run: |
           stage="$PWD/artifacts/release-stage"
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons -j2 release=1 client_profile=free server=0 lean_images=1 \
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py -j2 release=1 client_profile=free server=0 lean_images=1 \
             BINDIR="$stage/usr/bin" INSTALLDIR="$stage/usr/share" \
             DATADIR=/usr/share install
           python3 tools/release/release.py verify-install --stage "$stage"
-          scons -j2 release=1 client_profile=free server=0 lean_images=1 unit-tests
+          python3 tools/dev_build.py -j2 release=1 client_profile=free server=0 lean_images=1 unit-tests
           LD_LIBRARY_PATH="$stage/usr/lib/glob2" build/linux/client/release/lean-images/test/glob2-unit-tests --test-suite=ImageAssets
           env -u LD_LIBRARY_PATH "$stage/usr/bin/glob2" info version
           env -u LD_LIBRARY_PATH "$stage/usr/bin/glob2" info paths --format json > "$RUNNER_TEMP/linux-installed-paths.json"
@@ -234,11 +238,11 @@ jobs:
       - name: Measure original-assets Linux baseline
         run: |
           stage="$PWD/artifacts/size-baseline"
-          scons -j2 release=1 client_profile=free server=0 lean_images=0 optimized_assets=0 \
+          python3 tools/dev_build.py -j2 release=1 client_profile=free server=0 lean_images=0 optimized_assets=0 \
             BINDIR="$stage/usr/bin" INSTALLDIR="$stage/usr/share" DATADIR=/usr/share install
           # Original bytes are an offline measurement tree, not playable artwork.
           python3 tools/package_assets.py --platform linux --original --output artifacts/source-asset-baseline
-          python3 -c 'from scons.runtime_assets import install_export; import sys; install_export("artifacts/source-asset-baseline", sys.argv[1])' "$stage/usr/share/glob2"
+          python3 -c 'from buildsys.runtime_assets import install_export; import sys; install_export("artifacts/source-asset-baseline", sys.argv[1])' "$stage/usr/share/glob2"
           mkdir -p artifacts/package-sizes
           tar -C "$stage" -czf artifacts/package-sizes/baseline.tar.gz usr
           python3 tools/release/package_sizes.py report --staged-root "$stage" \
@@ -269,7 +273,7 @@ jobs:
         run: |
           for profile in gc lto size; do
             stage="$PWD/artifacts/profile-$profile"
-            scons -j2 release=1 client_profile=free server=0 lean_images=1 size_optimization="$profile" \
+            python3 tools/dev_build.py -j2 release=1 client_profile=free server=0 lean_images=1 size_optimization="$profile" \
               BINDIR="$stage/usr/bin" INSTALLDIR="$stage/usr/share" DATADIR=/usr/share install
             python3 tools/release/archives.py linux --stage "$stage" \
               --output "$PWD/artifacts/profile-$profile.tar.gz" \
@@ -305,6 +309,7 @@ jobs:
   distro-build:
     needs: preflight
     name: Source build on ${{ matrix.name }}
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     container: ${{ matrix.image }}
     strategy:
@@ -315,14 +320,14 @@ jobs:
             image: debian:trixie
             install: >-
               apt-get update -qq && apt-get install -y --no-install-recommends
-              git ca-certificates g++ make python3 python3-venv scons pkg-config nasm libva-dev cmake ninja-build libpng-dev libjpeg-dev libwebp-dev libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev
+              git ca-certificates g++ make python3 python3-venv pkg-config nasm libva-dev cmake ninja-build libpng-dev libjpeg-dev libwebp-dev libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev
               libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev
               libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev
               libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
           - name: Fedora 43
             image: fedora:43
             install: >-
-              dnf install -y git gcc-c++ make python3 scons pkgconf-pkg-config nasm libva-devel cmake freetype-devel
+              dnf install -y git gcc-c++ make python3 ninja-build pkgconf-pkg-config nasm libva-devel cmake freetype-devel
               libpng-devel libpng-static libjpeg-turbo-devel zlib-ng-compat-static
               libX11-devel libXext-devel libXcursor-devel libXi-devel libXrandr-devel libXScrnSaver-devel libXtst-devel
               wayland-devel libxkbcommon-devel alsa-lib-devel pulseaudio-libs-devel
@@ -332,7 +337,7 @@ jobs:
           - name: Arch Linux
             image: archlinux:base-devel
             install: >-
-              pacman -Syu --noconfirm --needed git python scons pkgconf nasm libva cmake freetype2
+              pacman -Syu --noconfirm --needed git python ninja pkgconf nasm libva cmake freetype2
               libpng libjpeg-turbo
               libx11 libxext libxcursor libxi libxrandr libxss libxtst wayland libxkbcommon alsa-lib libpulse
               opusfile opus libogg speex boost openssl
@@ -342,7 +347,7 @@ jobs:
             install: |
               set -e
               zypper --non-interactive dist-upgrade --allow-downgrade
-              zypper --non-interactive install git gcc-c++ make python3 scons pkg-config nasm libva-devel cmake freetype2-devel libpng16-devel libjpeg8-devel libX11-devel libXext-devel libXcursor-devel libXi-devel libXrandr-devel libXss-devel libXtst-devel wayland-devel libxkbcommon-devel alsa-devel libpulse-devel opusfile-devel libopus-devel libogg-devel speex-devel boost-devel libopenssl-devel zlib-devel fribidi-devel Mesa-libGL-devel Mesa-libGLU-devel libepoxy-devel
+              zypper --non-interactive install git gcc-c++ make python3 ninja pkg-config nasm libva-devel cmake freetype2-devel libpng16-devel libjpeg8-devel libX11-devel libXext-devel libXcursor-devel libXi-devel libXrandr-devel libXss-devel libXtst-devel wayland-devel libxkbcommon-devel alsa-devel libpulse-devel opusfile-devel libopus-devel libogg-devel speex-devel boost-devel libopenssl-devel zlib-devel fribidi-devel Mesa-libGL-devel Mesa-libGLU-devel libepoxy-devel
     steps:
       - name: Install dependencies
         run: ${{ matrix.install }}
@@ -354,20 +359,21 @@ jobs:
         run: |
           # The checkout is owned by another user inside the container.
           git config --global --add safe.directory '*'
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons -j2 release=1 client_profile=free server=0
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py -j2 release=1 client_profile=free server=0
           build/linux/client/release/src/glob2 info version
 
   rpm-package:
     needs: [preflight, source]
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     container: fedora:43
     steps:
       - name: Install RPM tools and build dependencies
         run: |
-          dnf install -y git rpm-build gcc-c++ python3 scons pkgconf-pkg-config nasm libva-devel \
+          dnf install -y git rpm-build gcc-c++ python3 ninja-build pkgconf-pkg-config nasm libva-devel \
             cmake freetype-devel libX11-devel libXext-devel libXcursor-devel libXi-devel libXrandr-devel alsa-lib-devel pulseaudio-libs-devel \
             libXScrnSaver-devel libXtst-devel wayland-devel libxkbcommon-devel libpng-devel libpng-static zlib-ng-compat-static \
             opusfile-devel opus-devel libogg-devel speex-devel boost-devel openssl-devel \
@@ -390,9 +396,9 @@ jobs:
           top="$GITHUB_WORKSPACE/artifacts/rpmbuild"
           mkdir -p "$top"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
           cp "artifacts/release-source/glob2-${VERSION}.tar.gz" "$top/SOURCES/"
-          python3 scons/sdl3_dependencies.py --download-only --work "$top/SOURCES"
+          python3 buildsys/sdl3_dependencies.py --download-only --work "$top/SOURCES"
           python3 tools/build_asset_encoder.py fetch --sources "$top/SOURCES"
-          rpmbuild -ba fedora/glob2.spec --define "_topdir $top"
+          rpmbuild -ba platforms/linux/fedora/glob2.spec --define "_topdir $top"
           stage="$GITHUB_WORKSPACE/artifacts/rpm-size-stage"
           mkdir -p "$stage"
           rpmfile="$(find "$top/RPMS" -name 'glob2-*.rpm' ! -name '*debuginfo*' ! -name '*debugsource*' -print -quit)"
@@ -413,6 +419,7 @@ jobs:
 
   windows-package:
     needs: preflight
+    timeout-minutes: 180
     runs-on: windows-latest
     defaults:
       run:
@@ -433,7 +440,7 @@ jobs:
           update: true
           install: >-
             git make mingw-w64-x86_64-toolchain mingw-w64-x86_64-pkgconf
-            mingw-w64-x86_64-nasm mingw-w64-x86_64-python mingw-w64-x86_64-scons
+            mingw-w64-x86_64-nasm mingw-w64-x86_64-python
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-freetype
             mingw-w64-x86_64-libpng mingw-w64-x86_64-libjpeg-turbo
@@ -450,12 +457,12 @@ jobs:
         env:
           VERSION: ${{ needs.preflight.outputs.version }}
         run: |
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          scons -j2 release=1 client_profile=free mingw=1 server=0 build/mingw/client/release/src/glob2.exe
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons -j2 release=1 client_profile=free mingw=1 server=0 lean_images=1 build/mingw/client/release/lean-images/src/glob2.exe
-          scons -j2 release=1 client_profile=free mingw=1 server=0 lean_images=1 unit-tests
+          python3 tools/dev_build.py -j2 release=1 client_profile=free mingw=1 build/mingw/client/release/src/glob2.exe
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py -j2 release=1 client_profile=free mingw=1 lean_images=1 build/mingw/client/release/lean-images/src/glob2.exe
+          python3 tools/dev_build.py -j2 release=1 client_profile=free mingw=1 lean_images=1 unit-tests
           image_prefix="$(python3 -c 'import json; print(json.load(open("build/mingw/client/release/lean-images/image-runtime.json"))["prefix"])')"
           PATH="$(cygpath -u "$image_prefix")/bin:$PATH" ./build/mingw/client/release/lean-images/test/glob2-unit-tests.exe --test-suite=ImageAssets
           ./build/mingw/client/release/lean-images/src/glob2.exe info version
@@ -492,7 +499,7 @@ jobs:
         run: |
           for profile in gc lto size; do
             binary="build/mingw/client/release/size-$profile/lean-images/src/glob2.exe"
-            scons -j2 release=1 client_profile=free mingw=1 server=0 lean_images=1 size_optimization="$profile" "$binary"
+            python3 tools/dev_build.py -j2 release=1 client_profile=free mingw=1 lean_images=1 size_optimization="$profile" "$binary"
             python3 tools/release/package_windows.py "$binary" "artifacts/profile-$profile.zip"
             python3 -c 'import sys,zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' \
               "artifacts/profile-$profile.zip" "artifacts/profile-$profile"
@@ -586,6 +593,7 @@ jobs:
             architecture: arm64
           - runner: macos-15-intel
             architecture: x86_64
+    timeout-minutes: 60
     runs-on: ${{ matrix.runner }}
     env:
       MACOSX_DEPLOYMENT_TARGET: '15.0'
@@ -598,21 +606,16 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: '3.14.8'
-      - name: Install pinned SCons driver
-        run: |
-          python3 -m venv "$RUNNER_TEMP/apple-build-tools"
-          "$RUNNER_TEMP/apple-build-tools/bin/pip" install scons==4.11.1
-          echo "$RUNNER_TEMP/apple-build-tools/bin" >> "$GITHUB_PATH"
       - name: Install dependencies
         run: |
-          brew install cmake freetype libpng jpeg-turbo scons nasm \
+          brew install cmake ninja freetype libpng jpeg-turbo nasm \
             opusfile opus libogg speex boost openssl@3 fribidi pcre libepoxy
       - name: Build application and DMG
         run: |
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons -j2 release=1 client_profile=free server=0 CXXFLAGS="-g -mmacosx-version-min=15.0" LINKFLAGS="-mmacosx-version-min=15.0" package
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py -j2 release=1 client_profile=free CXXFLAGS="-g -mmacosx-version-min=15.0" LINKFLAGS="-mmacosx-version-min=15.0" package
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: client-build-macos-${{ matrix.architecture }}
@@ -633,6 +636,7 @@ jobs:
   flatpak-package:
     if: ${{ inputs.build_flatpak }}
     needs: preflight
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50
@@ -649,11 +653,11 @@ jobs:
           # Package size reports run git on the container's checkout.
           git config --global --add safe.directory '*'
           python3 tools/release/render_flatpak.py "$REVISION" \
-            flatpak/org.globulation2.Globulation2.yml
+            platforms/linux/flatpak/org.globulation2.Globulation2.yml
       - uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
         with:
           bundle: glob2.flatpak
-          manifest-path: flatpak/org.globulation2.Globulation2.yml
+          manifest-path: platforms/linux/flatpak/org.globulation2.Globulation2.yml
           build-dir: artifacts/flatpak-app
           cache-key: glob2-flatpak-${{ needs.preflight.outputs.revision }}
           upload-artifact: false
@@ -671,11 +675,12 @@ jobs:
           name: release-flatpak
           path: |
             glob2.flatpak
-            flatpak/org.globulation2.Globulation2.yml
+            platforms/linux/flatpak/org.globulation2.Globulation2.yml
           if-no-files-found: error
 
   snap-package:
     needs: preflight
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -706,6 +711,7 @@ jobs:
   compiler-profile-portability:
     if: inputs.benchmark_profiles
     needs: [preflight, linux-package, windows-package]
+    timeout-minutes: 180
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2

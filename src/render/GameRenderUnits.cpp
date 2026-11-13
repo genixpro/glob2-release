@@ -1,12 +1,13 @@
 #include <RenderBatch.h>
+#include "Map.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "unit/render/UnitHarvestAnimation.h"
 #include <PerformanceTelemetry.h>
 #include "MapCopies.h"
 #include <iostream>
 
-#include "AICastor.h"
 
 #include <assert.h>
 #include <string.h>
@@ -20,6 +21,7 @@
 #include "BuildingType.h"
 #include "DatasetWriter.h"
 #include "Game.h"
+#include "MapDrawer.h"
 #include "GameUtilities.h"
 #include "GlobalContainer.h"
 #include "Order.h"
@@ -27,10 +29,13 @@
 #include "unit/render/UnitDrawGeometry.h"
 #include "unit/render/UnitAnimation.h"
 #include "unit/render/UnitMotion.h"
+#include "unit/render/SwimmingPresentation.h"
+#include <RenderStateScope.h>
 #include "unit/render/ColonySkinPreview.h"
 #include <algorithm>
 #include "unit/render/UnitSkin.h"
 #include "scene/Scene.h"
+#include "UnitEffectArt.h"
 #include "Utilities.h"
 #include "GameGUI.h"
 #include <SDL3/SDL.h>
@@ -39,13 +44,14 @@
 #include "Brush.h"
 #include "unit/render/UnitSkin.h"
 #include "FailureShapes.h"
+#include "Building.h"
 #include <algorithm>
 
 
 // Unit rendering. Split from Game_render.cpp.
 
 
-void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
 {
 	MapRenderState* drawnRender = globalContainer->settings.adaptiveZoomDetail ? &view.render : nullptr;
 	const SceneEntities &entities = scene.entities;
@@ -68,7 +74,7 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	// linear in the fade level, unlike the shade's darkness, so the unit is gone
 	// exactly when its tile is fully fogged.
 	Uint8 fogAlpha = Color::ALPHA_OPAQUE;
-	if ((drawOptions & DRAW_WHOLE_MAP) == 0)
+	if ((drawOptions & Game::DRAW_WHOLE_MAP) == 0)
 	{
 		const FogFade &fade = view.render.fogFade;
 		if (fade.active())
@@ -82,6 +88,20 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 		else if ((!map.isFOWDiscovered(x+viewportX, y+viewportY, visibleTeams))&&(!map.isFOWDiscovered(x+viewportX-dx, y+viewportY-dy, visibleTeams)))
 			return;
 	}
+	// A unit a swarm has just produced fades in as a team-colour silhouette,
+	// sliding out of the swarm; one a building has just serviced shimmers in the
+	// service's colour, and one that has just changed sides in its new colour (UnitEffects.h).
+	const auto effect = view.render.unitEffects.find(gid);
+	const bool hasEffect = effect != view.render.unitEffects.end();
+	const auto effectKind = hasEffect ? UnitEffect::Kind(effect->second.kind) : UnitEffect::Kind::Spawn;
+	const float effectAge = hasEffect ? effect->second.age + view.render.unitMotion : 0;
+	const UnitEffect::UnitLook effectLook = !hasEffect ? UnitEffect::UnitLook{1, 0, 0}
+		: effectKind == UnitEffect::Kind::Spawn ? UnitEffect::unitLook(effectAge)
+		: effectKind == UnitEffect::Kind::Convert ? UnitEffect::UnitLook{1, 0, UnitEffect::convertSilhouette(effectAge)}
+		: UnitEffect::UnitLook{1, 0, UnitEffect::serviceSilhouette(effectAge)};
+	fogAlpha = Uint8(std::lround(fogAlpha * effectLook.opacity));
+	if (fogAlpha == 0)
+		return;
 	// Everything drawn for the unit fades with it: `opacity` for the bars, pips and
 	// marker, which take a fraction, and faded() for alphas out of 255.
 	const float opacity = fogAlpha / 255.f;
@@ -112,13 +132,21 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	{
 		// TODO : if looks ugly, do something intelligent here
 	}
+	if (hasEffect)
+	{
+		px -= int(std::lround(effect->second.dx * effectLook.slide));
+		py -= int(std::lround(effect->second.dy * effectLook.slide));
+	}
 
 	int dir=unit->direction;
 	assert(dir>=0);
 	assert(dir<9);
 	assert(delta>=0);
 	assert(delta<256);
-	imgid=unitAnimationFrame(imgid, dir, delta);
+	const int pronePhase = unitProneHarvestPhase(scene, *unit, meshClass, view.render.unitMotion);
+	imgid = pronePhase >= 0
+				? UNIT_ANIMATION_PRONE_HARVEST_BASE + unitProneHarvestFrame(dir, pronePhase)
+				: unitAnimationFrame(imgid, dir, delta);
 
 	// draw unit
 	Sprite *unitSprite = skin.sprite;
@@ -138,12 +166,52 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 	// The sprite stays opaque under the marker fading in over it, and goes once
 	// the marker is solid. Units at the fog edge fade, including painted meshes
 	// and their original ground shadows.
-	if (detail.unitSprite > 0 &&
-		!view.render.skinPreview().draw(*globalContainer->gfx, meshClass, unit->team,
-			unit->action, dir, delta, px, py,
-            {unitSprite->baseFrame(imgid), unsigned(unitSprite->getW(imgid)),
-             unsigned(unitSprite->getH(imgid))}, fogAlpha))
-		globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid, fogAlpha);
+	const float teamHue = UnitEffectArt::hueOf(color);
+	const GAGCore::Color glow = !hasEffect ? GAGCore::Color()
+		: effectKind == UnitEffect::Kind::Spawn || effectKind == UnitEffect::Kind::Convert ? UnitEffectArt::tint(teamHue)
+		: UnitEffectArt::serviceTint(effectKind);
+	const Uint8 glowAlpha = Uint8(std::lround(255 * effectLook.silhouette));
+	// A swimmer's limbs fade into the water, whichever artwork draws it.
+	const bool swimming = (unit->action == STOP_SWIM || unit->action == SWIM || pronePhase >= 0) &&
+						  detail.unitSprite > 0;
+	const float reach = meshClass == WARRIOR ? SWIM_REACH_WARRIOR : SWIM_REACH_WORKER;
+	{
+		const GAGCore::RadialFadeScope fade(*globalContainer->gfx,
+			swimming ? swimmerFade(px, py, reach) : GAGCore::RadialFade{});
+		if (detail.unitSprite > 0 &&
+			!view.render.skinPreview().draw(
+				*globalContainer->gfx, meshClass, unit->team, unit->action, dir, delta, px, py,
+				{unitSprite->baseFrame(imgid), unsigned(unitSprite->getW(imgid)),
+				 unsigned(unitSprite->getH(imgid))},
+				fogAlpha, pronePhase, Uint32(glow.r) << 16 | Uint32(glow.g) << 8 | glow.b, glowAlpha))
+		{
+			globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid, fogAlpha);
+			// Meshes brighten as they draw; a sprite gets its silhouette's light added.
+			if (glowAlpha)
+				if (DrawableSurface *shape = unitSprite->silhouette(imgid, glow))
+					globalContainer->gfx->drawSurfaceAdditive(float(px-decX), float(py-decY), float(unitSprite->getW(imgid)),
+						float(unitSprite->getH(imgid)), shape, faded(glowAlpha));
+		}
+	}
+	if (hasEffect && detail.unitSprite > 0)
+		view.render.unitOverlays.push_back({float(px), float(py), effectAge, teamHue, opacity,
+			UnitEffect::seedOf(effect->second.x, effect->second.y, gid), gid, effect->second.kind, effect->second.level});
+	if (swimming && pronePhase < 0)
+	{
+		// Each stroke sends a ring back across the water over the faded limbs.
+		// It fades out with the sprite.
+		const SwimRipple ring = swimRipple(delta, reach);
+		const float alpha = ring.alpha * opacity * detail.unitSprite;
+		if (alpha >= 1)
+			forEachSwimRippleSegment(
+				px + 16, py + 16, ring.radius, unit->dx, unit->dy,
+				[&](const SwimRippleSegment &segment)
+				{
+					if (alpha * segment.weight >= 1)
+						globalContainer->gfx->drawLine(segment.x0, segment.y0, segment.x1, segment.y1,
+							Color(225, 240, 255, Uint8(alpha * segment.weight)));
+				});
+	}
 	if (detail.unitMarker > 0)
 	{
 		const bool warrior = meshClass==WARRIOR, explorer = meshClass==EXPLORER;
@@ -217,12 +285,13 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 		}
 	}
 
-	if ((px<view.mouseX)&&((px+32)>view.mouseX)&&(py<view.mouseY)&&((py+32)>view.mouseY)&&(((drawOptions & DRAW_WHOLE_MAP) != 0) ||(map.isFOWDiscovered(x+viewportX, y+viewportY, visibleTeams))||(Unit::GIDtoTeam(gid)==localTeam)))
+	if ((px<view.mouseX)&&((px+32)>view.mouseX)&&(py<view.mouseY)&&((py+32)>view.mouseY)&&(((drawOptions & Game::DRAW_WHOLE_MAP) != 0) ||(map.isFOWDiscovered(x+viewportX, y+viewportY, visibleTeams))||(Unit::GIDtoTeam(gid)==localTeam)))
 		view.mouseUnit=UnitRef{unit->gid, unit->scriptIdentity};
 
-	if ((drawOptions & DRAW_HEALTH_FOOD_BAR) != 0 )
+	if ((drawOptions & Game::DRAW_HEALTH_FOOD_BAR) != 0 )
 	{
-		// A hungry or hurt unit keeps a status pip once every bar has faded.
+		// A hungry or hurt unit keeps a status badge once every bar has faded,
+		// beside the top right of its body rather than over it.
 		const int food=int((Sint64(unit->hungry)*10)/definition.runtime.foodCapacity);
 		const bool hungry=food<=1;
 		const bool hurt=unit->hp*10<=unit->performance[HP]*6;
@@ -234,9 +303,9 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 		anchorBars(px+16, py+25, drawnRender, opacity);
 		drawHealthBar(px+1, py+25+3, 10, 1+(int)(9*hpRatio), hpRatio, drawnRender, opacity);
 		if (hurt)
-			drawStatusPip(px+16, py+28, 255, 0, 0, drawnRender, opacity);
+			drawStatusPip(px+24, py+8, MapOverlayQueue::Hurt, drawnRender, opacity, true);
 		else if (hungry)
-			drawStatusPip(px+16, py+28, 80, 179, 223, drawnRender, opacity);
+			drawStatusPip(px+24, py+8, MapOverlayQueue::Hungry, drawnRender, opacity, true);
 
 		const int carriedAlpha=faded(unsigned(view.render.detail.barAll*255));
 		if ((unit->performance[HARVEST]) && (unit->carriedMaterial>=0) && carriedAlpha>0)
@@ -244,7 +313,7 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 		globalContainer->gfx->finishDrawingSprite(globalContainer->resourceMini, 255);
 	}
 
-	if (drawOptions & DRAW_ACCESSIBILITY)
+	if (drawOptions & Game::DRAW_ACCESSIBILITY)
 	{
 		std::ostringstream oss;
 		oss << entities.owner(*unit).number;
@@ -263,7 +332,7 @@ void Game::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int 
 }
 
 
-void Game::drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+void MapDrawer::drawMapGroundUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
 {
 	PERF_SCOPE_TIME(GroundUnits);
     GAGCore::UnitDrawBatch unitBatch(globalContainer->gfx);
@@ -280,7 +349,7 @@ void Game::drawMapGroundUnits(int left, int top, int right, int bot, int sw, int
 }
 
 
-void Game::drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+void MapDrawer::drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
 {
 	PERF_SCOPE_TIME(AirUnits);
     GAGCore::UnitDrawBatch unitBatch(globalContainer->gfx);
@@ -294,10 +363,10 @@ void Game::drawMapAirUnits(int left, int top, int right, int bot, int sw, int sh
 }
 
 
-void Game::drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+void MapDrawer::drawUnitPathLines(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
 {
 	const SceneEntities &entities = scene.entities;
-	if ((drawOptions & DRAW_PATH_LINE) != 0)
+	if ((drawOptions & Game::DRAW_PATH_LINE) != 0)
 	{
 		// Units are extracted team by team in slot order, as the old loop visited them.
 		for (const SnapshotUnit &unit : entities.units)
@@ -313,7 +382,7 @@ void Game::drawUnitPathLines(int left, int top, int right, int bot, int sw, int 
 
 
 
-void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SnapshotUnit& sceneUnit, const PresentationFrame& scene, float unitMotion)
+void MapDrawer::drawUnitPathLine(int left, int top, int right, int bot, int sw, int sh, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SnapshotUnit& sceneUnit, const PresentationFrame& scene, float unitMotion)
 {
 	const SceneMap &map = scene.map; // the extracted map, not Game::map
 	const SnapshotUnit *unit = &sceneUnit;
@@ -351,7 +420,7 @@ void Game::drawUnitPathLine(int left, int top, int right, int bot, int sw, int s
 
 
 
-void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SnapshotUnit& sceneUnit, Uint32 drawOptions, const PresentationFrame& scene, float unitMotion)
+void MapDrawer::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int viewportY, const SnapshotUnit& sceneUnit, Uint32 drawOptions, const PresentationFrame& scene, float unitMotion)
 {
 	const SceneMap &map = scene.map; // the extracted map, not Game::map
 	const SnapshotUnit *unit = &sceneUnit;
@@ -428,7 +497,11 @@ void Game::drawUnitOffScreen(int sx, int sy, int sw, int sh, int viewportX, int 
 	assert(dir<9);
 	assert(delta>=0);
 	assert(delta<256);
-	imgid=unitAnimationFrame(imgid, dir, delta);
+	const int pronePhase = unitProneHarvestPhase(
+		scene, *unit, scene.world.catalogs->units->runtime(unit->typeNum).meshClass, unitMotion);
+	imgid = pronePhase >= 0
+				? UNIT_ANIMATION_PRONE_HARVEST_BASE + unitProneHarvestFrame(dir, pronePhase)
+				: unitAnimationFrame(imgid, dir, delta);
 
 	Sprite *unitSprite=globalContainer->units;
 	unitSprite->setBaseColor(presentationColor(scene.entities.owner(*unit).color));

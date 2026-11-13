@@ -1,8 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real game rendering regression. Run with an isolated GLOB2_USER_DIR and
 // either -g (OpenGL) or -G (software). No desktop input is generated.
+#include <thread>
+#include "Map.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include <chrono>
 #include <Environment.h>
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "DrawFixtures.h"
 #include "ScopedEnvironment.h"
 #include <vector>
 #include <algorithm>
@@ -15,6 +20,7 @@
 #include <SDL3/SDL.h>
 // Expose camera and settings widgets for deterministic integration checks.
 #include "TorusView.h"
+#include "render/terrain/DirectTerrain.h"
 #include "SettingsScreen.h"
 #include "GameGUI.h"
 #include "GameGUIInternal.h"
@@ -43,6 +49,9 @@
 #include <optional>
 #include "render/terrain/TerrainCompositor.h"
 #include "render/SoftwareTerrainCache.h"
+#include "render/MapDrawer.h"
+#include "sim/EntityRefOf.h"
+#include "GameGUIToolManager.h"
 
 class TorusRenderIntegrationTest
 {
@@ -61,6 +70,10 @@ static void tiledCapture(bool hd = false)
         frames << "GLOB2_HIGHRES 1\n";
         for (int variant = 0; variant < 16; ++variant)
             frames << "terrain" << variant << " 32 32 4 grass.webp -\n";
+        // Catalogue grass, sand and ice draw from their own 8x8-block banks.
+        for (const char *bank : {"terrain-grass", "terrain-sand", "terrain-ice"})
+            for (int variant = 0; variant < 256; ++variant)
+                frames << bank << variant << " 32 32 4 grass.webp -\n";
         frames.close();
         hdPath.emplace("GLOB2_EXPERIMENT_TEXTURE_DIR", directory.string().c_str());
     }
@@ -81,6 +94,7 @@ static void tiledCapture(bool hd = false)
         game.map.fogOfWarA[index] = game.map.fogOfWarB[index] = visible;
         game.map.mapDiscovered[index] = unknown ? 0 : 1;
     }
+    game.map.markDiscoveryChanged();
     TorusView view;
     view.textureLimit = 1024;
     view.toggle();
@@ -106,12 +120,21 @@ static void tiledCapture(bool hd = false)
     glMatrixMode(GL_MODELVIEW); glPushMatrix(); glLoadIdentity();
     glUseProgram(0); glDisable(GL_DEPTH_TEST); glDisable(GL_SCISSOR_TEST);
     globalContainer->gfx->setRenderTargetScale(1);
-    Game::ViewState baseline;
+    ViewState baseline;
     baseline.render.animationTime = view.standaloneRender.animationTime;
     baseline.render.areaAnimationTick = 0;
-    glob2test::drawMap(game,0, 0, 2048, 2048, 0, 0, view.originX, view.originY, 0,
-                 baseline, options | Game::DRAW_NO_CLOUD_LAYER, nullptr, nullptr, true, 128);
-    Sprite::flushBatches(globalContainer->gfx);
+    // A fresh view draws the overview until its terrain tables are ready, and
+    // mixed cells their first material until their masks land: draw the
+    // reference until it is complete.
+    for (int attempt = 0; attempt < 400; ++attempt)
+    {
+        glob2test::drawMap(game,0, 0, 2048, 2048, 0, 0, view.originX, view.originY, 0,
+                     baseline, options | Game::DRAW_NO_CLOUD_LAYER, nullptr, nullptr, true, 128);
+        Sprite::flushBatches(globalContainer->gfx);
+        const auto *direct = baseline.render.existingDirectTerrain();
+        if (!direct || (!direct->preparing() && direct->pendingHdMasks() == 0)) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
     std::vector<unsigned char> pixels(2048 * 2048 * 4);
     glReadPixels(0, 0, 2048, 2048, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
@@ -281,7 +304,10 @@ static void deviceOverlayRetry(GAGCore::RendererBackend backend)
     probe->overlayFailure=false;
     gui.selectionMode=GameGUI::NO_SELECTION;
     bool initialized=false;
-    for(unsigned attempt=0;attempt<128 && !initialized;++attempt){
+    // Software Vulkan can hold the first terrain pages for seconds, so this
+    // setup waits on time rather than on a fixed number of frames.
+    const auto deadline=SDL_GetTicks()+60000;
+    for(unsigned attempt=0;(attempt<128 || SDL_GetTicks()<deadline) && !initialized;++attempt){
         int vx=17,vy=21;
         REQUIRE(gui.torusView.draw(gui.drawnScene(),&gui,0,Game::DRAW_WHOLE_MAP|Game::DRAW_AREA,vx,vy,960,720));
         initialized=gfx->flushDeviceFrame() && probe->completedWorld;
@@ -358,7 +384,7 @@ static void devicePhaseFallback(GAGCore::RendererBackend backend)
     probe->phaseFault={};
     REQUIRE(gui.view.render.animationTime==animationBefore);
     REQUIRE(gui.view.render.areaAnimationTick==areaBefore);
-    Game::drawSceneMap(gui.drawnScene(),0,0,640,480,0,0,vx,vy,0,gui.view,Game::DRAW_WHOLE_MAP|Game::DRAW_AREA);
+    MapDrawer::drawSceneMap(gui.drawnScene(),0,0,640,480,0,0,vx,vy,0,gui.view,Game::DRAW_WHOLE_MAP|Game::DRAW_AREA);
     REQUIRE(gui.view.render.animationTime==animationBefore+1);
     REQUIRE(gui.view.render.areaAnimationTick==areaBefore+1);
     REQUIRE(gui.game.checkSum()==checksum);
@@ -665,7 +691,7 @@ static void run(bool gpu, int width, int height)
                 gui.view.mouseX = x * 32;
                 gui.view.mouseY = y * 32;
                 gui.view.mouseUnit = UnitRef();
-                gui.game.drawUnit(x, y, explorer->gid, (-x) & gui.game.map.getMaskW(),
+                MapDrawer::drawUnit(x, y, explorer->gid, (-x) & gui.game.map.getMaskW(),
                     (-y) & gui.game.map.getMaskH(), gui.game.map.getW(), gui.game.map.getH(),
                     0, Game::DRAW_WHOLE_MAP, gui.view, glob2test::sceneOf(gui.game, gui.view));
                 REQUIRE(gui.game.resolveUnit(gui.view.mouseUnit) == explorer);
@@ -826,7 +852,7 @@ static void run(bool gpu, int width, int height)
             }
             Sprite::setHighResolution(globalContainer->settings.highResolutionArtwork);
             DynamicClouds clouds(&globalContainer->settings);
-            std::valarray<unsigned char> pixels;
+            std::vector<unsigned char> pixels;
             int gridW, gridH;
             clouds.computeWorld(256, 256, 250, pixels, gridW, gridH, 128);
             REQUIRE((gridW == 128 && gridH == 128));
@@ -891,7 +917,7 @@ static void run(bool gpu, int width, int height)
                 REQUIRE(selected);
                 gui.showUnitWorkingToBuilding = true;
                 gui.setSelection(GameGUI::BUILDING_SELECTION, selected);
-                REQUIRE(std::get<BuildingRef>(gui.selection) == Game::refOf(selected));
+                REQUIRE(std::get<BuildingRef>(gui.selection) == refOf(selected));
                 REQUIRE(gui.view.selectedBuilding == nullptr);
                 const int worldW = gui.game.map.getW() * 32, worldH = gui.game.map.getH() * 32;
                 std::vector<std::vector<unsigned char>> atlas;

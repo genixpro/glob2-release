@@ -16,6 +16,7 @@
 //   2. savePlayerInfo() -> loadPlayerInfo() round-trip stays aligned
 // Links libgag_server.a for TextStream + MemoryStreamBackend.
 
+#include "Team.h"
 #include "Glob2Test.h"
 #include <string>
 #include <cstdio>
@@ -359,7 +360,7 @@ TEST_SUITE("GameHeaderTextSaveLoad")
 TEST_CASE("AI order delay round trips at both boundaries and rejects invalid saved bytes" *
           doctest::test_suite("GameHeaderTextSaveLoad"))
 {
-    for(unsigned delay : {0u,8u}) for(bool text : {false,true}) for(bool players : {false,true}) {
+    for(unsigned delay : {0u,8u,16u}) for(bool text : {false,true}) for(bool players : {false,true}) {
         CAPTURE(delay); CAPTURE(text); CAPTURE(players);
         auto original=makeFixtureHeader();original.setAIOrderDelay(delay);
         auto* memory=new MemoryStreamBackend;
@@ -377,9 +378,9 @@ TEST_CASE("AI order delay round trips at both boundaries and rejects invalid sav
         CHECK(input->readUint32("sentinel")==0xA17);
     }
     GameHeader header;
-    CHECK_THROWS_AS(header.setAIOrderDelay(9),std::invalid_argument);
+    CHECK_THROWS_AS(header.setAIOrderDelay(17),std::invalid_argument);
     CHECK_THROWS_AS(header.setAIOrderDelay(unsigned(-1)),std::invalid_argument);
-    for(unsigned invalid : {9u,255u}) for(bool players : {false,true}) {
+    for(unsigned invalid : {17u,255u}) for(bool players : {false,true}) {
         auto* memory=new MemoryStreamBackend;
         BinaryOutputStream output(memory);
         if(players) header.save(&output);else header.saveWithoutPlayerInfo(&output);
@@ -391,14 +392,15 @@ TEST_CASE("AI order delay round trips at both boundaries and rejects invalid sav
     }
 }
 
-TEST_CASE("New games and reset headers default to eight tick AI decisions" *
+TEST_CASE("New games and reset headers default to fourteen tick AI decisions" *
           doctest::test_suite("GameHeaderTextSaveLoad"))
 {
     GameHeader header;
-    CHECK(header.getAIOrderDelay() == 8);
+    CHECK(header.getAIOrderDelay() == GameHeader::DEFAULT_AI_ORDER_DELAY);
+    CHECK(GameHeader::DEFAULT_AI_ORDER_DELAY == 14);
     header.setAIOrderDelay(0);
     header.reset();
-    CHECK(header.getAIOrderDelay() == 8);
+    CHECK(header.getAIOrderDelay() == GameHeader::DEFAULT_AI_ORDER_DELAY);
 }
 
 TEST_CASE("Building gradient delay round trips at both boundaries and rejects invalid saved bytes" *

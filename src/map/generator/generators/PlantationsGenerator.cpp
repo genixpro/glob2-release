@@ -3,7 +3,7 @@
 #include "Channels.h"
 #include "Drawing.h"
 #include "Farmland.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "GraphMaze.h"
@@ -141,8 +141,8 @@ constexpr int kRelaxRounds = 3;
 // its nearest neighbours, so the swim to the next island lands on a lane and the plot is reached from
 // two sides when a field is solid; a home gets one per granted island when it holds more (the bulk
 // study's causeway failures were all homes with three granted islands and two lanes).
-// kCausewayHalfWidth is the sand line's half width across the strait for a causeway: one vertex of
-// sand already carries units two tiles wide (Channels.h's bridgeAcross).
+// kCausewayHalfWidth is the sand stroke's half width across a strait. It keeps the corner line
+// connected at every angle, supplying at least two sand corners to traversed tiles (bridgeAcross).
 constexpr int kLanes = 2;
 constexpr double kCausewayHalfWidth = 0.75;
 // Islets: a rock islet is a disc of this radius, a grass core of about three tiles that holds a stone
@@ -747,7 +747,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return L;
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "plantations layout";
 	const PlantationsOptions o(context.request);
@@ -758,7 +758,7 @@ bool generate(Game &game, GenerationContext &context)
 		context.detail = L.failure;
 		return false;
 	}
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const Torus &t = L.t;
 	const int n = t.size(), teams = context.request.nbTeams;
 	for (int k = 0; k < teams; ++k)
@@ -896,7 +896,7 @@ bool generate(Game &game, GenerationContext &context)
 			{
 				const size_t selected = i + context.bounded("plantations-outpost-workers", tiles.size() - i);
 				std::swap(tiles[i], tiles[selected]);
-				if (!game.addUnit(t.remainderX(tiles[i]), tiles[i] / t.w, k, WORKER, 0, 0, 0, 0))
+				if (!game.addWorker(t.remainderX(tiles[i]), tiles[i] / t.w, k))
 				{
 					context.detail = "Could not place a granted island's starting worker.";
 					return false;
@@ -995,11 +995,11 @@ bool generate(Game &game, GenerationContext &context)
 	return true;
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	if (const std::string mismatch = designMismatch(L, map, "plantations"); !mismatch.empty())
 		return mismatch;
 	const PlantationsOptions o(context.request);

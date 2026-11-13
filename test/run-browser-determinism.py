@@ -18,7 +18,7 @@ args = parser.parse_args()
 binary = args.binary.resolve()
 output = args.output.resolve()
 output.mkdir(parents=True, exist_ok=True)
-fixture = root / 'games/cross-replay.game.gz'
+fixture = root / 'content/games/cross-replay.game.gz'
 replay = output / 'native.replay'
 command = [str(binary), 'game', 'repeat', str(fixture), '--ticks', '1500', '--runs', '1']
 with tempfile.TemporaryDirectory(prefix='glob2-browser-determinism-') as profile:
@@ -30,14 +30,14 @@ with tempfile.TemporaryDirectory(prefix='glob2-browser-determinism-') as profile
                        SDL_AUDIODRIVER='dummy'))
 trace = Path(str(replay) + '.checksums').read_bytes()
 assert len(trace) > 1000, 'Missing or empty simulation trace'
-metadata = {'fixture': 'games/cross-replay.game.gz', 'seed': 42, 'ticks': 1500,
+metadata = {'fixture': 'content/games/cross-replay.game.gz', 'seed': 42, 'ticks': 1500,
             'fixture_sha256': hashlib.sha256(fixture.read_bytes()).hexdigest(),
             'trace_sha256': hashlib.sha256(trace).hexdigest(), 'command': command}
 
 # The committed turn-protocol match record, verified headlessly. Its per-tick
 # checksum trace must match every other platform's (and the browsers').
 record = root / 'test/fixtures/multiplayer/FourSquares1.g2mr'
-match_map = root / 'maps/FourSquares1.map.gz'
+match_map = root / 'content/maps/FourSquares1.map.gz'
 verify_dir = output / 'verify-match'
 shutil.rmtree(verify_dir, ignore_errors=True)
 verify_command = [str(binary), 'match', 'verify', str(record), '--map-file', str(match_map), '--output-dir', str(verify_dir)]
@@ -48,6 +48,8 @@ verify_trace = (verify_dir / 'checksums.txt').read_bytes()
 assert verify_trace.count(b'\n') > 600, 'Missing or short verify-match trace'
 (output / 'verify-match.checksums.txt').write_bytes(verify_trace)
 verdict = json.loads((verify_dir / 'verdict.json').read_text())
+# The record carries the checksums its clients reported: a simulation change fails here.
+assert verdict['verdict'] == 'verified', f"match verify: {verdict['verdict']}"
 # Keep the uploaded evidence small: the replay and scratch profile are reproducible.
 (verify_dir / 'match.replay').unlink()
 shutil.rmtree(verify_dir / 'profile', ignore_errors=True)
@@ -80,14 +82,13 @@ if args.engine_binary:
     if len(traces) != 1:
         raise RuntimeError(f'Expected one resource composition trace, got {traces}')
     trace = traces[0].read_bytes().replace(b'\r\n', b'\n')
-    committed = root / 'test/fixtures/resources/seeded-compositions-units.trace'
-    if len(trace.splitlines()) != 150 or trace != committed.read_bytes().replace(b'\r\n', b'\n'):
-        raise RuntimeError('Incomplete or changed resource composition trace')
+    # Platforms are compared with each other in ci_compare_evidence.py.
+    if len(trace.splitlines()) != 150:
+        raise RuntimeError('Incomplete resource composition trace')
     producer = json.loads((resources / 'cases/build-provenance.json').read_text())
     (resources / 'manifest.json').write_text(json.dumps({
         'producer': producer, 'command': resource_command,
         'trace_sha256': hashlib.sha256(trace).hexdigest(),
-        'fixture_sha256': hashlib.sha256(committed.read_bytes()).hexdigest(),
     }, indent=2) + '\n')
 
     # Keep the native custom-catalog continuation alongside the stock traces.
@@ -111,12 +112,11 @@ if args.engine_binary:
     if len(traces) != 1:
         raise RuntimeError(f'Expected one unit composition trace, got {traces}')
     trace = traces[0].read_bytes().replace(b'\r\n', b'\n')
-    committed = root / 'test/fixtures/unit-catalog/ablation-checksums.txt'
-    if len(trace.splitlines()) != 97 or trace != committed.read_bytes().replace(b'\r\n', b'\n'):
-        raise RuntimeError('Incomplete or changed unit composition trace')
+    # Platforms are compared with each other in ci_compare_evidence.py.
+    if len(trace.splitlines()) != 97:
+        raise RuntimeError('Incomplete unit composition trace')
     producer = json.loads((resources / 'cases/build-provenance.json').read_text())
     (resources / 'manifest.json').write_text(json.dumps({
         'producer': producer, 'command': resource_command,
         'trace_sha256': hashlib.sha256(trace).hexdigest(),
-        'fixture_sha256': hashlib.sha256(committed.read_bytes()).hexdigest(),
     }, indent=2) + '\n')

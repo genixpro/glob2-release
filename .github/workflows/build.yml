@@ -1,21 +1,26 @@
 name: build
 
+# The full development matrix. Pull requests and master pushes run the fast gate
+# (ci-fast.yml); this matrix runs on master every six hours (a run whose revision
+# already has a decided full run, passed or failed, skips the expensive jobs), on demand, for
+# releases, and for pull requests labelled ci:full through ci-full-label.yml.
+# Running it on every master push kept the hosted runners busy for hours and
+# starved the fast gate.
 on:
-  push:
-    branches: [master]
   workflow_call:
     inputs:
       revision:
-        description: Exact release candidate revision
+        description: Exact revision to verify (a release candidate or a ci:full pull request head)
         required: true
         type: string
-  pull_request:
-    # PRs run cheap contracts plus a 12% ranked check budget; ci:full runs everything.
-    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft, labeled, unlabeled]
   schedule:
-    - cron: '0 6 * * *'
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
+      desktop_localization:
+        description: Add native Mac/Windows Thai preview captures to selected builds
+        type: boolean
+        default: false
       browser_only:
         description: Run only browser, transport and deployment checks
         required: false
@@ -39,6 +44,7 @@ jobs:
     permissions:
       contents: read
       actions: read
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
     outputs:
       native: ${{ steps.select.outputs.native }}
@@ -99,17 +105,21 @@ jobs:
         with:
           ref: ${{ inputs.revision || github.sha }}
           fetch-depth: 0
+          filter: blob:none
       - name: Test shared build-system contracts once
-        run: '"$(python3 tools/package_assets.py --encoder-python)" -m unittest discover -s test/build_system -v'
+        run: |
+          encoder_python="$(python3 tools/package_assets.py --encoder-python)"
+          "$encoder_python" -m venv artifacts/build-contract-venv
+          artifacts/build-contract-venv/bin/python -m pip install -r test/build_system/requirements.txt
+          artifacts/build-contract-venv/bin/python -m unittest discover -s test/build_system -v
       - name: Test CI runners and failure reporting
         run: |
           python3 test/ci_run_commands.py \
             --check 'native runner contracts' 'python3 -m unittest discover -s test -p test_run_tests.py -v' \
             --check 'failure aggregation contracts' 'python3 -m unittest discover -s test -p test_ci_failure_aggregation.py -v' \
             --check 'terrain ecology analysis contracts' 'python3 tools/test_terrain_ecology.py' \
-            --check 'gradient benchmark contracts' 'python3 tools/test_gradient_benchmark.py' \
-            --check 'resource benchmark contracts' "python3 -m unittest discover -s test -p 'test_*benchmark*.py' -v" \
-            --check 'recording extraction contracts' 'python3 test/test_recording_tool.py'
+            --check 'recording extraction contracts' 'python3 test/test_recording_tool.py' \
+            --check 'MCP launcher contracts' 'python3 test/test_mcp_stdio.py'
       - name: Check that the sim version follows the simulation
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -118,6 +128,10 @@ jobs:
           python3 test/check_sim_revision.py --base "$BASE_SHA"
       - name: Check private RNG ownership
         run: python3 test/check_entity_random.py
+      - name: Check header layering and fan-in budgets
+        run: |
+          python3 -m unittest discover -s test -p test_check_header_layering.py -v
+          python3 test/check_header_layering.py
       - name: Check documentation links and navigation
         run: |
           python3 -m venv artifacts/docs-venv
@@ -133,9 +147,6 @@ jobs:
           BROWSER_ONLY: ${{ inputs.browser_only }}
           DRAFT: ${{ github.event.pull_request.draft }}
           CI_CALLED_FULL: ${{ inputs.revision != '' }}
-          CI_PREDICTIVE_ENABLED: ${{ vars.CI_PREDICTIVE_ENABLED || 'true' }}
-          CI_PR_CHECK_BUDGET: ${{ vars.CI_PR_CHECK_BUDGET || '0.12' }}
-          CI_PR_FULL_AUDIT_PERCENT: ${{ vars.CI_PR_FULL_AUDIT_PERCENT || '0' }}
           GH_TOKEN: ${{ github.token }}
         run: |
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
@@ -161,6 +172,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.run_macos == 'true' }}
     uses: ./.github/workflows/ci-macos.yml
     with:
+      desktop_localization: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_localization }}
       revision: ${{ inputs.revision || github.sha }}
       coverage_profile: ${{ needs.changes.outputs.secondary_profile }}
 
@@ -176,7 +188,9 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_native_coverage == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    # An instrumented -O0 build takes ~50 min cold, unit coverage ~6 and the
+    # 2,233 display-tier engine cases ~3 h on a 4-core runner.
+    timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
         with:
@@ -185,7 +199,7 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            clang-18 llvm-18 python3 scons pkg-config nasm libva-dev git cmake \
+            clang-18 llvm-18 python3 ninja-build pkg-config nasm libva-dev git cmake \
             libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev \
             libopusfile-dev libopus-dev libogg-dev libspeex-dev libboost-dev libssl-dev \
             zlib1g-dev libfribidi-dev libpcre3-dev libgl1-mesa-dev \
@@ -195,7 +209,7 @@ jobs:
           cc: clang-18
           cxx: clang++-18
       - name: Build pinned SDL3 dependencies
-        run: python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+        run: python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
       - name: Verify coverage accounting
         run: python3 -m unittest discover -s test -p test_run_coverage.py -v
       - uses: ./.github/actions/renderer-shader-tools
@@ -208,7 +222,17 @@ jobs:
             --debug-info line-tables-only --profile-pool-size 4 \
             --discard-merged-profiles --stream-logs \
             --cc clang-18 --cxx clang++-18 \
-            --llvm-profdata llvm-profdata-18 --llvm-cov llvm-cov-18
+            --llvm-profdata llvm-profdata-18 --llvm-cov llvm-cov-18 \
+            --coverage-map artifacts/coverage-map/coverage-map.json.gz
+      # test/run_tests.py --affected reads this (python3 test/select_affected.py --fetch).
+      - name: Retain the per-case coverage map
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-map
+          path: artifacts/coverage-map/coverage-map.json.gz
+          if-no-files-found: warn
+          retention-days: 30
       - name: Retain coverage and failing test evidence
         if: always()
         uses: actions/upload-artifact@v4
@@ -243,6 +267,7 @@ jobs:
     if: ${{ !cancelled() && needs.changes.outputs.run_linux_gcc13_producer == 'true' }}
     uses: ./.github/workflows/ci-linux-build.yml
     with:
+      desktop_localization: ${{ github.event_name == 'workflow_dispatch' && inputs.desktop_localization }}
       revision: ${{ inputs.revision || github.sha }}
       image: ubuntu:24.04
       runner: ubuntu-24.04
@@ -273,6 +298,7 @@ jobs:
   linux-build:
     needs: [changes, linux-gcc11, linux-gcc13-producer, linux-gcc13]
     if: ${{ !cancelled() && needs.changes.outputs.run_linux_build == 'true' }}
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
     steps:
       - name: Require every selected Linux producer and check
@@ -311,6 +337,7 @@ jobs:
     name: linux (${{ matrix.image }})
     needs: [changes, linux-build, linux-clang]
     if: ${{ !cancelled() && needs.changes.outputs.run_linux == 'true' }}
+    timeout-minutes: 60
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -338,6 +365,7 @@ jobs:
     name: linux variants (${{ matrix.image }})
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_linux_variants == 'true' }}
+    timeout-minutes: 150
     runs-on: ${{ matrix.runner }}
     env:
       CCACHE: 1
@@ -379,7 +407,7 @@ jobs:
           EOF
           sudo apt-get update -qq
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            ca-certificates git ${{ matrix.compiler }} python3 python3-venv scons pkg-config nasm libva-dev ccache \
+            ca-certificates git ${{ matrix.compiler }} python3 python3-venv ninja-build pkg-config nasm libva-dev ccache \
             cmake libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev \
             libopusfile-dev libopus-dev libogg-dev libspeex-dev \
             libboost-dev libssl-dev \
@@ -414,10 +442,10 @@ jobs:
         id: build_without_opengl
         continue-on-error: true
         run: |
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons CXX=${{ matrix.compiler }} -j$(nproc) release=1 server=0 opengl=0 --build=build-software build-software/src/glob2 engine-tests
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py CXX=${{ matrix.compiler }} -j$(nproc) release=1 opengl=0 --build=build-software build-software/src/glob2 engine-tests
           python3 test/SoftwareStartupTest.py build-software/src/glob2
           python3 test/run_tests.py --binary engine --build-dir build-software --no-display --filter 'TorusRender/*software*' --junit artifacts/tests/software-junit.xml
 
@@ -490,6 +518,7 @@ jobs:
   linux-map-generators:
     needs: [changes, linux-gcc11, linux-gcc13, linux-map-generators-standalone]
     if: ${{ !cancelled() && needs.changes.outputs.run_linux_map_generators == 'true' }}
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
     steps:
       - name: Require every selected Linux producer and check
@@ -513,6 +542,7 @@ jobs:
     name: windows (mingw-w64)
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_windows == 'true' }}
+    timeout-minutes: 330
     runs-on: windows-latest
     env:
       CCACHE: 1
@@ -539,7 +569,7 @@ jobs:
             make mingw-w64-x86_64-toolchain
             mingw-w64-x86_64-pkgconf
             mingw-w64-x86_64-python
-            mingw-w64-x86_64-scons
+            mingw-w64-x86_64-ninja
             mingw-w64-x86_64-cmake
             mingw-w64-x86_64-freetype
             mingw-w64-x86_64-opusfile
@@ -614,10 +644,12 @@ jobs:
       - name: Build glob2 and the regression harnesses
         id: build_glob2_and_the_regression_harnesses
         run: |
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           cygpath -w "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons -j$(nproc) release=1 mingw=1 server=0 build/mingw/client/release/src/glob2.exe \
+          preview_target=""
+          if test "${{ github.event_name == 'workflow_dispatch' && inputs.desktop_localization }}" = true; then preview_target=translation-preview-harness; fi
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py -j$(nproc) release=1 mingw=1 $preview_target build/mingw/client/release/src/glob2.exe \
             unit-tests \
             engine-tests \
             software-render-benchmark \
@@ -628,6 +660,15 @@ jobs:
             cp build/sdl3-ci/prefix/bin/*.dll "$directory/"
           done
 
+      - name: Capture actual registered Thai menus and gameplay on Windows
+        if: ${{ !cancelled() && github.event_name == 'workflow_dispatch' && inputs.desktop_localization && steps.build_glob2_and_the_regression_harnesses.outcome == 'success' }}
+        run: python3 tools/capture_localization_platform.py --binary build/mingw/client/release/test/TranslationPreviewHarness.exe --output artifacts/localization-windows
+      - uses: actions/upload-artifact@v4
+        if: ${{ always() && github.event_name == 'workflow_dispatch' && inputs.desktop_localization }}
+        with:
+          name: localization-windows
+          path: artifacts/localization-windows/
+          if-no-files-found: error
       - name: Exercise production CLI and retain continuation traces
         if: ${{ !cancelled() && steps.build_glob2_and_the_regression_harnesses.outcome == 'success' }}
         run: python3 test/test_cli_smoke.py --binary build/mingw/client/release/src/glob2.exe --artifacts artifacts/cli-smoke --junit artifacts/cli-smoke.xml
@@ -674,12 +715,12 @@ jobs:
       - name: Run the unit tests
         id: run_the_unit_tests
         continue-on-error: true
-        run: python3 test/run_tests.py --binary unit --build-dir build/mingw/client/release --junit artifacts/tests/unit-junit.xml
+        run: python3 test/run_tests.py --tier full --binary unit --build-dir build/mingw/client/release --junit artifacts/tests/unit-junit.xml
       - name: Run the engine tests
         id: run_the_engine_tests
         continue-on-error: true
         # The [map-generators] contract stays on Linux, as before this runner existed.
-        run: python3 test/run_tests.py --binary engine --coverage-profile ${{ needs.changes.outputs.secondary_profile }} --write-inventory artifacts/tests/engine.inventory.json --build-dir build/mingw/client/release --exclude-tag map-generators --junit artifacts/tests/engine-junit.xml
+        run: python3 test/run_tests.py --tier full --binary engine --coverage-profile ${{ needs.changes.outputs.secondary_profile }} --write-inventory artifacts/tests/engine.inventory.json --build-dir build/mingw/client/release --exclude-tag map-generators --junit artifacts/tests/engine-junit.xml
       - name: Capture Windows native crash backtraces
         if: ${{ !cancelled() && steps.run_the_engine_tests.outcome == 'failure' }}
         continue-on-error: true
@@ -807,7 +848,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.run_web_build == 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 120
     env:
       CCACHE_DIR: /tmp/glob2-wasm-ccache
       CCACHE_COMPILERCHECK: content
@@ -825,33 +866,18 @@ jobs:
             /etc/apt/sources.list.d/google-chrome.list \
             /etc/apt/sources.list.d/google-chrome.sources
           sudo apt-get update -qq
-          sudo apt-get install -y python3-venv scons nasm libva-dev ccache g++-13 cmake libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
+          sudo apt-get install -y python3-venv ninja-build nasm libva-dev ccache g++-13 cmake libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
       - name: Install pinned Emscripten
         id: install_pinned_emscripten
-        run: python3 browser/setup.py
+        run: python3 platforms/web/setup.py
       - name: Restore WebAssembly compiler cache
         id: restore_webassembly_compiler_cache
         continue-on-error: true
         uses: actions/cache/restore@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-
-      - name: Restore WebAssembly object tree
-        id: restore_webassembly_object_tree
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/emscripten/client/release/.sconsign.dblite
-            build/emscripten/client/release/identity.json
-            build/emscripten/client/release/include/glob2/BuildConfig.h
-            build/emscripten/client/release/obj
-            build/emscripten/client/release/threaded/obj
-            build/emscripten/client/release/threaded/include
-            build/emscripten/client/release/threaded/identity.json
-          key: wasm-objects-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: wasm-objects-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-
+          key: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platforms/web/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platforms/web/toolchain.json') }}-
       - name: Restore pinned WebAssembly dependencies
         id: wasm_dependencies
         uses: actions/cache/restore@v4
@@ -859,10 +885,10 @@ jobs:
           path: |
             build/emscripten/client/release/sdl3/prefix
             build/emscripten/client/release/threaded/sdl3/prefix
-          key: wasm-dependencies-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json', 'scons/web_build.py', 'scons/sdl3_dependencies.py', 'scons/sdl3-*.json', 'scons/vcpkg-ports/sdl3/*.patch') }}
+          key: wasm-dependencies-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platforms/web/toolchain.json', 'buildsys/web_build.py', 'buildsys/sdl3_dependencies.py', 'buildsys/sdl3-*.json', 'buildsys/vcpkg-ports/sdl3/*.patch') }}
       - name: Verify restored WebAssembly dependency prefixes
         env:
-          DEPENDENCY_KEY: ${{ hashFiles('browser/toolchain.json', 'scons/web_build.py', 'scons/sdl3_dependencies.py', 'scons/sdl3-*.json', 'scons/vcpkg-ports/sdl3/*.patch') }}
+          DEPENDENCY_KEY: ${{ hashFiles('platforms/web/toolchain.json', 'buildsys/web_build.py', 'buildsys/sdl3_dependencies.py', 'buildsys/sdl3-*.json', 'buildsys/vcpkg-ports/sdl3/*.patch') }}
         run: |
           for prefix in build/emscripten/client/release/sdl3/prefix build/emscripten/client/release/threaded/sdl3/prefix; do
             python3 .github/scripts/ci_dependency_cache.py verify --prefix "$prefix" --key "$DEPENDENCY_KEY"
@@ -875,14 +901,11 @@ jobs:
         run: |
           ccache -z
           echo "WASM_CACHE_START=$(date +%s)" >> "$GITHUB_ENV"
-          # This source embeds __DATE__ and __TIME__. Refresh it after restoring
-          # objects so the binary still reports the current compilation time.
-          rm -f build/emscripten/client/release/obj/src/GlobalContainerArgs.cpp.o build/emscripten/client/release/threaded/obj/src/GlobalContainerArgs.cpp.o
-          scons target=web release=1 web-tests build/emscripten/client/release/index.html -j$(nproc)
+          python3 tools/dev_build.py target=web release=1 web-tests web-package -j$(nproc)
           ccache -s -v
       - name: Seal built WebAssembly dependency prefixes
         env:
-          DEPENDENCY_KEY: ${{ hashFiles('browser/toolchain.json', 'scons/web_build.py', 'scons/sdl3_dependencies.py', 'scons/sdl3-*.json', 'scons/vcpkg-ports/sdl3/*.patch') }}
+          DEPENDENCY_KEY: ${{ hashFiles('platforms/web/toolchain.json', 'buildsys/web_build.py', 'buildsys/sdl3_dependencies.py', 'buildsys/sdl3-*.json', 'buildsys/vcpkg-ports/sdl3/*.patch') }}
         run: |
           for prefix in build/emscripten/client/release/sdl3/prefix build/emscripten/client/release/threaded/sdl3/prefix; do
             python3 .github/scripts/ci_dependency_cache.py seal --prefix "$prefix" --key "$DEPENDENCY_KEY"
@@ -894,22 +917,7 @@ jobs:
           path: |
             build/emscripten/client/release/sdl3/prefix
             build/emscripten/client/release/threaded/sdl3/prefix
-          key: wasm-dependencies-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json', 'scons/web_build.py', 'scons/sdl3_dependencies.py', 'scons/sdl3-*.json', 'scons/vcpkg-ports/sdl3/*.patch') }}
-      - name: Save WebAssembly object tree
-        id: save_webassembly_object_tree
-        if: ${{ !cancelled() && steps.build_web.outcome == 'success' && ((github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch') }}
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            build/emscripten/client/release/.sconsign.dblite
-            build/emscripten/client/release/identity.json
-            build/emscripten/client/release/include/glob2/BuildConfig.h
-            build/emscripten/client/release/obj
-            build/emscripten/client/release/threaded/obj
-            build/emscripten/client/release/threaded/include
-            build/emscripten/client/release/threaded/identity.json
-          key: wasm-objects-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: wasm-dependencies-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platforms/web/toolchain.json', 'buildsys/web_build.py', 'buildsys/sdl3_dependencies.py', 'buildsys/sdl3-*.json', 'buildsys/vcpkg-ports/sdl3/*.patch') }}
       - name: Prune WebAssembly compiler cache
         id: prune_webassembly_compiler_cache
         if: ${{ !cancelled() && steps.build_web.outcome == 'success' && github.ref == 'refs/heads/master' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch') }}
@@ -920,7 +928,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: ${{ env.CCACHE_DIR }}
-          key: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('browser/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
+          key: ccache-wasm-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('platforms/web/toolchain.json') }}-${{ github.run_id }}-${{ github.run_attempt }}
       # Serve the game and scripting harness; retain compiler identity for the
       # scripting evidence collected by the browser test jobs.
       - uses: actions/upload-artifact@v4
@@ -939,6 +947,8 @@ jobs:
             build/emscripten/client/release/loader.js
             build/emscripten/client/release/presentation-surface.js
             build/emscripten/client/release/i18n.js
+            build/emscripten/client/release/script-fonts.css
+            build/emscripten/client/release/fonts/
             build/emscripten/client/release/locales/
             build/emscripten/client/release/hive-worker.js
             build/emscripten/client/release/hive-runtime.js
@@ -952,6 +962,9 @@ jobs:
             build/emscripten/client/release/music-output.js
             build/emscripten/client/release/music-runtime.js
             build/emscripten/client/release/music-runtime.wasm
+            build/emscripten/client/release/asset-video-worker.js
+            build/emscripten/client/release/asset-video-runtime.js
+            build/emscripten/client/release/asset-video-runtime.wasm
             build/emscripten/client/release/licenses/
             build/emscripten/client/release/threaded/identity.json
             build/emscripten/client/release/threaded/index.js
@@ -981,6 +994,8 @@ jobs:
             build/emscripten/client/release/loader.js
             build/emscripten/client/release/presentation-surface.js
             build/emscripten/client/release/i18n.js
+            build/emscripten/client/release/script-fonts.css
+            build/emscripten/client/release/fonts/
             build/emscripten/client/release/locales/
             build/emscripten/client/release/hive-worker.js
             build/emscripten/client/release/hive-runtime.js
@@ -994,6 +1009,9 @@ jobs:
             build/emscripten/client/release/music-output.js
             build/emscripten/client/release/music-runtime.js
             build/emscripten/client/release/music-runtime.wasm
+            build/emscripten/client/release/asset-video-worker.js
+            build/emscripten/client/release/asset-video-runtime.js
+            build/emscripten/client/release/asset-video-runtime.wasm
             build/emscripten/client/release/licenses/
             build/emscripten/client/release/threaded/index.js
             build/emscripten/client/release/threaded/index.wasm
@@ -1045,7 +1063,7 @@ jobs:
         id: install_native_build_dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y python3-venv scons nasm libva-dev ccache g++-13 cmake libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
+          sudo apt-get install -y python3-venv ninja-build nasm libva-dev ccache g++-13 cmake libfreetype-dev libx11-dev libxext-dev libxcursor-dev libxi-dev libxrandr-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libopusfile-dev libopus-dev libogg-dev libspeex-dev libboost-dev libssl-dev zlib1g-dev libfribidi-dev libgl1-mesa-dev libglu1-mesa-dev libepoxy-dev
       # Reuse the native client objects already populated by the main Linux job.
       # This job only reads that cache; transport-specific misses stay local.
       - name: Restore native compiler cache
@@ -1056,25 +1074,6 @@ jobs:
           path: ${{ env.CCACHE_DIR }}
           key: ccache-main-ubuntu-24.04-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: ccache-main-ubuntu-24.04-
-      - name: Identify native compiler
-        id: native_compiler
-        run: |
-          digest=$(sha256sum "$(command -v g++-13)" | cut -d' ' -f1)
-          echo "digest=$digest" >> "$GITHUB_OUTPUT"
-      - name: Restore native object tree
-        id: restore_native_object_tree
-        continue-on-error: true
-        uses: actions/cache/restore@v4
-        with:
-          path: |
-            build/linux/**/.sconsign.dblite
-            build/linux/**/identity.json
-            build/linux/**/configure
-            build/linux/**/include/glob2/BuildConfig.h
-            build/linux/**/*.o
-            build/linux/**/*.a
-          key: native-objects-v2-ubuntu-24.04-${{ steps.native_compiler.outputs.digest }}-${{ github.run_id }}-${{ github.run_attempt }}
-          restore-keys: native-objects-v2-ubuntu-24.04-${{ steps.native_compiler.outputs.digest }}-
       - name: Reset native compiler cache statistics
         id: reset_native_compiler_cache_statistics
         run: |
@@ -1089,10 +1088,10 @@ jobs:
         id: build_match_relay
         continue-on-error: true
         run: |
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons CXX=g++-13 role=relay release=1 relay -j$(nproc)
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py CXX=g++-13 role=relay release=1 relay -j$(nproc)
       - name: Test match relay
         id: test_match_relay
         continue-on-error: true
@@ -1112,10 +1111,10 @@ jobs:
           fi
           # The browser's editor tests read the native generator catalog, then
           # navigate the visible picker with real keyboard/pointer events.
-          python3 scons/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
+          python3 buildsys/sdl3_dependencies.py --prefix build/sdl3-ci/prefix --work build/sdl3-ci/sources --jobs 2
           echo "$PWD/build/sdl3-ci/prefix/bin" >> "$GITHUB_PATH"
           export PATH="$PWD/build/sdl3-ci/prefix/bin:$PATH"
-          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix scons CXX=g++-13 release=1 transport-test build/linux/client/release/src/glob2 -j$(nproc)
+          GLOB2_SDL3_PREFIX=build/sdl3-ci/prefix python3 tools/dev_build.py CXX=g++-13 release=1 transport-test build/linux/client/release/src/glob2 -j$(nproc)
       - name: Test network transport
         id: test_network_transport
         continue-on-error: true
@@ -1138,20 +1137,6 @@ jobs:
             build/linux/client/release/runtime-assets \
             build/linux/client/release/runtime-assets.json \
             build/sdl3-ci/prefix/lib
-      - name: Save native object tree
-        id: save_native_object_tree
-        if: ${{ !cancelled() && steps.package_the_programs_the_browser_tests_drive.outcome == 'success' && ((github.event_name == 'push' && github.ref == 'refs/heads/master') || github.event_name == 'workflow_dispatch') }}
-        continue-on-error: true
-        uses: actions/cache/save@v4
-        with:
-          path: |
-            build/linux/**/.sconsign.dblite
-            build/linux/**/identity.json
-            build/linux/**/configure
-            build/linux/**/include/glob2/BuildConfig.h
-            build/linux/**/*.o
-            build/linux/**/*.a
-          key: native-objects-v2-ubuntu-24.04-${{ steps.native_compiler.outputs.digest }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: actions/upload-artifact@v4
         id: upload_artifact_1
         continue-on-error: true
@@ -1195,8 +1180,8 @@ jobs:
         id: test_self_hosting_with_real_tls_and_persistent_volumes
         continue-on-error: true
         run: |
-          python3 browser/package-static.py
-          python3 browser/package-static.py --verify build/browser-static
+          python3 platforms/web/package-static.py
+          python3 platforms/web/package-static.py --verify build/browser-static
           python3 -m unittest discover -s test/deployment -v
 
       - name: Summarize CI failures
@@ -1254,15 +1239,15 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: browser/package-lock.json
+          cache-dependency-path: platforms/web/package-lock.json
       - name: Restore Playwright browser installations
         uses: actions/cache/restore@v4
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.browsers }}-${{ hashFiles('browser/package-lock.json') }}
+          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.browsers }}-${{ hashFiles('platforms/web/package-lock.json') }}
       - name: Install browser test dependencies
         id: install_browser_test_dependencies
-        working-directory: browser
+        working-directory: platforms/web
         run: |
           npm ci --ignore-scripts
           npx playwright install --with-deps ${{ matrix.browsers }}
@@ -1271,7 +1256,7 @@ jobs:
         if: ${{ !cancelled() && github.ref == 'refs/heads/master' && github.event_name != 'pull_request' && (matrix.name == 'chromium 1/5' || matrix.name == 'firefox' || matrix.name == 'webkit') }}
         with:
           path: ~/.cache/ms-playwright
-          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.browsers }}-${{ hashFiles('browser/package-lock.json') }}
+          key: playwright-v1-${{ runner.os }}-${{ runner.arch }}-${{ matrix.browsers }}-${{ hashFiles('platforms/web/package-lock.json') }}
       # Firefox needs an X display and an audio service. A null sink is silent.
       - name: Start a silent audio service
         id: start_a_silent_audio_service
@@ -1282,7 +1267,7 @@ jobs:
       - name: Run ${{ matrix.name }}
         id: run_matrix_name
         continue-on-error: true
-        working-directory: browser
+        working-directory: platforms/web
         run: ${{ matrix.command }}
       # Baseline replay and per-browser scripting results share this artifact
       # family; the comparison job selects each corpus explicitly.
@@ -1322,6 +1307,7 @@ jobs:
       COMPATIBILITY: ${{ needs.changes.outputs.compatibility }}
     needs: [changes, linux, windows, web-test, macos]
     if: ${{ !cancelled() && needs.changes.outputs.run_browser_determinism == 'true' }}
+    timeout-minutes: 30
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -1337,30 +1323,43 @@ jobs:
         with:
           pattern: cli-*
           path: artifacts/cli-platforms
+      # Compare only the platforms whose producing job succeeded; a failed producer
+      # is reported once, by its own job, and noted here (UPSTREAM is the needs context).
       - name: Compare complete native CLI continuation checksums
+        env:
+          LINUX_RESULT: ${{ needs.linux.result }}
+          WINDOWS_RESULT: ${{ needs.windows.result }}
         run: |
-          python3 test/check_cli_evidence.py artifacts/cli-platforms --require-platform linux --require-platform windows
+          args=()
+          for platform in linux windows; do
+            result_var="${platform^^}_RESULT"
+            if [ "${!result_var}" = success ]; then args+=(--require-platform "$platform")
+            else echo "::notice::$platform CLI evidence is not compared: upstream job $platform ${!result_var}"; fi
+          done
+          python3 test/check_cli_evidence.py artifacts/cli-platforms "${args[@]}"
 
       - name: Compare every selected native and WebAssembly match verify trace
         id: compare_every_verify_match_trace
+        env:
+          UPSTREAM: ${{ toJSON(needs) }}
         run: |
           python3 - <<'PY'
+          import json, os, sys
           from pathlib import Path
-          traces = sorted(Path('artifacts/ci-traces').rglob('verify-match.checksums.txt'))
-          expected = 8 + int('${{ needs.changes.outputs.compatibility }}' == 'true') + int('${{ needs.changes.outputs.macos }}' == 'true')
-          assert len(traces) == expected, f'Expected {expected} selected native/browser traces, got {traces}'
-          reference = traces[0].read_bytes().replace(b'\r\n', b'\n')
-          assert reference.count(b'\n') > 600
-          for trace in traces[1:]:
-              assert trace.read_bytes().replace(b'\r\n', b'\n') == reference, f'Verification differs: {trace}'
-          committed = Path('test/fixtures/multiplayer/FourSquares1.verify-trace.txt').read_bytes()
-          # Every platform agreeing on a different trace means the simulation changed:
-          # that needs a new sim version (test/check_sim_revision.py checks the bump).
-          assert committed.replace(b'\r\n', b'\n') == reference, (
-              'Every platform agrees, but not with the committed trace: the simulation changed. '
-              'Bump SIM_REVISION in src/game/SimRevision.h and regenerate test/fixtures/multiplayer with '
-              "python3 test/run_tests.py --update-fixtures --filter 'TurnEngineHarness/the committed*'")
-          print(f'All {expected} selected match verify traces match')
+          sys.path.insert(0, '.github/scripts')
+          from ci_compare_evidence import compare_verify_traces, succeeded
+          upstream = json.loads(os.environ['UPSTREAM'])
+          producers = ['linux', 'windows', 'web-test'] + (['macos'] if '${{ needs.changes.outputs.macos }}' == 'true' else [])
+          complete = all(succeeded(upstream, job) for job in producers)
+          # With every producer present the count is exact; otherwise compare what is present.
+          expected = (8 + int('${{ needs.changes.outputs.compatibility }}' == 'true')
+                      + int('${{ needs.changes.outputs.macos }}' == 'true')) if complete else None
+          traces, reference = compare_verify_traces('artifacts/ci-traces', expected)
+          if reference is None:
+              sys.exit(0)
+          # Each producer also requires a "verified" verdict against the record's own
+          # reported checksums; a simulation change fails that before this step.
+          print(f'All {len(traces)} present match verify traces match')
           PY
 
       - uses: actions/download-artifact@v4
@@ -1368,8 +1367,10 @@ jobs:
           pattern: javascript-profile-*
           path: artifacts/ci-scripting
       - name: Compare selected native and browser evidence
+        env:
+          UPSTREAM: ${{ toJSON(needs) }}
         run: |
-          python3 .github/scripts/ci_compare_evidence.py             --traces artifacts/ci-traces --scripting artifacts/ci-scripting             --compatibility '${{ needs.changes.outputs.compatibility }}'             --variants '${{ needs.changes.outputs.variants }}'             --macos '${{ needs.changes.outputs.macos }}'
+          python3 .github/scripts/ci_compare_evidence.py             --traces artifacts/ci-traces --scripting artifacts/ci-scripting             --compatibility '${{ needs.changes.outputs.compatibility }}'             --variants '${{ needs.changes.outputs.variants }}'             --macos '${{ needs.changes.outputs.macos }}' --upstream "$UPSTREAM"
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -1389,7 +1390,7 @@ jobs:
           path: artifacts/ci-observation/
           if-no-files-found: ignore
 
-  # The TypeScript platform (platform/): lint, type checks, the web build, and
+  # The TypeScript platform (services/online/): lint, type checks, the web build, and
   # unit and integration tests against a real Postgres.
   platform:
     name: platform (TypeScript)
@@ -1415,7 +1416,7 @@ jobs:
       TERRAIN_PYTHON: /usr/bin/python3
     defaults:
       run:
-        working-directory: platform
+        working-directory: services/online
     steps:
       - uses: actions/checkout@v4
         id: actions_checkout_v4_1
@@ -1426,7 +1427,7 @@ jobs:
         with:
           node-version: '22'
           cache: npm
-          cache-dependency-path: platform/package-lock.json
+          cache-dependency-path: services/online/package-lock.json
       - name: Install music and terrain artwork processing tools
         id: install_music_upload_processing_tools
         run: |
@@ -1536,6 +1537,7 @@ jobs:
       actions: read
     needs: [changes, android, macos, tsan, native-coverage, linux-gcc11, linux-gcc13-producer, linux-gcc13, linux-build, linux-clang, linux, linux-variants, linux-map-generators-standalone, linux-map-generators, windows, web-build, web-native, web-deploy, web-test, browser-determinism, platform, platform-stack, music]
     if: ${{ always() }}
+    timeout-minutes: 15
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4

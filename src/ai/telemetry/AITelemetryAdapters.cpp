@@ -2,21 +2,27 @@
 #include "AITelemetryFields.h"
 #include "AI.h"
 #include "AINumbi.h"
-#include "AICastor.h"
 #include "AIWarrush.h"
 #include "AINicowar.h"
 #include "shared_runtime/Runtime.h"
-#include "cortex/AICortex.h"
 #include "AIMaxima.h"
-#include "AICabino.h"
 
 namespace AITelemetry
 {
 const std::vector<Field> &schema(int implementation)
 {
-	static const std::vector<std::vector<Field>> schemas = []
+	// Never destroyed: snapshots read on other threads may outlive static teardown.
+	static const std::vector<std::vector<Field>> &schemas = *[]
 	{
-		std::vector<std::vector<Field>> all(AI::SIZE);
+		static const auto *orderNames = []
+		{
+			auto *names = new std::vector<std::string>;
+			for (int n = 0; n < 256; ++n)
+				names->push_back("orders_" + std::to_string(n));
+			return names;
+		}();
+		auto *result = new std::vector<std::vector<Field>>(AI::SIZE);
+		auto &all = *result;
 		for (auto &f : all)
 		{
 			f.push_back({"polls", "calls", "Actual AI implementation polls", Unsigned, Counter});
@@ -24,7 +30,7 @@ const std::vector<Field> &schema(int implementation)
 			f.push_back({"emitted_orders", "orders",
 						 "Returned non-null orders; not engine acceptance", Unsigned, Counter});
 			for (int n = 0; n < 256; ++n)
-				f.push_back({"orders_" + std::to_string(n), "orders", "Returned engine order type",
+				f.push_back({(*orderNames)[n], "orders", "Returned engine order type",
 							 Unsigned, Counter});
 		}
 #define AI_BEGIN(number)                                                                           \
@@ -37,7 +43,7 @@ const std::vector<Field> &schema(int implementation)
 #undef AI_BEGIN
 #undef AI_FIELD
 #undef AI_END
-		return all;
+		return result;
 	}();
 	return schemas.at(implementation);
 }
@@ -52,54 +58,6 @@ void AINumbi::captureTelemetry()
 	telemetry.set(AITrace::AI1::state_criticalWarriors, criticalWarriors);
 	telemetry.set(AITrace::AI1::state_criticalTime, criticalTime);
 	telemetry.set(AITrace::AI1::state_attackTimer, attackTimer);
-}
-
-void AICastor::captureTelemetry()
-{
-	telemetry.set(AITrace::AI2::state_buildingSum_8_0, buildingSum[8][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_8_1, buildingSum[8][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_9_0, buildingSum[9][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_9_1, buildingSum[9][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_10_0, buildingSum[10][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_10_1, buildingSum[10][1]);
-	// Legacy telemetry slots: 11 was walls (no Castor demand), 12 was exchange.
-	telemetry.set(AITrace::AI2::state_buildingSum_11_0, 0);
-	telemetry.set(AITrace::AI2::state_buildingSum_11_1, 0);
-	telemetry.set(AITrace::AI2::state_buildingSum_12_0, buildingSum[ExchangeResources][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_12_1, buildingSum[ExchangeResources][1]);
-	telemetry.set(AITrace::AI2::state_timer, timer);
-	telemetry.set(AITrace::AI2::state_canSwim, canSwim);
-	telemetry.set(AITrace::AI2::state_needSwim, needSwim);
-	telemetry.set(AITrace::AI2::state_warLevel, warLevel);
-	telemetry.set(AITrace::AI2::state_warTimeTriggerLevel, warTimeTriggerLevel);
-	telemetry.set(AITrace::AI2::state_warLevelTriggerLevel, warLevelTriggerLevel);
-	telemetry.set(AITrace::AI2::state_warAmountTriggerLevel, warAmountTriggerLevel);
-	telemetry.set(AITrace::AI2::state_onStrike, onStrike);
-	telemetry.set(AITrace::AI2::state_strikeTeamSelected, strikeTeamSelected);
-	telemetry.set(AITrace::AI2::state_strikeTeam, strikeTeam);
-	telemetry.set(AITrace::AI2::state_foodWarning, foodWarning);
-	telemetry.set(AITrace::AI2::state_foodLock, foodLock);
-	telemetry.set(AITrace::AI2::state_foodSurplus, foodSurplus);
-	telemetry.set(AITrace::AI2::state_overWorkers, overWorkers);
-	telemetry.set(AITrace::AI2::state_starvingWarning, starvingWarning);
-	telemetry.set(AITrace::AI2::state_buildsAmount, buildsAmount);
-	telemetry.set(AITrace::AI2::state_projects_count, projects.size());
-	telemetry.set(AITrace::AI2::state_buildingSum_0_0, buildingSum[0][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_0_1, buildingSum[0][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_1_0, buildingSum[1][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_1_1, buildingSum[1][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_2_0, buildingSum[2][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_2_1, buildingSum[2][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_3_0, buildingSum[3][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_3_1, buildingSum[3][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_4_0, buildingSum[4][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_4_1, buildingSum[4][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_5_0, buildingSum[5][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_5_1, buildingSum[5][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_6_0, buildingSum[6][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_6_1, buildingSum[6][1]);
-	telemetry.set(AITrace::AI2::state_buildingSum_7_0, buildingSum[7][0]);
-	telemetry.set(AITrace::AI2::state_buildingSum_7_1, buildingSum[7][1]);
 }
 
 void AIWarrush::captureTelemetry()
@@ -144,39 +102,6 @@ void NewNicowar::captureTelemetry()
 	telemetry.set(AITrace::AI5::state_defense_flags_count, defense_flags.size());
 	telemetry.set(AITrace::AI5::state_explorer_attack_flags_count, explorer_attack_flags.size());
 	telemetry.set(AITrace::AI5::state_exploration_on_fruit, exploration_on_fruit);
-}
-
-void AICortex::captureTelemetry()
-{
-	telemetry.set(AITrace::AI6::state_timer, timer);
-	telemetry.set(AITrace::AI6::state_pendingUpgradeType, pendingUpgradeType);
-	telemetry.set(AITrace::AI6::state_pendingUpgradeUntil, pendingUpgradeUntil);
-	telemetry.set(AITrace::AI6::state_flagPosture, flagPosture);
-	telemetry.set(AITrace::AI6::state_offenseHoldUntil, offenseHoldUntil);
-	telemetry.set(AITrace::AI6::state_wheatOpenMargin, wheatOpenMargin);
-	telemetry.set(AITrace::AI6::state_swarmKickstarted, swarmKickstarted);
-	telemetry.set(AITrace::AI6::state_orderQueue_count, orderQueue.size());
-	telemetry.set(AITrace::AI6::state_offenseWaves_0_gid, offenseWaves[0].gid);
-	telemetry.set(AITrace::AI6::state_offenseWaves_0_phase, offenseWaves[0].phase);
-	telemetry.set(AITrace::AI6::state_offenseWaves_0_phaseDeadline, offenseWaves[0].phaseDeadline);
-	telemetry.set(AITrace::AI6::state_offenseWaves_0_musterBestArrived,
-				  offenseWaves[0].musterBestArrived);
-	telemetry.set(AITrace::AI6::state_offenseWaves_0_createCooldown,
-				  offenseWaves[0].createCooldown);
-	telemetry.set(AITrace::AI6::state_offenseWaves_1_gid, offenseWaves[1].gid);
-	telemetry.set(AITrace::AI6::state_offenseWaves_1_phase, offenseWaves[1].phase);
-	telemetry.set(AITrace::AI6::state_offenseWaves_1_phaseDeadline, offenseWaves[1].phaseDeadline);
-	telemetry.set(AITrace::AI6::state_offenseWaves_1_musterBestArrived,
-				  offenseWaves[1].musterBestArrived);
-	telemetry.set(AITrace::AI6::state_offenseWaves_1_createCooldown,
-				  offenseWaves[1].createCooldown);
-	telemetry.set(AITrace::AI6::state_offenseWaves_2_gid, offenseWaves[2].gid);
-	telemetry.set(AITrace::AI6::state_offenseWaves_2_phase, offenseWaves[2].phase);
-	telemetry.set(AITrace::AI6::state_offenseWaves_2_phaseDeadline, offenseWaves[2].phaseDeadline);
-	telemetry.set(AITrace::AI6::state_offenseWaves_2_musterBestArrived,
-				  offenseWaves[2].musterBestArrived);
-	telemetry.set(AITrace::AI6::state_offenseWaves_2_createCooldown,
-				  offenseWaves[2].createCooldown);
 }
 
 void AIMaxima::Maxima::captureTelemetry()
@@ -928,28 +853,39 @@ void AIMaxima::Maxima::captureTelemetry()
 	telemetry.set(AITrace::AI7::state_policy_bids_5_attack_units, policy_bids[5].attack_units);
 	telemetry.set(AITrace::AI7::state_policy_bids_5_request_upgrades,
 				  policy_bids[5].request_upgrades);
-	// Keep the legacy columns so saved telemetry remains readable, but never read
-	// a seventh policy: Maxima has only six. Clear stale values loaded from saves.
-	static_assert(PolicyCount == 6);
-	if (telemetry.series)
-		for (unsigned field = AITrace::AI7::state_policy_bids_6_utility;
-			 field <= AITrace::AI7::state_policy_bids_6_request_upgrades; ++field)
-			telemetry.series->current.values[field] = {};
+	// The formerly unused seventh policy slot now carries prestige demand.
+	static_assert(PolicyCount == 7);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_utility, policy_bids[PolicyPrestige].utility);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_construction_sites,
+				  policy_bids[PolicyPrestige].construction_sites);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_inns, policy_bids[PolicyPrestige].desired_inns);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_swarms, policy_bids[PolicyPrestige].desired_swarms);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_barracks,
+				  policy_bids[PolicyPrestige].desired_barracks);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_schools,
+				  policy_bids[PolicyPrestige].desired_schools);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_pools, policy_bids[PolicyPrestige].desired_pools);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_racetracks,
+				  policy_bids[PolicyPrestige].desired_racetracks);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_hospital_beds,
+				  policy_bids[PolicyPrestige].desired_hospital_beds);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_towers, policy_bids[PolicyPrestige].desired_towers);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_swarm_workers, policy_bids[PolicyPrestige].swarm_workers);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_worker_ratio, policy_bids[PolicyPrestige].worker_ratio);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_explorer_ratio, policy_bids[PolicyPrestige].explorer_ratio);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_warrior_ratio, policy_bids[PolicyPrestige].warrior_ratio);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_explorers,
+				  policy_bids[PolicyPrestige].desired_explorers);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_desired_warriors,
+				  policy_bids[PolicyPrestige].desired_warriors);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_defense_reserve,
+				  policy_bids[PolicyPrestige].defense_reserve);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_attack_flags, policy_bids[PolicyPrestige].attack_flags);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_attack_units, policy_bids[PolicyPrestige].attack_units);
+	telemetry.set(AITrace::AI7::state_policy_bids_6_request_upgrades,
+				  policy_bids[PolicyPrestige].request_upgrades);
 
-}
 
-void Cabino::AICabino::captureTelemetry()
-{
-	if (iteration)
-		for (const auto *module : modules)
-			module->captureTelemetry(telemetry);
-	telemetry.set(AITrace::AI8::state_timer, timer);
-	telemetry.set(AITrace::AI8::state_iteration, iteration);
-	telemetry.set(AITrace::AI8::state_module_timer, module_timer);
-	telemetry.set(AITrace::AI8::state_center_x, center_x);
-	telemetry.set(AITrace::AI8::state_center_y, center_y);
-	telemetry.set(AITrace::AI8::state_orders_count, orders.size());
-	telemetry.set(AITrace::AI8::state_modules_count, modules.size());
 }
 
 void AISharedRuntime::Runtime::captureTelemetry()
@@ -969,105 +905,4 @@ void AISharedRuntime::Runtime::captureTelemetry()
 					  ? AITrace::AI4::shared_runtime_management_orders_count
 					  : AITrace::AI5::shared_runtime_management_orders_count,
 				  management_orders.size());
-}
-
-void Cabino::SimpleBuildingDefense::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::SimpleBuildingDefense_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_SimpleBuildingDefense_defending_zones_count,
-			 defending_zones.size());
-	sink.set(AITrace::AI8::module_SimpleBuildingDefense_building_health_count,
-			 building_health.size());
-}
-
-void Cabino::GeneralsDefense::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::GeneralsDefense_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_GeneralsDefense_defending_flags_count, defending_flags.size());
-}
-
-void Cabino::PrioritizedBuildingAttack::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::PrioritizedBuildingAttack_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_PrioritizedBuildingAttack_attacks_count, attacks.size());
-	sink.set(AITrace::AI8::module_PrioritizedBuildingAttack_target_team, enemyTeamNumber == 255 ? -1 : int(enemyTeamNumber));
-}
-
-void Cabino::DistributedNewConstructionManager::captureTelemetry(
-	const AITelemetry::Sink &sink) const
-{
-	sink.set(AITrace::AI8::module_DistributedNewConstructionManager_new_buildings_count,
-			 new_buildings.size());
-	sink.set(AITrace::AI8::module_DistributedNewConstructionManager_num_buildings_wanted_count,
-			 num_buildings_wanted.size());
-	sink.set(AITrace::AI8::module_DistributedNewConstructionManager_no_build_cache_count,
-			 no_build_cache.size());
-	sink.set(AITrace::AI8::module_DistributedNewConstructionManager_imap_count, imap.size());
-}
-
-void Cabino::RandomUpgradeRepairModule::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::RandomUpgradeRepairModule_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_RandomUpgradeRepairModule_active_construction_count,
-			 active_construction.size());
-	sink.set(AITrace::AI8::module_RandomUpgradeRepairModule_pending_construction_count,
-			 pending_construction.size());
-}
-
-void Cabino::DistributedUnitManager::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::BasicDistributedSwarmManager_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_DistributedUnitManager_buildings_count, buildings.size());
-	sink.set(AITrace::AI8::module_DistributedUnitManager_module_records_count,
-			 module_records.size());
-	sink.set(AITrace::AI8::module_DistributedUnitManager_unit_names_count, unit_names.size());
-	sink.set(AITrace::AI8::module_DistributedUnitManager_ability_names_count, ability_names.size());
-}
-
-void Cabino::ExplorationManager::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::ExplorationManager_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_ExplorationManager_explorers_wanted, explorers_wanted);
-	sink.set(AITrace::AI8::module_ExplorationManager_original_explorers_wanted,
-			 original_explorers_wanted);
-}
-
-void Cabino::InnManager::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::InnManager_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_InnManager_inns_count, inns.size());
-}
-
-void Cabino::BuildingClearer::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::BuildingClearer_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_BuildingClearer_cleared_buildings_count,
-			 cleared_buildings.size());
-}
-
-void Cabino::HappinessHandler::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::HappinessHandler_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_HappinessHandler_fruit_trees_count, fruit_trees.size());
-	sink.set(AITrace::AI8::module_HappinessHandler_is_fruit_trees_computed,
-			 is_fruit_trees_computed);
-	sink.set(AITrace::AI8::module_HappinessHandler_exploring_fruit_trees_count,
-			 exploring_fruit_trees.size());
-}
-
-void Cabino::Farmer::captureTelemetry(const AITelemetry::Sink &sink) const
-{
-	if (!sink.series || !sink.series->current.values[AITrace::AI8::Farmer_perform_calls].bits)
-		return;
-	sink.set(AITrace::AI8::module_Farmer_resources_count, resources.size());
-	sink.set(AITrace::AI8::module_Farmer_is_water_gradient_computed, is_water_gradient_computed);
 }

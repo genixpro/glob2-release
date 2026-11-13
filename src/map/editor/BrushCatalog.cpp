@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "BrushCatalog.h"
+#include "TerrainBuiltins.h"
+#include "TerrainGroupTable.h"
 #include "ExperimentalFeatures.h"
 #include "FormatableString.h"
-#include "TerrainExperiments.h"
 #include "map/TerrainRegistry.h"
 #include "resource/ResourceRegistry.h"
 #include <algorithm>
@@ -89,10 +90,7 @@ BrushEntry terrainEntry(const BrushCatalogInputs &inputs, const Text &text, Terr
 	entry.swatch.terrain = type;
 	entry.swatch.key = registry.key(type);
 	entry.action = "select terrain " + registry.key(type);
-	entry.experiment = terrainExperimentKey(type).value_or("");
-	entry.locked = !enabled(inputs, entry.experiment);
-	entry.tooltip = joinLines({entry.label, entry.rules.empty() ? groupRules : entry.rules,
-							   lockedLine(text, entry.experiment, entry.locked)});
+	entry.tooltip = joinLines({entry.label, entry.rules.empty() ? groupRules : entry.rules});
 	return entry;
 }
 
@@ -107,22 +105,22 @@ void addTerrain(const BrushCatalogInputs &inputs, const Text &text, std::vector<
 		if (!group.entries.empty())
 			catalog.push_back(std::move(group));
 	};
-	{
-		BrushGroup classic{"classic", BrushSection::Terrain, text.tr("[terrain group classic]"), "", {}};
-		for (auto type : {WATER, SAND, GRASS})
-			if (selectable(type))
-				classic.entries.push_back(terrainEntry(inputs, text, type, classic.key,
-													   terrainRuleSummary(registry.properties(type), translate), ""));
-		push(std::move(classic));
-	}
+	// One section per group: grass, sand and water first, since those three
+	// decide where a colony can live and grass is the brush reached for most
+	// (the phone tray shows the first cards without scrolling), deep water
+	// right under water, then the other groups in table order.
+	std::vector<TerrainGroup> order{TerrainGroup::Grass, TerrainGroup::Sand, TerrainGroup::Water,
+									TerrainGroup::DeepWater};
 	for (unsigned g = 0; g < TERRAIN_GROUP_COUNT; ++g)
+		if (std::find(order.begin(), order.end(), TerrainGroup(g)) == order.end())
+			order.push_back(TerrainGroup(g));
+	for (const auto group : order)
 	{
-		const auto group = TerrainGroup(g);
 		const auto &definition = terrainGroupDefinition(group);
-		if (!definition.paletteVisible || terrainGroupIsClassic(group))
+		if (!definition.paletteVisible)
 			continue;
-		BrushGroup entries{definition.key, BrushSection::Terrain, text.tr(definition.label),
-						   terrainRuleSummary(definition.properties, translate), {}};
+		std::string rules = terrainRuleSummary(definition.properties, translate);
+		BrushGroup entries{definition.key, BrushSection::Terrain, text.tr(definition.label), std::move(rules), {}};
 		for (unsigned id = 0; id < TERRAIN_COUNT; ++id)
 			if (terrainGroup(TerrainType(id)) == group && selectable(TerrainType(id)))
 				entries.entries.push_back(terrainEntry(inputs, text, TerrainType(id), entries.key, "", entries.rules));
@@ -327,27 +325,12 @@ const BrushGroup *findBrushGroup(const std::vector<BrushGroup> &catalog, BrushSe
 	return nullptr;
 }
 
-std::optional<std::string> terrainExperimentKey(TerrainType type)
-{
-	if (const auto id = terrainExperiment(type))
-		return std::string(experimentDefinition(*id).key);
-	return std::nullopt;
-}
-
-bool terrainBrushOffered(const TerrainRegistry &registry, TerrainType type, const ExperimentGate &enabled)
-{
-	if (!registry.valid(type) || !registry.presentation(type).editorSelectable)
-		return false;
-	const auto experiment = terrainExperimentKey(type);
-	return !experiment || (enabled && enabled(*experiment));
-}
-
-std::vector<TerrainType> offeredTerrainBrushes(const TerrainRegistry &registry, TerrainGroup group,
-											   const ExperimentGate &enabled)
+std::vector<TerrainType> offeredTerrainBrushes(const TerrainRegistry &registry, TerrainGroup group)
 {
 	std::vector<TerrainType> brushes;
 	for (unsigned id = 0; id < TERRAIN_COUNT; ++id)
-		if (terrainGroup(TerrainType(id)) == group && terrainBrushOffered(registry, TerrainType(id), enabled))
+		if (terrainGroup(TerrainType(id)) == group && registry.valid(TerrainType(id)) &&
+			registry.presentation(TerrainType(id)).editorSelectable)
 			brushes.push_back(TerrainType(id));
 	return brushes;
 }

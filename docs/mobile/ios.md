@@ -7,10 +7,10 @@ Build and run the iOS app with isolated simulators and pinned dependencies.
 Build dependencies and the generated Xcode project with the same configuration:
 
 ```sh
-python3 mobile/dependencies.py --target ios --environment simulator --release
-python3 mobile/ios.py build --environment simulator --release
-python3 mobile/ios.py install --environment simulator --release --device SIMULATOR_UUID
-python3 mobile/ios.py launch --environment simulator --release --device SIMULATOR_UUID
+python3 platforms/mobile/dependencies.py --target ios --environment simulator --release
+python3 platforms/mobile/ios.py build --environment simulator --release
+python3 platforms/mobile/ios.py install --environment simulator --release --device SIMULATOR_UUID
+python3 platforms/mobile/ios.py launch --environment simulator --release --device SIMULATOR_UUID
 ```
 
 The simulator tools use an isolated device set under
@@ -105,6 +105,6 @@ alone does not add `applinks:`. Check a TestFlight IPA with
 The iOS project embeds the matching hash-pinned MoltenVK 1.4.2 framework and its
 Apache-2.0 notice for device or simulator builds. Xcode signs the embedded framework
 on copy. Gradient compute loads it independently of rendering, and falls back to
-CPU for unavailable device capabilities. The lock is `scons/moltenvk.json`; no
+CPU for unavailable device capabilities. The lock is `buildsys/moltenvk.json`; no
 runtime shader compiler is shipped. Device correctness and signed package launch
 need Apple qualification in addition to cross-platform solver tests.

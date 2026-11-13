@@ -1,10 +1,13 @@
 #include "GameEvent.h"
+#include "Map.h"
 #include "ClientAreaPreview.h"
 #include "sim/ClientEvents.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // PresentationFrame extraction: entities by gid, the selection's map-view contribution, and
 // the overlay map's refresh cadence.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include "OverlayAreas.h"
 #include "SceneExtract.h"
 #include "SceneBuffer.h"
@@ -22,6 +25,9 @@
 #include "sim/presentation/ScenePreparation.h"
 #include <thread>
 #include "sim/snapshot/SnapshotStore.h"
+#include "sim/EntityRefOf.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
 
 namespace {
 template<class Source> concept AcceptsLivePresentationSource=requires(SceneExtractor& preparer,const Source& source,const SceneRequest& request,PresentationFrame& frame) {
@@ -162,8 +168,8 @@ TEST_SUITE("SceneExtract")
 		worker->hp = 3;
 
 		SceneRequest request;
-		request.selectedBuilding = Game::refOf(inn);
-		request.selectedUnit = Game::refOf(worker);
+		request.selectedBuilding = refOf(inn);
+		request.selectedUnit = refOf(worker);
 		PresentationFrame scene;
 		SceneExtractor().prepare((world.game).captureReadBoundary(SceneExtractor::captureOptions(request)), request, scene);
 
@@ -251,7 +257,7 @@ TEST_SUITE("SceneExtract")
         glob2test::HeadlessGame world({.clearImmobile=true,.loadDefaultRace=true});
         auto* unit=world.addUnit(WORKER,10,10);
         SceneExtractor extractor; SceneRequest request; PresentationFrame scene;
-        request.selectedUnit=Game::refOf(unit); const auto gid=unit->gid;
+        request.selectedUnit=refOf(unit); const auto gid=unit->gid;
         extractor.prepare((world.game).captureReadBoundary(SceneExtractor::captureOptions(request)), request, scene);
         REQUIRE(scene.entities.unit(gid)); CHECK(scene.entities.isSelected(*scene.entities.unit(gid)));
         REQUIRE(world.game.removeUnitAndBuildingAndFlags(10,10,Game::DEL_UNIT));
@@ -463,7 +469,7 @@ TEST_SUITE("SceneExtract")
                     const int index=buildingSpriteFrame(*frame.entities.type(b),b.hp,b.maxHp,frame.entities.connections(b));
                     REQUIRE(index>=0);REQUIRE(index<frame.entities.type(b)->gameSpritePtr->getFrameCount());
                 }
-                Game::ViewState view;view.scene=&frame;
+                ViewState view;view.scene=&frame;
                 auto* gfx=globals->gfx;
                 gfx->beginFrame(GAGCore::GraphicContext::FrameMode::FullRedraw);gfx->setClipRect();
                 gfx->drawFilledRect(0,0,1024,1024,GAGCore::Color(20,30,20));
@@ -519,8 +525,8 @@ TEST_CASE("snapshot preparation retains definitions after the source game is des
         REQUIRE(unit); REQUIRE(building);
         unitId = unit->gid; buildingId = building->gid;
         SceneRequest request;
-        request.selectedUnit = Game::refOf(unit);
-        request.selectedBuilding = Game::refOf(building);
+        request.selectedUnit = refOf(unit);
+        request.selectedBuilding = refOf(building);
         input = SceneExtractor::inputs((world.game).captureReadBoundary(SceneExtractor::captureOptions(request)), request);
     }
     PresentationFrame scene;
@@ -546,7 +552,7 @@ TEST_CASE("snapshot preparation matches retained queries and survives later live
     unit->medical = Unit::MED_DAMAGED; unit->hp = 1; unit->hungry = 0;
     building->lastShootStep = 19; building->lastShootSpeedX = 2;
     SceneRequest request;
-    request.selectedUnit = Game::refOf(unit); request.selectedBuilding = Game::refOf(building);
+    request.selectedUnit = refOf(unit); request.selectedBuilding = refOf(building);
     request.view.displayW = 800; request.view.displayH = 600;
     request.includeScriptAreas = true;
     world.game.map.setPoint(8,3,4);

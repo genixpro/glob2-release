@@ -3,13 +3,15 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #include <GAG.h>
+#include "SetLibraryDialog.h"
+#include "Map.h"
 #include "ExperimentalFeatures.h"
-#include "TerrainExperiments.h"
 #include "Game.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
 #include "MapEditDialog.h"
 #include "PhoneEditor.h"
+#include "EditorSceneCache.h"
 #include "EditorDock.h"
 #include <InterfacePresentation.h>
 #include "ScriptEditorScreen.h"
@@ -18,7 +20,7 @@
 
 
 MapEdit::MapEdit()
-  : game(NULL, this), keyboardManager(MapEditShortcuts), 
+  : gameOwner(std::make_unique<Game>(nullptr, this)), game(*gameOwner), keyboardManager(MapEditShortcuts), 
     minimap(globalContainer->runNoX,
             RIGHT_MENU_WIDTH, // menu width
             globalContainer->gfx->getW(), // game width
@@ -129,30 +131,30 @@ MapEdit::MapEdit()
 	orange = new TerrainSelector(*this, widgetRectangle(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+decX, 248, 32, 32), "terrain view", "orange selector", "select orange tree", TerrainSelector::OrangeTree);
 	cherry = new TerrainSelector(*this, widgetRectangle(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+32+decX, 248, 32, 32), "terrain view", "cherry selector", "select cherry tree", TerrainSelector::CherryTree);
 	prune = new TerrainSelector(*this, widgetRectangle(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+64+decX, 248, 32, 32), "terrain view", "prune selector", "select prune tree", TerrainSelector::PruneTree);
-    // One side-panel brush per enabled catalogue group: a single enabled member
-    // selects directly (ice, or trail while path-terrain is off); several members
+    // One side-panel brush per catalogue group: a single selectable member
+    // selects directly (ice); several members
     // open the Terrain palette at that group's section.
     for (unsigned g = 0; g < TERRAIN_GROUP_COUNT; ++g)
     {
         const auto group = TerrainGroup(g);
         const auto &definition = terrainGroupDefinition(group);
         if (!definition.paletteVisible || terrainGroupIsClassic(group)) continue;
-        const auto enabled = offeredTerrainBrushes(game.map.terrainRegistry(), group, experimentGate());
-        if (enabled.empty()) continue;
+        const auto members = offeredTerrainBrushes(game.map.terrainRegistry(), group);
+        if (members.empty()) continue;
         const int slot = int(additionalTerrainSelectors.size());
         const widgetRectangle area(globalContainer->gfx->getW()-RIGHT_MENU_WIDTH+32*(slot%4)+decX, 286+38*(slot/4), 32, 32);
         MapEditorWidget *selector;
-        if (enabled.size() == 1)
+        if (members.size() == 1)
         {
-            const auto &presentation = game.map.terrainPresentation(enabled.front());
+            const auto &presentation = game.map.terrainPresentation(members.front());
             selector = new TerrainSelector(*this, area, "terrain view",
                 std::string(presentation.name)+" selector", std::string("select ")+presentation.name,
-                TerrainSelector::selectorFor(enabled.front()));
+                TerrainSelector::selectorFor(members.front()));
         }
         else
             selector = new TerrainGroupSelector(*this, area, "terrain view",
                 std::string(definition.key)+" group selector", std::string("open terrain palette ")+definition.key,
-                group, enabled.front());
+                group, members.front());
         additionalTerrainSelectors.push_back(selector);
         addWidget(selector);
     }

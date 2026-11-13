@@ -4,7 +4,7 @@
 #include "Drawing.h"
 #include "Farmland.h"
 #include "FertilityField.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Grid.h"
 #include "Growth.h"
@@ -276,7 +276,7 @@ void dressLanes(Layout &L)
 			for (int dx = -1; dx <= 1; ++dx)
 				beach = beach || before[t.at(t.remainderX(i) + dx, i / t.w + dy)] == WATER;
 		if (!beach)
-			L.terrain[i] = DIRT_TRACK;
+			L.terrain[i] = BRICK_PATH;
 	}
 }
 
@@ -349,7 +349,7 @@ void dressGround(Layout &L, GenerationContext &context)
 		const int x = t.remainderX(i), y = i / t.w;
 		if (fromWall[i] >= 3 && fromWall[i] <= 6 && L.homeOf[i] < 0)
 		{
-			next[i] = clay.at(x, y) > .72 ? DIRT : GRAVEL;
+			next[i] = clay.at(x, y) > .72 ? DIRT : SHALE;
 			++glacis;
 		}
 		else if (L.arm[i])
@@ -357,7 +357,7 @@ void dressGround(Layout &L, GenerationContext &context)
 			// A harbour arm is a rocky headland: shingle, with outcrop on its far half so it reads
 			// as a breakwater rather than a strip of lawn.
 			const bool outerHalf = fromWall[i] >= armFrom;
-			next[i] = outerHalf && scrub.at(x, y) > .5 ? OUTCROP : clay.at(x, y) > .8 ? DIRT : GRAVEL;
+			next[i] = outerHalf && scrub.at(x, y) > .5 ? OUTCROP : clay.at(x, y) > .8 ? DIRT : SHALE;
 			++arms;
 		}
 		else if (fromSea[i] <= 3 && scrub.at(x, y) > .55)
@@ -367,7 +367,7 @@ void dressGround(Layout &L, GenerationContext &context)
 		}
 		else if (fromWall[i] >= 8 && clay.at(x, y) > .66)
 		{
-			next[i] = FLOWER_MEADOW;
+			next[i] = HEATH;
 			++meadows;
 		}
 	}
@@ -398,7 +398,7 @@ void dressGround(Layout &L, GenerationContext &context)
 					}
 					else
 					{
-						next[v] = clay.at(x, y) > .7 ? DIRT : GRAVEL;
+						next[v] = clay.at(x, y) > .7 ? DIRT : SHALE;
 						++battery;
 					}
 				}
@@ -669,7 +669,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return L;
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "bastion keys design";
 	const Layout L = design(context.request, context);
@@ -790,7 +790,7 @@ bool generate(Game &game, GenerationContext &context)
 	return true;
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
@@ -916,7 +916,8 @@ GeneratorDefinition bastionKeysDefinition()
 		"bastion-keys",
 		68,
 		"Bastion Keys",
-		3,
+		// Revision 5: fertile ground contributes 48 Q8 to crop growth.
+		5,
 		false,
 		{GeneratorControl{"home-size", "Home size", 13, 15, 1, 14, ControlGroup::Layout}
 			 .withSearchRange(13, 15),

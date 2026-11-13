@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "TurretTargeting.h"
+#include "Map.h"
 #include "FileFormatVersions.h"
 #include "Game.h"
 #include "Team.h"
@@ -8,11 +9,14 @@
 #include "ComputeExecutor.h"
 #include "Stream.h"
 #include <algorithm>
+#include <array>
+#include <span>
 #include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <tuple>
+#include "sim/EntityRefOf.h"
 
 namespace TurretTargeting
 {
@@ -88,6 +92,13 @@ struct Pipeline::State
     std::deque<std::unique_ptr<Generation>> pending;
     // Ordered contiguous records avoid a node allocation and tree walk per turret.
     std::vector<Record> published;
+    // Owner-only admission scratch. Damage rows are immutable and compared by
+    // value, so an unchanged row is shared across boundaries instead of rebuilt.
+    struct DamageRow { const BuildingUnitInteraction* interactions=nullptr; Uint64 admission=0; std::shared_ptr<const std::vector<int>> values; };
+    std::vector<DamageRow> damageRows;
+    std::vector<int> damageScratch;
+    std::vector<const Building*> selected;
+    Uint64 admissions=0;
     Statistics metrics;
     State(Game& game,Configuration configuration):executor(game.map.computeExecutor()),rules(configuration) {}
     auto findPublished(BuildingRef identity) {
@@ -95,9 +106,9 @@ struct Pipeline::State
             return IdentityLess{}(record.identity,key);
         });
     }
-    void complete(Generation& generation) {
+    void complete(Generation& generation, JoinContext context = {JoinReason::Teardown, ComputeTelemetry::NoTick}) {
         if (generation.batch.empty()) return;
-        try { executor.join(generation.batch); } catch (...) { generation.error=std::current_exception(); }
+        try { executor.join(generation.batch, context); } catch (...) { generation.error=std::current_exception(); }
         generation.preparation->observation=nullptr;
         generation.observation.reset(); // Completed jobs need no world lease.
     }
@@ -116,33 +127,42 @@ void Pipeline::admit(const Game& game,const SimulationSnapshot::Handle& captured
 {
     auto& s=*state;
     if (!admissionPending(game,paused)) return;
-    // Turrets sharing a weapon table share one immutable damage row per boundary.
-    std::map<const BuildingUnitInteraction*,std::shared_ptr<const std::vector<int>>> rows;
+    // Turrets sharing a weapon table share one immutable damage row per boundary,
+    // taken from the first turret that uses the table.
+    const Uint64 admission=++s.admissions;
+    if (s.damageRows.size()>64) s.damageRows.clear();
+    const auto row=[&](const Building& turret) -> const std::shared_ptr<const std::vector<int>>& {
+        const auto* interactions=turret.runtime->interactions;
+        auto it=std::find_if(s.damageRows.begin(),s.damageRows.end(),[&](const auto& r){return r.interactions==interactions;});
+        if (it!=s.damageRows.end() && it->admission==admission) return it->values;
+        auto& values=s.damageScratch; values.clear();
+        for (unsigned id=0;id<turret.runtime->unitCount;++id) values.push_back(turret.runtime->damage(id));
+        if (it==s.damageRows.end()) it=s.damageRows.insert(s.damageRows.end(),{interactions,0,{}});
+        if (!it->values || *it->values!=values) it->values=std::make_shared<const std::vector<int>>(values);
+        it->admission=admission;
+        return it->values;
+    };
+    const int teams=game.mapHeader.getNumberOfTeams();
     std::unique_ptr<State::Generation> generation;
-    for (int team=0;team<game.mapHeader.getNumberOfTeams();++team) if (due(game,team,s.rules)) {
-        std::vector<const Building*> selected;
+    for (int team=0;team<teams;++team) if (due(game,team,s.rules)) {
+        auto& selected=s.selected; selected.clear();
         for (const auto* turret:game.teams[team]->turrets) {
             if (turret->buildingState==Building::DEAD || turret->runtime->shootSpeed<256) continue;
             if (!refreshNeeded(turret->shootingCooldownRemaining(),turret->runtime->shootRhythm,s.rules.delay,s.rules.refresh)) { ++s.metrics.skipped; continue; }
             selected.push_back(turret);
         }
         if (selected.empty()) continue;
-        std::sort(selected.begin(),selected.end(),[](const auto* a,const auto* b){return IdentityLess{}(Game::refOf(a),Game::refOf(b));});
+        std::sort(selected.begin(),selected.end(),[](const auto* a,const auto* b){return IdentityLess{}(refOf(a),refOf(b));});
         auto job=std::make_unique<State::Job>();
         job->capacity=s.rules.capacity; job->margin=s.rules.margin;
         job->sources.reserve(selected.size());
         if (!generation) {
             generation=std::make_unique<State::Generation>();
             generation->deadline=Uint64(game.stepCounter)+s.rules.delay;
+            generation->jobs.reserve(teams-team);
         }
         for (const auto* turret:selected) {
-            auto& row=rows[turret->runtime->interactions];
-            if (!row) {
-                auto values=std::make_shared<std::vector<int>>(); values->reserve(turret->runtime->unitCount);
-                for (unsigned id=0;id<turret->runtime->unitCount;++id) values->push_back(turret->runtime->damage(id));
-                row=std::move(values);
-            }
-            job->sources.push_back(source(*turret,row)); ++s.metrics.sources;
+            job->sources.push_back(source(*turret,row(*turret))); ++s.metrics.sources;
         }
         generation->jobs.push_back(std::move(job));
     }
@@ -152,14 +172,16 @@ void Pipeline::admit(const Game& game,const SimulationSnapshot::Handle& captured
     generation->preparation=std::make_shared<State::IndexPreparation>();
     generation->preparation->observation=generation->observation.get();
     generation->preparation->previous=s.lastPreparation;
-    std::vector<ComputeExecutor::Group> groups;
-    for (auto& job:generation->jobs) {
-        job->generation=generation.get();
-        groups.push_back({1,{State::Job::run,job.get()}});
+    std::array<ComputeExecutor::Group,Team::MAX_COUNT> groupStorage;
+    const auto groups=std::span(groupStorage).first(generation->jobs.size());
+    for (std::size_t i=0;i<groups.size();++i) {
+        auto& job=*generation->jobs[i];
+        job.generation=generation.get();
+        groups[i]={1,{State::Job::run,&job}};
     }
     s.pending.push_back(std::move(generation));
     auto& scheduled=*s.pending.back();
-    try { scheduled.batch=s.executor.submit(groups,ComputeExecutor::advanceDue(scheduled.deadline)); }
+    try { scheduled.batch=s.executor.submit(groups,ComputeExecutor::advanceDue(scheduled.deadline), {ComputeProducer::Turret, game.stepCounter, scheduled.deadline}); }
     catch (...) { s.pending.pop_back(); throw; }
     s.lastPreparation=scheduled.preparation;
     ++s.metrics.admissions; s.metrics.teamJobs+=scheduled.jobs.size();
@@ -169,7 +191,7 @@ void Pipeline::publish(Game& game)
     auto& s=*state;
     while (!s.pending.empty() && s.pending.front()->deadline<=game.stepCounter) {
         auto& generation=*s.pending.front();
-        s.complete(generation);
+        s.complete(generation, {JoinReason::TickDeadline, game.stepCounter});
         if (generation.error) {
             auto error=generation.error; s.pending.pop_front();
             std::rethrow_exception(error); // Never silently drop a failed generation.
@@ -193,7 +215,7 @@ void Pipeline::drain() { for (auto& generation:state->pending) state->complete(*
 const std::vector<Entry>& Pipeline::entries(const Building& turret)
 {
     auto& s=*state;
-    const auto identity=Game::refOf(&turret);
+    const auto identity=refOf(&turret);
     const auto it=s.findPublished(identity);
     if (it!=s.published.end() && it->identity==identity) return it->entries;
     static const std::vector<Entry> empty;

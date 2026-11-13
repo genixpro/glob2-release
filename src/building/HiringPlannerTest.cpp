@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include <algorithm>
 #include "HiringPipeline.h"
-#include "EngineFixtures.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "GradientFixture.h"
 #include "HiringPlanner.h"
 #include <sstream>
@@ -8,6 +12,7 @@
 #include <thread>
 #include <set>
 #include <nlohmann/json.hpp>
+#include "sim/EntityRefOf.h"
 
 namespace
 {
@@ -59,8 +64,8 @@ TEST_SUITE("HiringPlanner")
         worker->hungriness=0;
         // Cold building routes now publish at a completed-world boundary.
         // Await the seed without completing its retained lazy frontier.
-        glob2test::awaitBuildingGradient(game,building,worker->swimClass(),BuildingRoute::Footprint);
-        const auto slot=building->routeSlot(worker->swimClass(),BuildingRoute::Footprint);
+        glob2test::awaitBuildingGradient(game,building,accessClass(worker->movementAccess()),BuildingRoute::Footprint);
+        const auto slot=building->routeSlot(accessClass(worker->movementAccess()),BuildingRoute::Footprint);
         auto* search=building->globalGradientSearch[slot].get();
         REQUIRE(search);
         REQUIRE_FALSE(search->complete());
@@ -84,7 +89,7 @@ TEST_SUITE("HiringPlanner")
         CHECK(map.checkSum(true)==before); // Derived worker progress is not world state.
         const int preparedDepth=search->settledCost();
         int distance=-1;
-        REQUIRE(map.buildingAvailable(building,worker->swimClass(),worker->posX,worker->posY,&distance,BuildingRoute::Footprint));
+        REQUIRE(map.routing().buildingAvailable(building,worker->movementAccess(),worker->posX,worker->posY,&distance,BuildingRoute::Footprint));
         CHECK(search->settledCost()==preparedDepth);
         CHECK(search->requiredCost()>initialDemand);
     }
@@ -160,21 +165,21 @@ TEST_SUITE("HiringPlanner")
 		u->medical = Unit::MED_FREE;
 		u->hungriness = 0;
 		REQUIRE(w.game.map.incResourceByIndex(24, 12, WHEAT, 0));
-		glob2test::awaitGradient(w.game,[&] { return w.game.map.getMaterialGradientSlot(0, WHEAT, u->swimClass()); });
+		glob2test::awaitGradient(w.game,[&] { return w.game.map.routing().getMaterialGradientSlot(0, WHEAT, u->movementAccess()); });
 		const auto snapshot = w.game.captureReadBoundary();
 		const auto input = HiringPipeline::bindRoutes(w.game, snapshot);
 		REQUIRE(input.world.resourceFields == snapshot.resourceFields);
 		HiringPlanner::Planner planner;
 		const auto expected = planner.rank(input, 0);
 		CHECK(expected.metrics.resourcePlaneReads > 0);
-		const auto key = MapState::planeKey(0, WHEAT, u->swimClass(), false);
-		const auto plane = input.world.resourceFields->find(key)->values;
-		const auto frozen = *plane;
+		const auto key = MapState::planeKey(0, WHEAT, accessClass(u->movementAccess()), false);
+		const auto* plane = input.world.resourceFields->find(key);
+		const std::vector<Uint16> frozen(plane->span().begin(), plane->span().end());
 		// Normal field publication can replace a generation without changing
 		// a job's immutable lease or requiring a hiring-specific copy.
 		w.game.map.addForbidden(24, 12, 0);
-		w.game.map.updateMaterialGradient(0, WHEAT, u->swimClass());
-		CHECK(*plane == frozen);
+		w.game.map.routing().updateMaterialGradient(0, WHEAT, u->movementAccess());
+		CHECK(std::ranges::equal(plane->span(), frozen));
 		checkPlannerOutput(planner.rank(input, 0), expected);
 	}
 	TEST_CASE("shared resource planes retain ordered unreachable-neighbor admission estimates")
@@ -194,7 +199,7 @@ TEST_SUITE("HiringPlanner")
 			for (int x = 22; x <= 26; ++x)
 				if (x == 22 || x == 26 || y == 22 || y == 26)
 					w.game.map.addForbidden(x, y, 0);
-		glob2test::awaitGradient(w.game,[&] { return w.game.map.getMaterialGradientSlot(0, WHEAT, unit->swimClass()); });
+		glob2test::awaitGradient(w.game,[&] { return w.game.map.routing().getMaterialGradientSlot(0, WHEAT, unit->movementAccess()); });
 		const auto input = HiringPipeline::bindRoutes(w.game, w.game.captureReadBoundary());
 		const auto actual = HiringPlanner::Planner{}.rank(input, 0);
 		CHECK(actual.metrics.resourcePlaneReads > 0);
@@ -230,7 +235,7 @@ TEST_SUITE("HiringPlanner")
 			CHECK(route.field->values == nullptr);
 		}
 		// A normal simulation query establishes the shared generation.
-		glob2test::awaitBuildingGradient(w.game,b, u->swimClass());
+		glob2test::awaitBuildingGradient(w.game,b, accessClass(u->movementAccess()));
 		CHECK_FALSE(HiringPipeline::bindRoutes(w.game, w.game.captureReadBoundary()).routes->empty());
 	}
 	TEST_CASE("cold route observation suggests candidates while live admission remains Pending")
@@ -246,7 +251,7 @@ TEST_SUITE("HiringPlanner")
 		u->activity = Unit::ACT_RANDOM;
 		u->hungriness = 0;
 		u->carriedMaterial = WHEAT;
-		const auto slot = b->routeSlot(u->swimClass(), BuildingRoute::Footprint);
+		const auto slot = b->routeSlot(accessClass(u->movementAccess()), BuildingRoute::Footprint);
 		CHECK(b->globalGradient[slot] == nullptr);
 		const auto input=HiringPipeline::bindRoutes(w.game,w.game.captureReadBoundary());
 		REQUIRE_FALSE(input.routes->empty());
@@ -258,19 +263,19 @@ TEST_SUITE("HiringPlanner")
 		}
 		const auto output=HiringPlanner::Planner{}.rank(input,0);
 		bool suggested=false;
-		for (const auto& building:output.buildings) if (building.building==Game::refOf(b))
+		for (const auto& building:output.buildings) if (building.building==refOf(b))
 			for (const auto& job:building.jobs)
 				if (job.key==Hiring::Key{Hiring::Job::Delivery,WHEAT})
-					for (const auto& candidate:job.candidates) suggested|=candidate.unit==Game::refOf(u);
+					for (const auto& candidate:job.candidates) suggested|=candidate.unit==refOf(u);
 		CHECK(suggested);
 		CHECK(b->globalGradient[slot] == nullptr);
 		int distance=-1;
-		CHECK(w.game.map.queryBuildingDistance(b,u->swimClass(),u->posX,u->posY,&distance,BuildingRoute::Footprint)==RouteResult::Pending);
+		CHECK(w.game.map.routing().queryBuildingDistance(b,u->movementAccess(),u->posX,u->posY,&distance,BuildingRoute::Footprint)==RouteResult::Pending);
 		CHECK(distance==-1);
 		CHECK(b->unitsWorking.empty());
 		CHECK(b->globalGradient[slot] == nullptr);
-		glob2test::awaitBuildingGradient(w.game,b,u->swimClass(),BuildingRoute::Footprint);
-		CHECK(w.game.map.queryBuildingDistance(b,u->swimClass(),u->posX,u->posY,&distance,BuildingRoute::Footprint)==RouteResult::Reachable);
+		glob2test::awaitBuildingGradient(w.game,b,accessClass(u->movementAccess()),BuildingRoute::Footprint);
+		CHECK(w.game.map.routing().queryBuildingDistance(b,u->movementAccess(),u->posX,u->posY,&distance,BuildingRoute::Footprint)==RouteResult::Reachable);
 	}
 	TEST_CASE("unrelated live route enrollment cannot change hiring inputs")
 	{
@@ -303,9 +308,9 @@ TEST_SUITE("HiringPlanner")
 		auto input = HiringPipeline::bindRoutes(w.game, w.game.captureReadBoundary());
 		auto local = input;
 		auto planes = std::make_shared<SimulationSnapshot::ResourceFields>();
-		auto values = std::make_shared<const std::vector<Uint16>>(
-			w.game.map.getW() * w.game.map.getH(), GRADIENT_UNREACHABLE);
-		planes->add({MapState::planeKey(0, WHEAT, 0, false), 1, values});
+		const std::size_t cells = std::size_t(w.game.map.getW()) * w.game.map.getH();
+		auto values = std::make_shared<Uint16[]>(cells, Uint16(GRADIENT_UNREACHABLE));
+		planes->add({MapState::planeKey(0, WHEAT, 0, false), 1, values, cells});
 		local.world.resourceFields = planes;
 		HiringPlanner::Planner a, bCache;
 		const auto normal = a.rank(input, 0), enrolled = bCache.rank(local, 0);
@@ -443,7 +448,7 @@ TEST_SUITE("HiringPlanner")
 											   : 0;
 				CHECK(supply.vacancies[m] == vacancies);
 				CHECK(supply.modes[m] ==
-					  (vacancies ? world.game.map.materialSupplyModesSlot(inn, m) : 0));
+					  (vacancies ? world.game.map.routing().materialSupplyModesSlot(inn, m) : 0));
 			}
 			REQUIRE(snapshot.entities->funding.size() == 1);
 			CHECK(snapshot.entities->funding.front().reservedMaterials[WHEAT] == 1);
@@ -499,7 +504,7 @@ TEST_SUITE("HiringPlanner")
 		warrior->experienceLevel = INT_MAX;
 		world.game.gameHeader.setGlassCannonLevel(2);
 		world.game.areaEffects.beginTick(world.game);
-		glob2test::awaitBuildingGradient(world.game,flag, warrior->swimClass(), BuildingRoute::Combat);
+		glob2test::awaitBuildingGradient(world.game,flag, accessClass(warrior->movementAccess()), BuildingRoute::Combat);
 		const auto expected =
 			std::int64_t(warrior->performance[ATTACK_SPEED]) * warrior->getRealAttackStrength();
 		const auto snapshot = world.game.captureReadBoundary();
@@ -541,7 +546,7 @@ TEST_SUITE("HiringPlanner")
 			HiringPlanner::prepare(HiringPipeline::bindRoutes(world.game, snapshot), 0);
 		REQUIRE(supplies.size() == 1);
 		CHECK(supplies.front().modes[CHERRY] ==
-			  world.game.map.materialSupplyModesSlot(inn, CHERRY));
+			  world.game.map.routing().materialSupplyModesSlot(inn, CHERRY));
 		CHECK((snapshot.teams->values[0].supplierPresence & 1) != 0);
 	}
 	TEST_CASE("snapshot planning skips busy workers without changing live units")
@@ -572,13 +577,13 @@ TEST_SUITE("HiringPlanner")
 		CHECK(world.checksum() == checksum);
 		bool found = false;
 		for (const auto &b : result.buildings)
-			if (b.building == Game::refOf(inn))
+			if (b.building == refOf(inn))
 				for (const auto &job : b.jobs)
 					if (job.key == Hiring::Key{Hiring::Job::Delivery, WHEAT})
 					{
 						found = true;
 						CHECK(job.candidates.size() == 1);
-						CHECK(job.candidates.front().unit == Game::refOf(free));
+						CHECK(job.candidates.front().unit == refOf(free));
 					}
 		CHECK(found);
 		const auto repeated = cache.rank(inputs, 0, 8);
@@ -597,7 +602,7 @@ TEST_SUITE("HiringPlanner")
 		REQUIRE(inn);
 		REQUIRE(worker);
 		worker->carriedMaterial = WHEAT;
-		glob2test::awaitBuildingGradient(world.game,inn, worker->swimClass());
+		glob2test::awaitBuildingGradient(world.game,inn, accessClass(worker->movementAccess()));
 		HiringPlanner::Planner cache;
 		const auto plan = [&]
 		{
@@ -676,7 +681,7 @@ TEST_SUITE("HiringPlanner")
 			for (int swim = 0; swim < SWIM_CLASS_COUNT; ++swim)
 				glob2test::awaitBuildingGradient(world.game,building, swim);
 		for (int swim = 0; swim < SWIM_CLASS_COUNT; ++swim)
-			glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(0, WHEAT, swim); });
+			glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(0, WHEAT, movementAccessFromLegacy(swim)); });
 		auto snapshot = world.game.captureReadBoundary();
 		auto inputs = HiringPipeline::bindRoutes(world.game, snapshot);
 		const auto checksum = world.checksum();
@@ -719,7 +724,7 @@ TEST_SUITE("HiringPlanner")
 		REQUIRE(inn);
 		int distance = 0;
 		glob2test::awaitBuildingGradient(world.game,inn,0);
-		REQUIRE(world.game.map.buildingAvailable(inn, 0, 12, 12, &distance));
+		REQUIRE(world.game.map.routing().buildingAvailable(inn, MovementAccess::Land, 12, 12, &distance));
 		auto lease = inn->leaseGradient(inn->routeSlot(0, BuildingRoute::Automatic));
 		REQUIRE(lease);
 		REQUIRE(lease->search);
@@ -736,10 +741,10 @@ TEST_SUITE("HiringPlanner")
 					lease->distance(24 + i % 4, 24);
 			});
 		for (int i = 0; i < 1000; ++i)
-			CHECK(world.game.map.buildingAvailable(inn, 0, 12 + i % 4, 12, &distance));
+			CHECK(world.game.map.routing().buildingAvailable(inn, MovementAccess::Land, 12 + i % 4, 12, &distance));
 		inn->resetPathfindGradients();
 		glob2test::awaitBuildingGradient(world.game,inn,0);
-		REQUIRE(world.game.map.buildingAvailable(inn, 0, 20, 20, &distance));
+		REQUIRE(world.game.map.routing().buildingAvailable(inn, MovementAccess::Land, 20, 20, &distance));
 		worker.join();
 		CHECK(distance == oldDistance);
 		CHECK(lease->values != inn->globalGradient[0]);
@@ -802,9 +807,9 @@ TEST_SUITE("HiringPlanner")
 		REQUIRE(worker);
 		inn->desiredMaxUnitWorking = 1;
 		world.game.map.incResourceByIndex(16, 16, WHEAT, 0);
-		const int swim = worker->swimClass();
+		const int swim = accessClass(worker->movementAccess());
 		glob2test::awaitBuildingGradient(world.game,inn, swim);
-        glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(0, WHEAT, swim, false, inn); });
+        glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(0, WHEAT, movementAccessFromLegacy(swim), false, inn); });
 		const auto checksum = world.checksum();
 		auto snapshot = world.game.captureReadBoundary();
 		auto inputs = HiringPipeline::bindRoutes(world.game, snapshot);
@@ -844,21 +849,21 @@ TEST_SUITE("HiringPlanner")
 		auto inputs = HiringPipeline::bindRoutes(world.game, snapshot);
 		const auto supplies = HiringPlanner::prepare(inputs, 0);
 		const auto supply = std::find_if(supplies.begin(), supplies.end(), [&](const auto &s)
-										 { return s.building == Game::refOf(inn); });
+										 { return s.building == refOf(inn); });
 		REQUIRE(supply != supplies.end());
-		CHECK(supply->modes[CHERRY] == world.game.map.materialSupplyModesSlot(inn, CHERRY));
+		CHECK(supply->modes[CHERRY] == world.game.map.routing().materialSupplyModesSlot(inn, CHERRY));
 		CHECK(supply->modes[CHERRY] != 0);
 		HiringPlanner::Planner cache;
 		const auto output = cache.rank(inputs, 0, 8);
 		bool found = false;
 		for (const auto &building : output.buildings)
-			if (building.building == Game::refOf(inn))
+			if (building.building == refOf(inn))
 				for (const auto &list : building.jobs)
 					if (list.key == Hiring::Key{Hiring::Job::Fetch, CHERRY})
 					{
 						found = true;
 						REQUIRE(list.candidates.size() == 1);
-						CHECK(list.candidates[0].unit == Game::refOf(worker));
+						CHECK(list.candidates[0].unit == refOf(worker));
 					}
 		CHECK(found);
 		// Missing supplier planes use an optimistic estimate and remain recruitable.
@@ -867,7 +872,7 @@ TEST_SUITE("HiringPlanner")
 		const auto repeated = cache.rank(inputs, 0, 8);
 		CHECK(repeated.metrics.resourcePlaneReads + repeated.metrics.resourceEstimateFallbacks > 0);
 		checkPlannerOutput(repeated, output);
-		glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(0, CHERRY, worker->swimClass(), false, inn); });
+		glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(0, CHERRY, worker->movementAccess(), false, inn); });
 		world.game.snapshotStore()
 			.invalidateBoundary(); // Announce this mid-boundary fixture query.
 		auto published = world.game.captureReadBoundary();

@@ -140,18 +140,20 @@ executes hostile orders unchecked to show the executor guards.
 
 `src/online/MatchSetupTest.cpp` runs every MatchSetup and SimVersion contract fixture: valid
 ones must parse and round-trip, invalid ones must fail at the stage the manifest names.
-It reads `platform/packages/protocol/fixtures` when that directory exists; until the
+It reads `services/online/packages/protocol/fixtures` when that directory exists; until the
 platform workspace is on the branch it reads the copy in `test/fixtures/protocol`, and
 once both exist it requires the copy to equal the source.
 
 `test/fixtures/multiplayer/FourSquares1.g2mr` is a short recorded match (two humans,
-Nicowar and Warrush) with its expected verification trace. The browser/native
+Nicowar and Warrush) carrying the checksums its clients reported. The browser/native
 simulation equivalence job verifies it on Linux, Windows, macOS and in three browsers and
-requires identical traces (see
+requires a `verified` verdict and identical traces. It compares only the platforms whose producing job succeeded:
+a platform missing because its build or test job failed is left out with a notice naming
+that job, which reports the failure itself (see
 [headless replays](../development/headless-replays.md#verifying-a-match-record)). A
 simulation change makes it stale and must bump `SIM_REVISION`; `python3
-test/run_tests.py --update-fixtures --filter 'TurnEngineHarness/the committed*'`
-records a fresh match and trace.
+test/run_tests.py --update-fixtures --filter "TurnEngineHarness/the committed*"`
+records a fresh match.
 
 Building catalogs are part of match rules identity: a setup carries the canonical
 embedded catalog and its hash, and clients and verifiers compare it with the map

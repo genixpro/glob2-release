@@ -35,11 +35,13 @@ and definition ordering. They use installed artwork.
 when designing a new fixture, then review and retain the resulting JSON. Tests
 load the committed definitions rather than regenerating from changing stock data.
 The engine harness checks every continuation tick, inventories and reservations,
-plus exact production resource conservation including cancellation. Retained
-traces cover the new custom rules; they are distinct from stock parity evidence.
+plus exact production resource conservation including cancellation, and every
+material's colony ledger at every tick. Their sampled continuation states are
+recorded as `building-catalog/composition/seed-*.trace` sim-diff traces
+(`[sim-trace]`), not committed; they are distinct from stock parity evidence.
 
 `terrain136.game.gz` was produced by unchanged master `71d7eee1b` with
-`game run --map-file maps/SmallForTwo.map.gz --game-seed 716 --player numbi
+`game run --map-file content/maps/SmallForTwo.map.gz --game-seed 716 --player numbi
 --player castor --ticks 257 --save final --replay false`. It exercises the format
 136 embedded terrain catalog alongside frozen building definitions and active AI
 state. The regression imports it, resaves to the current format, and compares

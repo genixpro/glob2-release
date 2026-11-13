@@ -4,7 +4,7 @@
 #pragma once
 
 // MatchSetup: the engine-independent JSON description of a match
-// (platform/packages/protocol, src/matchSetup.ts, is the source of truth for its
+// (services/online/packages/protocol, src/matchSetup.ts, is the source of truth for its
 // shape). This file turns it into the GameHeader every client and the verifier run,
 // so all of them build the same game from the same JSON:
 //
@@ -72,7 +72,7 @@ namespace Online
 		bool allyTeamsFixed = true;
 		bool resourceGrowthDisabled = false;
 		int resourceScarcityLevel = 0; ///< 0..3
-		int aiOrderDelay = 8; ///< Engine-wide decision deadline offset, 0..8 ticks
+		int aiOrderDelay = 14; ///< Engine-wide decision deadline offset, 0..16 ticks; matches GameHeader::DEFAULT_AI_ORDER_DELAY
 		int buildingGradientDelay = 8; ///< Building walking-field refresh publication delay, 1..8 ticks
 		bool instantConstruction = false;
 		int stockpileStartLevel = 0; ///< 0..3

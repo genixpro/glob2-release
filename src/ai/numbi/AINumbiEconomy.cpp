@@ -7,7 +7,6 @@
 #include "AINumbi.h"
 #include "NumbiQueries.h"
 #include "ai/engine/AIDecision.h"
-#include "Game.h"
 #include "Order.h"
 #include "Player.h"
 #include "Unit.h"
@@ -48,13 +47,13 @@ int AINumbi::estimateFood(const AIEngine::BuildingView *building)
 	if (resource < 0) return std::numeric_limits<int>::max();
 	int rx, ry, dist;
 	bool found;
-	if (queries->resourceAvailableUpdate(teamNumber, resource, 0, building->posX-1, building->posY-1, &rx, &ry, &dist))
+	if (queries->resourceAvailableUpdate(teamNumber, resource, MovementAccess::Land, building->posX-1, building->posY-1, &rx, &ry, &dist))
 		found=true;
-	else if (queries->resourceAvailableUpdate(teamNumber, resource, 0, building->posX+queries->kind(*building).width+1, building->posY-1, &rx, &ry, &dist))
+	else if (queries->resourceAvailableUpdate(teamNumber, resource, MovementAccess::Land, building->posX+queries->kind(*building).width+1, building->posY-1, &rx, &ry, &dist))
 		found=true;
-	else if (queries->resourceAvailableUpdate(teamNumber, resource, 0, building->posX+queries->kind(*building).width+1, building->posY+queries->kind(*building).height+1, &rx, &ry, &dist))
+	else if (queries->resourceAvailableUpdate(teamNumber, resource, MovementAccess::Land, building->posX+queries->kind(*building).width+1, building->posY+queries->kind(*building).height+1, &rx, &ry, &dist))
 		found=true;
-	else if (queries->resourceAvailableUpdate(teamNumber, resource, 0, building->posX-1, building->posY+queries->kind(*building).height+1, &rx, &ry, &dist))
+	else if (queries->resourceAvailableUpdate(teamNumber, resource, MovementAccess::Land, building->posX-1, building->posY+queries->kind(*building).height+1, &rx, &ry, &dist))
 		found=true;
 	else
 		found=false;

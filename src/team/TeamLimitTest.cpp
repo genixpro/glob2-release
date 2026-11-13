@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "ProfileNeeds.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
 #include "AI.h"
 #include "GameGUIDialog.h"
 #include "Utilities.h"
@@ -22,6 +27,7 @@
 #include <BinaryStream.h>
 #include <StreamBackend.h>
 #include <TextStream.h>
+#include "SGSL.h"
 
 TEST_SUITE("TeamLimit")
 {
@@ -387,7 +393,7 @@ TEST_CASE("script generation slot counts reject missing capacity and truncated p
     CHECK_THROWS(loads(saved.substr(0, out.slotsOffset + 7)));
 }
 
-TEST_CASE("dense designed maps accept thirteen through sixteen only on the largest square")
+TEST_CASE("dense designed maps accept thirteen through sixteen only on the largest square" * glob2test::needs({"generators"}))
 {
     for (const char *id : {"gauntlet", "faulted-city", "portage-lakes", "hungry-marches", "encircled-kingdom"})
     {

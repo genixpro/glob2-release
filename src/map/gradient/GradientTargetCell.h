@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "GradientFieldIdentity.h"
-#include "UnitConsts.h"
+#include "MovementClass.h"
 #include "TeamCapacity.h"
 #include <array>
 #include <cstdint>
@@ -30,7 +30,7 @@ struct GradientTargetCell
         case GradientFieldFamily::Materials:
         case GradientFieldFamily::Markets:
             if(denied || !mobile) return false;
-            if((materials&(std::uint32_t(1)<<key.material)) && (visibleTeams&mask)) return true;
+            if(!(forbidden&mask) && (materials&(std::uint32_t(1)<<key.material)) && (visibleTeams&mask)) return true;
             if(key.family==GradientFieldFamily::Materials) return false;
             return (overlaySupplies[key.team]&(std::uint32_t(1)<<key.material))
                 || (!blocked && buildingTeam==key.team

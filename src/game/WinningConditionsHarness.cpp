@@ -18,13 +18,14 @@
 // destructors for std::list/std::map etc. on Team and Game are skipped, and
 // the program leaks the storage at exit. test/unit/stubs/MapHeaderStubs.cpp
 // supplies the few non-inline methods WC.cpp invokes (MapHeader getters and
-// the MapScriptSGSL hooks).
+// the MapScriptSGSL hooks). Game holds its script state behind owning pointers
+// with same-named references, so the harness points those two references at
+// zeroed storage of their own, as the embedded members were before.
 //
-// The output is a deterministic stream of one-line records. To verify the
-// recent cleanup of WinningConditions.cpp is behaviour-preserving, run the
-// harness on the cleaned-up source, save stdout, then `git stash` the WC
-// changes, rebuild, run, and `diff` the two outputs. Identical output =
-// equivalent behaviour.
+// Every case states the won and lost team masks the rules imply and checks the
+// predicates against them. The same cases are also written as a one-line record
+// stream for tools/sim_fingerprint.py, so a behaviour change still shows up in
+// sim-diff without a committed fixture.
 
 #include "Glob2Test.h"
 #include "unit/stubs/MapHeaderStubs.h"
@@ -34,17 +35,19 @@
 #include "Player.h"
 #include "MapHeader.h"
 #include "SGSL.h"
+#include "MapScript.h"
 
 #include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <memory>
 #include <string>
 
 namespace {
 
-// Every record of the golden stream; compared with test/fixtures/winning-conditions/expected.txt.
+// Every record of the stream recorded for sim-diff (winning-conditions/expected.txt).
 std::string out;
 
 void emit(const char* text)
@@ -65,13 +68,32 @@ constexpr int kMaxTeams = 4;
 alignas(Game) unsigned char gameStorage[sizeof(Game)];
 alignas(Team) unsigned char teamStorage[kMaxTeams][sizeof(Team)];
 
+alignas(MapScriptSGSL) unsigned char sgslStorage[sizeof(MapScriptSGSL)];
+alignas(MapScript) unsigned char mapScriptStorage[sizeof(MapScript)];
+
 Game* g() { return reinterpret_cast<Game*>(gameStorage); }
 Team* T(int i) { return reinterpret_cast<Team*>(teamStorage[i]); }
+
+// Game declares each script owner immediately followed by its reference, which
+// occupies the pointer-sized slot after the owner. clearAll() checks the result.
+template <typename Target>
+void bindReference(std::unique_ptr<Target>& owner, unsigned char* storage)
+{
+	static_assert(sizeof(std::unique_ptr<Target>) == sizeof(Target*));
+	Target* target = reinterpret_cast<Target*>(storage);
+	std::memcpy(reinterpret_cast<unsigned char*>(&owner) + sizeof owner, &target, sizeof target);
+}
 
 void clearAll()
 {
 	std::memset(gameStorage, 0, sizeof(gameStorage));
 	std::memset(teamStorage, 0, sizeof(teamStorage));
+	std::memset(sgslStorage, 0, sizeof(sgslStorage));
+	std::memset(mapScriptStorage, 0, sizeof(mapScriptStorage));
+	bindReference(g()->sgslScriptOwner, sgslStorage);
+	bindReference(g()->mapscriptOwner, mapScriptStorage);
+	REQUIRE(static_cast<void*>(&g()->sgslScript) == sgslStorage);
+	REQUIRE(static_cast<void*>(&g()->mapscript) == mapScriptStorage);
 	std::memset(glob2test::sgsl::teamWon, 0, sizeof(glob2test::sgsl::teamWon));
 	std::memset(glob2test::sgsl::teamLost, 0, sizeof(glob2test::sgsl::teamLost));
 }
@@ -104,14 +126,27 @@ void mutualAlliances(int n, Uint32 mask)
 		if (mask & (1u << i)) T(i)->allies = m;
 }
 
-void emitWonLost(const char* tag, WinningCondition& cond, int n)
+// Records each team's verdict and checks it against the expected won and lost
+// team masks (bit t = team t).
+void emitWonLost(const char* tag, WinningCondition& cond, int n, Uint32 expectWon, Uint32 expectLost)
 {
+	const std::string scenario = out.substr(out.rfind('\n', out.size() - 2) + 1);
 	for (int t = 0; t < n; ++t)
 	{
 		const bool w = cond.hasTeamWon(t, g());
 		const bool l = cond.hasTeamLost(t, g());
 		emit("  %s team=%d won=%d lost=%d\n", tag, t, w ? 1 : 0, l ? 1 : 0);
+		INFO(scenario << tag << " team " << t);
+		CHECK(w == (((expectWon >> t) & 1u) != 0));
+		CHECK(l == (((expectLost >> t) & 1u) != 0));
 	}
+}
+
+// Teams i and j are mutually allied under mutualAlliances(mask) exactly when
+// both are in the mask; a team outside it is not even allied with itself.
+Uint32 mutualPartners(Uint32 allyMask, int team)
+{
+	return ((allyMask >> team) & 1u) ? allyMask : 0u;
 }
 
 // ---------------- Death ----------------
@@ -126,7 +161,8 @@ void testDeath()
 			T(i)->isAlive = (aliveMask & (1u << i)) != 0;
 		emit("Death/aliveMask=0x%x\n", aliveMask);
 		WinningConditionDeath wc;
-		emitWonLost("Death", wc, N);
+		// Death never awards a win; every dead colony has lost.
+		emitWonLost("Death", wc, N, 0, ~aliveMask & 0x7u);
 	}
 }
 
@@ -148,7 +184,11 @@ void testAllies()
 			if (winner >= 0) T(winner)->hasWon = true;
 			emit("Allies/allyMask=0x%x winner=%d\n", ally, winner);
 			WinningConditionAllies wc;
-			emitWonLost("Allies", wc, N);
+			// A team wins through a mutual ally (itself included) that has won.
+			Uint32 won = 0;
+			for (int t = 0; t < N; ++t)
+				if (winner >= 0 && ((mutualPartners(ally, t) >> winner) & 1u)) won |= 1u << t;
+			emitWonLost("Allies", wc, N, won, 0);
 		}
 	}
 
@@ -163,7 +203,8 @@ void testAllies()
 		T(1)->hasWon = true;
 		emit("Allies/oneWay 0->1, 1 wins\n");
 		WinningConditionAllies wc;
-		emitWonLost("Allies", wc, N);
+		// Only team 1 itself (self-allied here) shares its win.
+		emitWonLost("Allies", wc, N, 0x2, 0);
 	}
 }
 
@@ -177,17 +218,20 @@ void testPrestige()
 		int totalPrestige;
 		int prestigeToReach;
 		std::array<int, N> teamPrestige;
+		Uint32 won, lost;
 	};
 	static const Tile tiles[] = {
-		{"all-zero-belowGate",   0,   100, {0, 0, 0}},
-		{"all-zero-atGate",      100, 100, {0, 0, 0}},
-		{"belowGate-noTie",      50,  100, {10, 30, 10}},
-		{"atGate-uniqueMax",     100, 100, {10, 30, 10}},
-		{"atGate-tieAtTop",      100, 100, {30, 30, 10}},
-		{"atGate-allTied",       100, 100, {25, 25, 25}},
-		{"aboveGate-uniqueMax",  200, 100, {50, 100, 25}},
-		{"aboveGate-tieAtTop",   200, 100, {100, 100, 25}},
-		{"negativePrestige",     100, 100, {-5, 0, -10}},
+		// Below the gate nobody is decided; at or above it every surviving
+		// team on the top score wins and the rest lose.
+		{"all-zero-belowGate",   0,   100, {0, 0, 0},      0x0, 0x0},
+		{"all-zero-atGate",      100, 100, {0, 0, 0},      0x7, 0x0},
+		{"belowGate-noTie",      50,  100, {10, 30, 10},   0x0, 0x0},
+		{"atGate-uniqueMax",     100, 100, {10, 30, 10},   0x2, 0x5},
+		{"atGate-tieAtTop",      100, 100, {30, 30, 10},   0x3, 0x4},
+		{"atGate-allTied",       100, 100, {25, 25, 25},   0x7, 0x0},
+		{"aboveGate-uniqueMax",  200, 100, {50, 100, 25},  0x2, 0x5},
+		{"aboveGate-tieAtTop",   200, 100, {100, 100, 25}, 0x3, 0x4},
+		{"negativePrestige",     100, 100, {-5, 0, -10},   0x2, 0x5},
 	};
 	for (const auto& c : tiles)
 	{
@@ -200,7 +244,7 @@ void testPrestige()
 		            c.tag, c.totalPrestige, c.prestigeToReach,
 		            c.teamPrestige[0], c.teamPrestige[1], c.teamPrestige[2]);
 		WinningConditionPrestige wc;
-		emitWonLost("Prestige", wc, N);
+		emitWonLost("Prestige", wc, N, c.won, c.lost);
 	}
 }
 
@@ -214,17 +258,20 @@ void testSuddenDeath()
 		Uint32 stepCounter;
 		Uint32 endStepTick;
 		std::array<int, N> teamPrestige;
+		Uint32 won, lost;
 	};
 	static const Tile tiles[] = {
-		{"beforeTick-noTie",    50,  100, {10, 30, 10}},
-		{"beforeTick-tieAtTop", 50,  100, {30, 30, 10}},
-		{"atTick-uniqueMax",    100, 100, {10, 30, 10}},
-		{"atTick-tieAtTop",     100, 100, {30, 30, 10}},
-		{"afterTick-uniqueMax", 150, 100, {10, 30, 10}},
-		{"negativePrestige",    100, 100, {-5, 0, -10}},
+		// Before the buzzer nobody is decided; from it on every surviving team
+		// on the top score wins and the rest lose.
+		{"beforeTick-noTie",    50,  100, {10, 30, 10},  0x0, 0x0},
+		{"beforeTick-tieAtTop", 50,  100, {30, 30, 10},  0x0, 0x0},
+		{"atTick-uniqueMax",    100, 100, {10, 30, 10},  0x2, 0x5},
+		{"atTick-tieAtTop",     100, 100, {30, 30, 10},  0x3, 0x4},
+		{"afterTick-uniqueMax", 150, 100, {10, 30, 10},  0x2, 0x5},
+		{"negativePrestige",    100, 100, {-5, 0, -10},  0x2, 0x5},
 		// All-negative standings must find team 1's -2 as the true maximum,
 		// rather than comparing everybody against a floor of zero.
-		{"allNegativePrestige", 100, 100, {-5, -2, -10}},
+		{"allNegativePrestige", 100, 100, {-5, -2, -10}, 0x2, 0x5},
 	};
 	for (const auto& c : tiles)
 	{
@@ -237,7 +284,7 @@ void testSuddenDeath()
 		            c.teamPrestige[0], c.teamPrestige[1], c.teamPrestige[2]);
 		WinningConditionSuddenDeath wc;
 		wc.endStepTick = c.endStepTick;
-		emitWonLost("SuddenDeath", wc, N);
+		emitWonLost("SuddenDeath", wc, N, c.won, c.lost);
 	}
 }
 
@@ -258,7 +305,8 @@ void testScript()
 			}
 			emit("Script/wonMask=0x%x lostMask=0x%x\n", wMask, lMask);
 			WinningConditionScript wc;
-			emitWonLost("Script", wc, N);
+			// The legacy script decides both verdicts independently.
+			emitWonLost("Script", wc, N, wMask, lMask);
 		}
 	}
 }
@@ -278,7 +326,11 @@ void testOpponentsDefeated()
 				T(i)->hasLost = (lostMask & (1u << i)) != 0;
 			emit("OpponentsDefeated/allyMask=0x%x lostMask=0x%x\n", ally, lostMask);
 			WinningConditionOpponentsDefeated wc;
-			emitWonLost("OppDef", wc, N);
+			// A team wins once every team outside its mutual alliance has lost.
+			Uint32 won = 0;
+			for (int t = 0; t < N; ++t)
+				if ((~mutualPartners(ally, t) & 0x7u & ~lostMask) == 0) won |= 1u << t;
+			emitWonLost("OppDef", wc, N, won, 0);
 		}
 	}
 
@@ -294,7 +346,8 @@ void testOpponentsDefeated()
 		T(2)->hasLost = true;
 		emit("OpponentsDefeated/oneWay 0->1, 2 lost, 1 alive\n");
 		WinningConditionOpponentsDefeated wc;
-		emitWonLost("OppDef", wc, N);
+		// Teams 0 and 1 are opponents and both alive, so nobody has won.
+		emitWonLost("OppDef", wc, N, 0, 0);
 	}
 }
 
@@ -305,9 +358,12 @@ void testOpponentsDefeated()
 void testFactoryOrder()
 {
 	auto wcs = WinningCondition::getDefaultWinningConditions();
+	const WinningConditionType expected[] = {WCDeath, WCAllies, WCPrestige, WCScript, WCOpponentsDefeated};
+	REQUIRE(wcs.size() == std::size(expected));
 	int idx = 0;
 	for (const auto& wc : wcs)
 	{
+		CHECK(wc->getType() == expected[idx]);
 		emit("DefaultList/%d type=%d\n", idx++, static_cast<int>(wc->getType()));
 	}
 }
@@ -375,7 +431,7 @@ const BasePlayer::PlayerType kRealAI = BasePlayer::playerTypeFromImplementationI
 
 TEST_SUITE("WinningConditions")
 {
-TEST_CASE("every predicate matches the golden record stream [golden]")
+TEST_CASE("every predicate gives the verdict its rule implies [sim-trace]")
 {
 	out.clear();
 	out += "# WinningConditionsHarness golden output\n";
@@ -386,7 +442,7 @@ TEST_CASE("every predicate matches the golden record stream [golden]")
 	testSuddenDeath();
 	testScript();
 	testOpponentsDefeated();
-	glob2test::expectGolden("winning-conditions/expected.txt", out);
+	glob2test::recordSimTrace("winning-conditions/expected.txt", out);
 }
 
 TEST_CASE("prestige and timer adjudication exclude eliminated leaders")

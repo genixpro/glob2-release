@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
+#include "Continuation.h"
 #include "LegacyPopulationOutput.h"
 #include "GradientFixture.h"
 
@@ -19,15 +23,15 @@
 #include <climits>
 #include <cstddef>
 #include <functional>
+#include "Unit.h"
+#include "Building.h"
 
 namespace {
+// FNV-1a over the simulation components.
 Uint32 trace(Game& game)
 {
-    std::vector<Uint32> gameFields,buildings,units;
-    game.checkSum(&gameFields,&buildings,&units,true);
-    if (!gameFields.empty()) gameFields.erase(gameFields.begin()); // format of the saved map header
     Uint32 result=2166136261u;
-    for (const auto& values:{gameFields,buildings,units}) for (Uint32 value:values) result=(result^value)*16777619u;
+    for (Uint32 value:glob2test::simulationComponents(game)) result=(result^value)*16777619u;
     return result;
 }
 void deposit(Map& map,int x,int y,int type,int amount)
@@ -52,11 +56,11 @@ void prepareUnitBuildingGradient(Game& game,Building* building,int type,int team
     const auto* definition=game.teams[team]->race.getUnitType(type,0);
     const int access=definition->performance[FLY] ? AIR_MOVEMENT_CLASS
         : Map::swimClass(definition->performance[WALK],definition->performance[SWIM]);
-    for (unsigned tick=0; !game.map.lookupBuildingField(building,access,BuildingRoute::Footprint) && tick<4096; ++tick) {
-        game.map.requestBuildingField(building,access,BuildingRoute::Footprint);
+    for (unsigned tick=0; !game.map.routing().lookupBuildingField(building,movementAccessFromLegacy(access),BuildingRoute::Footprint) && tick<4096; ++tick) {
+        game.map.routing().requestBuildingField(building,movementAccessFromLegacy(access),BuildingRoute::Footprint);
         game.step(0);
     }
-    REQUIRE(game.map.lookupBuildingField(building,access,BuildingRoute::Footprint));
+    REQUIRE(game.map.routing().lookupBuildingField(building,movementAccessFromLegacy(access),BuildingRoute::Footprint));
 }
 
 // The steering fixtures combine existing guard/exploration policies with
@@ -85,14 +89,12 @@ void configureSteeringUnits(glob2test::HeadlessGame& world)
 // Compare the complete checksum vectors, serialized cached unit state, ordered
 // relationships and reservations. A digest alone would hide which continuation
 // contract failed, and catalog-derived values must not replace saved caches.
+// relationshipAudit holds everything beyond the simulation components, which
+// expectContinuation already compares at every tick.
 using ContinuationAudit = std::pair<std::vector<Uint32>,std::vector<std::string>>;
-ContinuationAudit continuationAudit(Game& game)
+ContinuationAudit relationshipAudit(Game& game)
 {
     ContinuationAudit result;
-    std::vector<Uint32> buildings,units;
-    game.checkSum(&result.first,&buildings,&units,true);
-    result.first.insert(result.first.end(),buildings.begin(),buildings.end());
-    result.first.insert(result.first.end(),units.begin(),units.end());
     const auto appendList=[&](const auto& list) {
         result.first.push_back(Uint32(list.size()));
         for(const auto* entry:list) result.first.push_back(entry->gid);
@@ -121,31 +123,32 @@ ContinuationAudit continuationAudit(Game& game)
     }
     return result;
 }
+ContinuationAudit continuationAudit(Game& game)
+{
+    auto result=relationshipAudit(game);
+    auto components=glob2test::simulationComponents(game);
+    result.first.insert(result.first.begin(),components.begin(),components.end());
+    return result;
+}
 void checkPhaseContinuation(Game& game,int ticks,const std::function<void()>& observe={})
 {
     if(observe) observe();
     glob2test::discardPrematureHiringSuggestions(game);
     const auto before=continuationAudit(game);
     const auto random=game.syncRandom;
-    auto* storage=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(storage);
-    game.save(&output,false,"custom unit phase continuation");
-    const std::string bytes(storage->getBuffer(),storage->getPosition());
-    GameGUI resumed;
-    GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));
-    input.seekFromStart(0); REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
-    REQUIRE(resumed.game.unitCatalog().digest()==game.unitCatalog().digest());
-    REQUIRE(continuationAudit(resumed.game)==before);
-    REQUIRE(resumed.game.syncRandom==random);
-    REQUIRE(resumed.game.unitCargo.entries()==game.unitCargo.entries());
-    for(int tick=0;tick<ticks;++tick) {
-        CAPTURE(tick);
-        game.step(0); resumed.game.step(0);
-        if(observe) observe();
-        REQUIRE(continuationAudit(resumed.game)==continuationAudit(game));
-        REQUIRE(resumed.game.syncRandom==game.syncRandom);
-        REQUIRE(resumed.game.unitCargo.entries()==game.unitCargo.entries());
-    }
+    const auto result=glob2test::expectContinuation(game,{.ticks=ticks,.name="custom unit phase continuation",
+        .afterLoad=[&](Game& original,Game& resumed) {
+            REQUIRE(resumed.unitCatalog().digest()==original.unitCatalog().digest());
+            REQUIRE(continuationAudit(resumed)==before);
+            REQUIRE(resumed.syncRandom==random);
+            REQUIRE(resumed.unitCargo.entries()==original.unitCargo.entries());
+        },
+        .each=[&](Game& original,Game& resumed,int tick) {
+            if(tick>=0 && observe) observe();
+            REQUIRE(relationshipAudit(resumed)==relationshipAudit(original));
+            REQUIRE(resumed.unitCargo.entries()==original.unitCargo.entries());
+        }});
+    REQUIRE(result.matched);
 }
 
 // Historical visibility depends on the live cached ability, not the type or
@@ -167,22 +170,16 @@ void checkVisionAction(Unit& unit,int radius)
 void checkVisionContinuation(Game& game,int ticks)
 {
     const auto before=continuationAudit(game);
-    auto* storage=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(storage);
-    game.save(&output,false,"legacy cached flight vision continuation");
-    const auto bytes=storage->takeContents();
-    GameGUI resumed;
-    GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));
-    input.seekFromStart(0); REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
-    REQUIRE(continuationAudit(resumed.game)==before);
-    REQUIRE(resumed.game.map.mapDiscovered==game.map.mapDiscovered);
-    for(int tick=0;tick<ticks;++tick) {
-        CAPTURE(tick);
-        game.step(0); resumed.game.step(0);
-        REQUIRE(continuationAudit(resumed.game)==continuationAudit(game));
-        REQUIRE(resumed.game.map.mapDiscovered==game.map.mapDiscovered);
-        REQUIRE(resumed.game.syncRandom==game.syncRandom);
-    }
+    const auto result=glob2test::expectContinuation(game,{.ticks=ticks,.name="legacy cached flight vision continuation",
+        .afterLoad=[&](Game& original,Game& resumed) {
+            REQUIRE(continuationAudit(resumed)==before);
+            REQUIRE(resumed.map.mapDiscovered==original.map.mapDiscovered);
+        },
+        .each=[](Game& original,Game& resumed,int) {
+            REQUIRE(relationshipAudit(resumed)==relationshipAudit(original));
+            REQUIRE(resumed.map.mapDiscovered==original.map.mapDiscovered);
+        }});
+    REQUIRE(result.matched);
 }
 }
 
@@ -234,7 +231,7 @@ TEST_SUITE("UnitCustomization")
             CHECK(unit->action==(mode==0?SWIM:mode==1?WALK:mode==2?FLY:STOP_WALK));
             CHECK((mode==2?map.getAirUnit(unit->posX,unit->posY):map.getGroundUnit(unit->posX,unit->posY))==unit->gid);
             if(mode==0) {
-                REQUIRE(unit->swimClass()==WATER_ONLY_CLASS);
+                REQUIRE(accessClass(unit->movementAccess())==WATER_ONLY_CLASS);
                 for(int tick=0;tick<64;++tick) {
                     CAPTURE(tick); game.step(0);
                     REQUIRE(map.terrainPropertiesAt(unit->posX,unit->posY).swimmable);
@@ -282,7 +279,7 @@ TEST_SUITE("UnitCustomization")
             CHECK(unit->action==(mode==0?SWIM:mode==1?WALK:mode==2?FLY:STOP_WALK));
             CHECK((mode==2?map.getAirUnit(unit->posX,unit->posY):map.getGroundUnit(unit->posX,unit->posY))==unit->gid);
             if(mode==0) {
-                REQUIRE(unit->swimClass()==WATER_ONLY_CLASS);
+                REQUIRE(accessClass(unit->movementAccess())==WATER_ONLY_CLASS);
                 for(int tick=0;tick<64;++tick) {
                     CAPTURE(tick); game.step(0);
                     REQUIRE(map.terrainPropertiesAt(unit->posX,unit->posY).swimmable);
@@ -553,10 +550,10 @@ TEST_SUITE("UnitCustomization")
             Unit* loaded=nullptr;
             if(text) {
                 GAGCore::MemoryStreamBackend backend(bytes.data(),bytes.size()); backend.seekFromStart(0);
-                GAGCore::TextInputStream input(&backend); loaded=new Unit(&input,restored.team,FILE_FORMAT_VERSION_UNIT_CATALOG);
+                GAGCore::TextInputStream input(&backend); loaded=new Unit(&input,restored.team,VERSION_MINOR);
             } else {
                 GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size())); input.seekFromStart(0);
-                loaded=new Unit(&input,restored.team,FILE_FORMAT_VERSION_UNIT_CATALOG);
+                loaded=new Unit(&input,restored.team,VERSION_MINOR);
                 REQUIRE(input.getPosition()==bytes.size());
             }
             restored.team->attachUnit(0, loaded);
@@ -839,7 +836,16 @@ TEST_SUITE("UnitCustomization")
         CHECK(world.game.unitCargo.empty());
     }
 
-    TEST_CASE("all locked capability ablations match fixed tick and RNG traces [golden][artifacts]")
+    // Eight units, one per combination of the melee, clear and flight capability
+    // bits (ablation-i: melee = bit 0, clear = bit 1, flight = bit 2), each
+    // carrying wood and stone. The run repeats tick for tick, every unit keeps
+    // exactly the capabilities its definition grants and the layer its movement
+    // implies, nobody loses or gains cargo with nowhere to deliver it, and a save
+    // after the run continues identically. The per-tick trace is recorded for
+    // sim-diff and for the cross-platform evidence, where every native and
+    // browser producer must match the first native trace row for row
+    // (test/run-browser-determinism.py, .github/scripts/ci_compare_evidence.py).
+    TEST_CASE("all locked capability ablations keep their capabilities and cargo and match fixed tick and RNG traces [sim-trace][artifacts]")
     {
         glob2test::HeadlessGlobals globals;
         std::vector<Uint32> expected;
@@ -848,11 +854,13 @@ TEST_SUITE("UnitCustomization")
             glob2test::HeadlessGame world({.teams=2,.clearImmobile=true,.header=true,.seed=4921});
             configure(world);
             world.game.gameHeader.setHungerDisabled(true);
+            std::vector<Unit*> units;
             for (int i=0;i<8;++i) {
                 auto* unit=world.addUnit(*world.game.unitCatalog().find("ablation-"+std::to_string(i)),5+3*(i%4),5+3*(i/4));
                 REQUIRE(unit);
                 unit->receiveCarriedMaterial(WOOD,{});
                 unit->receiveCarriedMaterial(STONE,{});
+                units.push_back(unit);
             }
             for (int tick=0;tick<96;++tick) {
                 world.game.step(0);
@@ -860,8 +868,30 @@ TEST_SUITE("UnitCustomization")
                 if (!repeat) { expected.push_back(checksum); golden << tick << " " << checksum << "\n"; }
                 else CHECK(checksum==expected[tick]);
             }
+            const auto& map=world.game.map;
+            for (int i=0;i<8;++i) {
+                CAPTURE(i);
+                Unit* unit=units[i];
+                REQUIRE(world.team->myUnits[Unit::GIDtoID(unit->gid)]==unit);
+                CHECK_FALSE(unit->isDead);
+                CHECK(unit->hasCapability(UnitRuntimeTraits::Melee)==bool(i&1));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::GuardIdle)==bool(i&1));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::Clear)==bool(i&2));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::ClearIdle)==bool(i&2));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::Fly)==bool(i&4));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::Walk)==!(i&4));
+                CHECK(unit->hasCapability(UnitRuntimeTraits::Transport));
+                // Flyers occupy the air layer and walkers the ground layer.
+                if (i&4) CHECK(map.getAirUnit(unit->posX,unit->posY)==unit->gid);
+                else CHECK(map.getGroundUnit(unit->posX,unit->posY)==unit->gid);
+                // Nothing on the map takes wood or stone, so both packets stay.
+                CHECK(unit->carriedPacketCount()==2);
+                CHECK(unit->hasCarriedMaterial(WOOD));
+                CHECK(unit->hasCarriedMaterial(STONE));
+            }
+            if (repeat) checkPhaseContinuation(world.game,32);
         }
-        glob2test::expectGolden("unit-catalog/ablation-checksums.txt",golden.str());
+        glob2test::recordSimTrace("unit-catalog/ablation-checksums.txt",golden.str());
         glob2test::writeFile(glob2test::artifactDir()/"unit-ablations.trace",golden.str());
     }
 
@@ -1124,11 +1154,11 @@ TEST_SUITE("UnitCustomization")
         for (int y=10;y<=12;++y) for (int x=4;x<=14;++x) world.game.map.paintCell(x,y,WATER);
         auto* swimmer=world.addUnit(*world.game.unitCatalog().find("swimmer"),5,11);
         REQUIRE(swimmer);
-        CHECK(swimmer->swimClass()==WATER_ONLY_CLASS);
+        CHECK(accessClass(swimmer->movementAccess())==WATER_ONLY_CLASS);
         int dx=0,dy=0;
-        CHECK(world.game.map.pathfindPointToPoint(5,11,13,11,&dx,&dy,swimmer->swimClass(),world.team->me,20));
+        CHECK(world.game.map.routing().pathfindPointToPoint(5,11,13,11,&dx,&dy,swimmer->movementAccess(),world.team->me,20));
         CHECK(world.game.map.terrainPropertiesAt(5+dx,11+dy).swimmable);
-        CHECK_FALSE(world.game.map.pathfindPointToPoint(5,11,13,9,&dx,&dy,swimmer->swimClass(),world.team->me,20));
+        CHECK_FALSE(world.game.map.routing().pathfindPointToPoint(5,11,13,9,&dx,&dy,swimmer->movementAccess(),world.team->me,20));
         swimmer->dx=1; swimmer->dy=-1;
         int quality=INT_MAX;
         swimmer->tryAcquireAttackTarget(8,-2,0,quality);
@@ -1172,8 +1202,8 @@ TEST_SUITE("UnitCustomization")
             unit->subscriptionSuccess(inn,false,false,UnitJobPurpose::Transport);
             inn->unitsWorking.push_back(unit);
             if(warm) {
-                glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(world.team->teamNumber,WHEAT,unit->swimClass(),false,inn); });
-                REQUIRE(world.game.map.materialAvailableSlot(world.team->teamNumber,WHEAT,unit->swimClass(),6,8,false,inn));
+                glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(world.team->teamNumber,WHEAT,unit->movementAccess(),false,inn); });
+                REQUIRE(world.game.map.routing().materialAvailableSlot(world.team->teamNumber,WHEAT,unit->movementAccess(),6,8,false,inn));
             }
             world.game.map.markImmobileUnit(6,8,world.team->teamNumber);
             REQUIRE(world.game.map.isImmobileUnit(6,8));
@@ -1195,7 +1225,7 @@ TEST_SUITE("UnitCustomization")
                     CHECK(unit->displacement==Unit::DIS_GOING_TO_RESOURCE);
                     CHECK_FALSE(unit->validTarget());
                     glob2test::awaitGradient(world.game,[&] {
-                        return world.game.map.getMaterialGradientSlot(world.team->teamNumber,WHEAT,unit->swimClass(),false,inn);
+                        return world.game.map.routing().getMaterialGradientSlot(world.team->teamNumber,WHEAT,unit->movementAccess(),false,inn);
                     });
                     REQUIRE(unit->continueCargoCollection());
                     CHECK(unit->entityRandom==entityRandom); CHECK(world.game.syncRandom==gameRandom);
@@ -1263,7 +1293,7 @@ TEST_SUITE("UnitCustomization")
             // The scenario tests mixed cargo, so make both destination queries
             // available before travel; a cold second field may deliver wood first.
             for (int material:{WOOD,WHEAT}) glob2test::awaitGradient(world.game,[&] {
-                return world.game.map.getMaterialGradientSlot(0,material,unit->movementClass(),false,inn);
+                return world.game.map.routing().getMaterialGradientSlot(0,material,unit->movementAccess(),false,inn);
             });
             unit->destinationPurpose=WOOD;
             unit->subscriptionSuccess(inn,false,false,UnitJobPurpose::Transport);
@@ -1304,20 +1334,13 @@ TEST_SUITE("UnitCustomization")
         REQUIRE(unit);
         unit->receiveCarriedMaterial(WOOD,{1,2}); unit->receiveCarriedMaterial(STONE,{});
         for (int tick=0;tick<17;++tick) world.game.step(0);
-        auto* storage=new GAGCore::MemoryStreamBackend;
-        GAGCore::BinaryOutputStream output(storage);
-        world.game.save(&output,false,"mixed unit continuation");
-        const std::string bytes(storage->getBuffer(),storage->getPosition());
-        std::vector<Uint32> expected;
-        for (int tick=0;tick<96;++tick) { world.game.step(0); expected.push_back(trace(world.game)); }
-        GameGUI resumed;
-        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size()));
-        input.seekFromStart(0);
-        REQUIRE(resumed.game.load(&input));
-        resumed.game.setWaitingOnMask(0);
-        auto* copy=resumed.game.teams[0]->myUnits[Unit::GIDtoID(unit->gid)];
-        REQUIRE(copy); CHECK(copy->carriedPacketCount()==2);
-        for (int tick=0;tick<96;++tick) { resumed.game.step(0); CHECK(trace(resumed.game)==expected[tick]); }
+        const auto gid=unit->gid;
+        const auto result=glob2test::expectContinuation(world.game,{.ticks=96,.name="mixed unit continuation",
+            .afterLoad=[gid](Game&,Game& resumed) {
+                auto* copy=resumed.teams[0]->myUnits[Unit::GIDtoID(gid)];
+                REQUIRE(copy); CHECK(copy->carriedPacketCount()==2);
+            }});
+        CHECK(result.matched);
     }
 
     TEST_CASE("passive healing and starvation damage are independent configured rates")
@@ -1701,24 +1724,20 @@ TEST_SUITE("UnitCustomization")
         std::vector<UnitJobPurpose> savedPurposes;
         for(Uint16 gid:gids) savedPurposes.push_back(world.team->myUnits[Unit::GIDtoID(gid)]->jobPurpose);
         REQUIRE(std::count(savedPurposes.begin(),savedPurposes.end(),UnitJobPurpose::Transport)>0);
-        auto* storage=new GAGCore::MemoryStreamBackend; GAGCore::BinaryOutputStream output(storage);
-        world.game.save(&output,false,"high unit identity continuation");
-        const std::string bytes(storage->getBuffer(),storage->getPosition());
-        std::vector<Uint32> expected;
-        for (int tick=0;tick<96;++tick) { world.game.step(0); expected.push_back(trace(world.game)); }
-        GameGUI resumed;
-        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size())); input.seekFromStart(0);
-        REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
-        CHECK(resumed.game.unitTypeCount()==1024);
-        for (std::size_t index=0;index<gids.size();++index) {
-            auto* unit=resumed.game.teams[0]->myUnits[Unit::GIDtoID(gids[index])]; REQUIRE(unit);
-            // Route publication can change which carrier is still assigned at
-            // this checkpoint. Loading must preserve each exact saved purpose.
-            CHECK(unit->typeNum>31); CHECK(unit->jobPurpose==savedPurposes[index]);
-            CHECK(unit->carriedPacketCount()==2); CHECK(unit->hasCarriedMaterial(STONE));
-            CHECK(resumed.game.teams[0]->stats.getLatestStat()->numberUnitPerType[unit->typeNum]==0);
-        }
-        for (int tick=0;tick<96;++tick) { resumed.game.step(0); CHECK(trace(resumed.game)==expected[tick]); }
+        const auto result=glob2test::expectContinuation(world.game,{.ticks=96,.name="high unit identity continuation",
+            .afterLoad=[&](Game&,Game& resumed) {
+                CHECK(resumed.unitTypeCount()==1024);
+                for (std::size_t index=0;index<gids.size();++index) {
+                    auto* unit=resumed.teams[0]->myUnits[Unit::GIDtoID(gids[index])]; REQUIRE(unit);
+                    // Route publication can change which carrier is still assigned at
+                    // this checkpoint. Loading must preserve each exact saved purpose.
+                    CHECK(unit->typeNum>31); CHECK(unit->jobPurpose==savedPurposes[index]);
+                    CHECK(unit->carriedPacketCount()==2); CHECK(unit->hasCarriedMaterial(STONE));
+                    CHECK(resumed.teams[0]->stats.getLatestStat()->numberUnitPerType[unit->typeNum]==0);
+                }
+            }});
+        CHECK(result.matched);
+        auto& resumed=*result.loaded;
         for (int id:{35,275,1023}) {
             CHECK(world.team->stats.getLatestStat()->numberUnitPerType[id]==1);
             CHECK(resumed.game.teams[0]->stats.getLatestStat()->numberUnitPerType[id]==1);
@@ -1767,15 +1786,15 @@ TEST_SUITE("UnitCustomization")
         CHECK(oldUnit->performance[WALK]==16); CHECK(changedUnit->performance[WALK]==24);
         CHECK(oldUnit->foodCapacity()==150000); CHECK(changedUnit->foodCapacity()==90000);
         for (int tick=0;tick<32;++tick) { first.game.step(0); second.game.step(0); }
-        auto* storage=new GAGCore::MemoryStreamBackend; GAGCore::BinaryOutputStream output(storage);
-        first.game.save(&output,false,"independent catalog");
-        const std::string bytes(storage->getBuffer(),storage->getPosition());
-        std::vector<Uint32> expected;
-        for (int tick=0;tick<96;++tick) { first.game.step(0); second.game.step(0); expected.push_back(trace(first.game)); }
-        GameGUI resumed;
-        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size())); input.seekFromStart(0);
-        REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
-        for (int tick=0;tick<96;++tick) { resumed.game.step(0); second.game.step(0); CHECK(trace(resumed.game)==expected[tick]); }
+        // The game with the altered catalog keeps stepping beside both continuations.
+        const auto result=glob2test::expectContinuation(first.game,{.ticks=96,
+            .step=[&](Game& game) {
+                game.step(0);
+                { auto random=second.game.bindRandom(); second.game.step(0); }
+                return std::vector<std::string>{};
+            },
+            .name="independent catalog"});
+        CHECK(result.matched);
         CHECK(oldUnit->performance[WALK]==16); CHECK(changedUnit->performance[WALK]==24);
     }
 
@@ -2008,20 +2027,13 @@ TEST_SUITE("UnitCustomization")
         inn->unitsWorking.push_back(unit); inn->updateCallLists();
         inn->desiredMaxUnitWorking=inn->maxUnitWorking=inn->maxUnitWorkingPreferred=1;
         for (int tick=0;tick<3;++tick) world.game.step(0);
-        auto* storage=new GAGCore::MemoryStreamBackend; GAGCore::BinaryOutputStream output(storage);
-        world.game.save(&output,false,"fractional delivery continuation");
-        const std::string bytes(storage->getBuffer(),storage->getPosition());
-        std::vector<Uint32> expected;
-        for (int tick=0;tick<192;++tick) { world.game.step(0); expected.push_back(trace(world.game)); }
+        const auto result=glob2test::expectContinuation(world.game,{.ticks=192,.name="fractional delivery continuation"});
+        CHECK(result.matched);
         CHECK(unit->activity==Unit::ACT_RANDOM); CHECK_FALSE(unit->attachedBuilding);
         CHECK(inn->unitsWorking.empty()); CHECK(inn->material(WHEAT)==0);
         CHECK(unit->carriedPacketCount()==1); CHECK(unit->carriedPacket==MaterialPacket{1,2});
         CHECK(world.team->stats.events().materialSpillageEvents==0);
-        GameGUI resumed;
-        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(),bytes.size())); input.seekFromStart(0);
-        REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
-        for (int tick=0;tick<192;++tick) { resumed.game.step(0); CHECK(trace(resumed.game)==expected[tick]); }
-        auto* copy=resumed.game.teams[0]->myUnits[Unit::GIDtoID(gid)]; REQUIRE(copy);
+        auto* copy=result.loaded->game.teams[0]->myUnits[Unit::GIDtoID(gid)]; REQUIRE(copy);
         CHECK(copy->activity==Unit::ACT_RANDOM); CHECK(copy->carriedPacket==MaterialPacket{1,2});
     }
 
@@ -2334,36 +2346,36 @@ TEST_SUITE("UnitCustomization")
             deposit(map,7,y,ALGA,3);
             auto* unit=world.addUnit(type,5,y); REQUIRE(unit);
             const auto unitId=Unit::GIDtoID(unit->gid), buildingId=Building::GIDtoID(inn->gid);
-            REQUIRE(game.hasWaterOnlyUnits()); REQUIRE(unit->swimClass()==WATER_ONLY_CLASS);
+            REQUIRE(game.hasWaterOnlyUnits()); REQUIRE(accessClass(unit->movementAccess())==WATER_ONLY_CLASS);
             unit->receiveCarriedMaterial(STONE,{1,2});
             unit->destinationPurpose=ALGA;
             unit->subscriptionSuccess(inn,false,false,UnitJobPurpose::Transport);
             inn->unitsWorking.push_back(unit); inn->updateCallLists();
-            glob2test::awaitGradient(game,[&] { return map.getMaterialGradient(0,MaterialId::Algae,WATER_ONLY_CLASS); });
-            game.map.prepareBuildingGradient(inn,WATER_ONLY_CLASS);
-            REQUIRE(map.materialAvailable(0,MaterialId::Algae,WATER_ONLY_CLASS,5,y));
+            glob2test::awaitGradient(game,[&] { return map.routing().getMaterialGradient(0,MaterialId::Algae,MovementAccess::Water); });
+            game.map.routing().prepareBuildingGradient(inn,MovementAccess::Water);
+            REQUIRE(map.routing().materialAvailable(0,MaterialId::Algae,MovementAccess::Water,5,y));
             glob2test::awaitBuildingGradient(game,inn,WATER_ONLY_CLASS);
             const int slot=inn->routeSlot(WATER_ONLY_CLASS,BuildingRoute::Footprint);
             const auto probe=map.coordToIndex(13,y);
             REQUIRE(inn->globalGradient[slot][probe]!=GRADIENT_FORBIDDEN);
             map.configureCompute(threads);
-            map.configureGradientPipeline(threads>1?threads-1:0,4);
-            map.advanceGradientPipeline(); // one deterministic admission boundary
+            map.routing().configureGradientPipeline(threads>1?threads-1:0,4);
+            map.routing().advanceGradientPipeline(); // one deterministic admission boundary
             map.addForbidden(13,y,0); // serving field must lag the captured refresh
-            REQUIRE(map.requestBuildingRefresh(inn,slot));
-            REQUIRE(map.buildingGradientPipelineStatus().queued==1);
+            REQUIRE(map.routing().requestBuildingRefresh(inn,slot));
+            REQUIRE(map.routing().buildingGradientPipelineStatus().queued==1);
             REQUIRE(inn->refreshRequested.test(slot));
             if (boundary!=Boundary::Queued) {
-                map.stagePeriodicGradientPreparation(); map.preparePendingGradient(game.captureReadBoundary());
-                REQUIRE(map.buildingGradientPipelineStatus().pending==1);
-                REQUIRE(map.buildingGradientPipelineStatus().queued==0);
+                map.routing().stagePeriodicGradientPreparation(); map.routing().preparePendingGradient(game.captureReadBoundary());
+                REQUIRE(map.routing().buildingGradientPipelineStatus().pending==1);
+                REQUIRE(map.routing().buildingGradientPipelineStatus().queued==0);
                 if (boundary==Boundary::PendingHalfway)
                     for (int tick=0;tick<2;++tick) game.step(0);
             }
             if (superseded) {
                 // A newer synchronous lifetime invalidates queued or pending work.
-                map.updateGlobalGradient(inn,WATER_ONLY_CLASS,BuildingRoute::Footprint);
-                map.finishBuildingGradient(inn,WATER_ONLY_CLASS,BuildingRoute::Footprint);
+                map.routing().updateGlobalGradient(inn,MovementAccess::Water,BuildingRoute::Footprint);
+                map.routing().finishBuildingGradient(inn,MovementAccess::Water,BuildingRoute::Footprint);
                 REQUIRE_FALSE(inn->refreshRequested.test(slot));
             }
             const auto runtimeBytes=[](Map& value) {
@@ -2377,12 +2389,12 @@ TEST_SUITE("UnitCustomization")
             game.save(&output,false,"active class7 queued/pending carrier"); output.flush();
             const auto checkpoint=memory->takeContents();
             const auto baselineRuntime=runtimeBytes(map);
-            const auto statusAtSave=map.buildingGradientPipelineStatus();
+            const auto statusAtSave=map.routing().buildingGradientPipelineStatus();
             if (boundary==Boundary::Queued) REQUIRE(statusAtSave.queued==1);
             else REQUIRE(statusAtSave.pending==1);
             if (boundary!=Boundary::Queued) {
                 bool actualClass7=false;
-                map.gradientRuntime->buildings.visitPending([&](auto& job,unsigned remaining) {
+                map.routing().gradientRuntime->buildings.visitPending([&](auto& job,unsigned remaining) {
                     const auto& p=job.payload;
                     if (p.buildingId==buildingId && p.swim==WATER_ONLY_CLASS && p.slot==slot) {
                         actualClass7=true;
@@ -2396,16 +2408,16 @@ TEST_SUITE("UnitCustomization")
             GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(checkpoint.data(),checkpoint.size()));
             input.seekFromStart(0); REQUIRE(resumed.game.load(&input)); resumed.game.setWaitingOnMask(0);
             auto& restored=resumed.game; restored.map.configureCompute(threads);
-            restored.map.setGradientWorkerCount(threads>1?threads-1:0); // loader defaults to shared2
+            restored.map.routing().setGradientWorkerCount(threads>1?threads-1:0); // loader defaults to shared2
             auto* restoredInn=restored.teams[0]->myBuildings[buildingId]; REQUIRE(restoredInn);
             auto* restoredUnit=restored.teams[0]->myUnits[unitId]; REQUIRE(restoredUnit);
-            REQUIRE(restoredUnit->swimClass()==WATER_ONLY_CLASS);
+            REQUIRE(accessClass(restoredUnit->movementAccess())==WATER_ONLY_CLASS);
             REQUIRE(authoritativeAudit(restored)==authoritativeAudit(game));
             REQUIRE(runtimeBytes(restored.map)==baselineRuntime);
             REQUIRE(restoredInn->refreshRequested.test(slot)==inn->refreshRequested.test(slot));
             if (boundary!=Boundary::Queued) {
                 bool reboundClass7=false;
-                restored.map.gradientRuntime->buildings.visitPending([&](auto& job,unsigned remaining) {
+                restored.map.routing().gradientRuntime->buildings.visitPending([&](auto& job,unsigned remaining) {
                     const auto& payload=job.payload;
                     if (payload.buildingId==buildingId && payload.slot==slot) {
                         reboundClass7=true;
@@ -2419,7 +2431,7 @@ TEST_SUITE("UnitCustomization")
             }
             const int advancesUntilPublication=boundary==Boundary::Queued?5:
                 boundary==Boundary::PendingHalfway?2:4;
-            const auto resumedStatus=restored.map.buildingGradientPipelineStatus();
+            const auto resumedStatus=restored.map.routing().buildingGradientPipelineStatus();
             REQUIRE(resumedStatus.pending==statusAtSave.pending); REQUIRE(resumedStatus.queued==statusAtSave.queued);
             const auto originalPublished=statusAtSave.published, originalDiscarded=statusAtSave.discarded;
             const auto restoredPublished=resumedStatus.published, restoredDiscarded=resumedStatus.discarded;
@@ -2441,7 +2453,7 @@ TEST_SUITE("UnitCustomization")
                 REQUIRE(restored.map.worldRandom.streams==map.worldRandom.streams);
                 REQUIRE(restored.map.worldRandom.initialized==map.worldRandom.initialized);
                 REQUIRE(restored.unitCargo.entries()==game.unitCargo.entries());
-                const auto lhs=map.buildingGradientPipelineStatus(), rhs=restored.map.buildingGradientPipelineStatus();
+                const auto lhs=map.routing().buildingGradientPipelineStatus(), rhs=restored.map.routing().buildingGradientPipelineStatus();
                 REQUIRE(lhs.pending==rhs.pending); REQUIRE(lhs.queued==rhs.queued);
                 REQUIRE(lhs.published-originalPublished==rhs.published-restoredPublished);
                 REQUIRE(lhs.discarded-originalDiscarded==rhs.discarded-restoredDiscarded);
@@ -2469,8 +2481,8 @@ TEST_SUITE("UnitCustomization")
             REQUIRE(world.team->stats.events().materialSpillageEvents==0);
             REQUIRE(unit->integrity()); REQUIRE(restoredUnit->integrity());
             // Check the selected row actually publishes the new passability value.
-            map.finishBuildingGradient(inn,WATER_ONLY_CLASS,BuildingRoute::Footprint);
-            restored.map.finishBuildingGradient(restoredInn,WATER_ONLY_CLASS,BuildingRoute::Footprint);
+            map.routing().finishBuildingGradient(inn,MovementAccess::Water,BuildingRoute::Footprint);
+            restored.map.routing().finishBuildingGradient(restoredInn,MovementAccess::Water,BuildingRoute::Footprint);
             REQUIRE(inn->globalGradient[slot]);
             REQUIRE(inn->globalGradient[slot][probe]==GRADIENT_FORBIDDEN);
             REQUIRE(restoredInn->globalGradient[slot]);
@@ -2515,11 +2527,11 @@ TEST_SUITE("UnitCustomization")
                 unit->destinationPurpose=material;
                 unit->subscriptionSuccess(inn,false,false,UnitJobPurpose::Transport);
                 inn->unitsWorking.push_back(unit); inn->updateCallLists();
-                glob2test::awaitGradient(world.game,[&] { return world.game.map.getMaterialGradientSlot(world.team->teamNumber,material,unit->swimClass()); });
-                world.game.map.prepareBuildingGradient(inn,unit->swimClass());
-                REQUIRE(world.game.map.materialAvailable(world.team->teamNumber,static_cast<MaterialId>(material),unit->swimClass(),unit->posX,unit->posY));
-                glob2test::awaitBuildingGradient(world.game,inn,unit->swimClass());
-                if(waterOnly) REQUIRE(unit->swimClass()==WATER_ONLY_CLASS);
+                glob2test::awaitGradient(world.game,[&] { return world.game.map.routing().getMaterialGradientSlot(world.team->teamNumber,material,unit->movementAccess()); });
+                world.game.map.routing().prepareBuildingGradient(inn,unit->movementAccess());
+                REQUIRE(world.game.map.routing().materialAvailable(world.team->teamNumber,static_cast<MaterialId>(material),unit->movementAccess(),unit->posX,unit->posY));
+                glob2test::awaitBuildingGradient(world.game,inn,accessClass(unit->movementAccess()));
+                if(waterOnly) REQUIRE(accessClass(unit->movementAccess())==WATER_ONLY_CLASS);
                 for(int tick=0;tick<4096 && unit->displacement!=phase;++tick) world.game.step(0);
                 REQUIRE(unit->displacement==phase);
                 REQUIRE(unit->jobPurpose==UnitJobPurpose::Transport);
@@ -2671,8 +2683,10 @@ TEST_SUITE("UnitCustomization")
         static_assert(offsetof(UnitState,configuredVisionRadius)==offsetof(UnitState,underAttackTimer)+1);
         static_assert(offsetof(UnitState,hp)%alignof(Sint32)==0);
         // Native layout budgets; the vision cache must not enlarge compact storage.
+        // Units also carry their resource-claim selection cadence (decision ordinals).
         static_assert(sizeof(void*)!=8 || sizeof(UnitState)<=264);
-        static_assert(sizeof(void*)!=8 || sizeof(Unit)<=344);
+        static_assert(sizeof(ResourceClaims::MaterialClaimPolicyState)<=24);
+        static_assert(sizeof(void*)!=8 || sizeof(Unit)<=344+sizeof(ResourceClaims::MaterialClaimPolicyState));
         glob2test::HeadlessGlobals globals;
         glob2test::HeadlessGame world({.wDec=6,.hDec=6,.clearImmobile=true,.header=true,.seed=4921});
         auto definitions=nlohmann::json::parse(world.game.unitCatalog().serialize());
@@ -3454,7 +3468,7 @@ TEST_CASE("shared air routing stress exports a reproducible benchmark setup [art
     for(int tick=0;tick<256;++tick) game.step(0);
     CHECK(game.teams[0]->liveUnits.size()==64);
     for(const auto* unit:game.teams[0]->liveUnits.entries())
-        CHECK(unit->movementClass()==AIR_MOVEMENT_CLASS);
+        CHECK(accessClass(unit->movementAccess())==AIR_MOVEMENT_CLASS);
 }
 
 TEST_CASE("ordinary flyers retain angular steering and local avoidance without movement fields" * doctest::test_suite("UnitCustomization"))
@@ -3564,7 +3578,7 @@ TEST_CASE("flying carriers steer directly between shared destination queries" * 
     flyer->subscriptionSuccess(inn,false,false,UnitJobPurpose::Transport);
     inn->unitsWorking.push_back(flyer);
     deposit(map,18,11,WHEAT,1);
-    glob2test::awaitGradient(world.game,[&] { return map.getMaterialGradientSlot(0,WHEAT,AIR_MOVEMENT_CLASS,false,inn); });
+    glob2test::awaitGradient(world.game,[&] { return map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Air,false,inn); });
     flyer->setValidTarget(false);
     flyer->handleMovementGoingToResource();
     REQUIRE(flyer->movement==Unit::MOV_FLYING_TARGET);
@@ -3574,9 +3588,9 @@ TEST_CASE("flying carriers steer directly between shared destination queries" * 
     flyer->handleMovementGoingToResource();
     CHECK(flyer->movement==Unit::MOV_RANDOM_FLY);
     CHECK(flyer->attachedBuilding==inn); // Keep the job until shared guidance refreshes.
-    map.updateMaterialGradient(0,WHEAT,AIR_MOVEMENT_CLASS,false);
+    map.routing().updateMaterialGradient(0,WHEAT,MovementAccess::Air,false);
     glob2test::awaitGradient(world.game,[&] {
-        const auto* field=map.getMaterialGradientSlot(0,WHEAT,AIR_MOVEMENT_CLASS,false,inn);
+        const auto* field=map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Air,false,inn);
         return field && field[map.coordToIndex(18,9)]==GRADIENT_AT_GOAL ? field : nullptr;
     });
     flyer->handleMovementGoingToResource();
@@ -3611,7 +3625,7 @@ TEST_CASE("direct flying clearers retain shared goals and clearing claims" * doc
             glob2test::awaitBuildingGradient(world.game,flag,AIR_MOVEMENT_CLASS,BuildingRoute::Clearing);
             flyer->handleMovementClearingResources();
         } else {
-            glob2test::awaitGradient(world.game,[&] { return map.getClearAreasGradient(0,AIR_MOVEMENT_CLASS); });
+            glob2test::awaitGradient(world.game,[&] { return map.routing().getClearAreasGradient(0,MovementAccess::Air); });
             flyer->handleMovementRandom();
             CHECK(map.isClearingAreaClaimed(18,12,0)==flyer->gid);
         }
@@ -3708,7 +3722,7 @@ TEST_CASE("direct flying carriers retain priced overlay and direct stock destina
         REQUIRE_FALSE(map.hasAirRoutingConstraints());
         REQUIRE(map.getBuilding(18,12)==NOGBID);
         glob2test::awaitGradient(game,[&] {
-            return map.getMaterialGradientSlot(0,WOOD,AIR_MOVEMENT_CLASS,consumer->fetchesFromMarkets(),consumer);
+            return map.routing().getMaterialGradientSlot(0,WOOD,MovementAccess::Air,consumer->fetchesFromMarkets(),consumer);
         });
         flyer->handleMovementGoingToResource();
         REQUIRE(flyer->movement==Unit::MOV_FLYING_TARGET);
@@ -3742,11 +3756,11 @@ TEST_CASE("idle flyers wander inside forbidden paint instead of requesting groun
     for(int y=0;y<map.getH();++y) for(int x=0;x<map.getW();++x)map.addForbidden(x,y,0);
     flyer->handleMovementRandom();
     CHECK(flyer->movement==Unit::MOV_RANDOM_FLY);
-    CHECK(map.forbiddenGradient[0][AIR_MOVEMENT_CLASS]==nullptr);
+    CHECK(map.routing().forbiddenGradient[0][AIR_MOVEMENT_CLASS]==nullptr);
     const auto random=flyer->entityRandom;
     flyer->handleActionRandomFly();
     CHECK_FALSE(flyer->entityRandom==random);
     CHECK(map.isForbidden(flyer->posX,flyer->posY,flyer->owner->me));
     CHECK(map.getAirUnit(flyer->posX,flyer->posY)==flyer->gid);
-    CHECK(map.forbiddenGradient[0][AIR_MOVEMENT_CLASS]==nullptr);
+    CHECK(map.routing().forbiddenGradient[0][AIR_MOVEMENT_CLASS]==nullptr);
 }

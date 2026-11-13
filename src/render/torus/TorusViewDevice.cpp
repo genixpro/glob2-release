@@ -3,6 +3,7 @@
 #include "TorusGeometry.h"
 #include "render/SoftwareTerrainCache.h"
 #include "Game.h"
+#include "render/MapDrawer.h"
 #include "GameGUI.h"
 #include "GlobalContainer.h"
 #include <GraphicContext.h>
@@ -13,6 +14,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include "GameGUIToolManager.h"
 
 using namespace GAGCore;
 struct TorusDeviceState
@@ -29,7 +31,7 @@ struct TorusDeviceState
     // Backing targets are hidden while a bounded capture cycle is assembled.
     // The device retains the completed main image during these presentation turns.
     std::shared_ptr<const PresentationFrame> captureFrame;
-    Game::ViewState captureView;
+    ViewState captureView;
     BuildingGuiStateMap captureBuildings;
     std::size_t captureTile = 0;
     int captureX = 0, captureY = 0;
@@ -59,18 +61,19 @@ class SourceMapPhaseScope
     unsigned options;
     bool paused;
     int initialAnimation;
+    AnimationClock initialClock;
     int exceptions;
 public:
     SourceMapPhaseScope(MapRenderState &state,unsigned drawOptions,bool animationsPaused)
         : render(state),options(drawOptions),paused(animationsPaused),
-          initialAnimation(state.animationTime),exceptions(std::uncaught_exceptions())
-    { if(!paused)++render.animationTime; }
+          initialAnimation(state.animationTime),initialClock(state.animationClock),exceptions(std::uncaught_exceptions())
+    { render.animationTime+=render.animationClock.advance(paused); }
     ~SourceMapPhaseScope()
     {
         // The caller draws the ordinary map after a fatal torus exception.
         // Leave that fallback to advance the source phases once for this turn.
-        if(std::uncaught_exceptions()>exceptions)render.animationTime=initialAnimation;
-        else Game::finishMapCapture(render,options,paused);
+        if(std::uncaught_exceptions()>exceptions){render.animationTime=initialAnimation;render.animationClock=initialClock;}
+        else MapDrawer::finishMapCapture(render,options,paused);
     }
 };
 constexpr int cloudGridLimit = 128;
@@ -327,10 +330,14 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
         state.captureTile = 0; state.captureX = state.captureY = 0;
         state.advancePreviews = true; state.captureReady = false;
         auto &captureRender = state.captureView.render;
-        // prepareSceneMapFrame advances the frozen capture once. The source
-        // phase already advanced for this host turn and keeps advancing on holds.
-        captureRender.animationTime = sourceRender.animationTime-(sourcePaused?0:1);
+        // prepareSceneMapFrame advances the frozen capture once, by the steps the
+        // source phase already advanced for this host turn; the source keeps
+        // advancing on holds.
+        const int sourceSteps = sourcePaused ? 0 : sourceRender.animationClock.steps();
+        captureRender.animationTime = sourceRender.animationTime-sourceSteps;
+        captureRender.animationClock.presetNext(sourceSteps);
         captureRender.areaAnimationTick = sourceRender.areaAnimationTick;
+        captureRender.areaClock = sourceRender.areaClock;
         captureRender.unitMotion = sourceRender.unitMotion;
         captureRender.minimumZoom = sourceRender.minimumZoom;
         captureRender.zonesEmphasised = sourceRender.zonesEmphasised;
@@ -340,7 +347,7 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
         }
         state.captureView.scene = state.captureFrame.get();
         CaptureSkinScope skin(captureRender, gui ? &sourceRender : nullptr);
-        Game::prepareSceneMapFrame(*state.captureFrame, state.captureTeam, state.captureView,
+        MapDrawer::prepareSceneMapFrame(*state.captureFrame, state.captureTeam, state.captureView,
                                   state.captureOptions, state.capturePaused);
     }
     const auto &captureFrame = *state.captureFrame;
@@ -380,7 +387,7 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
             MapTransformScope mapPass(*gfx,state.captureZoom,0,0,clip);
             const int tx=(originX+tile.x/32-1)&captureFrame.map.getMaskW();
             const int ty=(originY+tile.y/32-1)&captureFrame.map.getMaskH();
-            Game::drawSceneMapRegion(captureFrame,culling.x,culling.y,culling.w,culling.h,0,0,tx,ty,
+            MapDrawer::drawSceneMapRegion(captureFrame,culling.x,culling.y,culling.w,culling.h,0,0,tx,ty,
                 state.captureTeam,state.captureView,state.captureOptions,nullptr,
                 gui ? &state.captureBuildings : nullptr,state.capturePaused,cloudGridLimit,true,captureW,captureH);
         } catch (...) {
@@ -446,7 +453,7 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
             state.captureTile=0;state.captureX=state.captureY=0;
             return true;
         }
-        Game::finishMapCapture(state.captureView,state.captureOptions,state.capturePaused);
+        MapDrawer::finishMapCapture(state.captureView,state.captureOptions,state.capturePaused);
         state.captureReady=true;
     }
     gfx->setRenderTargetScale(0);gfx->setClipRect();

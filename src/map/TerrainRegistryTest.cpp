@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Glob2Test.h"
+#include "TerrainBuiltins.h"
+#include "TerrainCatalog.h"
 #include "TerrainRegistry.h"
+#include "io/TerrainFormatHistory.h"
 #include "field/RuntimeTerrainGradient.h"
 #include <nlohmann/json.hpp>
 #include <queue>
@@ -247,6 +250,258 @@ TEST_SUITE("TerrainRegistry")
 		CHECK_THROWS(TerrainRegistry::deserialize(saved.dump(), TERRAIN_COUNT_BEFORE_CATALOGUE - 1));
 		CHECK_THROWS(TerrainRegistry::deserialize(saved.dump(), TERRAIN_COUNT + 1));
 		CHECK(TerrainRegistry::deserialize(R"({"schemaVersion":1,"terrains":[]})", TERRAIN_COUNT_BEFORE_CATALOGUE) == builtin);
+
+		// Formats 146 to 190 number their definitions from 29, before the grass and sand looks.
+		auto beforeLooks = Json::parse(registry->serialize());
+		for (auto &item : beforeLooks["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_GROUND_LOOKS;
+		const auto vertex = TerrainRegistry::deserialize(beforeLooks.dump(), TERRAIN_COUNT_BEFORE_GROUND_LOOKS);
+		CHECK(vertex->serialize() == registry->serialize());
+		CHECK(vertex->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeLooks.dump()));
+
+		// Formats 191 to 194 number their definitions from 33, before sandstone, pumice and frozen lake.
+		auto beforeSandstone = Json::parse(registry->serialize());
+		for (auto &item : beforeSandstone["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE;
+		const auto looks = TerrainRegistry::deserialize(beforeSandstone.dump(), TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE);
+		CHECK(looks->serialize() == registry->serialize());
+		CHECK(looks->digest() == registry->digest());
+		CHECK(looks->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeSandstone.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeSandstone.dump(), TERRAIN_COUNT_BEFORE_GROUND_LOOKS));
+
+		// Format 195 numbers its definitions from 36, before wind-swept snow.
+		auto beforeDrifts = Json::parse(registry->serialize());
+		for (auto &item : beforeDrifts["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW;
+		const auto lake = TerrainRegistry::deserialize(beforeDrifts.dump(), TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW);
+		CHECK(lake->serialize() == registry->serialize());
+		CHECK(lake->digest() == registry->digest());
+		CHECK(lake->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeDrifts.dump()));
+
+		// Format 196 numbers its definitions from 37, before weathered sandstone.
+		auto beforeWeathered = Json::parse(registry->serialize());
+		for (auto &item : beforeWeathered["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE;
+		const auto drifts = TerrainRegistry::deserialize(beforeWeathered.dump(), TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE);
+		CHECK(drifts->serialize() == registry->serialize());
+		CHECK(drifts->digest() == registry->digest());
+		CHECK(drifts->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeWeathered.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeWeathered.dump(), TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW));
+
+		// Format 197 numbers its definitions from 38, before windy sand dune.
+		auto beforeDunes = Json::parse(registry->serialize());
+		for (auto &item : beforeDunes["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE;
+		const auto weathered = TerrainRegistry::deserialize(beforeDunes.dump(), TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE);
+		CHECK(weathered->serialize() == registry->serialize());
+		CHECK(weathered->digest() == registry->digest());
+		CHECK(weathered->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeDunes.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeDunes.dump(), TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE));
+
+		// Format 198 numbers its definitions from 39, before hardpan.
+		auto beforeHardpan = Json::parse(registry->serialize());
+		for (auto &item : beforeHardpan["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_HARDPAN;
+		const auto dunes = TerrainRegistry::deserialize(beforeHardpan.dump(), TERRAIN_COUNT_BEFORE_HARDPAN);
+		CHECK(dunes->serialize() == registry->serialize());
+		CHECK(dunes->digest() == registry->digest());
+		CHECK(dunes->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeHardpan.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeHardpan.dump(), TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE));
+
+		// Format 199 numbers its definitions from 40, before tundra.
+		auto beforeTundra = Json::parse(registry->serialize());
+		for (auto &item : beforeTundra["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_TUNDRA;
+		const auto crust = TerrainRegistry::deserialize(beforeTundra.dump(), TERRAIN_COUNT_BEFORE_TUNDRA);
+		CHECK(crust->serialize() == registry->serialize());
+		CHECK(crust->digest() == registry->digest());
+		CHECK(crust->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeTundra.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeTundra.dump(), TERRAIN_COUNT_BEFORE_HARDPAN));
+
+		// Format 200 numbers its definitions from 41, before volcanic ash.
+		auto beforeAsh = Json::parse(registry->serialize());
+		for (auto &item : beforeAsh["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_VOLCANIC_ASH;
+		const auto previous = TerrainRegistry::deserialize(beforeAsh.dump(), TERRAIN_COUNT_BEFORE_VOLCANIC_ASH);
+		CHECK(previous->serialize() == registry->serialize());
+		CHECK(previous->digest() == registry->digest());
+		CHECK(previous->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeAsh.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeAsh.dump(), TERRAIN_COUNT_BEFORE_TUNDRA));
+
+		// Format 201 numbers its definitions from 42, before glacier ice.
+		auto beforeGlacierIce = Json::parse(registry->serialize());
+		for (auto &item : beforeGlacierIce["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_GLACIER_ICE;
+		const auto volcanic = TerrainRegistry::deserialize(beforeGlacierIce.dump(), TERRAIN_COUNT_BEFORE_GLACIER_ICE);
+		CHECK(volcanic->serialize() == registry->serialize());
+		CHECK(volcanic->digest() == registry->digest());
+		CHECK(volcanic->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeGlacierIce.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeGlacierIce.dump(), TERRAIN_COUNT_BEFORE_VOLCANIC_ASH));
+
+		// Format 202 numbers its definitions from 43, before overgrown road.
+		auto beforeOvergrown = Json::parse(registry->serialize());
+		for (auto &item : beforeOvergrown["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD;
+		const auto glacier = TerrainRegistry::deserialize(beforeOvergrown.dump(), TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD);
+		CHECK(glacier->serialize() == registry->serialize());
+		CHECK(glacier->digest() == registry->digest());
+		CHECK(glacier->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeOvergrown.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeOvergrown.dump(), TERRAIN_COUNT_BEFORE_GLACIER_ICE));
+
+		// Format 203 numbers its definitions from 44, before laterite.
+		auto beforeLaterite = Json::parse(registry->serialize());
+		for (auto &item : beforeLaterite["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_LATERITE;
+		const auto prior = TerrainRegistry::deserialize(beforeLaterite.dump(), TERRAIN_COUNT_BEFORE_LATERITE);
+		CHECK(prior->serialize() == registry->serialize());
+		CHECK(prior->digest() == registry->digest());
+		CHECK(prior->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeLaterite.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeLaterite.dump(), TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD));
+
+		// Formats 204 and 205 number their definitions from 45, before cliffs.
+		auto beforeCliffs = Json::parse(registry->serialize());
+		for (auto &item : beforeCliffs["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_CLIFFS;
+		const auto cliffless = TerrainRegistry::deserialize(beforeCliffs.dump(), TERRAIN_COUNT_BEFORE_CLIFFS);
+		CHECK(cliffless->serialize() == registry->serialize());
+		CHECK(cliffless->digest() == registry->digest());
+		CHECK(cliffless->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeCliffs.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeCliffs.dump(), TERRAIN_COUNT_BEFORE_LATERITE));
+
+		// Format 206 numbers its definitions from 46, before molten lava pool.
+		auto beforePool = Json::parse(registry->serialize());
+		for (auto &item : beforePool["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL;
+		const auto cliffsFormat = TerrainRegistry::deserialize(beforePool.dump(), TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL);
+		CHECK(cliffsFormat->serialize() == registry->serialize());
+		CHECK(cliffsFormat->digest() == registry->digest());
+		CHECK(cliffsFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforePool.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforePool.dump(), TERRAIN_COUNT_BEFORE_CLIFFS));
+
+		// Format 207 numbers its definitions from 47, before the rock paths.
+		auto beforeRockPaths = Json::parse(registry->serialize());
+		for (auto &item : beforeRockPaths["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_ROCK_PATHS;
+		const auto poolFormat = TerrainRegistry::deserialize(beforeRockPaths.dump(), TERRAIN_COUNT_BEFORE_ROCK_PATHS);
+		CHECK(poolFormat->serialize() == registry->serialize());
+		CHECK(poolFormat->digest() == registry->digest());
+		CHECK(poolFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeRockPaths.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeRockPaths.dump(), TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL));
+
+		// Format 208 numbers its definitions from 50, before the ice paths.
+		auto beforeIcePaths = Json::parse(registry->serialize());
+		for (auto &item : beforeIcePaths["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_ICE_PATHS;
+		const auto rockFormat = TerrainRegistry::deserialize(beforeIcePaths.dump(), TERRAIN_COUNT_BEFORE_ICE_PATHS);
+		CHECK(rockFormat->serialize() == registry->serialize());
+		CHECK(rockFormat->digest() == registry->digest());
+		CHECK(rockFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeIcePaths.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeIcePaths.dump(), TERRAIN_COUNT_BEFORE_ROCK_PATHS));
+
+		// Format 209 numbers its definitions from 53, before arctic tundra.
+		auto beforeArcticTundra = Json::parse(registry->serialize());
+		for (auto &item : beforeArcticTundra["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA;
+		const auto iceFormat =
+			TerrainRegistry::deserialize(beforeArcticTundra.dump(), TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA);
+		CHECK(iceFormat->serialize() == registry->serialize());
+		CHECK(iceFormat->digest() == registry->digest());
+		CHECK(iceFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeArcticTundra.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeArcticTundra.dump(), TERRAIN_COUNT_BEFORE_ICE_PATHS));
+
+		// Format 210 numbers its definitions from 54, before glacier.
+		auto beforeGlacierWall = Json::parse(registry->serialize());
+		for (auto &item : beforeGlacierWall["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_GLACIER;
+		const auto glacierless = TerrainRegistry::deserialize(beforeGlacierWall.dump(), TERRAIN_COUNT_BEFORE_GLACIER);
+		CHECK(glacierless->serialize() == registry->serialize());
+		CHECK(glacierless->digest() == registry->digest());
+		CHECK(glacierless->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeGlacierWall.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeGlacierWall.dump(), TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA));
+
+		// Format 211 numbers its definitions from 55, before the Barriers and Outcrops looks.
+		auto beforeIcefall = Json::parse(registry->serialize());
+		for (auto &item : beforeIcefall["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_ICEFALL;
+		const auto glacierFormat = TerrainRegistry::deserialize(beforeIcefall.dump(), TERRAIN_COUNT_BEFORE_ICEFALL);
+		CHECK(glacierFormat->serialize() == registry->serialize());
+		CHECK(glacierFormat->digest() == registry->digest());
+		CHECK(glacierFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeIcefall.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeIcefall.dump(), TERRAIN_COUNT_BEFORE_GLACIER));
+
+		// Formats 212 to 215 number their definitions from 64, before steppe grass and moor grass.
+		auto beforeSteppe = Json::parse(registry->serialize());
+		for (auto &item : beforeSteppe["terrains"])
+			item["id"] = item["id"].get<unsigned>() - TERRAIN_COUNT + TERRAIN_COUNT_BEFORE_STEPPE_GRASS;
+		const auto icefallFormat = TerrainRegistry::deserialize(beforeSteppe.dump(), TERRAIN_COUNT_BEFORE_STEPPE_GRASS);
+		CHECK(icefallFormat->serialize() == registry->serialize());
+		CHECK(icefallFormat->digest() == registry->digest());
+		CHECK(icefallFormat->find("test:a") == TerrainType(TERRAIN_COUNT));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeSteppe.dump()));
+		CHECK_THROWS(TerrainRegistry::deserialize(beforeSteppe.dump(), TERRAIN_COUNT_BEFORE_ICEFALL));
+	}
+	TEST_CASE("renamed built-ins still resolve by their legacy names")
+	{
+		const std::pair<const char *, TerrainType> renamed[] = {
+			{"gravel", SHALE}, {"flower_meadow", HEATH}, {"marsh", MUDFLAT}, {"dirt_track", BRICK_PATH}};
+		const auto builtin = TerrainRegistry::builtins();
+		for (auto [legacy, type] : renamed)
+		{
+			CAPTURE(legacy);
+			CHECK(terrainTypeByName(legacy) == type);
+			CHECK(builtin->find(legacy) == type);
+			// The current name is the only one ever written.
+			CHECK(builtin->key(type) == terrainPresentation(type).name);
+			CHECK(builtin->key(type) != legacy);
+		}
+		CHECK(std::string(terrainPresentation(SHALE).name) == "shale");
+		CHECK(std::string(terrainPresentation(HEATH).name) == "heath");
+		CHECK(std::string(terrainPresentation(MUDFLAT).name) == "mudflat");
+		CHECK(std::string(terrainPresentation(BRICK_PATH).name) == "brick_path");
+		CHECK(builtin->find("shale") == SHALE);
+		CHECK(terrainTypeByName("road") == TRAIL);
+		CHECK_FALSE(terrainTypeByName("no_such_terrain"));
+		CHECK_FALSE(builtin->find("no_such_terrain"));
+
+		// Authoring JSON may name the old base and appearance; it imports and
+		// serializes under the current names.
+		auto old = definition("test:fen", "marsh");
+		old["appearance"] = "flower_meadow";
+		auto current = definition("test:fen", "mudflat");
+		current["appearance"] = "heath";
+		const auto fromOld = builtin->importJson(source(Json::array({old})));
+		const auto fromCurrent = builtin->importJson(source(Json::array({current})));
+		CHECK(fromOld->serialize() == fromCurrent->serialize());
+		CHECK(fromOld->digest() == fromCurrent->digest());
+		const auto fen = *fromOld->find("test:fen");
+		CHECK(fromOld->appearance(fen) == HEATH);
+		CHECK(sameTerrainProperties(fromOld->properties(fen), terrainProperties(MUDFLAT)));
+		CHECK(Json::parse(fromOld->serialize())["terrains"][0]["appearance"] == "heath");
+
+		// A saved registry written before the rename (appearance "dirt_track") loads.
+		auto saved = Json::parse(fromCurrent->serialize());
+		saved["terrains"][0]["appearance"] = "dirt_track";
+		const auto loaded = TerrainRegistry::deserialize(saved.dump());
+		CHECK(loaded->appearance(*loaded->find("test:fen")) == BRICK_PATH);
+		CHECK(Json::parse(loaded->serialize())["terrains"][0]["appearance"] == "brick_path");
 	}
 	TEST_CASE("large registries compile equivalent definitions into bounded movement profiles")
 	{

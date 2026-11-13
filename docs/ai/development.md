@@ -38,6 +38,23 @@ clearing orders. Missing reachable starts, stationary steps and repeated tiles
 reject the attempt without activating a partial dig. Valid routes retain the
 existing neighbor preference and clearing-flag spacing.
 
+Econo and Nicowar share the farming scan in
+`src/ai/shared_runtime/Farming.cpp`, running every 250 ticks. It protects seed
+resources on a checkerboard and temporarily protects edge donors to expand fields.
+Wood is reserved within six water-gradient steps and wheat within ten. The
+gradient starts from irrigating water only (swimmable fertility sources, see
+`terrainIsIrrigatingWater`). Fertile ground (Loam, Moss, Spring meadow) is
+farmable land: its own tiles join both zones, but no zone reaches out from it.
+Nicowar's building orders keep their minimum distances from irrigating water only;
+Fertile ground is ordinary building land for them. Cabino's and Warrush's farm
+scans use the same split, and Castor weighs its hydration estimate by each
+source's engine fertility strength. Spreading
+wood beside wheat (including diagonals) or in the outer wheat band is cleared;
+obsolete clearing paint is released unless needed beside a friendly building.
+The farm-areas experiment uses farm paint for eligible wheat and forbidden paint
+for wood. Resource growth disabled skips the scan. These rules add clearance work
+and temporarily reserve harvestable resources to support future growth.
+
 Respect rules that disable training or building upgrades and release obsolete
 worker assignments where appropriate.
 
@@ -59,6 +76,35 @@ command paths rather than assuming the enum is the only list.
 Add telemetry identity/schema only for meaningful measurements; use the
 [telemetry contract](telemetry.md) for field retention and freshness. Tests and
 examples must use the same public order/capability interfaces as the controller.
+
+## Assess effectiveness
+
+For a quick look while tuning Maxima, `python3 tools/maxima_watch.py` rebuilds
+the perf client, plays a seeded Maxima match headless, prints a scoreboard and
+opens the game in the replay viewer; `--seeds 1-8` prints a batch instead and
+`--param KEY=VALUE` passes strategy overrides. It is a viewing aid, not an
+assessment.
+
+Use [the tournament framework](../tools/tournaments.md) for custom assessments as
+well as standard comparisons. Its CLI and planners default to 95% probability
+victory, and cap adjudication uses final win probability. Every game records the
+probability trajectory automatically, without a verbose telemetry request.
+
+Treat the **adjusted win-probability trajectory score** (`log_time_outcome_v1`,
+`c=2`) as the standard continuous effectiveness score alongside wins, losses and
+draws. It weights earlier trajectory strength more heavily and credits completed
+outcomes through the fixed tick horizon. Probability-based early victories also
+receive full outcome credit, labelled predicted; caps receive no terminal tail.
+Standard reports include the score, coverage and paired seed-block intervals.
+Custom scripts should use `tools.tournaments.probability.group_score`, counting
+an alliance once. The raw linear AUC is retained as a legacy diagnostic and is
+no longer the standard score. Compact results preserve the required log integral;
+older compact payloads lacking it cannot reconstruct the new score.
+Use matched maps/seeds, rotations and held-out comparisons. Keep score version,
+coefficient, horizon, model and stopping rules identical. Report unavailable
+history explicitly and check actual wins, completion times and representative
+play: this is a trajectory score, not a calibrated probability of winning.
+See [whole-game scoring](../tools/tournaments.md#whole-game-probability-scores).
 
 ## Verify and review
 

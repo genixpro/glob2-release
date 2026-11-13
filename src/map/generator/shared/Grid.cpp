@@ -1,12 +1,12 @@
 #include "GenerationWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Grid.h"
-#include "Map.h"
-#include "Unit.h"
+#include "GenerationWorld.h"
 #include <algorithm>
+#include <stdexcept>
 namespace MapGeneration
 {
-Torus::Torus(const Map &map) : w(map.getW()), h(map.getH()) {}
+Torus::Torus(const GenerationMap &map) : w(map.getW()), h(map.getH()) {}
 
 Reach reachFrom(const Torus &t, const std::vector<int> &sources, const std::vector<unsigned char> &open,
 				int limit)
@@ -119,12 +119,75 @@ Flood floodImpl(const Torus &t, const std::vector<unsigned char> &source,
 	}
 	return flood;
 }
+
+// The same flood for native generation, which has no work budget to charge: identical
+// sources, visit order, steps and queue, without a checkpoint per neighbour. Indices are
+// in range once the masks are (checked up front, as at() would have thrown), and a tile
+// off the wrap edges reaches its eight neighbours by fixed offsets in the same order.
+template <bool AllOpen>
+Flood floodUncharged(const Torus &t, const std::vector<unsigned char> &source,
+					 const std::vector<unsigned char> &open, int limit)
+{
+	Flood flood;
+	std::vector<int> &dist = flood.steps, &queue = flood.visited;
+	const size_t size = size_t(t.size());
+	if (source.size() < size || (!AllOpen && open.size() < size))
+		throw std::out_of_range("flood mask smaller than the map");
+	dist.assign(size, -1);
+	queue.reserve(size);
+	int *const steps = dist.data();
+	const unsigned char *const sources = source.data();
+	const unsigned char *const passable = AllOpen ? nullptr : open.data();
+	for (size_t i = 0; i < size; ++i)
+		if (sources[i])
+		{
+			steps[i] = 0;
+			queue.push_back(int(i));
+		}
+	const int w = t.w, h = t.h;
+	const int offsets[8] = {-w - 1, -w, -w + 1, -1, 1, w - 1, w, w + 1};
+	for (size_t head = 0; head < queue.size(); ++head)
+	{
+		const int tile = queue[head], here = steps[tile];
+		if (here >= limit)
+			continue;
+		const int x = t.remainderX(tile), y = tile / w, stepped = here + 1;
+		const auto visit = [&](int n)
+		{
+			if (steps[n] < 0 && (AllOpen || passable[n]))
+			{
+				steps[n] = stepped;
+				queue.push_back(n);
+			}
+		};
+		if (x > 0 && x < w - 1 && y > 0 && y < h - 1)
+			for (const int offset : offsets)
+				visit(tile + offset);
+		else
+			for (int dy = -1; dy <= 1; ++dy)
+			{
+				const int row = t.y(y + dy) * w;
+				for (int dx = -1; dx <= 1; ++dx)
+					if (dx || dy)
+						visit(row + t.x(x + dx));
+			}
+	}
+	return flood;
+}
+
+template <bool AllOpen>
+Flood flood(const Torus &t, const std::vector<unsigned char> &source,
+			const std::vector<unsigned char> &open, int limit)
+{
+	return generationWorkActive() ? floodImpl<AllOpen>(t, source, open, limit)
+						  : floodUncharged<AllOpen>(t, source, open, limit);
+}
 } // namespace
 
 Flood floodFrom(const Torus &t, const std::vector<unsigned char> &source,
 				const std::vector<unsigned char> &open, int limit)
 {
-	return floodImpl<false>(t, source, open, limit);
+	return flood<false>(t, source, open, limit);
 }
 
 std::vector<int> stepsFrom(const Torus &t, const std::vector<unsigned char> &source,
@@ -137,7 +200,7 @@ std::vector<int> stepsFrom(const Torus &t, const std::vector<unsigned char> &sou
 {
 	// `open` is never read under AllOpen, so nothing is built for it.
 	static const std::vector<unsigned char> none;
-	return floodImpl<true>(t, source, none, INT_MAX).steps;
+	return flood<true>(t, source, none, INT_MAX).steps;
 }
 
 std::vector<unsigned char> tileMask(const Torus &t, const std::vector<int> &tiles)
@@ -151,7 +214,7 @@ std::vector<unsigned char> tileMask(const Torus &t, const std::vector<int> &tile
 	return mask;
 }
 
-std::vector<std::vector<int>> unitTilesByTeam(const Map &map, int teams)
+std::vector<std::vector<int>> unitTilesByTeam(const GenerationMap &map, int teams)
 {
 	std::vector<std::vector<int>> units(size_t(std::max(teams, 0)));
 	for (int y = 0; y < map.getH(); ++y)
@@ -163,7 +226,7 @@ std::vector<std::vector<int>> unitTilesByTeam(const Map &map, int teams)
 			const Uint16 gid = map.getGroundUnit(x, y);
 			if (gid == NOGUID)
 				continue;
-			const int team = Unit::GIDtoTeam(gid);
+			const int team = GenerationWorld::unitTeamOf(gid);
 			if (team >= 0 && team < teams)
 				units.at(team).push_back(y * map.getW() + x);
 		}
@@ -171,7 +234,7 @@ std::vector<std::vector<int>> unitTilesByTeam(const Map &map, int teams)
 	return units;
 }
 
-std::vector<unsigned char> walkableTiles(const Map &map)
+std::vector<unsigned char> walkableTiles(const GenerationMap &map)
 {
 	std::vector<unsigned char> open(size_t(map.getW()) * map.getH(), 0);
 	for (int y = 0; y < map.getH(); ++y)
@@ -190,11 +253,11 @@ std::vector<unsigned char> walkableTiles(const Map &map)
 	return open;
 }
 
-std::vector<unsigned char> groundUnitTiles(const Map &map)
+std::vector<unsigned char> groundUnitTiles(const GenerationMap &map)
 {
 	return groundUnitTiles(map, false);
 }
-std::vector<unsigned char> groundUnitTiles(const Map &map, bool canSwim)
+std::vector<unsigned char> groundUnitTiles(const GenerationMap &map, bool canSwim)
 {
 	std::vector<unsigned char> hard(size_t(map.getW()) * map.getH(), 0);
 	for (int y = 0; y < map.getH(); ++y)

@@ -6,6 +6,7 @@
 #include <vector>
 #include <Stream.h>
 #include "Ressource.h"
+#include "UnitConsts.h"
 
 namespace AIEngine
 {
@@ -29,21 +30,7 @@ inline void saveResourceInitializations(GAGCore::OutputStream* stream,const Reso
  }
  stream->writeLeaveSection();
 }
-inline bool loadResourceInitializations(GAGCore::InputStream* stream,ResourceInitializations& fields,int owner,size_t expectedCells)
-{
- stream->readEnterSection("resourceInitializations");const Uint32 count=stream->readUint32("count");
- if(count>MaterialSlotCount*7) {stream->readLeaveSection();return false;}
- for(Uint32 i=0;i<count;++i) {
-  stream->readEnterSection(i);const int key=stream->readSint32("key");ResourceInitialization field;
-  field.observedTick=stream->readUint32("tick");const Uint32 cells=stream->readUint32("cells");
-  if(key<0 || key/(MaterialSlotCount*7)!=owner || cells!=expectedCells) {stream->readLeaveSection(2);return false;}
-  std::vector<Uint8> bytes(size_t(cells)*2);stream->read(bytes.data(),bytes.size(),"values");
-  auto values=std::make_shared<std::vector<Uint16>>(cells);
-  for(size_t cell=0;cell<cells;++cell) (*values)[cell]=bytes[cell*2]|(Uint16(bytes[cell*2+1])<<8);
-  field.values=std::move(values);stream->readLeaveSection();
-  if(!fields.emplace(key,std::move(field)).second) {stream->readLeaveSection();return false;}
- }
- stream->readLeaveSection();return stream->isValid();
-}
+// Defined in ResourceInitializationCache.cpp, which owns the format-version gates.
+bool loadResourceInitializations(GAGCore::InputStream* stream,ResourceInitializations& fields,int owner,size_t expectedCells,int versionMinor);
 
 }

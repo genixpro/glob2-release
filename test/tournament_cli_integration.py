@@ -3,6 +3,7 @@
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from build_paths import native_binary
 import argparse
 import gzip
@@ -107,14 +108,35 @@ def main():
             '--ai-param','0:expandDebounceCycles=3','--ai-param','1:expandDebounceCycles=5']
     value,original=run('configured',base+params+['--save','initial','--save','final','--save','every:512'])
     assert value['termination']=='tick_cap' and value['unresolved'] and value['winning_teams']==[]
+    assert value['resolved']['rules']['winProbabilityPermille'] == 950
     assert 'swarmWorkerCap=4' in value['players'][0]['runtime_values']
     assert 'swarmWorkerCap=7' in value['players'][1]['runtime_values']
     assert all('standard_statistics' in t and 'history' in t for t in value['teams'])
+    for team in value['teams']:
+        probability = team['win_probability']
+        history = team['win_probability_history']
+        assert history[0][0] == 0 and history[-1][0] == value['ticks']
+        assert probability['end_tick'] == value['ticks'] and probability['start_tick'] == 0
+        assert probability['permille'] == history[-1][1]
+        area = sum((b[0]-a[0])*(a[1]+b[1]) for a,b in zip(history,history[1:]))
+        assert probability['area_twice_permille_ticks'] == area
+        assert abs(probability['mean'] - area / (2000*value['ticks'])) < .000001
+    from tools.tournaments.probability import group_score, SCORE_METRIC
+    from tools.tournaments.worker import outcome_only
+    compact=outcome_only(value)
+    for full_team, compact_team in zip(value['teams'], compact['teams']):
+        expected=group_score([full_team], value)
+        assert expected['available'] and expected['metric']==SCORE_METRIC
+        assert expected==group_score([compact_team],compact)
     original_ticks=tick_records(original/'game.replay.checksums')
     for name,save in [('initial-reload','initial.game.gz'),('continuation','checkpoint-512.game.gz')]:
         restored,target=run(name,['game', 'run','--load-game',str(original/save),'--ticks',str(args.ticks),'--telemetry','checksums','--save','final'],
                             environment={'GLOB2_CORTEX_TUNING':'/nonexistent/ambient','GLOB2_MAXIMA_OVERRIDES':'invalid=1','GLOB2_CORTEX_POLICY':'ml'})
         trace=tick_records(target/'game.replay.checksums')
+        for before, after in zip(value['teams'], restored['teams']):
+            assert before['win_probability'] == after['win_probability']
+            assert before['win_probability_history'] == after['win_probability_history']
+            assert group_score([before],value)==group_score([after],restored)
         assert trace and all(original_ticks[t]==record for t,record in trace.items()),name
         assert restored['players']==value['players']
     _,normal=run('defaults',base)
@@ -166,7 +188,7 @@ def main():
     legacy.write_bytes(gzip.decompress((root/'test/fixtures/team-stats/version88.game.gz').read_bytes()))
     run('empty-player-save',['game', 'run','--load-game',str(legacy),'--ticks','10000'],2)
     legacy_v84=legacy_fixtures/'gd-small-2ai.game'
-    legacy_v84.write_bytes(gzip.decompress((root/'games/gd-small-2ai.game.gz').read_bytes()))
+    legacy_v84.write_bytes(gzip.decompress((root/'content/games/gd-small-2ai.game.gz').read_bytes()))
     run('legacy-v84',['game', 'run','--load-game',str(legacy_v84),'--ticks','10000'])
     (output/'verification.json').write_text(json.dumps({'passed':True,'cases':records,'ticks':args.ticks,'binary_sha256':hashlib.sha256(binary.read_bytes()).hexdigest(),'platform':platform.platform()},indent=2))
     print(f'PASS {len(records)} main-binary cases; retained artifacts: {output}')

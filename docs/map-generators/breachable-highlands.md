@@ -210,15 +210,15 @@ than silently shrinking settlements or removing all saddles.
 ## Reproduce
 
 ```sh
-scons release=1 server=0 -j4 engine-tests map-generator-golden-test map-generator-study build/src/glob2
-build/src/glob2 map generate breachable-highlands --seed 1 \
+python3 tools/dev_build.py release=1 -j4 engine-tests map-generator-golden-test map-generator-study glob2
+build/linux/client/release/src/glob2 map generate breachable-highlands --seed 1 \
   --width 256 --height 256 --teams 4 \
   --output artifacts/breachable-highlands/play.map \
   --preview artifacts/breachable-highlands/play.png \
   --report-file artifacts/breachable-highlands/play.json
 python3 test/run_tests.py --filter 'MapGeneratorDefaults/*'
-build/src/MapGeneratorGoldenTest breachable-golden --require-rows
-build/src/MapGeneratorGoldenTest breachable-telemetry --telemetry
+build/linux/client/release/src/MapGeneratorGoldenTest breachable-golden --print --only=breachable-highlands
+build/linux/client/release/src/MapGeneratorGoldenTest breachable-telemetry --telemetry
 python3 tools/map_telemetry.py collect --generators breachable-highlands \
   --seed-start 20001 --count 16 --set width=256 --set height=256 \
   --set teams=4 --jobs 3 --out artifacts/breachable-highlands/held-out
@@ -241,7 +241,7 @@ See the [extraction and paired-map evidence](https://github.com/Globulation2/glo
 
 The source definition and its request/world validators define accepted settings and
 finished-map guarantees. Run the focused `MapGeneratorDefaults` contracts and the
-platform golden rows, inspect small/large rectangles and resource extremes, then
+sim-diff map fingerprints, inspect small/large rectangles and resource extremes, then
 check populated games with complete seat rotations. See [generator verification](verification.md)
 for commands, revisions, save/replay checks and evidence requirements.
 

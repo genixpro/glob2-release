@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SierpinskiGardensGenerator.h"
 #include "FractalMapSupport.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "Drawing.h"
 #include <algorithm>
 #include <cmath>
@@ -255,9 +255,7 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 	layBeaches(L.terrain, t);
 	// Graph travel uses the preliminary land mask. Finished-world validators later
 	// account for deposits, settlements, and actual engine movement predicates.
-	auto passable = pureTiles(L.terrain, t, WATER);
-	for (auto &tile : passable)
-		tile = !tile;
+	const auto passable = walkableTiles(L.terrain, t);
 	const auto graph = crossingEndpointGraph(t, passable, candidates);
 	if (!graph.failure.empty())
 	{
@@ -338,7 +336,7 @@ Layout design(const GenerationRequest &r, GenerationContext &context)
 	context.telemetry.measure("sierpinski.crossing-pairs.requested", o.pairs);
 	return L;
 }
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "Sierpiński Gardens design";
 	const Layout L = design(context.request, context);
@@ -354,7 +352,7 @@ std::string validateRequest(const GenerationRequest &r)
 	GenerationContext context(r);
 	return design(r, context).failure;
 }
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	return validate(game, context, design(context.request, replay));
@@ -380,7 +378,7 @@ GeneratorDefinition sierpinskiGardensDefinition()
 			49,
 			"Sierpiński Gardens",
 			// Revision 8: one of four home garden designs per map (FractalMapSupport.h).
-			9,
+			10,
 			false,
 			controls,
 			generate,

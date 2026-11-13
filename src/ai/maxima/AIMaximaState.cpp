@@ -3,6 +3,7 @@
 
 // Save/load of the resolved strategy, director, and pending execution work.
 #include "AIMaximaContinuation.h"
+#include "Building.h"
 #include "AIMaxima.h"
 #include "Version.h"
 #include "Game.h"
@@ -250,6 +251,32 @@ void Maxima::saveExecutionState(GAGCore::OutputStream* stream)
     archive("failed_waves",failed_waves);
     // An initialized director can execute this budget before its next plan.
     stream->writeSint32(budget.tactical_quarantine_ticks,"tacticalQuarantineTicks");
+    archive("prestige_race",prestige_race);
+    archive("prestige_cancellations",prestige_cancellations);
+    archive("budget.prestige_priority",budget.prestige_priority);
+    archive("budget.prestige_building_type",budget.prestige_building_type);
+    archive("budget.prestige_target_level",budget.prestige_target_level);
+    archive("budget.prestige_completion_allowed",budget.prestige_completion_allowed);
+    archive("budget.prestige_desired_buildings",budget.prestige_desired_buildings);
+    archive("prestige_migration_pending",prestige_migration_pending);
+    auto towers=development_planner.towerState();
+    archive("placement_enemy_structures",towers.pendingEnemyStructures);
+    archive("placement_contested_buildings",towers.pendingContestedBuildings);
+    archive("tower_structure_distance",towers.structureDistance);
+    archive("tower_enemy_structure_distance",towers.enemyStructureDistance);
+    archive("tower_enemy_structure_source",towers.enemyStructureSource);
+    archive("tower_enemy_structure_gap",towers.enemyStructureGap);
+    archive("maintenance_clearing_requested_by_farming",maintenance_clearing_requested_by_farming);
+    archive("last_maintenance_clearing_tick",last_maintenance_clearing_tick);
+    std::map<int,int> foodUpgradeRetries=development_planner.foodUpgradeRetries();
+    archive("food_upgrade_retries",foodUpgradeRetries);
+    archive("farming_wood_reserve_valid",farming_wood_reserve_valid);
+    archive("farming_wood_reserve_cells",farming_wood_reserve.cells);
+    archive("farming_wood_reserve_seeds",farming_wood_reserve.seeds);
+    archive("farming_wood_reserve_wheat",farming_wood_reserve.wheatCapacity);
+    archive("farming_wood_reserve_wood",farming_wood_reserve.woodCapacity);
+    archive("farming_wood_reserve_target",farming_wood_reserve.targetWoodCapacity);
+    archive("budget.preemptive_min_gap_ticks",budget.preemptive_min_gap_ticks);
     stream->writeLeaveSection();
 }
 void Maxima::loadExecutionState(GAGCore::InputStream* stream, Sint32 versionMinor)
@@ -310,8 +337,67 @@ void Maxima::loadExecutionState(GAGCore::InputStream* stream, Sint32 versionMino
         // Older formats omitted this budget. The restored canonical strategy
         // is its sole source when planning; optional telemetry may be stale.
         budget.tactical_quarantine_ticks=strategy.tactics.failed_target_quarantine_ticks;
+    prestige_race={};prestige_cancellations.clear();
+    prestige_migration_pending=versionMinor<FILE_FORMAT_VERSION_MAXIMA_PRESTIGE;
+    if(!prestige_migration_pending) {
+        archive("prestige_race",prestige_race);
+        archive("prestige_cancellations",prestige_cancellations);
+        archive("budget.prestige_priority",budget.prestige_priority);
+        archive("budget.prestige_building_type",budget.prestige_building_type);
+        archive("budget.prestige_target_level",budget.prestige_target_level);
+        archive("budget.prestige_completion_allowed",budget.prestige_completion_allowed);
+        archive("budget.prestige_desired_buildings",budget.prestige_desired_buildings);
+        archive("prestige_migration_pending",prestige_migration_pending);
+        if(prestige_race.state<Prestige::Hold || prestige_race.state>Prestige::Finish
+            || prestige_race.reason<Prestige::Disabled || prestige_race.reason>Prestige::WinningFinish
+            || prestige_race.priority<0 || prestige_race.priority>100
+            || prestige_race.remaining<0 || prestige_race.pending<0 || prestige_race.gain<0
+            || prestige_race.catchUpSteps<0 || prestige_race.finishSteps<0
+            || budget.prestige_target_level<0 || budget.prestige_target_level>int(context.observation().catalog->size())
+            || budget.prestige_desired_buildings<0 || budget.prestige_desired_buildings>Building::MAX_COUNT
+            || budget.prestige_priority<0 || budget.prestige_priority>100
+            || prestige_cancellations.size()>Building::MAX_COUNT)
+            throw std::runtime_error("Invalid saved Maxima prestige state");
+    } else {
+        budget.prestige_priority=0;budget.prestige_building_type=-1;
+        budget.prestige_target_level=0;budget.prestige_completion_allowed=false;budget.prestige_desired_buildings=0;
+    }
     if(budget.tactical_quarantine_ticks<0 || budget.tactical_quarantine_ticks>1000000)
         throw std::runtime_error("Invalid saved Maxima tactical quarantine duration");
+    if(versionMinor>=FILE_FORMAT_VERSION_MAXIMA_TOWER_ROLES) {
+        AIMaximaPlacement::Planner::TowerState towers;
+        archive("placement_enemy_structures",towers.pendingEnemyStructures);
+    archive("placement_contested_buildings",towers.pendingContestedBuildings);
+        archive("tower_structure_distance",towers.structureDistance);
+        archive("tower_enemy_structure_distance",towers.enemyStructureDistance);
+        archive("tower_enemy_structure_source",towers.enemyStructureSource);
+        archive("tower_enemy_structure_gap",towers.enemyStructureGap);
+        development_planner.restoreTowerState(std::move(towers));
+    }
+    maintenance_clearing_requested_by_farming=false;last_maintenance_clearing_tick=-1000000;
+    farming_wood_reserve=WoodReserve(0);farming_wood_reserve_valid=false;
+    budget.preemptive_min_gap_ticks=0;
+    if(versionMinor>=FILE_FORMAT_VERSION_MAXIMA_COALESCED_REVIEWS) {
+        archive("maintenance_clearing_requested_by_farming",maintenance_clearing_requested_by_farming);
+        archive("last_maintenance_clearing_tick",last_maintenance_clearing_tick);
+        if(last_maintenance_clearing_tick>timer)
+            throw std::runtime_error("Invalid saved Maxima maintenance clearing tick");
+        std::map<int,int> foodUpgradeRetries;
+        archive("food_upgrade_retries",foodUpgradeRetries);
+        development_planner.restoreFoodUpgradeRetries(std::move(foodUpgradeRetries),int(timer));
+        archive("farming_wood_reserve_valid",farming_wood_reserve_valid);
+        archive("farming_wood_reserve_cells",farming_wood_reserve.cells);
+        archive("farming_wood_reserve_seeds",farming_wood_reserve.seeds);
+        archive("farming_wood_reserve_wheat",farming_wood_reserve.wheatCapacity);
+        archive("farming_wood_reserve_wood",farming_wood_reserve.woodCapacity);
+        archive("farming_wood_reserve_target",farming_wood_reserve.targetWoodCapacity);
+        for(Uint8 cell:farming_wood_reserve.cells)if(cell>2)
+            throw std::runtime_error("Invalid saved Maxima wood reserve");
+        if(farming_wood_reserve.seeds<0)throw std::runtime_error("Invalid saved Maxima wood reserve");
+        archive("budget.preemptive_min_gap_ticks",budget.preemptive_min_gap_ticks);
+        if(budget.preemptive_min_gap_ticks<0||budget.preemptive_min_gap_ticks>100000)
+            throw std::runtime_error("Invalid saved Maxima preemptive defense gap");
+    }
     stream->readLeaveSection();
 
 }
@@ -353,6 +439,15 @@ std::shared_ptr<Order> Maxima::getOrder(const AIEngine::DecisionContext& decisio
         }
         }
         observe_wave_delivery();ensure_strategy();context.telemetry=telemetry;
+        if(prestige_migration_pending) {
+            // Refresh the new policy before any previously queued development.
+            if(prestige_enabled(context)) {
+                director.invalidate();
+                director.evaluate(*this,context);
+            }
+            prestige_migration_pending=false;
+        }
+        guard_prestige_completions(context);
         auto order=context.getOrder(*this);
         for(auto& diagnostic:context.bufferedDiagnostics)
             bufferedDiagnostics.push_back(std::move(diagnostic));
@@ -633,6 +728,10 @@ bool Maxima::loadState(GAGCore::InputStream *stream, Player *player,
 	farming_urgent=false;
 	land_clearing_pending=false;
 	maintenance_clearing_pending=false;
+	maintenance_clearing_requested_by_farming=false;
+	last_maintenance_clearing_tick=-1000000;
+	farming_wood_reserve=WoodReserve(0);
+	farming_wood_reserve_valid=false;
 	development_cycle_pending=false;
 	preemptive_defense_pending=false;
 	reactive_defense_pending=false;
@@ -792,7 +891,17 @@ void Maxima::save(GAGCore::OutputStream *stream)
 
 void AIMaxima::Maxima::orderExecutionCompleted(const Order& order, bool accepted)
 {
+    if(const auto* cancel=dynamic_cast<const OrderCancelConstruction*>(&order)) {
+        auto found=prestige_cancellations.find(cancel->gid);
+        if(found!=prestige_cancellations.end() && order.aiSelectedTarget
+            && found->second.generation==order.aiSelectedTarget->generation) {
+            if(accepted)found->second.acknowledged=true;
+            else prestige_cancellations.erase(found);
+        }
+    }
     if(const auto* construction=dynamic_cast<const OrderConstruction*>(&order))
         context.get_building_register().order_execution_completed(construction->gid,accepted,
             order.aiSelectedTarget ? std::optional<Uint32>(order.aiSelectedTarget->generation) : std::nullopt);
+    else if(const auto* create=dynamic_cast<const OrderCreate*>(&order); create && !accepted)
+        context.get_building_register().placement_rejected(create->posX,create->posY,create->typeNum);
 }

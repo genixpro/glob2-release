@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scons"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "buildsys"))
 import dev_store as store
 from tool_archives import digest
 
@@ -37,7 +37,7 @@ def checkouts(extra=()):
             for line in command.stdout.splitlines()
             if line.startswith("worktree ")
         )
-    return sorted(p for p in result if (p / "mobile/toolchain.json").is_file())
+    return sorted(p for p in result if (p / "platforms/mobile/toolchain.json").is_file())
 
 
 def open_paths(arguments):
@@ -85,14 +85,14 @@ def busy(checkout):
 
 
 def artifacts(root):
-    tools = json.loads((root / "mobile/android-tools.json").read_text())
+    tools = json.loads((root / "platforms/mobile/android-tools.json").read_text())
     result = [tools["gradle"]]
     host = store.platform.system() + "-" + store.platform.machine()
     if "jdk-" + host in tools:
         result.append(tools["jdk-" + host])
     if "sdk-tools-" + store.platform.system() in tools:
         result.append(tools["sdk-tools-" + store.platform.system()])
-    android = json.loads((root / "mobile/toolchain.json").read_text())["android"]
+    android = json.loads((root / "platforms/mobile/toolchain.json").read_text())["android"]
     if store.platform.system() in android["ndk_archives"]:
         result.append(
             dict(
@@ -101,7 +101,7 @@ def artifacts(root):
                 archive_directory="android-ndk-r28c",
             )
         )
-    emulator = json.loads((root / "mobile/emulator.json").read_text())["archives"]
+    emulator = json.loads((root / "platforms/mobile/emulator.json").read_text())["archives"]
     if host in emulator:
         result.append(emulator[host])
     arch = "arm64-v8a" if store.platform.machine() in ("arm64", "aarch64") else "x86_64"
@@ -168,7 +168,7 @@ def migrate_browser(checkout, item, receipt, apply):
     """Compare installed components, preserving local SDK configuration and caches."""
     if not receipt or receipt.get("checks", {}).get("browser-build") != 0:
         return
-    manifest = checkout / "browser/toolchain.json"
+    manifest = checkout / "platforms/web/toolchain.json"
     if not manifest.is_file():
         return
     target = store.browser_sdk(checkout, lease=False)
@@ -440,10 +440,24 @@ def main():
     paths.add_argument("--json", action="store_true")
     paths.add_argument("--field")
     commands.add_parser("status")
+    commands.add_parser("lanes", help="builds running on this machine and the CPU token pool")
+    trees = commands.add_parser("worktrees", help="every worktree with size, activity and PR state")
+    trees.add_argument("--json", action="store_true")
+    trees.add_argument("--finished", action="store_true", help="only merged or closed, clean, unlocked trees")
+    trees.add_argument("--remove", type=Path, nargs="+", metavar="PATH", help="remove these worktrees")
+    trees.add_argument("--discard", action="store_true", help="also remove trees with uncommitted changes")
+    trees.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+    build_dirs = commands.add_parser("builds", help="build directories of every checkout, largest first")
+    build_dirs.add_argument("--gc", action="store_true", help="delete idle, unlocked build directories")
+    build_dirs.add_argument("--idle", type=float, default=14, help="days without use before --gc deletes (default 14)")
+    build_dirs.add_argument("--dry-run", action="store_true")
+    commands.add_parser("disk", help="where the space goes, largest first")
     sdkmanager = commands.add_parser("sdkmanager")
     sdkmanager.add_argument("arguments", nargs=argparse.REMAINDER)
     prune = commands.add_parser("prune")
     prune.add_argument("--dry-run", action="store_true")
+    prune.add_argument("--toolchains", action="store_true",
+                       help="remove mobile/Emscripten toolchains and archive components no checkout uses")
     migrate_parser = commands.add_parser("migrate")
     mode = migrate_parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
@@ -495,6 +509,59 @@ def main():
             ),
             "external_storage": external_storage(),
         }
+    elif args.command == "lanes":
+        import jobserver
+
+        result = {
+            "token_pool": {"enabled": jobserver.enabled(), "tokens": jobserver.token_count(),
+                           "directory": str(jobserver.directory())},
+            "lanes": jobserver.live_lanes(),
+        }
+    elif args.command == "worktrees":
+        import dev_disk
+
+        if args.remove:
+            confirm = (lambda prompt: True) if args.yes else (lambda prompt: input(prompt).strip().lower() == "y")
+            for path in args.remove:
+                print(dev_disk.remove_worktree(path, args.discard, confirm))
+            return
+        rows = dev_disk.worktrees()
+        if args.finished:
+            rows = [row for row in rows if dev_disk.finished(row)]
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return
+        for row in sorted(rows, key=lambda r: -(r["build_bytes"] + r["artifacts_bytes"])):
+            pr = row["pr"]
+            state = (f"#{pr['number']} {pr['state'].lower()}" if pr else "no PR") + (" merged" if row["merged_into_master"] else "")
+            flags = " ".join(flag for flag in ("dirty", "locked", "scratch") if row[flag])
+            idle = f"{row['idle_days']:6.1f} d" if row["idle_days"] is not None else "missing "
+            print(f"{dev_disk.gib(row['build_bytes'] + row['artifacts_bytes'])}  idle {idle}  "
+                  f"{state:22s} {flags:18s} {row['branch'] or '(detached)'}  {row['path']}")
+        finished = [row for row in rows if dev_disk.finished(row)]
+        print(f"{len(finished)} finished worktrees hold {dev_disk.gib(sum(r['build_bytes'] + r['artifacts_bytes'] for r in finished)).strip()}"
+              " of builds and artifacts; remove them with --remove PATH...")
+        return
+    elif args.command == "builds":
+        import dev_disk
+
+        rows = dev_disk.builds(checkouts())
+        if args.gc:
+            result = {"deleted" if not args.dry_run else "would_delete": dev_disk.gc_builds(rows, args.idle, not args.dry_run)}
+        else:
+            result = rows
+    elif args.command == "disk":
+        import dev_disk
+
+        for row in dev_disk.disk(checkouts(), store.home()):
+            print(f"{dev_disk.gib(row['bytes'])}  {row['what']}")
+        usage = shutil.disk_usage(ROOT)
+        print(f"free {dev_disk.gib(usage.free).strip()} of {dev_disk.gib(usage.total).strip()}")
+        return
+    elif args.command == "prune" and args.toolchains:
+        import dev_disk
+
+        result = dev_disk.prune_toolchains(checkouts(), store.home(), not args.dry_run)
     elif args.command == "prune":
         result = store.prune(args.dry_run)
     else:

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2007 Bradley Arsenault
 
+#include "Team.h"
 #include "GameHeader.h"
 
 #include "FileFormatVersions.h"
@@ -124,7 +125,7 @@ GameHeader::GameHeader()
 void GameHeader::reset()
 {
 	unitCatalogValue=UnitCatalog::availableDefaults();
-	++observationRevisionValue; aiOrderDelay = 8; teamStatsDelay = 8; buildingGradientDelay = DEFAULT_BUILDING_GRADIENT_DELAY;
+	++observationRevisionValue; aiOrderDelay = DEFAULT_AI_ORDER_DELAY; teamStatsDelay = 8; buildingGradientDelay = DEFAULT_BUILDING_GRADIENT_DELAY;
 	buildingCatalogSnapshot.clear();
 	buildingArtwork.reset();
 	buildingCatalogExperimentKeys.clear();
@@ -249,7 +250,7 @@ bool GameHeader::load(GAGCore::InputStream *stream, Sint32 versionMinor, Sint32 
 	gameLatency = stream->readSint32("gameLatency");
 	orderRate = stream->readUint8("orderRate");
 	aiOrderDelay = versionMinor >= FILE_FORMAT_VERSION_AI_PIPELINE ? stream->readUint8("aiOrderDelay") : 0;
-	if (aiOrderDelay > 8) throw std::runtime_error("Invalid saved AI order delay");
+	if (aiOrderDelay > MAX_AI_ORDER_DELAY) throw std::runtime_error("Invalid saved AI order delay");
     teamStatsDelay = versionMinor >= FILE_FORMAT_VERSION_TEAM_STATS_PIPELINE ? stream->readUint8("teamStatsDelay") : 0;
     if(teamStatsDelay>8) throw std::runtime_error("Invalid saved statistics delay");
 	buildingGradientDelay = versionMinor >= FILE_FORMAT_VERSION_BUILDING_GRADIENT_PIPELINE ? stream->readUint8("buildingGradientDelay") : DEFAULT_BUILDING_GRADIENT_DELAY;
@@ -434,7 +435,7 @@ bool GameHeader::loadWithoutPlayerInfo(GAGCore::InputStream *stream, Sint32 vers
 	gameLatency = stream->readSint32("gameLatency");
 	orderRate = stream->readUint8("orderRate");
 	aiOrderDelay = versionMinor >= FILE_FORMAT_VERSION_AI_PIPELINE ? stream->readUint8("aiOrderDelay") : 0;
-	if (aiOrderDelay > 8) throw std::runtime_error("Invalid saved AI order delay");
+	if (aiOrderDelay > MAX_AI_ORDER_DELAY) throw std::runtime_error("Invalid saved AI order delay");
     teamStatsDelay = versionMinor >= FILE_FORMAT_VERSION_TEAM_STATS_PIPELINE ? stream->readUint8("teamStatsDelay") : 0;
     if(teamStatsDelay>8) throw std::runtime_error("Invalid saved statistics delay");
 	buildingGradientDelay = versionMinor >= FILE_FORMAT_VERSION_BUILDING_GRADIENT_PIPELINE ? stream->readUint8("buildingGradientDelay") : DEFAULT_BUILDING_GRADIENT_DELAY;

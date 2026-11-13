@@ -1,11 +1,11 @@
 #include "GenerationWork.h"
+#include "TerrainBuiltins.h"
 #include "GenerationFertilityWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "PowerOfTwo.h"
 #include "Growth.h"
-#include "Map.h"
+#include "GenerationWorld.h"
 #include "Morphology.h"
-#include "Map.h"
 #include <stdexcept>
 #include "TerrainType.h"
 #include "TerrainProperties.h"
@@ -13,7 +13,7 @@ namespace MapGeneration
 {
 namespace
 {
-bool spreadingCrop(const Map& map, int type)
+bool spreadingCrop(const GenerationMap &map, int type)
 {
     if (type==NO_RES_TYPE) return false;
     const auto& properties=map.resourcePropertiesByIndex(type);
@@ -22,7 +22,7 @@ bool spreadingCrop(const Map& map, int type)
 }
 }
 
-int cropSeedsIn(const Map &map, const std::vector<unsigned char> &region)
+int cropSeedsIn(const GenerationMap &map, const std::vector<unsigned char> &region)
 {
 	const Torus t(map);
 	if (region.size() != size_t(t.size()))
@@ -40,7 +40,7 @@ int cropSeedsIn(const Map &map, const std::vector<unsigned char> &region)
 	return seeds;
 }
 
-Flood cropSpreadEnvelope(const Map &map, const Fertility::Field *fertility)
+Flood cropSpreadEnvelope(const GenerationMap &map, const Fertility::Field *fertility)
 {
 	const Torus t(map);
 	std::vector<unsigned char> seeds(t.size(), 0), grass(t.size(), 0);
@@ -71,7 +71,8 @@ Flood cropSpreadEnvelope(const Map &map, const Fertility::Field *fertility)
 	return result;
 }
 
-std::vector<unsigned char> fertileCropEnvelope(const Map &map, const Fertility::Field &fertility)
+std::vector<unsigned char> fertileCropEnvelope(const GenerationMap &map,
+											   const Fertility::Field &fertility)
 {
 	const Torus t(map);
 	std::vector<unsigned char> reached(t.size(), 0);
@@ -113,6 +114,23 @@ Fertility::Field cropGrowthField(const TerrainSketch &sketch, const Torus &t)
 {
 	std::vector<std::int16_t> contribution(t.size(),0);
 	std::vector<std::uint16_t> inhibition(t.size(),0), growth(t.size(),256);
+	// A tile is pure for at most one terrain (all four corners equal), so native generation
+	// reads each tile's own terrain in one pass instead of testing every terrain in turn.
+	if (!generationWorkActive() && sketch.size() >= size_t(t.size()))
+		for (int y = 0; y < t.h; ++y)
+			for (int x = 0; x < t.w; ++x)
+			{
+				const unsigned char id = sketch[t.at(x, y)];
+				if (id >= TERRAIN_COUNT || sketch[t.at(x + 1, y)] != id || sketch[t.at(x, y + 1)] != id ||
+					sketch[t.at(x + 1, y + 1)] != id)
+					continue;
+				const auto& properties=terrainProperties(static_cast<TerrainType>(id));
+				const size_t i = size_t(y) * t.w + x;
+				contribution[i] = properties.fertilitySource ? properties.fertilityQ8 : 0;
+				inhibition[i] = properties.inhibitionQ8;
+				growth[i] = properties.growthQ8;
+			}
+	else
 	for (unsigned id=0; id<TERRAIN_COUNT; ++id)
 	{
 		::MapGeneration::generationCheckpoint();

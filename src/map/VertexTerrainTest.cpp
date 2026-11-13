@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Terrain stored per vertex: the corner combine rule, the per-map cell rule
 // table, vertex edits and the conversion of files written before format 146.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "TerrainBuiltins.h"
+#include "field/TerrainMovementCosts.h"
+#include "Map.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
 #include "BinaryStream.h"
 #include "TextStream.h"
 #include "StreamBackend.h"
 #include "FileFormatVersions.h"
+#include "Version.h"
 #include "CellRules.h"
+#include "io/TerrainFormatHistory.h"
 #include "LegacyTerrainFrames.h"
 #include <algorithm>
 #include <memory>
@@ -34,7 +41,7 @@ TEST_CASE("equal corners keep their terrain's exact rules")
 	CHECK(sameTerrainProperties(combine(DIRT, CLAY, DIRT, CLAY), rules(DIRT)));
 }
 
-TEST_CASE("mixed classic corners are exactly the retired shore profile")
+TEST_CASE("classic transitions vote on movement and blend ecology")
 {
 	const TerrainType classic[] = {WATER, SAND, GRASS};
 	for (auto a : classic)
@@ -42,25 +49,157 @@ TEST_CASE("mixed classic corners are exactly the retired shore profile")
 			for (auto c : classic)
 				for (auto d : classic)
 				{
-					const bool uniform = a == b && b == c && c == d;
-					const bool grassWater = (a == GRASS || b == GRASS || c == GRASS || d == GRASS) &&
-											(a == WATER || b == WATER || c == WATER || d == WATER);
-					if (uniform || grassWater)
-						continue;
-					CHECK(sameTerrainProperties(combine(a, b, c, d), CLASSIC_SHORE_PROPERTIES));
+					const unsigned water = unsigned(a == WATER) + unsigned(b == WATER) + unsigned(c == WATER) + unsigned(d == WATER);
+					const unsigned sand = unsigned(a == SAND) + unsigned(b == SAND) + unsigned(c == SAND) + unsigned(d == SAND);
+					const auto p = combine(a, b, c, d);
+					CHECK_EQ(p.walkable, water <= 2);
+					CHECK_EQ(p.swimmable, water >= 3);
+					const unsigned grass = 4 - water - sand;
+					// Sand is a beach; grass meeting water directly is one too.
+					CHECK_EQ(p.shoreline, sand > 0 || (grass > 0 && water > 0));
+					CHECK_EQ(p.buildable, a == GRASS && b == GRASS && c == GRASS && d == GRASS);
+					CHECK_EQ(p.fertilityQ8, water * 64);
+					CHECK_EQ(p.inhibitionQ8, sand * 64);
+					// Algae regrows by any coast, beach or bare bank; sand alone is none.
+					CHECK_EQ(p.coast, water > 0 && water < 4);
 				}
 }
 
-TEST_CASE("grass directly against water is walkable and unbuildable")
+TEST_CASE("water-majority grass transitions are swimmable and unbuildable")
 {
 	const auto p = combine(GRASS, WATER, WATER, WATER);
-	CHECK(p.walkable);
-	CHECK_FALSE(p.swimmable);
+	CHECK_FALSE(p.walkable);
+	CHECK(p.swimmable);
 	CHECK_FALSE(p.buildable);
-	CHECK_FALSE(p.shoreline);
+	CHECK(p.shoreline);
 	// Both corners grow resources, but they share none.
 	CHECK_EQ(p.allowedResources, 0);
 	CHECK_EQ(p.farmMaterial, 255);
+}
+
+TEST_CASE("corner movement votes cover every arrangement and tie")
+{
+	// Movement is a categorical vote, independent of numeric averages.
+	TerrainProperties walking, swimming, blocked;
+	walking.walkable = true;
+	swimming.swimmable = true;
+	const TerrainProperties categories[] = {walking, swimming, blocked};
+	for (unsigned pattern = 0; pattern < 81; ++pattern)
+	{
+		CAPTURE(pattern);
+		unsigned remaining = pattern;
+		std::array<unsigned, 3> counts{};
+		std::array<unsigned, 4> corners{};
+		for (auto& corner : corners)
+		{
+			corner = remaining % 3;
+			remaining /= 3;
+			++counts[corner];
+		}
+		// Rows are walking counts, columns swimming counts; the remainder is
+		// blocked. Covers all fifteen count triples, including (1, 2, 1).
+		constexpr unsigned winners[5][5] = {
+			{2, 2, 2, 1, 1}, {2, 2, 1, 1, 99}, {2, 0, 0, 99, 99},
+			{0, 0, 99, 99, 99}, {0, 99, 99, 99, 99}};
+		const unsigned winner = winners[counts[0]][counts[1]];
+		const auto p = combineCornerRules(categories[corners[0]], categories[corners[1]],
+			categories[corners[2]], categories[corners[3]]);
+		REQUIRE(winner < 3);
+		CHECK_EQ(p.walkable, winner == 0);
+		CHECK_EQ(p.swimmable, winner == 1);
+		CHECK(validTerrainProperties(p));
+	}
+}
+
+TEST_CASE("all numeric modifiers use four-corner means in every arrangement")
+{
+	std::array<TerrainProperties, 4> corners;
+	corners[0].walkable = corners[3].walkable = true;
+	corners[1].swimmable = true;
+	// Different expected values catch cross-wiring between fields. Signed and
+	// unsigned fractional sums exercise rounding; every corner contributes.
+	constexpr std::uint16_t groundSpeed[] = {64, 129, 511, 1024};
+	constexpr std::uint16_t airSpeed[] = {128, 255, 256, 512};
+	constexpr std::int16_t groundHealth[] = {-32768, -9, 4, 32767};
+	constexpr std::int16_t airHealth[] = {-32768, -16, -7, 32767};
+	constexpr std::uint16_t growth[] = {0, 0, 512, 1024};
+	constexpr std::int16_t fertility[] = {-1024, -127, 128, 1024};
+	constexpr std::uint16_t inhibition[] = {0, 128, 768, 1024};
+	for (unsigned i = 0; i < corners.size(); ++i)
+	{
+		auto& p = corners[i];
+		p.groundSpeedQ8 = groundSpeed[i]; p.airSpeedQ8 = airSpeed[i];
+		p.groundHealthQ8 = groundHealth[i]; p.airHealthQ8 = airHealth[i];
+		p.growthQ8 = growth[i]; p.fertilityQ8 = fertility[i];
+		p.inhibitionQ8 = inhibition[i];
+		REQUIRE(validTerrainProperties(p));
+	}
+	std::array<unsigned, 4> order{0, 1, 2, 3};
+	do
+	{
+		const auto p = combineCornerRules(corners[order[0]], corners[order[1]], corners[order[2]], corners[order[3]]);
+		CHECK(p.walkable);
+		CHECK_EQ(p.groundSpeedQ8, 432);
+		CHECK_EQ(p.airSpeedQ8, 287);
+		CHECK_EQ(p.groundHealthQ8, -1);
+		CHECK_EQ(p.airHealthQ8, -6);
+		CHECK_EQ(p.growthQ8, 384);
+		CHECK_EQ(p.fertilityQ8, 0);
+		CHECK_EQ(p.inhibitionQ8, 480);
+		CHECK(validTerrainProperties(p));
+	} while (std::next_permutation(order.begin(), order.end()));
+}
+
+TEST_CASE("mean health rates neither overflow nor clip authored extremes")
+{
+	for (const auto rates : {std::array<std::int16_t, 4>{32764, 32765, 32766, 32767},
+		std::array<std::int16_t, 4>{-32768, -32767, -32766, -32765}})
+	{
+		std::array<unsigned, 4> order{0, 1, 2, 3};
+		do
+		{
+			std::array<TerrainProperties, 4> corners;
+			for (unsigned i = 0; i < corners.size(); ++i)
+				corners[i].groundHealthQ8 = corners[i].airHealthQ8 = rates[order[i]];
+			const auto p = combineCornerRules(corners[0], corners[1], corners[2], corners[3]);
+			CHECK_EQ(p.groundHealthQ8, rates[0] > 0 ? 32765 : -32766);
+			CHECK_EQ(p.airHealthQ8, p.groundHealthQ8);
+		} while (std::next_permutation(order.begin(), order.end()));
+	}
+}
+
+TEST_CASE("different water profiles join without a movement barrier")
+{
+	const auto mixed = combine(WATER, DEEP_WATER, DARK_WATER, WATER);
+	CHECK_FALSE(mixed.walkable);
+	CHECK(mixed.swimmable);
+	CHECK_FALSE(mixed.buildable);
+	CHECK_EQ(mixed.groundSpeedQ8, 224); // Half ordinary, half deep water: 87.5%.
+	// All four corners contribute, including the minority ice corner.
+	const auto icyPool = combine(DEEP_WATER, DEEP_WATER, WATER, ICE);
+	CHECK(icyPool.swimmable);
+	CHECK_EQ(icyPool.groundSpeedQ8, rules(DEEP_WATER).groundSpeedQ8);
+	CHECK_EQ(icyPool.groundHealthQ8, -2);
+}
+
+TEST_CASE("compiled movement queries respect corner votes and vertex edits")
+{
+	glob2test::HeadlessGlobals globals;
+	Map map;
+	map.setSize(4, 4, WATER);
+	map.setVertexTerrain(5, 5, GRASS);
+	CHECK_FALSE(map.isFreeForMovement(5, 5, 0, 0));
+	CHECK(map.isFreeForMovement(5, 5, WATER_ONLY_CLASS, 0));
+	map.setVertexTerrain(6, 5, GRASS);
+	CHECK(map.isFreeForMovement(5, 5, 0, 0));
+	CHECK_FALSE(map.isFreeForMovement(5, 5, WATER_ONLY_CLASS, 0));
+	map.setVertexTerrain(5, 5, CHASM);
+	map.setVertexTerrain(6, 5, CHASM);
+	CHECK_FALSE(map.isFreeForMovement(5, 5, 0, 0));
+	CHECK_FALSE(map.isFreeForMovement(5, 5, WATER_ONLY_CLASS, 0));
+	CHECK_FALSE(map.isFreeForGroundUnit(5, 5, true, 0));
+	map.setVertexTerrain(6, 5, DEEP_WATER);
+	CHECK(map.isFreeForMovement(5, 5, WATER_ONLY_CLASS, 0));
 }
 
 TEST_CASE("every built-in pair combines into valid transition rules")
@@ -74,31 +213,38 @@ TEST_CASE("every built-in pair combines into valid transition rules")
 			CHECK(validTerrainProperties(p));
 			if (sameTerrainProperties(rules(TerrainType(a)), rules(TerrainType(b))))
 				continue;
-			CHECK_FALSE(p.swimmable);
+			CHECK_EQ(p.swimmable, rules(TerrainType(a)).swimmable && rules(TerrainType(b)).swimmable);
 			CHECK_FALSE(p.buildable);
-			CHECK_EQ(p.walkable, rules(TerrainType(a)).walkable || rules(TerrainType(b)).walkable);
+			const auto& first = rules(TerrainType(a));
+			const auto& second = rules(TerrainType(b));
+			CHECK_EQ(p.walkable, (first.walkable || second.walkable) &&
+				(first.walkable || first.swimmable) && (second.walkable || second.swimmable));
 			CHECK_EQ(p.flyable, rules(TerrainType(a)).flyable && rules(TerrainType(b)).flyable);
 			CHECK_EQ(p.projectileBlocks, rules(TerrainType(a)).projectileBlocks || rules(TerrainType(b)).projectileBlocks);
 		}
 }
 
-TEST_CASE("ground costs follow the walkable corners and hazards take the worst")
+TEST_CASE("numeric terrain effects blend proportionally at boundaries")
 {
-	// One grass corner opens three chasm corners to walking at grass speed.
 	const auto chasm = combine(CHASM, CHASM, CHASM, GRASS);
-	CHECK(chasm.walkable);
+	CHECK_FALSE(chasm.walkable);
+	CHECK_FALSE(chasm.swimmable);
 	CHECK_FALSE(chasm.flyable);
 	CHECK(chasm.projectileBlocks);
-	CHECK_EQ(chasm.groundSpeedQ8, 256);
-	// Slow mud slows the transition; ice damages it.
-	CHECK_EQ(combine(MUD, GRASS, GRASS, GRASS).groundSpeedQ8, rules(MUD).groundSpeedQ8);
-	CHECK_EQ(combine(ICE, GRASS, GRASS, GRASS).groundHealthQ8, rules(ICE).groundHealthQ8);
-	CHECK_EQ(combine(ICE, GRASS, GRASS, GRASS).groundSpeedQ8, rules(ICE).groundSpeedQ8);
-	// Fast trail never speeds up its border.
-	CHECK_EQ(combine(TRAIL, TRAIL, GRASS, GRASS).groundSpeedQ8, 256);
-	// Deep water does not walk, so its swim speed does not slow a sand border.
-	CHECK_EQ(combine(DEEP_WATER, SAND, SAND, SAND).groundSpeedQ8, 256);
-	CHECK_EQ(combine(LAVA, GRASS, GRASS, GRASS).airHealthQ8, rules(LAVA).airHealthQ8);
+	// A lone corner contributes one quarter of its speed or health adjustment.
+	CHECK_EQ(combine(MUD, GRASS, GRASS, GRASS).groundSpeedQ8, 232);
+	CHECK_EQ(combine(ICE, GRASS, GRASS, GRASS).groundHealthQ8, -2);
+	CHECK_EQ(combine(ICE, GRASS, GRASS, GRASS).groundSpeedQ8, 224);
+	CHECK_EQ(combine(TRAIL, GRASS, GRASS, GRASS).groundSpeedQ8, 320);
+	CHECK_EQ(combine(LAVA, GRASS, GRASS, GRASS).airHealthQ8, -16);
+	// Even splits create one intermediate cell between speeds and hazards.
+	CHECK_EQ(combine(ICE, ICE, GRASS, GRASS).groundSpeedQ8, 192);
+	CHECK_EQ(combine(ICE, ICE, GRASS, GRASS).groundHealthQ8, -4);
+	CHECK_EQ(combine(TRAIL, TRAIL, GRASS, GRASS).groundSpeedQ8, 384);
+	CHECK_EQ(combine(TRAIL, TRAIL, TRAIL, GRASS).groundSpeedQ8, 448);
+	CHECK_EQ(combine(ICE, ICE, ICE, GRASS).groundSpeedQ8, 160);
+	CHECK_EQ(combine(ICE, ICE, ICE, GRASS).groundHealthQ8, -6);
+	CHECK_EQ(combine(LAVA, LAVA, GRASS, GRASS).airHealthQ8, -32);
 }
 
 TEST_CASE("the rule table numbers uniform rules by terrain and interns mixed ones in order")
@@ -118,7 +264,11 @@ TEST_CASE("the rule table numbers uniform rules by terrain and interns mixed one
 	CHECK(table.intern(GRASS, GRASS, SAND, SAND) == shore);
 	CHECK(table.intern(GRASS, GRASS, GRASS, SAND) == TERRAIN_COUNT + 1);
 	CHECK_FALSE(table[shore].uniform());
-	CHECK(sameTerrainProperties(table[shore].properties, CLASSIC_SHORE_PROPERTIES));
+	CHECK(table[shore].properties.walkable);
+	CHECK(table[shore].properties.shoreline);
+	CHECK_FALSE(table[shore].properties.buildable);
+	CHECK_EQ(table[shore].properties.inhibitionQ8, 128);
+	CHECK_FALSE(table[shore].properties.coast); // sand meeting grass, no water
 	// Costs come from the combined rules.
 	const auto mud = table.intern(MUD, MUD, GRASS, GRASS);
 	CHECK(table[mud].ground[0].cardinal == gradient_kernel::terrainEntrySteps(combine(MUD, MUD, GRASS, GRASS), 0).cardinal);
@@ -168,6 +318,23 @@ TEST_CASE("mixed cells take the shore habitat and intersect explicit resource li
 	CHECK(table.farmResource(GRASS) != NO_RES_TYPE);
 }
 
+TEST_CASE("grass directly against water is a shore: no land crops, algae where it swims")
+{
+	glob2test::HeadlessGlobals globals;
+	CellRuleTable table(TerrainRegistry::builtins(), ResourceRegistry::builtins());
+	CHECK(table.supportsResource(GRASS, WHEAT));
+	for (const auto water : {1, 2, 3})
+	{
+		CAPTURE(water);
+		const auto cell = table.intern(GRASS, water >= 3 ? WATER : GRASS, water >= 2 ? WATER : GRASS, WATER);
+		CHECK(table[cell].properties.shoreline);
+		CHECK_FALSE(table.supportsResource(cell, WHEAT));
+		CHECK_FALSE(table.supportsResource(cell, WOOD));
+		CHECK(table.farmResource(cell) == NO_RES_TYPE);
+		CHECK(table.supportsResource(cell, ALGA) == (water == 3));
+	}
+}
+
 TEST_CASE("a vertex write re-derives the four cells around it")
 {
 	glob2test::HeadlessGlobals globals;
@@ -195,9 +362,7 @@ TEST_CASE("a vertex write re-derives the four cells around it")
 	// The torus wraps vertices too.
 	map.setVertexTerrain(0, 0, ICE);
 	CHECK(map.cellCorners(15, 15) == std::array{GRASS, GRASS, GRASS, ICE});
-	CHECK(map.requiredTerrainExperiments().has(ExperimentId::IceTerrain));
 	map.setVertexTerrain(0, 0, GRASS);
-	CHECK_FALSE(map.requiredTerrainExperiments().has(ExperimentId::IceTerrain));
 	map.fillTerrain(SAND);
 	CHECK(map.terrainCounts[SAND] == 256);
 	CHECK(map.terrainTypeAt(5, 5) == SAND);
@@ -217,7 +382,8 @@ TEST_CASE("a cell's four corners paint it uniform and its neighbours mixed")
 			if (x != 6 || y != 6)
 			{
 				CHECK(map.terrainTypeAt(x, y) == MIXED_TERRAIN);
-				CHECK(map.terrainPropertiesAt(x, y).walkable);
+				// Side neighbours have two blocked corners; diagonals have one.
+				CHECK_EQ(map.terrainPropertiesAt(x, y).walkable, x != 6 && y != 6);
 				CHECK(map.terrainPropertiesAt(x, y).projectileBlocks);
 			}
 }
@@ -261,12 +427,51 @@ TEST_CASE("old cell terrain moves onto the vertices it covers")
 	CHECK(map.cellCorners(4, 3) == std::array{TRAIL, TRAIL, ICE, TRAIL});
 }
 
-TEST_CASE("terrain IDs of older files skip the retired shores")
+TEST_CASE("terrain IDs of older files skip the retired shores and follow the current built-ins")
 {
 	using R = TerrainRegistry;
 	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_TERRAIN_CATALOGUE - 1) == TERRAIN_COUNT_BEFORE_CATALOGUE);
 	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_VERTEX_TERRAIN - 1) == TERRAIN_COUNT_BEFORE_VERTEX);
-	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_VERTEX_TERRAIN) == TERRAIN_COUNT);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_VERTEX_TERRAIN) == TERRAIN_COUNT_BEFORE_GROUND_LOOKS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GROUND_LOOKS - 1) == TERRAIN_COUNT_BEFORE_GROUND_LOOKS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GROUND_LOOKS) == TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_SANDSTONE_PUMICE - 1) == TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_SANDSTONE_PUMICE) == TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WIND_SWEPT_SNOW - 1) == TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WIND_SWEPT_SNOW) == TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WEATHERED_SANDSTONE - 1) == TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WEATHERED_SANDSTONE) == TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WINDY_SAND_DUNE - 1) == TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_WINDY_SAND_DUNE) == TERRAIN_COUNT_BEFORE_HARDPAN);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_HARDPAN - 1) == TERRAIN_COUNT_BEFORE_HARDPAN);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_HARDPAN) == TERRAIN_COUNT_BEFORE_TUNDRA);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_TUNDRA - 1) == TERRAIN_COUNT_BEFORE_TUNDRA);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_TUNDRA) == TERRAIN_COUNT_BEFORE_VOLCANIC_ASH);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_VOLCANIC_ASH - 1) == TERRAIN_COUNT_BEFORE_VOLCANIC_ASH);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_VOLCANIC_ASH) == TERRAIN_COUNT_BEFORE_GLACIER_ICE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GLACIER_ICE - 1) == TERRAIN_COUNT_BEFORE_GLACIER_ICE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GLACIER_ICE) == TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_OVERGROWN_ROAD - 1) == TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_OVERGROWN_ROAD) == TERRAIN_COUNT_BEFORE_LATERITE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_LATERITE - 1) == TERRAIN_COUNT_BEFORE_LATERITE);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_LATERITE) == TERRAIN_COUNT_BEFORE_CLIFFS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_CLIFFS - 1) == TERRAIN_COUNT_BEFORE_CLIFFS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_CLIFFS) == TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_MOLTEN_LAVA_POOL - 1) == TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_MOLTEN_LAVA_POOL) == TERRAIN_COUNT_BEFORE_ROCK_PATHS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ROCK_PATHS - 1) == TERRAIN_COUNT_BEFORE_ROCK_PATHS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ROCK_PATHS) == TERRAIN_COUNT_BEFORE_ICE_PATHS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ICE_PATHS - 1) == TERRAIN_COUNT_BEFORE_ICE_PATHS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ICE_PATHS) == TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ARCTIC_TUNDRA - 1) == TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ARCTIC_TUNDRA) == TERRAIN_COUNT_BEFORE_GLACIER);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GLACIER - 1) == TERRAIN_COUNT_BEFORE_GLACIER);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_GLACIER) == TERRAIN_COUNT_BEFORE_ICEFALL);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ICEFALL - 1) == TERRAIN_COUNT_BEFORE_ICEFALL);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_ICEFALL) == TERRAIN_COUNT_BEFORE_STEPPE_GRASS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_STEPPE_GRASS - 1) == TERRAIN_COUNT_BEFORE_STEPPE_GRASS);
+	CHECK(R::savedBuiltinCount(FILE_FORMAT_VERSION_STEPPE_GRASS) == TERRAIN_COUNT);
+	CHECK(R::savedBuiltinCount(VERSION_MINOR) == TERRAIN_COUNT);
 	for (unsigned builtins : {TERRAIN_COUNT_BEFORE_CATALOGUE, TERRAIN_COUNT_BEFORE_VERTEX})
 	{
 		CHECK(R::currentTerrainId(builtins, WATER) == WATER);
@@ -278,6 +483,117 @@ TEST_CASE("terrain IDs of older files skip the retired shores")
 	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_VERTEX, 7) == BOULDERS);
 	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_VERTEX, 30) == CHASM);
 	CHECK(R::currentTerrainId(TERRAIN_COUNT, 5) == BOULDERS);
+	// Formats 146 to 190 keep every built-in and move custom IDs behind the looks.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GROUND_LOOKS, 5) == BOULDERS);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GROUND_LOOKS, CHASM) == CHASM);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GROUND_LOOKS, TERRAIN_COUNT_BEFORE_GROUND_LOOKS) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GROUND_LOOKS, 40) == 40 - TERRAIN_COUNT_BEFORE_GROUND_LOOKS + TERRAIN_COUNT);
+	// Formats 191 to 194 keep every built-in through PALE_SAND and move custom IDs behind
+	// sandstone, pumice and frozen lake.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE, CHASM) == CHASM);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE, PALE_SAND) == PALE_SAND);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE, TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE, 40) == 40 - TERRAIN_COUNT_BEFORE_SANDSTONE_PUMICE + TERRAIN_COUNT);
+	// Format 195 keeps every built-in through FROZEN_LAKE and moves custom IDs behind
+	// wind-swept snow.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW, FROZEN_LAKE) == FROZEN_LAKE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW, TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW, 40) == 40 - TERRAIN_COUNT_BEFORE_WIND_SWEPT_SNOW + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, SANDSTONE) == SANDSTONE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, PUMICE) == PUMICE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, FROZEN_LAKE) == FROZEN_LAKE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, WIND_SWEPT_SNOW) == WIND_SWEPT_SNOW);
+	// Format 196 keeps every built-in through WIND_SWEPT_SNOW and moves custom IDs
+	// behind weathered sandstone.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE, WIND_SWEPT_SNOW) == WIND_SWEPT_SNOW);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE, TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE) ==
+		  TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE, 40) ==
+		  40 - TERRAIN_COUNT_BEFORE_WEATHERED_SANDSTONE + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, WEATHERED_SANDSTONE) == WEATHERED_SANDSTONE);
+	// Format 197 keeps every built-in through WEATHERED_SANDSTONE and moves custom IDs
+	// behind windy sand dune.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE, WEATHERED_SANDSTONE) == WEATHERED_SANDSTONE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE, TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE) ==
+		  TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE, 40) ==
+		  40 - TERRAIN_COUNT_BEFORE_WINDY_SAND_DUNE + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, WINDY_SAND_DUNE) == WINDY_SAND_DUNE);
+	// Format 198 keeps every built-in through WINDY_SAND_DUNE and moves custom IDs
+	// behind hardpan.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_HARDPAN, WINDY_SAND_DUNE) == WINDY_SAND_DUNE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_HARDPAN, TERRAIN_COUNT_BEFORE_HARDPAN) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_HARDPAN, 40) == 40 - TERRAIN_COUNT_BEFORE_HARDPAN + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, HARDPAN) == HARDPAN);
+	// Format 199 keeps every built-in through HARDPAN and moves custom IDs behind tundra.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_TUNDRA, HARDPAN) == HARDPAN);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_TUNDRA, TERRAIN_COUNT_BEFORE_TUNDRA) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_TUNDRA, 41) == 41 - TERRAIN_COUNT_BEFORE_TUNDRA + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, TUNDRA) == TUNDRA);
+	// Format 200 keeps every built-in through TUNDRA and moves custom IDs
+	// behind volcanic ash.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_VOLCANIC_ASH, TUNDRA) == TUNDRA);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_VOLCANIC_ASH, TERRAIN_COUNT_BEFORE_VOLCANIC_ASH) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_VOLCANIC_ASH, 45) == 45 - TERRAIN_COUNT_BEFORE_VOLCANIC_ASH + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, VOLCANIC_ASH) == VOLCANIC_ASH);
+	// Format 201 keeps every built-in through VOLCANIC_ASH and moves custom IDs
+	// behind glacier ice.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER_ICE, VOLCANIC_ASH) == VOLCANIC_ASH);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER_ICE, TERRAIN_COUNT_BEFORE_GLACIER_ICE) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER_ICE, 46) == 46 - TERRAIN_COUNT_BEFORE_GLACIER_ICE + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, GLACIER_ICE) == GLACIER_ICE);
+	// Format 202 keeps every built-in through GLACIER_ICE and moves custom IDs
+	// behind overgrown road.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD, GLACIER_ICE) == GLACIER_ICE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD, TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD, 46) == 46 - TERRAIN_COUNT_BEFORE_OVERGROWN_ROAD + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, OVERGROWN_ROAD) == OVERGROWN_ROAD);
+	// Format 203 keeps every built-in through OVERGROWN_ROAD and moves custom IDs behind laterite.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_LATERITE, OVERGROWN_ROAD) == OVERGROWN_ROAD);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_LATERITE, TERRAIN_COUNT_BEFORE_LATERITE) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_LATERITE, 45) == 45 - TERRAIN_COUNT_BEFORE_LATERITE + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, LATERITE) == LATERITE);
+	// Formats 204 and 205 keep every built-in through LATERITE and move custom IDs behind cliffs.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_CLIFFS, LATERITE) == LATERITE);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_CLIFFS, TERRAIN_COUNT_BEFORE_CLIFFS) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_CLIFFS, 47) == 47 - TERRAIN_COUNT_BEFORE_CLIFFS + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, CLIFFS) == CLIFFS);
+	// Format 206 keeps every built-in through CLIFFS and moves custom IDs behind molten lava pool.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL, CLIFFS) == CLIFFS);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL, TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL, 48) ==
+		  48 - TERRAIN_COUNT_BEFORE_MOLTEN_LAVA_POOL + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, MOLTEN_LAVA_POOL) == MOLTEN_LAVA_POOL);
+	// Format 207 keeps every built-in through MOLTEN_LAVA_POOL and moves custom IDs behind the rock paths.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ROCK_PATHS, MOLTEN_LAVA_POOL) == MOLTEN_LAVA_POOL);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ROCK_PATHS, TERRAIN_COUNT_BEFORE_ROCK_PATHS) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ROCK_PATHS, 49) == 49 - TERRAIN_COUNT_BEFORE_ROCK_PATHS + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, SCORIA_BLOCKS) == SCORIA_BLOCKS);
+	// Format 208 keeps every built-in through SCORIA_BLOCKS and moves custom IDs behind the ice paths.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICE_PATHS, SCORIA_BLOCKS) == SCORIA_BLOCKS);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICE_PATHS, TERRAIN_COUNT_BEFORE_ICE_PATHS) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICE_PATHS, 52) == 52 - TERRAIN_COUNT_BEFORE_ICE_PATHS + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, FROST_PINWHEEL) == FROST_PINWHEEL);
+	// Format 209 keeps every built-in through FROST_PINWHEEL and moves custom IDs behind arctic tundra.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA, FROST_PINWHEEL) == FROST_PINWHEEL);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA, TERRAIN_COUNT_BEFORE_ARCTIC_TUNDRA) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, ARCTIC_TUNDRA) == ARCTIC_TUNDRA);
+	// Format 210 keeps every built-in through ARCTIC_TUNDRA and moves custom IDs behind glacier.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER, ARCTIC_TUNDRA) == ARCTIC_TUNDRA);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER, TERRAIN_COUNT_BEFORE_GLACIER) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_GLACIER, 56) == 56 - TERRAIN_COUNT_BEFORE_GLACIER + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, GLACIER) == GLACIER);
+	// Format 211 keeps every built-in through GLACIER and moves custom IDs behind icefall.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICEFALL, GLACIER) == GLACIER);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICEFALL, TERRAIN_COUNT_BEFORE_ICEFALL) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_ICEFALL, 57) == 57 - TERRAIN_COUNT_BEFORE_ICEFALL + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, ICEFALL) == ICEFALL);
+	// Formats 212 to 215 keep every built-in through PETRIFIED_STUMPS and move custom IDs
+	// behind moor grass.
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_STEPPE_GRASS, PETRIFIED_STUMPS) == PETRIFIED_STUMPS);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_STEPPE_GRASS, TERRAIN_COUNT_BEFORE_STEPPE_GRASS) == TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT_BEFORE_STEPPE_GRASS, 65) == 65 - TERRAIN_COUNT_BEFORE_STEPPE_GRASS + TERRAIN_COUNT);
+	CHECK(R::currentTerrainId(TERRAIN_COUNT, MOOR_GRASS) == MOOR_GRASS);
 	CHECK(legacyFrameCorners(16) == std::array{SAND, SAND, SAND, GRASS});
 	CHECK(legacyFrameCorners(3) == std::array{GRASS, GRASS, GRASS, GRASS});
 	CHECK_FALSE(legacyFrameCorners(272));
@@ -318,7 +634,6 @@ TEST_CASE("vertex terrain round-trips through packed and text saves")
 				break;
 			}
 		CHECK(loaded.game.map.checkSum(true) == map.checkSum(true));
-		CHECK(loaded.game.map.requiredTerrainExperiments() == map.requiredTerrainExperiments());
 	}
 }
 }

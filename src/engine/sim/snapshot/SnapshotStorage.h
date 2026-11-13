@@ -40,11 +40,27 @@ struct Storage
 	BufferPool<ResourceFields> resourceFields;
 	BufferPool<Fertility::GrowthCache> growth;
 	BufferPool<BuildingAreaEffects::FertilitySnapshot> areaFertility;
-	// Every live plane of every retained capture may be distinct.
-	BufferPool<std::vector<Uint16>, std::size_t(17) * MapState::PlaneCount> resourcePlanes;
+	BufferPool<MapState::BuildingSeedSnapshot> buildingSeeds;
+	//! Schemas of the telemetry series seen most recently; a series' fields are
+	//! fixed when it is created or loaded, so one shared copy serves every capture.
+	struct TelemetrySchema
+	{
+		std::weak_ptr<const AITelemetry::Series> series;
+		const AITelemetry::Field* data = nullptr;
+		std::size_t size = 0;
+		std::shared_ptr<const std::deque<std::string>> text;
+		std::shared_ptr<const std::vector<AITelemetry::Field>> fields;
+	};
+	std::vector<TelemetrySchema> telemetrySchemas;
+	//! Empty between captures; keeps its capacity for the next schema list.
+	std::vector<TelemetrySchema> telemetrySchemaScratch;
+	//! Scratch list of a map array's dirty chunks during one refresh.
+	std::vector<Uint32> dirtyChunks;
 	Uint64 allocations = 0;
 	//! Bytes of map arrays actually copied (changed chunks and full fills).
 	Uint64 bytesCopied = 0;
+	//! Derived building seed template bytes copied (kept apart from map arrays).
+	Uint64 buildingSeedBytesCopied = 0;
 	//! Actual entity extraction passes, including passes over an empty world.
 	Uint64 coreMaterializations = 0;
 	//! Bulk authoritative records read from live objects; excludes view metadata.

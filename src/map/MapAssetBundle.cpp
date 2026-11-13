@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "MapAssetBundle.h"
+#include "TerrainBuiltins.h"
 #include "online/Sha256.h"
 #include "TerrainRegistry.h"
 #include "ResourceRegistry.h"
@@ -154,7 +155,7 @@ void MapAssetBundle::validate(const TerrainRegistry& terrain, const ResourceRegi
             if (!material.decor.sprite.empty() && terrains.contains(material.key)) {
                 const auto decor = sheets.find(material.decor.sprite);
                 if (decor == sheets.end()) fail("Custom decor requires a bundled spritesheet");
-                for (const auto& frames : {material.decor.full, material.decor.edge})
+                for (const auto& frames : {material.decor.full, material.decor.edge, material.decor.connected})
                     for (int frame : frames) if (frame >= int(decor->second.frames())) fail("Missing custom decor frame");
             }
             if (found == sheets.end()) continue;

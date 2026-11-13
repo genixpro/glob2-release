@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real production growth versus the frozen pre-terrain-refactor routine. The
 // reference exists only in this opt-in test executable, never in the game.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
 #include "LegacyResourceTypes.h"
 #include "BinaryStream.h"
 #include "FileManager.h"
@@ -15,6 +18,7 @@
 #include <iomanip>
 #include <memory>
 #include <string>
+#include "Unit.h"
 
 namespace
 {

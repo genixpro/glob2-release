@@ -2,13 +2,13 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #include "PowerOfTwo.h"
+#include "Building.h"
 #include "Material.h"
 #include "AITelemetryFields.h"
 #include "AINicowar.h"
 #include <string>
 #include <utility>
 #include "Utilities.h"
-#include "Game.h"
 #include "Unit.h"
 
 using namespace AISharedRuntime;

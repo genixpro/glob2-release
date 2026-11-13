@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "sim/SimulationRunner.h"
+#include "Map.h"
 
 #include "Engine.h"
 #include "sim/presentation/SceneInputs.h"
@@ -7,6 +8,7 @@
 
 #include <chrono>
 #include <system_error>
+#include "Game.h"
 
 SimulationRunner::SimulationRunner(Engine &engine) : engine(engine) {}
 
@@ -20,6 +22,10 @@ bool SimulationRunner::start()
 	return false;
 #else
 	telemetry.reset();
+	configureTelemetry(PerformanceTelemetry::collector());
+	telemetry.budgetNs = telemetryMailbox.budgetNs;
+	telemetry.phase = telemetryMailbox.phase;
+	completedTelemetryTick = engine.gui.game.stepCounter;
 	requestedScene = engine.gui.sceneRequest(false);
 	engine.gui.startScriptClientChannel();
 	try
@@ -167,6 +173,8 @@ void SimulationRunner::withGame(const std::function<void()> &work)
 void SimulationRunner::suspend()
 {
 	std::unique_lock<std::mutex> lock(mutex);
+	if (!suspended)
+		PerformanceTelemetry::collector().windowFlags |= PerformanceTelemetry::Suspended;
 	suspended = true;
 	wake.notify_all();
 	if (thread.joinable())
@@ -177,6 +185,8 @@ void SimulationRunner::resume()
 {
 	{
 		std::lock_guard<std::mutex> lock(mutex);
+		if (suspended)
+			PerformanceTelemetry::collector().windowFlags |= PerformanceTelemetry::Resumed;
 		suspended = false;
 	}
 	wake.notify_all();
@@ -218,14 +228,16 @@ void SimulationRunner::requestScene(SceneRequest request)
     wake.notify_all();
 }
 
-void SimulationRunner::absorbTelemetry(PerformanceTelemetry::Collector& target)
+Uint32 SimulationRunner::absorbTelemetry(PerformanceTelemetry::Collector &target)
 {
     std::lock_guard lock(telemetryMutex);
     target.absorb(telemetryMailbox);
+	return completedTelemetryTick;
 }
 
-Uint32 SimulationRunner::latestTelemetryTick()
+void SimulationRunner::configureTelemetry(const PerformanceTelemetry::Collector &target)
 {
     std::lock_guard lock(telemetryMutex);
-    return completedTelemetryTick;
+	telemetryMailbox.budgetNs = target.budgetNs;
+	telemetryMailbox.phase = target.phase;
 }

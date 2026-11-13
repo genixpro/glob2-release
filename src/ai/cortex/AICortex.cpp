@@ -627,8 +627,8 @@ shared_ptr<Order> AICortex::decide()
 					if (!Cortex::servesRole(*observedWorld, *Cortex::buildingType(*observedWorld,*bb), Cortex::CORTEX_BUILD_FOOD))
 						continue;
                     int rx=0,ry=0,distance=0;
-                    const bool available=diagnosticQueries.resourceAvailableUpdate(tm->number,materialIndex(MaterialId::Food),0,Cortex::plannedX(intents,*bb),Cortex::plannedY(intents,*bb),&rx,&ry,&distance);
-                    auto field=g->resourceGradient(tm->number,materialIndex(MaterialId::Food),0);
+                    const bool available=diagnosticQueries.resourceAvailableUpdate(tm->number,materialIndex(MaterialId::Food),MovementAccess::Land,Cortex::plannedX(intents,*bb),Cortex::plannedY(intents,*bb),&rx,&ry,&distance);
+                    auto field=g->resourceGradient(tm->number,materialIndex(MaterialId::Food),MovementAccess::Land);
                     if(field.empty()) field=*diagnosticFields.at((tm->number*MaterialSlotCount+materialIndex(MaterialId::Food))*7).values;
                     const auto gradient=field[g->tileIndex(Cortex::plannedX(intents,*bb),Cortex::plannedY(intents,*bb))];
 					diagnosticStream << "CORTEX_INNGRAD t=" << obs.tick << " inn=" << innIdx++
@@ -1214,4 +1214,12 @@ std::optional<Uint64> AICortex::retainedQueryVectorBytes() const
     for(const auto* commands:{&issuedCommands,&queuedCommands})
         for(const auto& command:*commands) bytes+=command.bytes.capacity()*sizeof(Uint8);
     return bytes;
+}
+
+namespace Cortex {
+AIPlanning::BuildingCandidate selectBuilding(::Game& game,::Team& team,int role,int productionClass,int qualification)
+{
+    const auto view=AIEngine::AIWorldView::capture(game, AIEngine::AIWorldView::captureCatalog(game));
+    return selectBuilding(*view,view->teams[team.teamNumber],role,productionClass,qualification);
+}
 }

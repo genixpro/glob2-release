@@ -1,7 +1,7 @@
 #include "GenerationWork.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Contact.h"
-#include "Map.h"
+#include "GenerationWorld.h"
 #include "ResourceSemantics.h"
 #include <algorithm>
 #include <climits>
@@ -11,7 +11,7 @@
 #include <utility>
 namespace MapGeneration
 {
-int stepCost(const Map &map, int x, int y, const StepCosts &costs)
+int stepCost(const GenerationMap &map, int x, int y, const StepCosts &costs)
 {
     const auto index=map.coordToIndex(x,y);
     const auto& terrain=map.terrainPropertiesAt(index);
@@ -23,10 +23,75 @@ int stepCost(const Map &map, int x, int y, const StepCosts &costs)
     return open;
 }
 
-std::vector<int> costsFrom(const Map &map, const Torus &t, const std::vector<int> &sources,
-						   const StepCosts &costs, GridNeighbors neighbours)
+namespace
+{
+// Native generation charges no work budget, so it may find the same costs another way.
+// Shortest-path costs do not depend on the order equal-cost tiles leave the queue, so a
+// bucket queue over the small integer step costs (Dial's algorithm) returns exactly the
+// vector the binary heap does, without its logarithmic pops.
+std::vector<int> bucketCostsFrom(const Torus &t, const std::vector<int> &step,
+								 const std::vector<int> &sources, GridNeighbors neighbours, int maxStep)
 {
 	const int n = t.w * t.h;
+	std::vector<int> cost(n, INT_MAX);
+	std::vector<std::vector<int>> buckets(size_t(maxStep) + 1);
+	size_t queued = 0;
+	for (int i : sources)
+		if (cost.at(i) > 0)
+		{
+			cost[i] = 0;
+			buckets[0].push_back(i);
+			++queued;
+		}
+	const int w = t.w;
+	for (int c = 0; queued; ++c)
+	{
+		auto &bucket = buckets[size_t(c) % buckets.size()];
+		// Entries pushed into this bucket while it drains (zero-cost steps) are taken too.
+		for (size_t k = 0; k < bucket.size(); ++k)
+		{
+			const int i = bucket[k];
+			--queued;
+			if (c > cost[i])
+				continue;
+			const int x = t.remainderX(i), y = i / w;
+			for (int dy = -1; dy <= 1; ++dy)
+				for (int dx = -1; dx <= 1; ++dx)
+				{
+					if ((!dx && !dy) || (neighbours == GridNeighbors::Cardinal && dx && dy))
+						continue;
+					const int m = t.at(x + dx, y + dy);
+					const int s = step[m];
+					if (s < 0 || c + s >= cost[m])
+						continue;
+					cost[m] = c + s;
+					buckets[size_t(c + s) % buckets.size()].push_back(m);
+					++queued;
+				}
+		}
+		bucket.clear();
+	}
+	for (int &c : cost)
+		if (c == INT_MAX)
+			c = -1;
+	return cost;
+}
+} // namespace
+
+std::vector<int> costsFrom(const GenerationMap &map, const Torus &t,
+						   const std::vector<int> &sources, const StepCosts &costs,
+						   GridNeighbors neighbours)
+{
+	const int n = t.w * t.h;
+	if (!generationWorkActive())
+	{
+		std::vector<int> step(n);
+		int maxStep = 0;
+		for (int i = 0; i < n; ++i)
+			maxStep = std::max(maxStep, step[i] = stepCost(map, t.remainderX(i), i / t.w, costs));
+		if (maxStep <= 4096)
+			return bucketCostsFrom(t, step, sources, neighbours, maxStep);
+	}
 	std::vector<int> step(n), cost(n, INT_MAX);
 	for (int i = 0; i < n; ++i)
 	{
@@ -99,7 +164,7 @@ int ContactReport::spread() const
 	return costSpread(nearestRival());
 }
 
-ContactReport contactMatrix(const Map &map, int teams, const StepCosts &costs)
+ContactReport contactMatrix(const GenerationMap &map, int teams, const StepCosts &costs)
 {
 	const Torus t(map);
 	const auto units = unitTilesByTeam(map, teams);
@@ -126,8 +191,8 @@ ContactReport contactMatrix(const Map &map, int teams, const StepCosts &costs)
 	return report;
 }
 
-std::vector<int> costsToTarget(const Map &map, int teams, const std::vector<unsigned char> &targets,
-							   const StepCosts &costs)
+std::vector<int> costsToTarget(const GenerationMap &map, int teams,
+							   const std::vector<unsigned char> &targets, const StepCosts &costs)
 {
 	const Torus t(map);
 	const auto units = unitTilesByTeam(map, teams);

@@ -1,6 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "ProfileNeeds.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
+#include "Continuation.h"
+#include <PerformanceTelemetry.h>
+#include "ComputeTelemetry.h"
 #include <vector>
+#include <cmath>
 #include <algorithm>
 #include "GlobalContainer.h"
 #include "Game.h"
@@ -21,6 +29,7 @@
 #include "Bullet.h"
 #include "Sector.h"
 #include "EndGameScreen.h"
+#include "UIRecordingCanvas.h"
 #include "ReplayReader.h"
 #include "ReplayTelemetry.h"
 #include "FileFormatVersions.h"
@@ -40,6 +49,8 @@
 #include <cstdlib>
 #include <memory>
 #include <nlohmann/json.hpp>
+#include "Building.h"
+#include "SGSL.h"
 
 static void require(bool ok, const char* message)
 {
@@ -182,24 +193,23 @@ static void sample(Game& game, unsigned tick)
 
 static std::unique_ptr<GameGUI> roundTrip(Game& game)
 {
-    auto* bytes = new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream writer(bytes);
-    game.save(&writer, false, "team statistics regression");
-    auto* copy = new GAGCore::MemoryStreamBackend(*bytes);
+    const auto bytes = glob2test::saveGameBytes(game, "team statistics regression");
     if (glob2test::currentTestSuite()=="JavaScriptLifecycle")
-        glob2test::writeFile(glob2test::artifactDir()/"lifecycle.game",bytes->takeContents());
-    copy->seekFromStart(0);
-    GAGCore::BinaryInputStream reader(copy);
-    auto loaded = std::make_unique<GameGUI>();
-    require(loaded->game.load(&reader), "binary game save loads");
-    return loaded;
+        glob2test::writeFile(glob2test::artifactDir()/"lifecycle.game",bytes);
+    return glob2test::loadGameGUI(bytes);
 }
 
 class LocatedOutput : public GAGCore::BinaryOutputStream
 {
 public:
+  using BinaryOutputStream::writeEnterSection;
   size_t statsPosition = 0, smoothingPosition = 0, coveragePosition = 0,
-		 measurementCountPosition = 0;
+		 measurementCountPosition = 0, probabilityPosition = 0;
+  void writeEnterSection(std::string_view name) override
+  {
+      if (name == "winProbability") probabilityPosition = getPosition();
+      BinaryOutputStream::writeEnterSection(name);
+  }
   void writeUint32(Uint32 value, std::string_view name) override
   {
 	  if (name == "coverageStartTick")
@@ -293,6 +303,8 @@ static void textRoundTrip()
     game.teams[0]->race.loadDefault();
     require(game.addUnit(5, 5, 0, WORKER, 0, 0, 0, 0) != nullptr, "text fixture worker exists");
     for (unsigned tick = 1; tick <= 77; ++tick) sample(game, tick);
+    game.teams[0]->stats.recordWinProbability(0, 400, "text-model");
+    game.teams[0]->stats.recordWinProbability(77, 600, "text-model");
     auto* bytes = new GAGCore::MemoryStreamBackend;
     GAGCore::TextOutputStream writer(bytes);
     game.teams[0]->save(&writer);
@@ -305,6 +317,10 @@ static void textRoundTrip()
     loaded.game.map.setGame(&loaded.game);
     loaded.game.addTeam();
     require(loaded.game.teams[0]->load(&reader, &globalContainer->buildingsTypes, VERSION_MINOR), "text team save loads");
+    require(loaded.game.teams[0]->stats.getWinProbabilityModel() == "text-model" &&
+            loaded.game.teams[0]->stats.getWinProbabilityHistory().size() == 2 &&
+            loaded.game.teams[0]->stats.winProbabilityAreaTwice() == 77000,
+            "text saves retain probability model, explicit ticks and integral");
     compare(game.teams[0]->stats, loaded.game.teams[0]->stats);
     const unsigned start = game.stepCounter;
     for (unsigned i = 1; i <= 65; ++i)
@@ -846,11 +862,14 @@ static void measurementReplayBoundaries()
 	// Format 130 adds the farm-areas tile mask, still retaining that floor.
 	// Format 166 makes append-order populations authoritative; format 167
 	// changes completed-observation timing. Format 171 unifies flyer routing.
-	// Network and saved-game floors remain.
-	require(REPLAY_MINIMUM_VERSION_MINOR == VERSION_MINOR && NET_PROTOCOL_VERSION == 72,
-
-			"integrated simulation uses current replay and network gates");
-	for (int version : {98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 115, 119, 120, 121, 122, 123, 124, 133, 134, 135, FILE_FORMAT_VERSION_RUNTIME_TERRAIN, FILE_FORMAT_VERSION_TERRAIN_SEED, 139, FILE_FORMAT_VERSION_RUNTIME_RESOURCES, FILE_FORMAT_VERSION_TERRAIN_CATALOGUE, FILE_FORMAT_VERSION_AI_PIPELINE, FILE_FORMAT_VERSION_BUILDING_ARTWORK, FILE_FORMAT_VERSION_VERTEX_TERRAIN, FILE_FORMAT_VERSION_GREEDY_FETCHING, FILE_FORMAT_VERSION_PRIVATE_RANDOM-1, FILE_FORMAT_VERSION_PRIVATE_RANDOM, FILE_FORMAT_VERSION_ENTITY_RANDOM, 155, 156, 167, 168, 169, 170, REPLAY_MINIMUM_VERSION_MINOR-1, VERSION_MINOR, VERSION_MINOR+1})
+	// Resource-claim checksum coverage changes accepted replays in the claims format;
+	// probability telemetry itself must not change these acceptance boundaries.
+	require(REPLAY_MINIMUM_VERSION_MINOR == FILE_FORMAT_VERSION_RESOURCE_CLAIMS
+            && REPLAY_MINIMUM_VERSION_MINOR <= VERSION_MINOR && NET_PROTOCOL_VERSION == 75,
+			"resource-claim checksum coverage advances the replay floor without changing network protocol gates");
+	for (int version : std::initializer_list<int>{98, 99, 100, 101, 102, 103, 104, 105, 106, 107, 115, 119, 120, 121, 122, 123, 124, 133, 134, 135, FILE_FORMAT_VERSION_RUNTIME_TERRAIN, FILE_FORMAT_VERSION_TERRAIN_SEED, 139, FILE_FORMAT_VERSION_RUNTIME_RESOURCES, FILE_FORMAT_VERSION_TERRAIN_CATALOGUE, FILE_FORMAT_VERSION_AI_PIPELINE, FILE_FORMAT_VERSION_BUILDING_ARTWORK, FILE_FORMAT_VERSION_VERTEX_TERRAIN, FILE_FORMAT_VERSION_GREEDY_FETCHING, FILE_FORMAT_VERSION_PRIVATE_RANDOM-1, FILE_FORMAT_VERSION_PRIVATE_RANDOM, FILE_FORMAT_VERSION_ENTITY_RANDOM, 155, 156, 167, 168, 169, 170, REPLAY_MINIMUM_VERSION_MINOR-1, REPLAY_MINIMUM_VERSION_MINOR,
+            FILE_FORMAT_VERSION_MAXIMA_FORWARD_SUPPORT, FILE_FORMAT_VERSION_MAXIMA_FLAG_PROXIMITY,
+            VERSION_MINOR, VERSION_MINOR+1})
 	{
 		auto *bytes = new GAGCore::MemoryStreamBackend;
 		GAGCore::BinaryOutputStream writer(bytes);
@@ -913,67 +932,39 @@ static void aiTelemetryContinuation(const char *path)
 	GAGCore::BinaryInputStream input(new GAGCore::FileStreamBackend(file));
 	GameGUI gui;
 	require(gui.game.load(&input), "all-AI initial state loads");
-	auto step = glob2test::stepAI;
-	auto checks = [](Game &g)
-	{
-		std::vector<Uint32> c, b, u;
-		g.checkSum(&c, &b, &u, true);
-		c.erase(c.begin());
-		c.insert(c.end(), b.begin(), b.end());
-		c.insert(c.end(), u.begin(), u.end());
-		return c;
-	};
 	for (int t = 0; t < 500; ++t)
-		step(gui.game);
-	auto loaded = roundTrip(gui.game);
+		glob2test::stepAI(gui.game);
 	// Legacy controllers deliberately rebuild/reset some unsaved internal state.
-    // Compare two continuations of the same saved state, not different AI states.
-    auto reference = roundTrip(gui.game);
-    // Each game restores its own saved stream; the continuations start equal.
-    REQUIRE(loaded->game.syncRandom == reference->game.syncRandom);
-	std::vector<std::vector<Uint32>> expected;
-	std::vector<std::vector<AITelemetry::Sample>> samples;
-	for (int t = 0; t < 700; ++t)
-	{
-		step(reference->game);
-		expected.push_back(checks(reference->game));
-		std::vector<AITelemetry::Sample> row;
-		for (int p = 0; p < reference->game.gameHeader.getNumberOfPlayers(); ++p)
-			if (reference->game.players[p]->ai)
-				row.push_back(reference->game.players[p]->ai->telemetrySeries->current);
-		samples.push_back(std::move(row));
-	}
-	for (int t = 0; t < 700; ++t)
-	{
-		step(loaded->game);
-		if (checks(loaded->game) != expected[t])
+	// Compare two continuations of the same saved state, not different AI states;
+	// each game restores its own saved stream, so the continuations start equal.
+	const auto continuation = glob2test::expectContinuation(gui.game, {.ticks = 700, .step = glob2test::stepAI,
+		.twoLoads = true, .name = "team statistics regression",
+		.each = [](Game &reference, Game &loaded, int)
 		{
-			std::fprintf(stderr, "AI continuation simulation differs at tick %u\n",
-						 loaded->game.stepCounter);
-			FAIL("fatal condition in a harness helper");
-		}
-		unsigned ai = 0;
-		for (int p = 0; p < loaded->game.gameHeader.getNumberOfPlayers(); ++p)
-			if (loaded->game.players[p]->ai)
-			{
-				const auto &actual = loaded->game.players[p]->ai->telemetrySeries->current;
-				const auto &want = samples[t][ai++];
-				if (actual != want)
+			for (int p = 0; p < loaded.gameHeader.getNumberOfPlayers(); ++p)
+				if (loaded.players[p]->ai)
 				{
-					const auto &series = *loaded->game.players[p]->ai->telemetrySeries;
-					for (unsigned f = 0; f < actual.values.size(); ++f)
-						if (actual.values[f] != want.values[f])
-							std::fprintf(stderr, "AI %d telemetry %s differs at tick %u\n",
-										 series.implementation, series.fields[f].name.c_str(),
-										 actual.tick);
-					FAIL("fatal condition in a harness helper");
+					const auto &actual = loaded.players[p]->ai->telemetrySeries->current;
+					const auto &want = reference.players[p]->ai->telemetrySeries->current;
+					if (actual != want)
+					{
+						const auto &series = *loaded.players[p]->ai->telemetrySeries;
+						for (unsigned f = 0; f < actual.values.size(); ++f)
+							if (actual.values[f] != want.values[f])
+								std::fprintf(stderr, "AI %d telemetry %s differs at tick %u\n",
+											 series.implementation, std::string(series.fields[f].name).c_str(),
+											 actual.tick);
+						FAIL("fatal condition in a harness helper");
+					}
 				}
-			}
-	}
-	for (int p = 0; p < reference->game.gameHeader.getNumberOfPlayers(); ++p)
-		if (reference->game.players[p]->ai)
-			require(reference->game.players[p]->ai->telemetrySeries->history ==
-						loaded->game.players[p]->ai->telemetrySeries->history,
+		}});
+	REQUIRE(continuation.matched);
+	auto &reference = *continuation.reference;
+	auto &loaded = *continuation.loaded;
+	for (int p = 0; p < reference.game.gameHeader.getNumberOfPlayers(); ++p)
+		if (reference.game.players[p]->ai)
+			require(reference.game.players[p]->ai->telemetrySeries->history ==
+						loaded.game.players[p]->ai->telemetrySeries->history,
 					"all-AI sampled history continues across saves");
 	std::puts("PASS all-AI repeated load continuation: 700 ticks of simulation components, current telemetry and "
 			  "retained history");
@@ -1004,7 +995,7 @@ static void aiTelemetryScenarios()
 		require(schema(i).size() >= Specific, "common fields exist for every AI");
 		std::set<std::string> names;
 		for (const auto &f : schema(i))
-			require(names.insert(f.name).second, "schema names are unique");
+			require(names.insert(std::string(f.name)).second, "schema names are unique");
 	}
 	g.gameHeader.setAIConfig(0, "");
 	auto a = g.players[0]->ai->telemetrySeries, b = g.players[1]->ai->telemetrySeries;
@@ -1157,6 +1148,8 @@ static void measurementScreenshots(const std::string &directory)
 		for (unsigned tick = 0; tick <= 4096; tick += 512)
 		{
 			game.stepCounter = tick;
+            const int leader = 50 + int(tick * 750 / 4096);
+            stats.recordWinProbability(tick, t == 0 ? leader : (1000-leader)/(Team::MAX_COUNT-1), "screenshot-model");
 			stats.editMeasurements().births[WORKER] = (Uint64(1) << 40) + (t + 1) * tick;
 			stats.editMeasurements().harvested[WHEAT] = (t + 1) * tick;
 			stats.editMeasurements().completed[Measurements::NEW_BUILDING][0][0] = (t + 1) * tick / 512;
@@ -1190,6 +1183,16 @@ static void measurementScreenshots(const std::string &directory)
 	gui.localTeamNo = 0;
 	gui.localPlayer = 0;
 	gui.adjustLocalTeam();
+    auto &perf = PerformanceTelemetry::collector();
+    perf.history = std::make_unique<PerformanceTelemetry::History>();
+    for (unsigned i = 0; i < 8; ++i) {
+        auto sample = std::make_unique<PerformanceTelemetry::Window>();
+        sample->tickStart = i * 512; sample->tickEnd = (i + 1) * 512;
+        sample->startNs = i * 1000000000ULL; sample->endNs = (i + 1) * 1000000000ULL;
+        auto &m = sample->metrics[unsigned(PerformanceTelemetry::Id::OwnerAdvance)];
+        m.calls = 1; m.time.add((i + 1) * 1000000); m.cpuSamples = 1; m.cpuNs = (i + 1) * 500000;
+        perf.history->append(std::move(*sample));
+    }
 	for (const auto size : {std::pair{640, 480}, std::pair{1024, 768}})
 	{
 		globalContainer->gfx->setRes(size.first, size.second, 0);
@@ -1198,10 +1201,14 @@ static void measurementScreenshots(const std::string &directory)
 		{
 			EndGameScreen screen(&gui);
 			screen.beginExecution(globalContainer->gfx);
+            screen.showEnginePerformance = true; screen.invalidate(); screen.paintFrame(0);
+            require(bool(screen.host().find("engine-performance/chart")), "engine performance chart is present in results");
+            require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(), (directory + "/engine-performance-" + suffix).c_str()), "save engine performance screenshot");
+            screen.showEnginePerformance = false; screen.invalidate();
 			// The overview, then one chart of each form: a level, a smoothed rate, a
 			// split counter, bands of the population, a net value and a global series.
 			const std::pair<const char *, bool> charts[] = {{"population", false}, {"births", false}, {"births", true},
-															{"hunger", false},	 {"net growth", false}, {"growth map", false}, {"ground movement", true}};
+															{"hunger", false},	 {"net growth", false}, {"growth map", false}, {"ground movement", true}, {"win probability", false}};
 			screen.selectMetric(EndGameScreen::OVERVIEW);
 			screen.paintFrame(0);
 			require(IMG_SavePNG(globalContainer->gfx->getSDLSurface(), (directory + "/overview-" + suffix).c_str()),
@@ -1305,6 +1312,64 @@ TEST_CASE("clearing telemetry counts operations once by configured primary mater
 
 TEST_SUITE("TeamStatsSave")
 {
+    TEST_CASE("probability save section preserves Maxima-era statistics layouts [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame world({.header=true});
+        auto *bytes=new GAGCore::MemoryStreamBackend;
+        LocatedOutput writer(bytes);
+        world.team->stats.recordWinProbability(0,500,"layout-model");
+        world.team->stats.save(&writer);
+        writer.flush();
+        REQUIRE(writer.probabilityPosition>0);
+
+        // Formats 188/189 changed Maxima state, not TeamStats. Dropping the
+        // appended probability section reproduces their statistics payload.
+        for (const int version : {FILE_FORMAT_VERSION_MAXIMA_FORWARD_SUPPORT,
+                                  FILE_FORMAT_VERSION_MAXIMA_FLAG_PROXIMITY})
+        {
+            GAGCore::BinaryInputStream legacy(new GAGCore::MemoryStreamBackend(
+                bytes->getBuffer(),writer.probabilityPosition));
+            legacy.seekFromStart(0);
+            TeamStats loaded;
+            REQUIRE(loaded.load(&legacy,version));
+            CHECK(legacy.getPosition()==writer.probabilityPosition);
+            CHECK(loaded.getWinProbabilityHistory().empty());
+            CHECK(loaded.getWinProbabilityModel().empty());
+        }
+
+        GAGCore::BinaryInputStream missing(new GAGCore::MemoryStreamBackend(
+            bytes->getBuffer(),writer.probabilityPosition));
+        missing.seekFromStart(0);
+        TeamStats incomplete;
+        CHECK_THROWS_AS(incomplete.load(&missing,FILE_FORMAT_VERSION_WIN_PROBABILITY_HISTORY),std::runtime_error);
+    }
+    TEST_CASE("probability history rejects samples beyond the saved game tick [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        glob2test::HeadlessGame world({.header=true});
+        auto &game=world.game;
+        game.stepCounter=512;
+        auto &stats=world.team->stats;
+        stats.recordWinProbability(0,400,"saved-model");
+        stats.recordWinProbability(game.stepCounter,600,"saved-model");
+        const auto loaded=roundTrip(game);
+        REQUIRE(loaded->game.teams[0]->stats.getWinProbabilityHistory().back().tick==game.stepCounter);
+
+        // Ascending, in-range samples are still corrupt if they describe the future.
+        stats.recordWinProbability(game.stepCounter+1,600,"saved-model");
+        CHECK_THROWS_WITH_AS(roundTrip(game),"Invalid win probability game tick",std::runtime_error);
+    }
+    TEST_CASE("probability text history and integral survive a team save [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        textRoundTrip();
+    }
+    TEST_CASE("diagnostic probability history preserves replay acceptance boundaries [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        measurementReplayBoundaries();
+    }
     TEST_CASE("retained format152 magic levels count each explorer once through migration and current continuation [save-format]")
     {
         glob2test::HeadlessGlobals globals;
@@ -1345,47 +1410,45 @@ TEST_SUITE("TeamStatsSave")
         REQUIRE(stats.aiTelemetry[0]->active);
         // Admit the initial completed boundary before counting subsequent ticks.
         world.game.observeCompletedWorld();
-        auto restored=roundTrip(world.game);
-        CHECK(stats.aiTelemetry.size()==1);
-        CHECK_FALSE(stats.aiTelemetry[0]->active);
-        for(const auto& row:stats.stats) CHECK(row.rangedUnits==row.numberUnitPerType[EXPLORER]);
-        // Game::save captures AI telemetry and marks the retained source AI
-        // inactive in this smaller continuation world. Compare the complete
-        // state after that real save lifecycle, including its telemetry field.
-        const auto migrated=wire(stats);
-        REQUIRE(wire(restored->game.teams[0]->stats)==migrated);
-        const auto components=[](Game& game) {
-            std::vector<Uint32> state,buildings,units;
-            game.checkSum(&state,&buildings,&units,true);
-            state.insert(state.end(),buildings.begin(),buildings.end());
-            state.insert(state.end(),units.begin(),units.end());
-            return state;
-        };
-        REQUIRE(components(restored->game)==components(world.game));
-        // Establish the initial completed boundary before counting future samples.
-        world.game.observeCompletedWorld();
-        restored->game.observeCompletedWorld();
-        REQUIRE(components(restored->game)==components(world.game));
-        const auto phase=stats.smoothedIndex;
-        const auto index=stats.statsIndex;
-        for(int tick=1;tick<=32;++tick) {
-            world.game.step(0); restored->game.step(0);
-            world.game.observeCompletedWorld(); restored->game.observeCompletedWorld();
-            CHECK(components(restored->game)==components(world.game));
-            CHECK(wire(restored->game.teams[0]->stats)==wire(stats));
-            CHECK(restored->game.syncRandom==world.game.syncRandom);
-            if(tick<32-phase) CHECK(stats.statsIndex==index);
-            if(tick==32-phase) {
-                CHECK(stats.statsIndex==(index+1)%TeamStats::STATS_SIZE);
-                CHECK(stats.getLatestStat()->rangedUnits==1);
-            }
-        }
+        const auto components=[](Game& game) { return glob2test::simulationComponents(game); };
+        decltype(stats.smoothedIndex) phase{};
+        decltype(stats.statsIndex) index{};
+        const auto continuation=glob2test::expectContinuation(world.game,{.ticks=32,
+            .step=[](Game& game) { game.step(0); game.observeCompletedWorld(); return std::vector<std::string>{}; },
+            .name="team statistics regression",
+            .afterLoad=[&](Game& original,Game& restored) {
+                CHECK(stats.aiTelemetry.size()==1);
+                CHECK_FALSE(stats.aiTelemetry[0]->active);
+                for(const auto& row:stats.stats) CHECK(row.rangedUnits==row.numberUnitPerType[EXPLORER]);
+                // Game::save captures AI telemetry and marks the retained source AI
+                // inactive in this smaller continuation world. Compare the complete
+                // state after that real save lifecycle, including its telemetry field.
+                REQUIRE(wire(restored.teams[0]->stats)==wire(stats));
+                REQUIRE(components(restored)==components(original));
+                // Establish the initial completed boundary before counting future samples;
+                // the continuation compares both games again after this.
+                original.observeCompletedWorld();
+                restored.observeCompletedWorld();
+                phase=stats.smoothedIndex;
+                index=stats.statsIndex;
+            },
+            .each=[&](Game&,Game& restored,int step) {
+                if(step<0) return;
+                const int tick=step+1;
+                CHECK(wire(restored.teams[0]->stats)==wire(stats));
+                if(tick<32-phase) CHECK(stats.statsIndex==index);
+                if(tick==32-phase) {
+                    CHECK(stats.statsIndex==(index+1)%TeamStats::STATS_SIZE);
+                    CHECK(stats.getLatestStat()->rangedUnits==1);
+                }
+            }});
+        REQUIRE(continuation.matched);
         auto repeated=roundTrip(world.game);
         CHECK(wire(repeated->game.teams[0]->stats)==wire(stats));
         CHECK(components(repeated->game)==components(world.game));
     }
 
-	TEST_CASE("32 sampling phases; ring wrap; repeated loads; text streams and corruption controls [save-format]")
+	TEST_CASE("32 sampling phases; ring wrap; repeated loads; text streams and corruption controls [save-format]" * glob2test::needs({"ai:castor"}))
 	{
 		glob2test::HeadlessGlobals globals;
 		    GameGUI gui;
@@ -1510,6 +1573,255 @@ TEST_SUITE("TeamStatsSave")
 		            ++game.stepCounter;
 		        }
 		glob2test::expectGolden("team-stats/version84.expected.txt", trace.text());
+	}
+    TEST_CASE("performance wait charts distinguish zero events from missing coverage")
+    {
+        glob2test::HeadlessGlobals globals;
+        auto &perf=PerformanceTelemetry::collector();
+        perf.history=std::make_unique<PerformanceTelemetry::History>();
+        for(unsigned i=0;i<3;++i){
+            auto w=std::make_unique<PerformanceTelemetry::Window>();
+            w->tickStart=i*30;w->tickEnd=(i+1)*30;
+            w->startNs=i*1000000000ULL;w->endNs=(i+1)*1000000000ULL;
+            if(i<2)w->metrics[unsigned(PerformanceTelemetry::Id::OwnerAdvance)].time.add(1000);
+            if(i==0)w->metrics[unsigned(PerformanceTelemetry::Id::WaitAI)].time.add(2000000);
+            perf.history->append(std::move(*w));
+        }
+        EnginePerformancePanel panel;
+        panel.scope=unsigned(PerformanceTelemetry::Id::WaitAI);
+        panel.refresh();
+        REQUIRE(panel.points.size()==3);
+        CHECK(panel.points[0].value==2.);
+        CHECK(panel.points[1].value==0.);
+        CHECK(std::isnan(panel.points[2].value));
+        panel.view=EnginePerformancePanel::View::PerTick;panel.refresh();
+        CHECK(panel.points[1].value==0.);
+        CHECK(std::isnan(panel.points[2].value));
+        panel.scope=unsigned(PerformanceTelemetry::Id::GPUTime);panel.refresh();
+        CHECK(std::isnan(panel.points[1].value));
+        CHECK(perf.history->window(1).metrics[unsigned(PerformanceTelemetry::Id::WaitAI)].time.count==0);
+    }
+    TEST_CASE("the progress chart shows each producer that waited in the shown range")
+    {
+        glob2test::HeadlessGlobals globals;
+        auto &perf=PerformanceTelemetry::collector();
+        perf.history=std::make_unique<PerformanceTelemetry::History>();
+        // Ten game minutes: AI waits in the first, claims in the last.
+        for(unsigned i=0;i<10;++i){
+            auto w=std::make_unique<PerformanceTelemetry::Window>();
+            w->tickStart=i*1800;w->tickEnd=(i+1)*1800;
+            w->startNs=i*60000000000ULL;w->endNs=(i+1)*60000000000ULL;
+            w->metrics[unsigned(PerformanceTelemetry::Id::OwnerAdvance)].time.add(1000);
+            if(i==0)w->metrics[unsigned(PerformanceTelemetry::Id::WaitAI)].time.add(2000000);
+            if(i==9)w->metrics[unsigned(PerformanceTelemetry::Id::WaitClaims)].time.add(3000000);
+            perf.history->append(std::move(*w));
+        }
+        EnginePerformancePanel panel;
+        panel.initCharts();
+        auto &chart=*std::find_if(panel.charts.begin(),panel.charts.end(),
+            [](const auto &c){return c.title=="What holds up progress?";});
+        REQUIRE(chart.nonZeroOnly);
+        REQUIRE(chart.series.size()==unsigned(ComputeProducer::Count));
+        REQUIRE(chart.styles.size()==chart.series.size());
+        for(auto &s:chart.series)s->refresh();
+        auto labels=[&]{std::vector<std::string> out;for(auto n:panel.visibleSeries(chart))out.push_back(chart.labels[n]);return out;};
+        CHECK(labels()==std::vector<std::string>{"AI","Claims"});
+        panel.recent=true;
+        CHECK(labels()==std::vector<std::string>{"Claims"});
+    }
+	TEST_CASE("performance explorer units follow the selected population and denominator")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto &perf = PerformanceTelemetry::collector();
+		perf.history = std::make_unique<PerformanceTelemetry::History>();
+		auto w = std::make_unique<PerformanceTelemetry::Window>();
+		w->tickStart = 0;
+		w->tickEnd = 30;
+		w->startNs = 0;
+		w->endNs = 1000000000;
+		auto &sampled = w->metrics[unsigned(PerformanceTelemetry::Id::PathResource)];
+		sampled.calls = 2;
+		auto &bytes = w->metrics[unsigned(PerformanceTelemetry::Id::RenderMemory)];
+		bytes.calls = 1;
+		bytes.time.add(4096);
+		bytes.self = 4096;
+		perf.history->append(std::move(*w));
+		EnginePerformancePanel panel;
+		panel.scope = unsigned(PerformanceTelemetry::Id::PathResource);
+		panel.view = EnginePerformancePanel::View::Calls;
+		panel.refresh();
+		CHECK(panel.viewUnit() == "calls/min");
+		CHECK(panel.points[0].value == 120.);
+		panel.view = EnginePerformancePanel::View::Mean;
+		panel.refresh();
+		CHECK(std::isnan(panel.points[0].value));
+		panel.scope = unsigned(PerformanceTelemetry::Id::RenderMemory);
+		panel.view = EnginePerformancePanel::View::Total;
+		CHECK(panel.viewUnit() == "bytes/min");
+		panel.view = EnginePerformancePanel::View::PerTick;
+		CHECK(panel.viewUnit() == "bytes/tick");
+		panel.view = EnginePerformancePanel::View::Self;
+		panel.refresh();
+		CHECK(std::isnan(panel.points[0].value));
+		panel.scope = PerformanceTelemetry::ScopeCount + 5;
+		CHECK(panel.viewUnit() == "FPS");
+		panel.scope = PerformanceTelemetry::ScopeCount + 9;
+		CHECK(panel.viewUnit() == "%");
+	}
+	TEST_CASE("performance legends distinguish repeated paused tick windows")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto &perf = PerformanceTelemetry::collector();
+		perf.history = std::make_unique<PerformanceTelemetry::History>();
+		for (unsigned i = 0; i < 3; ++i)
+		{
+			auto w = std::make_unique<PerformanceTelemetry::Window>();
+			w->tickStart = i ? 30 : 0;
+			w->tickEnd = 30;
+			w->startNs = i * 1000000000ULL;
+			w->endNs = (i + 1) * 1000000000ULL;
+			auto &frames = w->metrics[unsigned(PerformanceTelemetry::Id::FrameInterval)];
+			frames.calls = 1;
+			frames.time.add((i + 1) * 10000000ULL);
+			perf.history->append(std::move(*w));
+		}
+		EnginePerformancePanel panel;
+		panel.scope = unsigned(PerformanceTelemetry::Id::FrameInterval);
+		panel.refresh();
+		GAGGUI::ui::FixedTextMeasurer measurer;
+		glob2test::RecordingCanvas canvas({600, 220}, measurer);
+		const auto plot = panel.paintLines(canvas, {0, 0, 600, 220}, {&panel}, {"Frames"}, "ms");
+		CHECK(std::any_of(canvas.texts.begin(), canvas.texts.end(),
+						  [](const auto &entry) { return entry.second == "Frames: 30.00 ms"; }));
+		panel.inspect(599, plot, panel.points);
+		canvas.texts.clear();
+		panel.paintLines(canvas, {0, 0, 600, 220}, {&panel}, {"Frames"}, "ms");
+		CHECK(std::any_of(canvas.texts.begin(), canvas.texts.end(),
+						  [](const auto &entry) { return entry.second == "Frames: 30.00 ms"; }));
+	}
+	TEST_CASE("performance explorer inspection and GPU pass samples share the dashboard presenter")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto &perf = PerformanceTelemetry::collector();
+		perf.history = std::make_unique<PerformanceTelemetry::History>();
+		for (unsigned i = 0; i < 3; ++i)
+		{
+			auto w = std::make_unique<PerformanceTelemetry::Window>();
+			w->tickStart = i * 30;
+			w->tickEnd = (i + 1) * 30;
+			w->startNs = i * 1000000000ULL;
+			w->endNs = (i + 1) * 1000000000ULL;
+			auto &gpu = w->metrics[unsigned(PerformanceTelemetry::Id::GPURenderPass)];
+			gpu.calls = 1;
+			gpu.time.add((i + 1) * 1000000ULL);
+			perf.history->append(std::move(*w));
+		}
+		EnginePerformancePanel panel;
+		panel.initCharts();
+		const auto &render = panel.charts.back();
+		CHECK(render.series.size() == 3);
+		CHECK(render.series.back()->scope == unsigned(PerformanceTelemetry::Id::GPURenderPass));
+		panel.scope = unsigned(PerformanceTelemetry::Id::GPURenderPass);
+		panel.refresh();
+		GAGGUI::ui::FixedTextMeasurer measurer;
+		glob2test::RecordingCanvas canvas({600, 220}, measurer);
+		panel.paint(canvas, {0, 0, 600, 220});
+		panel.inspect(panel.explorerPlot.left +
+						  (panel.explorerPlot.right - panel.explorerPlot.left) * (2. / 3.),
+					  panel.explorerPlot, panel.points);
+		canvas.texts.clear();
+		panel.paint(canvas, {0, 0, 600, 220});
+		CHECK(std::any_of(canvas.texts.begin(), canvas.texts.end(), [](const auto &entry)
+						  { return entry.second == "Value: 2.00 ms (n=1)"; }));
+		CHECK(std::any_of(canvas.texts.begin(), canvas.texts.end(), [](const auto &entry)
+						  { return entry.second.starts_with("Selected: "); }));
+	}
+	TEST_CASE("performance chart geometry respects enlarged text and measured plot margins")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto &perf = PerformanceTelemetry::collector();
+		perf.history = std::make_unique<PerformanceTelemetry::History>();
+		for (unsigned i = 0; i < 3; ++i)
+		{
+			auto w = std::make_unique<PerformanceTelemetry::Window>();
+			w->tickStart = i * 30;
+			w->tickEnd = (i + 1) * 30;
+			w->startNs = i * 1000000000ULL;
+			w->endNs = (i + 1) * 1000000000ULL;
+			w->metrics[unsigned(PerformanceTelemetry::Id::FrameInterval)].time.add((i + 1) *
+																				   1000000000ULL);
+			perf.history->append(std::move(*w));
+		}
+		EnginePerformancePanel panel;
+		panel.scope = unsigned(PerformanceTelemetry::Id::FrameInterval);
+		panel.refresh();
+		GAGGUI::ui::FixedTextMeasurer measurer(12, 28);
+		glob2test::RecordingCanvas canvas({600, 330}, measurer);
+		const auto plot = panel.paintLines(canvas, {0, 0, 600, 330}, {&panel, &panel, &panel},
+										   {"CPU", "GPU", "GPU passes"}, "ms");
+		CHECK(plot.left > 52);
+		// All header rows, axis values and legends must fit at the actual font size.
+		for (std::size_t i = 0; i < canvas.texts.size(); ++i)
+		{
+			const auto &[at, text] = canvas.texts[i];
+			const GAGGUI::ui::Rect rect{at.x, at.y,
+										measurer.width(GAGGUI::ui::FontRole::Support, text), 28};
+			CHECK((GAGGUI::ui::Rect{0, 0, 600, 330}.contains(rect)));
+			for (std::size_t j = 0; j < i; ++j)
+			{
+				const auto &[otherAt, other] = canvas.texts[j];
+				const GAGGUI::ui::Rect otherRect{
+					otherAt.x, otherAt.y, measurer.width(GAGGUI::ui::FontRole::Support, other), 28};
+				CHECK(rect.intersect(otherRect).empty());
+			}
+		}
+		panel.inspect(plot.left + (plot.right - plot.left) * (2. / 3.), plot, panel.points);
+		CHECK(panel.cursorMinute == doctest::Approx(2. / 60.));
+	}
+	TEST_CASE("capture latency charts use completed captures rather than frame delta samples")
+	{
+		glob2test::HeadlessGlobals globals;
+		auto &perf = PerformanceTelemetry::collector();
+		perf.history = std::make_unique<PerformanceTelemetry::History>();
+		for (unsigned i = 0; i < 2; ++i)
+		{
+			auto w = std::make_unique<PerformanceTelemetry::Window>();
+			w->tickStart = i * 30;
+			w->tickEnd = (i + 1) * 30;
+			w->startNs = i * 1000000000ULL;
+			w->endNs = (i + 1) * 1000000000ULL;
+			w->metrics[unsigned(PerformanceTelemetry::Id::CaptureLatency)].time.add(i ? 0
+																					  : 30000000);
+			w->metrics[unsigned(PerformanceTelemetry::Id::CaptureCount)].time.add(i ? 0 : 3);
+			perf.history->append(std::move(*w));
+		}
+		EnginePerformancePanel panel;
+		panel.scope = unsigned(PerformanceTelemetry::Id::CaptureLatency);
+		panel.refresh();
+		CHECK(panel.viewUnit() == "ms/capture");
+		CHECK(panel.points[0].value == 10.);
+		CHECK(std::isnan(panel.points[1].value));
+		panel.view = EnginePerformancePanel::View::Calls;
+		panel.refresh();
+		CHECK(panel.viewUnit() == "captures/min");
+		CHECK(panel.points[0].value == 180.);
+		CHECK(panel.points[1].value == 0.);
+		panel.view = EnginePerformancePanel::View::Total;
+		panel.refresh();
+		CHECK(panel.points[0].value == 1800.);
+		CHECK(panel.points[1].value == 0.);
+		panel.view = EnginePerformancePanel::View::PerTick;
+		panel.refresh();
+		CHECK(panel.points[0].value == 1.);
+		for (const auto view :
+			 {EnginePerformancePanel::View::Self, EnginePerformancePanel::View::P50,
+			  EnginePerformancePanel::View::P95, EnginePerformancePanel::View::P99,
+			  EnginePerformancePanel::View::Maximum, EnginePerformancePanel::View::Deviation})
+		{
+			panel.view = view;
+			panel.refresh();
+			CHECK(std::isnan(panel.points[0].value));
+		}
 	}
 	TEST_CASE("measurement screenshots [display][artifacts]")
 	{

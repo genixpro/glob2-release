@@ -37,6 +37,15 @@ Uint32 unitChecksum(const SimulationSnapshot::UnitView& u,const SimulationSnapsh
     h.add(u.carriedPacket.numerator); h.add(u.carriedPacket.denominator);
     h.add(Uint8(u.jobPurpose)|(Uint32(u.regenerationRemainder)<<8)|(Uint32(u.widePrimaryCargo())<<16));
     h.add(u.configuredFoodCapacity); h.add(u.capabilityFlags);
+    if(u.activeClaimsEnabled) {
+        h.add(u.activeMaterialClaim.has_value());h.add(u.materialClaimTask>>32);h.add(u.materialClaimTask);
+        if(u.activeMaterialClaim) {
+            const auto& c=*u.activeMaterialClaim;
+            h.add(c.source);h.add(c.access);h.add(c.material);h.add(c.resource);h.add(c.exclusive);h.add(c.reserve);
+        }
+        h.add(u.materialClaimPolicyState.decisionOrdinal>>32);h.add(u.materialClaimPolicyState.decisionOrdinal);
+        h.add(u.materialClaimPolicyState.lastGoalAttempt>>32);h.add(u.materialClaimPolicyState.lastGoalAttempt);
+    }
     // Additional cargo is sparse. Empty allocation nodes are not state.
     if ((u.capabilityFlags & UnitRuntimeTraits::ExtendedCargo) || u.widePrimaryCargo()) {
         const auto* cargo=entities.unitCargo.find(u.gid);
@@ -94,12 +103,13 @@ Uint32 mapChecksum(const SimulationSnapshot::Handle& w)
 Uint32 hashState(const SimulationSnapshot::Handle& w)
 {
     Checksum h;
-    h.add(0x534e4103u); h.add(w.width); h.add(w.height);
+    h.add(0x534e4104u); h.add(w.width); h.add(w.height); h.add(w.activeClaimRuntimeChecksum);
     h.add(w.catalogs->units->checksum()); h.add(w.catalogs->resources->checksum());
     h.add(w.terrain->registry->checksum());
     for (const auto& team:w.teams->values) {
         Checksum t;
         t.add(team.number); t.add(team.playersMask);
+        if(team.routingRatio.known) for(auto value:{team.routingRatio.selected,team.routingRatio.tick,unsigned(team.routingRatio.known)}) t.add(value);
         const auto units=w.entities->unitsForTeam(team.number);
         const auto buildings=w.entities->buildingsForTeam(team.number);
         t.add(Uint32(units.size())); t.add(Uint32(buildings.size()));
@@ -162,7 +172,7 @@ void Pipeline::submit(const SimulationSnapshot::Handle& world, Uint32 sourceTick
     catch (...) { --count; *ptr = {}; throw; }
     if (executor.threadCount()==1) {
         // With no worker there is no overlap to preserve. Compute immediately
-        // so the one-tick reporting delay retains only a scalar, not another
+        // so the reporting delay retains only a scalar, not another
         // generation of pooled snapshot buffers. Worker configurations never
         // take this path, including when they miss their delivery deadline.
         try { executor.join(ptr->batch,{JoinReason::ImmediateRequired,world.tick}); }

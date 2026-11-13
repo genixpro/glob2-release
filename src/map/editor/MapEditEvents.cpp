@@ -4,7 +4,6 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 // Copyright (C) 2006 Bradley Arsenault
 
-#include "Game.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
 #include "PhoneEditor.h"
@@ -44,6 +43,12 @@ void MapEdit::processEvent(SDL_Event& event)
 	else if (hasDialog())
 	{
 		delegateMenu(event);
+		return;
+	}
+	else if (GAGGUI::ui::isSemanticEvent(event))
+	{
+		for (auto *host : inspectionHosts())
+			if (host->event(event)) break;
 		return;
 	}
 	else if (dock && routeToDock(event))

@@ -12,6 +12,8 @@
 #include <StringTable.h>
 #include <algorithm>
 #include <cmath>
+#include "render/scene/Scene.h"
+#include "GameGUIToolManager.h"
 using namespace GAGCore;
 
 bool GameGUITouch::showsBuildPalette() const
@@ -150,21 +152,21 @@ void GameGUITouch::drawBuildPalette()
 					   .9);
 	}
 }
+void GameGUITouch::activatePalette(const PaletteItem &item)
+{
+	if (!item.enabled || globalContainer->isViewingGame()) return;
+	if (item.name.starts_with("zone:"))
+	{
+		gui.setSelection(GameGUI::BRUSH_SELECTION);
+		gui.brush.defaultSelection();
+		gui.toolManager.activateZoneTool(static_cast<GameGUIToolManager::ZoneType>(item.name.back() - '0'));
+		panelOpen = false;
+		return;
+	}
+	gui.setSelection(GameGUI::TOOL_SELECTION, const_cast<char *>(item.name.c_str()));
+	panelOpen = false;
+}
 void GameGUITouch::tapBuildPalette(ViewPoint point)
 {
-	const auto item = paletteItemAt(point);
-	if (item && item->enabled)
-	{
-		if (item->name.starts_with("zone:"))
-		{
-			gui.setSelection(GameGUI::BRUSH_SELECTION);
-			gui.brush.defaultSelection();
-			gui.toolManager.activateZoneTool(
-				static_cast<GameGUIToolManager::ZoneType>(item->name.back() - '0'));
-			panelOpen = false;
-			return;
-		}
-		gui.setSelection(GameGUI::TOOL_SELECTION, const_cast<char *>(item->name.c_str()));
-		panelOpen = false;
-	}
+	if (const auto item = paletteItemAt(point)) activatePalette(*item);
 }

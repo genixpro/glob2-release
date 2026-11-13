@@ -11,7 +11,7 @@ platform.
 | Source | What it supplies | Licence |
 | --- | --- | --- |
 | [Natural Earth](https://www.naturalearthdata.com/) 1:50m vector data, fetched as GeoJSON from the [nvkelso/natural-earth-vector](https://github.com/nvkelso/natural-earth-vector) mirror: `ne_50m_land`, `ne_50m_lakes`, `ne_50m_rivers_lake_centerlines`, `ne_50m_glaciated_areas`, `ne_50m_geography_regions_polys` | Coasts, lakes, the great rivers, ice caps, and the named deserts and mountain ranges | Public domain |
-| Köppen-Geiger climate classification, Kottek, Grieser, Beck, Rudolf and Rubel (2006), "World Map of the Köppen-Geiger climate classification updated", *Meteorologische Zeitschrift* 15, 259-263; the 0.5° ASCII grid from [koeppen-geiger.vu-wien.ac.at](http://koeppen-geiger.vu-wien.ac.at/) | Biomes: which land is forest, farmland, steppe, desert, tundra or ice | Free with attribution (credited in `data/authors.txt`) |
+| Köppen-Geiger climate classification, Kottek, Grieser, Beck, Rudolf and Rubel (2006), "World Map of the Köppen-Geiger climate classification updated", *Meteorologische Zeitschrift* 15, 259-263; the 0.5° ASCII grid from [koeppen-geiger.vu-wien.ac.at](http://koeppen-geiger.vu-wien.ac.at/) | Biomes: which land is forest, farmland, steppe, desert, tundra or ice | Free with attribution (credited in `content/data/authors.txt`) |
 
 Why these: the 1:50m scale resolves a continent at 512 pixels across (about 15 km a pixel)
 without hair-thin coastlines, and a 0.5° climate grid (about 55 km) is coarse enough to read as
@@ -31,7 +31,7 @@ The sources are downloaded once into `artifacts/world-atlas/cache` (ignored by G
 moves it). The script is plain Python 3: polygons are filled by an even-odd scanline, so holes need
 no special handling, and nothing but PIL for previews is required. The output is deterministic for
 a given cache. **The data is part of every map built on it**: when it changes, bump the revision of
-every generator that uses it (Continents), re-record their golden rows, and say so in the PR.
+every generator that uses it (Continents) and say so in the PR; sim-diff shows the moved maps.
 
 ## What a region holds
 
@@ -71,6 +71,6 @@ shrinking never fattens a coast) and `resampleAny` keeps a one-cell river throug
 wide is beach on both sides and grass nowhere), pools too small to be anything but beach are
 filled with the land round them, islets too small to build on vanish, and `largestRegion` finds
 the mainland every colony must share. All of it is integer arithmetic, so the same picture lands on
-the same tiles on every platform; the golden rows for Continents are identical on Linux and macOS.
+the same tiles on every platform; Continents' map fingerprints are identical on Linux and macOS.
 
 Related: [map generators](README.md).

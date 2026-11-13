@@ -1,3 +1,4 @@
+#include "AIRegistry.h"
 #include "FileFormatVersions.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
@@ -78,8 +79,6 @@ void Engine::applyLocalExperiments(GameHeader& header, const MapHeader& map)
             if (parseExperimentKey(key) || std::find(allowed.begin(), allowed.end(), key) != allowed.end())
                 enabled.set(key, true, allowed);
         header.setExperiments(enabled);
-        for (const auto& definition : experimentDefinitions())
-            if (map.requiredTerrainExperiments.has(definition.id)) header.getExperiments().set(definition.id);
 		for (const auto& key : map.requiredResourceExperiments.keys()) header.getExperiments().set(key, true, allowed);
     }
 }
@@ -102,7 +101,7 @@ GAGCore::CooperativeTask Engine::initCustomTask(MapHeader map, GameHeader player
         globalContainer->settings.gameSpeed = speed;
     }
     // Without this, a generated map falls back to a name-based library
-    // lookup ("Random map" -> maps/Random_map.map) that never exists; a
+    // lookup (a generator's name -> maps/<name>.map) that never exists; a
     // premade map's on-disk path can also legitimately differ from its
     // declared map name (user libraries, duplicate names).
     co_return co_await initGameTask(map, players, true, false, false, sourceFileName);
@@ -122,7 +121,9 @@ GAGCore::CooperativeTask Engine::initCustomTask(std::string filename)
     auto stream = openGameInput(filename, map, players);
     if (!stream) co_return false;
     for (int p = 0; p < players.getNumberOfPlayers(); ++p)
-        if (players.getBasePlayer(p).type == BasePlayer::P_IP) players.getBasePlayer(p).makeItAI(AI::toggleAI);
+        if (players.getBasePlayer(p).type == BasePlayer::P_IP)
+            // compile_profile=core may leave the usual stand-in out; Nicowar is always built.
+            players.getBasePlayer(p).makeItAI(AIRegistry::available(AI::toggleAI) ? AI::toggleAI : AI::NICOWAR);
     applyLocalExperiments(players, map);
     if (players.getNumberOfPlayers() == 0) co_return false;
     co_return co_await initGameFromStreamTask(map, players, std::move(stream), true);
@@ -558,7 +559,7 @@ void Engine::finishGameInit()
 	{
 		assert(globalContainer->replayWriter == nullptr);
 		globalContainer->replayWriter = std::make_unique<ReplayWriter>();
-		globalContainer->replayWriter->init(replayPath, gui);
+		gui.startReplay(*globalContainer->replayWriter, replayPath);
 	}
 
 	// Initialise checksum sidecar writer if requested

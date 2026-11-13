@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "hive/LocalCommander.h"
 #include <GameplayRecording.h>
 #include "Application.h"
 #include "mcp/UIService.h"
@@ -24,7 +25,9 @@
 #include "KeyboardManager.h"
 #include "GameGUIKeyActions.h"
 #include "CreditScreen.h"
-#include "EditorMainMenu.h"
+#include "CompileProfile.h"
+#include <iostream>
+#include "EditorEntry.h"
 #include "LANMenuScreen.h"
 #include "OnlineHubScreen.h"
 #include "InviteLink.h"
@@ -162,7 +165,20 @@ Application::Application()
 {
 #if GLOB2_DESKTOP_MCP
     mcp = std::make_unique<MCP::UIService>(*globalContainer->gfx);
-    mcp->configure(globalContainer->settings.mcpEnabled, globalContainer->settings.mcpPort);
+	mcp->domainHandler = [](const std::string &tool, const MCP::Json &args)
+	{
+		MCP::Result result;
+		result.data = Hive::localCall(tool, args);
+		return result;
+	};
+	mcp->inspectionHosts = [this] {
+		return screens.top() ? screens.top()->inspectionHosts() : std::vector<GAGGUI::ui::Host *>{};
+	};
+	mcp->inspectionScreen = [this] {
+		return screens.top() ? std::string(screens.top()->recordingId())
+							 : std::string("unavailable");
+	};
+	mcp->configure(globalContainer->settings.mcpEnabled, globalContainer->settings.mcpPort);
 #endif
 	if (GAGCore::ApplicationHost::storageRestoreFailed())
 	{
@@ -237,7 +253,9 @@ void Application::choose(int choice)
 		screens.push(std::make_unique<CreditScreen>());
 		break;
 	case MainMenuScreen::EDITOR:
-		screens.push(std::make_unique<EditorMainMenu>(screens));
+		// A compile_profile=core build has no editor; the button then only explains why.
+		if (!EditorEntry::open(screens))
+			std::cerr << CompileProfile::missing("The map editor") << std::endl;
 		break;
 	case MainMenuScreen::MULTIPLAYERS_LAN:
 		screens.push(std::make_unique<LANMenuScreen>(screens));
@@ -253,7 +271,7 @@ void Application::choose(int choice)
 	}
 }
 
-// The browser installs some data after the main menu is up (scons/web_assets.py);
+// The browser installs some data after the main menu is up (buildsys/web_assets.py);
 // native hosts never report an installation.
 void Application::installStagedAssets()
 {
@@ -265,7 +283,12 @@ void Application::installStagedAssets()
     for (const auto &package : GAGCore::ApplicationHost::takeInstalledAssetPackages())
     {
         GAGCore::Toolkit::assets().invalidate();
-		if (package == "game")
+        if (package == "hd" || package.starts_with("hd-terrain-"))
+        {
+            GAGCore::Sprite::refreshHighResolutionSprite(
+                package == "hd" ? std::string{} : "data/gfx/" + package.substr(3));
+        }
+		else if (package == "game")
 		{
 			// The menu colony and the settings' building artwork use them at once.
 			globalContainer->ensureGameGraphics();

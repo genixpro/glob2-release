@@ -1,3 +1,4 @@
+#include "AI.h"
 #include "UnitCatalog.h"
 #include "FileFormatVersions.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
@@ -27,6 +28,7 @@
 #include "ResourceRegistry.h"
 #include "Sha256.h"
 #include "WinningConditions.h"
+#include "Team.h"
 
 using nlohmann::json;
 
@@ -266,7 +268,7 @@ MatchRules parseRules(const json& value, const std::string& path)
 	r.allyTeamsFixed = b("allyTeamsFixed");
 	r.resourceGrowthDisabled = b("resourceGrowthDisabled");
 	r.resourceScarcityLevel = i("resourceScarcityLevel", 3);
-	r.aiOrderDelay = value.contains("aiOrderDelay") ? i("aiOrderDelay", 8) : 0;
+	r.aiOrderDelay = value.contains("aiOrderDelay") ? i("aiOrderDelay", int(GameHeader::MAX_AI_ORDER_DELAY)) : 0;
 	r.buildingGradientDelay = value.contains("buildingGradientDelay")
 	                              ? static_cast<int>(integer(value["buildingGradientDelay"], path + "/buildingGradientDelay", 1, 8))
 	                              : int(GameHeader::DEFAULT_BUILDING_GRADIENT_DELAY);
@@ -733,9 +735,6 @@ GameHeader MatchSetup::toGameHeader(const MapHeader& mapHeader) const
 		semanticError("/resourceExperiments", "does not match the map's embedded resource catalog");
 	header.setResourceExperiments(mapExperiments);
 	ExperimentSet experimentSet = ExperimentSet::fromKeys(experiments, nullptr, header.catalogExperimentKeys());
-	for (const auto& definition : experimentDefinitions())
-		if (mapHeader.requiredTerrainExperiments.has(definition.id) && !experimentSet.has(definition.id))
-			semanticError("/experiments", "missing map-required terrain experiment " + std::string(definition.key));
 	for (const auto& key : mapHeader.requiredResourceExperiments.keys())
 		if (!experimentSet.has(key)) semanticError("/experiments", "missing map-required resource experiment " + key);
 	header.setExperiments(experimentSet);
@@ -832,8 +831,6 @@ MatchSetup MatchSetup::fromGameHeader(GameHeader header, const MapHeader& mapHea
 	r.permadeathDisabled = header.isPermadeathDisabled();
 	r.peacefulMode = header.isPeacefulModeEnabled();
 	r.buildingHpLevel = header.getBuildingHpLevel();
-	for (const auto& definition : experimentDefinitions())
-		if (mapHeader.requiredTerrainExperiments.has(definition.id)) header.getExperiments().set(definition.id);
 	for (const auto& key : mapHeader.requiredResourceExperiments.keys()) header.getExperiments().set(key, true, header.catalogExperimentKeys());
 	setup.experiments = header.getExperiments().keys();
 	setup.validateSemantics();

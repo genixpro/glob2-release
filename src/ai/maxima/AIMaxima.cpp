@@ -23,6 +23,7 @@
 #include "GameDiagnostics.h"
 #include "AITelemetryFields.h"
 #include "AIMaxima.h"
+#include "AIMaximaForwardSupport.h"
 #include "AIMaximaBuildings.h"
 #include "AIMaximaFeedingEstimate.h"
 #include "AIMaximaFeedingDemand.h"
@@ -59,6 +60,21 @@ namespace
 {
 	const int PREEMPTIVE_UNREACHABLE=-1;
 
+    constexpr int InnCarrierCeiling=8;
+    constexpr int SwarmCarrierCeiling=12;
+
+    int carrierCeiling(const BuildingType& type,const MaximaStrategy& strategy)
+    {
+        int ceiling=std::min(type.semantics.assignmentLimit,
+            strategy.staffing.control_maximum_workers);
+        // A provider with both services keeps the production allowance.
+        if(!type.semantics.production.enabledUnits.empty())
+            ceiling=std::min(ceiling,SwarmCarrierCeiling);
+        else if(type.maxUnitInside>0 && type.semantics.feeding.enabled)
+            ceiling=std::min(ceiling,InnCarrierCeiling);
+        return ceiling;
+    }
+
     int initialCarrierRequest(const BuildingType& type,const MaximaStrategy& strategy)
     {
         int requested=-1;
@@ -66,7 +82,7 @@ namespace
         if(type.maxUnitInside>0)requested=std::max(requested,strategy.staffing.new_inn_workers);
         if(type.shootingRange>0 && type.shootRhythm>0)requested=std::max(requested,strategy.staffing.completed_tower_workers);
         if(requested<0)requested=type.presentation.defaultAssigned<0?2:type.presentation.defaultAssigned;
-        return std::clamp(requested,0,std::min(type.semantics.assignmentLimit,strategy.staffing.control_maximum_workers));
+        return std::clamp(requested,0,carrierCeiling(type,strategy));
     }
 
     FeedingEstimate operatingEstimate(const BuildingType& type,const MaximaStrategy& strategy,const GameHeader& rules,bool constrainHauling=true)
@@ -2369,10 +2385,13 @@ void Maxima::select_posture()
 }
 
 
-void Maxima::allocate_resources()
+void Maxima::allocate_resources(Context& runtime)
 {
 	telemetry.count(AITrace::AI7::Maxima_allocate_resources_calls);
 	budget=DirectorPlan();
+	// Assess against the fresh plan so selected prestige prerequisites survive
+	// arbitration and reach the ordinary development executor.
+	assess_prestige(runtime);
 	int largest_enemy_force=0;
 	for(int team=0; team<Team::MAX_COUNT; ++team)
 		if(opponents[team].alive)
@@ -2408,6 +2427,7 @@ const char* Maxima::policy_name(PolicyKind policy) const
 	{
 		case PolicySurvival: return "survival";
 		case PolicyGrowth: return "growth";
+        case PolicyPrestige: return "prestige";
 		case PolicyAccess: return "access";
 		case PolicyTechnology: return "technology";
 		case PolicyDefense: return "defense";
@@ -2715,6 +2735,39 @@ void Maxima::build_policy_bids()
 	offense.attack_flags=budget.attack_flags;
 	offense.attack_units=budget.attack_units;
 	offense.construction_sites=strategy.construction.policy_low_sites;
+    PolicyBid& prestige=policy_bids[PolicyPrestige];
+    prestige=PolicyBid();
+    if(prestige_race.state!=Prestige::Hold && prestige_enabled(context)) {
+        prestige.utility=prestige_race.priority;
+        prestige.request_upgrades=true;
+        // Add only the unfinished pipelines supported by qualified spare crews,
+        // crediting ordinary capacity and sites in the development intents.
+        int finished=0;
+        const auto& profiles=collect_building_profiles();
+        const auto profile=std::find_if(profiles.begin(),profiles.end(),[&](const auto& p){return p.buildingType==prestige_race.buildingType;});
+        if(profile!=profiles.end())for(const auto& [id,record]:context.get_building_register().found()) {
+            const auto* b=context.get_building_register().get_building(id);
+            if(b && std::any_of(profile->levels.begin(),profile->levels.end(),[&](const auto& v){
+                return v.completedType==b->typeNum && v.level>=budget.prestige_target_level;}))++finished;
+        }
+        Prestige::PipelineCapacity capacity;
+        const int pipelines=profile==profiles.end()?1:prestige_pipeline_allowance(*profile,&capacity);
+        budget.prestige_desired_buildings=std::min(finished+pipelines,int(Building::MAX_COUNT));
+        if(profile_serves(prestige_race.buildingType,AIMaximaBuildings::ConstructionTraining))
+            prestige.desired_schools=std::max(technology.desired_schools,budget.prestige_desired_buildings);
+        emit_telemetry(context,"prestige_capacity","\tconfigured="+std::to_string(strategy.prestige.max_pipelines)
+            +"\tsampled="+std::to_string(capacity.sampled)
+            +"\tqualified_idle="+std::to_string(capacity.qualifiedIdle)
+            +"\troot_assigned="+std::to_string(capacity.rootAssigned)
+            +"\ttraining_reserve="+std::to_string(capacity.trainingReserve)
+            +"\tordinary_unmet="+std::to_string(capacity.ordinaryUnmet)
+            +"\tunobserved_crews="+std::to_string(capacity.unobservedCrews)
+            +"\tcrew="+std::to_string(capacity.crew)
+            +"\tworker_limit="+std::to_string(capacity.workerLimit)
+            +"\tmaterial_limit="+std::to_string(capacity.materialLimit)
+            +"\tremaining_steps="+std::to_string(capacity.remainingSteps)
+            +"\tpipelines="+std::to_string(pipelines)+"\tdesired="+std::to_string(budget.prestige_desired_buildings));
+    }
 }
 
 
@@ -2726,6 +2779,7 @@ void Maxima::arbitrate_policy_bids()
 	if (rules.isUnitUpgradesDisabled())
 	{
 		policy_bids[PolicyTechnology]=PolicyBid();
+        policy_bids[PolicyPrestige]=PolicyBid();
 		policy_bids[PolicyAccess].desired_pools=0;
 		for (auto& bid:policy_bids) bid.request_upgrades=false;
 	}
@@ -2739,6 +2793,7 @@ void Maxima::arbitrate_policy_bids()
 	const PolicyBid& growth=policy_bids[PolicyGrowth];
 	const PolicyBid& access=policy_bids[PolicyAccess];
 	const PolicyBid& technology=policy_bids[PolicyTechnology];
+    const PolicyBid& prestige=policy_bids[PolicyPrestige];
 	const PolicyBid& defense=policy_bids[PolicyDefense];
 	const PolicyBid& offense=policy_bids[PolicyOffense];
 
@@ -2752,6 +2807,7 @@ void Maxima::arbitrate_policy_bids()
 		? access.desired_pools : 0;
 	result.desired_schools=technology.utility>=strategy.economy.school_bid_utility_min
 		? technology.desired_schools : 0;
+    result.desired_schools=std::max(result.desired_schools,prestige.desired_schools);
 	result.desired_racetracks=
 		technology.utility>=strategy.economy.racetrack_bid_utility_min
 		? technology.desired_racetracks : 0;
@@ -2850,7 +2906,7 @@ void Maxima::arbitrate_policy_bids()
 	// came from a batch that measured worse and was never justified on its own.
 	result.defense_reserve=defense.defense_reserve;
 	result.allow_upgrades=survival.request_upgrades
-		|| technology.request_upgrades;
+		|| technology.request_upgrades || prestige.request_upgrades;
 	result.allow_level2_upgrades=result.allow_upgrades
 		&& snapshot.population>=strategy.upgrades.level2_population_min;
 	result.attack_flags=!severe_colony_emergency() ? offense.attack_flags : 0;
@@ -2872,6 +2928,12 @@ void Maxima::arbitrate_policy_bids()
 			? strategy.scoring.priority_pool_network_bonus : 0);
 	result.priority_schools=technology.utility+(abundance_surge
 		? strategy.scoring.priority_abundance_school_bonus : 0);
+    result.priority_schools=std::max(result.priority_schools,prestige.utility);
+    result.prestige_priority=prestige.utility;
+    result.prestige_building_type=prestige_race.buildingType;
+    result.prestige_target_level=budget.prestige_target_level;
+    result.prestige_desired_buildings=budget.prestige_desired_buildings;
+    result.prestige_completion_allowed=prestige_race.state==Prestige::Invest || prestige_race.state==Prestige::Finish;
 	result.priority_racetracks=std::max(0,
 		technology.utility-strategy.scoring.priority_racetrack_penalty);
 	// Maxima used to buy a racetrack on a payback appraisal of walking speed,
@@ -3136,6 +3198,7 @@ void Maxima::finalize_director_plan(Context& runtime)
 	budget.target_switch_margin=strategy.scoring.target_switch_margin;
 	budget.preemptive_recompute_ticks=
 		strategy.scheduling.preemptive_defense_recompute_ticks;
+	budget.preemptive_min_gap_ticks=strategy.scheduling.preemptive_defense_min_gap_ticks;
 	budget.preemptive_inner_distance=
 		strategy.military.preemptive_defense_inner_distance;
 	budget.preemptive_band_width=
@@ -3438,6 +3501,9 @@ void Maxima::emit_director_snapshot(Context& runtime) const
 		<<"\tdesired_barracks="<<budget.desired_barracks
 		<<"\tdesired_hospital_beds="<<budget.desired_hospital_beds
 		<<"\tdesired_schools="<<budget.desired_schools
+        <<"\tordinary_school_request="<<policy_bids[PolicyTechnology].desired_schools
+        <<"\tprestige_target_level="<<budget.prestige_target_level
+        <<"\tprestige_pipeline_request="<<budget.prestige_desired_buildings
 		<<"\tdesired_towers="<<budget.desired_towers
 		<<"\ttowers="<<snapshot.towers
 		<<"\ttower_stone="<<snapshot.tower_stone
@@ -3565,7 +3631,7 @@ void Maxima::evaluate_strategy(Context& runtime)
 	select_posture();
 	if (posture != previous_posture)
 		telemetry.count(AITrace::AI7::runtime_posture_changed);
-	allocate_resources();
+	allocate_resources(runtime);
 	finalize_director_plan(runtime);
 	plan_offense(runtime);
 	// Explorer strikes share the offensive target. Keep the existing strategic
@@ -3764,6 +3830,10 @@ Maxima::Maxima(Player *player)
 	farming_urgent=false;
 	land_clearing_pending=false;
 	maintenance_clearing_pending=false;
+	maintenance_clearing_requested_by_farming=false;
+	last_maintenance_clearing_tick=-1000000;
+	farming_wood_reserve=WoodReserve(0);
+	farming_wood_reserve_valid=false;
 	development_cycle_pending=false;
 	preemptive_defense_pending=false;
 	reactive_defense_pending=false;
@@ -3797,7 +3867,10 @@ void Maxima::tick(Context& runtime)
 	// slot before the small executors so initialization, loaded saves and dirty
 	// plans publish a coherent budget before those executors consume it. A due
 	// periodic review shares this slot rather than evaluating a second time.
-	const bool strategyReviewDue=!director.initialized || director.dirty
+	// Building events mark the plan dirty; such reviews are spaced by
+	// strategy_review_min_gap_ticks from the last one (snapshot.tick).
+	const bool strategyReviewDue=!director.initialized
+		|| (director.dirty && timer-snapshot.tick>=strategy.scheduling.strategy_review_min_gap_ticks)
 		||timer%strategy.scheduling.strategy_interval_ticks
 			==staggered_phase(strategy.scheduling.strategy_phase_offset_ticks,
 				strategy.scheduling.strategy_interval_ticks,team);
@@ -3829,6 +3902,80 @@ void Maxima::tick(Context& runtime)
 		==staggered_phase(0,budget.tactical_review_interval,team))
 	{
 		control_offense(runtime);
+        if(telemetry_enabled())
+        {
+            std::ostringstream state;
+            state<<"\tkind="<<Tactics::missionKindName(tactical_mission.kind)
+                <<"\ttarget_team="<<tactical_mission.targetTeam
+                <<"\ttarget_gid="<<tactical_mission.targetGid
+                <<"\tphase="<<int(tactical_mission.phase)
+                <<"\trequested="<<tactical_mission.requestedForce
+                <<"\tflags="<<attack_flags.size()<<"\tfailed_waves="<<failed_waves
+                <<"\teligible="<<offense_diagnostics.eligibleWarriors
+                <<"\ttraining_reserved="<<offense_diagnostics.openTrainingSlots
+                <<"\tgate="<<offense_diagnostics.gate
+                <<"\tx="<<tactical_mission.targetX<<"\ty="<<tactical_mission.targetY
+                <<"\tlast_progress="<<tactical_mission.lastProgressTick
+                <<"\tobjective_hp="<<tactical_mission.lastTargetHp;
+            state<<"\tflag_proximity_distance="<<offense_diagnostics.flagProximityDistance
+                <<"\tflag_proximity_penalty="<<offense_diagnostics.flagProximityPenalty;
+            emit_telemetry(runtime,"offense_state",state.str());
+            for(int id:attack_flags)
+            {
+                const auto* flag=runtime.get_building_register().get_building(id);
+                if(!flag) continue;
+                int arrived=0,objectiveArrived=0,fighting=0,hungry=0;
+                for(const auto ref:runtime.observation().workers(*flag))
+                {
+                    const auto* unit=runtime.observation().unit(ref);if(!unit || unit->isDead) continue;
+                    const auto& world=runtime.observation();
+                    if(world.distanceSquared(unit->posX,unit->posY,flag->posX,flag->posY)<=flag->unitStayRange*flag->unitStayRange) ++arrived;
+                    if(unit->medical==Unit::MED_FREE && world.distanceSquared(unit->posX,unit->posY,tactical_mission.targetX,tactical_mission.targetY)<=budget.tactical_siege_radius*budget.tactical_siege_radius) ++objectiveArrived;
+                    fighting+=unit->movement==Unit::MOV_ATTACKING_TARGET;
+                    hungry+=unit->medical==Unit::MED_HUNGRY;
+                }
+                const auto wave=std::find_if(offense_waves.begin(),offense_waves.end(),[&](const auto& w){return w.flagId==id;});
+                std::ostringstream fields;
+                fields<<"\tflag="<<id<<"\tflag_gid="<<flag->gid<<"\tflag_generation="<<flag->identity.generation
+                    <<"\trole="<<(wave==offense_waves.end()?"streaming":wave->phase==Tactics::WaveMuster?"muster":"advance")
+                    <<"\ttarget_team="<<tactical_mission.targetTeam<<"\ttarget_gid="<<tactical_mission.targetGid
+                    <<"\tx="<<flag->posX<<"\ty="<<flag->posY<<"\trange="<<flag->unitStayRange
+                    <<"\tenrolled="<<flag->working.count<<"\tarrived="<<arrived
+                    <<"\tobjective_arrived="<<objectiveArrived<<"\tfighting="<<fighting<<"\thungry="<<hungry;
+                emit_telemetry(runtime,"offense_flag",fields.str());
+            }
+            for(const auto& [id,action]:development_planner.actions())
+                if(action.purpose==AIMaximaPlacement::ForwardSupport)
+                    if(const auto* provider=runtime.get_building_register().get_building(action.buildingId))
+                        if(!AIEngine::ObservationQueries::buildingType(runtime.observation(),*provider).isBuildingSite)
+                        {
+                            const auto& kind=AIEngine::ObservationQueries::buildingType(runtime.observation(),*provider);
+                            const unsigned roles=AIMaximaBuildings::capabilities(runtime.observation(),kind);
+                            int feedingDistance=INT_MAX;
+                            for(const auto* feeder:runtime.observation().buildingsForTeam(runtime.teamNumber()))
+                                if(feeder)
+                                {
+                                    const auto& feederKind=AIEngine::ObservationQueries::buildingType(runtime.observation(),*feeder);
+                                    if(!feederKind.isBuildingSite && (AIMaximaBuildings::capabilities(runtime.observation(),feederKind)
+                                        & AIMaximaBuildings::roleBit(AIMaximaBuildings::Feeding)))
+                                        feedingDistance=std::min(feedingDistance,AIEngine::ObservationQueries::distanceMax(runtime.observation(),
+                                            provider->posX+kind.width/2,provider->posY+kind.height/2,
+                                            feeder->posX+feederKind.width/2,feeder->posY+feederKind.height/2));
+                                }
+                            std::ostringstream fields;
+                            fields<<"\taction="<<id<<"\tbuilding_gid="<<provider->gid
+                                <<"\tbuilding_generation="<<provider->identity.generation
+                                <<"\tx="<<provider->posX<<"\ty="<<provider->posY
+                                <<"\tfeeding="<<bool(roles&AIMaximaBuildings::roleBit(AIMaximaBuildings::Feeding))
+                                <<"\thealing="<<bool(roles&AIMaximaBuildings::roleBit(AIMaximaBuildings::Healing))
+                                <<"\trequested_carriers="<<provider->maxUnitWorking
+                                <<"\tassigned_carriers="<<provider->working.count
+                                <<"\toccupants="<<runtime.observation().occupants(*provider).size()
+                                <<"\tfood_stock="<<runtime.observation().buildingResources(*provider)[materialIndex(MaterialId::Food)]
+                                <<"\tnearest_feeding_distance="<<(feedingDistance==INT_MAX?-1:feedingDistance);
+                            emit_telemetry(runtime,"forward_support_provider",fields.str());
+                        }
+        }
 	}
 	const int defenseInterval=strategy.scheduling.defense_interval_ticks;
 	const int defensePhase=staggered_phase(
@@ -3881,9 +4028,12 @@ void Maxima::tick(Context& runtime)
 		land_clearing_pending=false;
 		manage_land_clearing(runtime);
 	}
-	else if(maintenance_clearing_pending)
+	else if(maintenance_clearing_pending
+		&& (maintenance_clearing_requested_by_farming
+		    || timer-last_maintenance_clearing_tick>=strategy.scheduling.maintenance_clearing_min_gap_ticks))
 	{
-		maintenance_clearing_pending=false;
+		maintenance_clearing_pending=false;maintenance_clearing_requested_by_farming=false;
+		last_maintenance_clearing_tick=timer;
 		update_maintenance_clearing_areas(runtime);
 	}
 	else if(preemptive_defense_pending)
@@ -3901,7 +4051,7 @@ void Maxima::tick(Context& runtime)
 		update_farming(runtime);
 		last_farming_tick=timer;
 		land_clearing_pending=true;
-		maintenance_clearing_pending=true;
+		maintenance_clearing_pending=true;maintenance_clearing_requested_by_farming=true;
 	}
 	else if(development_cycle_pending)
 	{
@@ -4321,14 +4471,14 @@ void Maxima::configure_development_planner()
 	policy.innerFoodZoneMultiplier=strategy.placement.inner_food_zone_multiplier;
 	policy.hospitalFoodZoneMultiplier=strategy.placement.hospital_food_zone_multiplier;
 	policy.towerFoodZoneMultiplier=strategy.placement.tower_food_zone_multiplier;
-	policy.towerCriticalDistanceWeight=strategy.placement.defensive_siting_enabled
-		? strategy.placement.tower_critical_distance_weight : 0;
-	policy.towerSpacingTarget=strategy.placement.tower_spacing_target;
-	policy.towerSpacingWeight=strategy.placement.spacing_compactness_enabled
-		? strategy.placement.tower_spacing_weight : 0;
-	policy.towerThreatTarget=strategy.placement.tower_threat_target;
-	policy.towerThreatWeight=strategy.placement.defensive_siting_enabled
-		? strategy.placement.tower_threat_weight : 0;
+	policy.towerBorderPercent=strategy.placement.tower_border_percent;
+	policy.towerInteriorPercent=strategy.placement.tower_interior_percent;
+	policy.towerBorderEnemyRatio=strategy.placement.tower_border_enemy_ratio;
+	policy.towerRoleDistanceFalloff=strategy.placement.tower_role_distance_falloff;
+	policy.towerSpreadSaturationTiles=strategy.placement.tower_spread_saturation_tiles;
+	policy.towerSpreadPercent=strategy.placement.tower_spread_percent;
+	policy.towerRepairHealthPercent=strategy.repairs.tower_health_percent;
+	policy.foodUpgradeRetryTicks=strategy.placement.food_upgrade_retry_ticks;
 	policy.laborScale=strategy.placement.labor_scale;
 	policy.downtimeWorkerScale=strategy.placement.downtime_worker_scale;
 	policy.arteryLengthScale=strategy.placement.artery_length_scale;
@@ -4414,7 +4564,7 @@ AIMaximaPlacement::WorldState Maxima::collect_development_world(
     }
 	const bool cachedFertility=fertility_cache.validFor(world.width,world.height);
 	const std::vector<uint32_t>& fertilityValues=fertility_cache.values();
-	const WoodReserve wood_reserve=select_wood_reserve(runtime);
+	const WoodReserve wood_reserve=current_wood_reserve(runtime);
 	for(int y=0;y<world.height;++y)for(int x=0;x<world.width;++x)
 	{
 		const int index=y*world.width+x;
@@ -4516,6 +4666,12 @@ AIMaximaPlacement::WorldState Maxima::collect_development_world(
 		{
 			if(!enemy||AIEngine::ObservationQueries::buildingType(runtime.observation(),*enemy).isVirtual
 			   ||!(enemy->seenByMask&runtime.observedTeam().allies))continue;
+			const auto& enemyType=AIEngine::ObservationQueries::buildingType(runtime.observation(),*enemy);
+			if(!AIMaximaBuildings::serves(runtime.observation(),enemyType,
+					AIMaximaBuildings::ProjectileDefense))
+				world.enemyStructures.push_back(world.index(
+					(*map).normalizeX(enemy->posX-enemyType.decLeft),
+					(*map).normalizeY(enemy->posY-enemyType.decTop)));
 			const int radius=strategy.placement.enemy_threat_radius;
 			for(int dy=-radius;dy<=radius;++dy)
 				for(int dx=-(radius-std::abs(dy));
@@ -4555,7 +4711,7 @@ AIMaximaPlacement::WorldState Maxima::collect_development_world(
             const auto allowed=swarm_allowance.find(value.id);
             if(allowed!=swarm_allowance.end())value.plannedCarriers=std::min(value.plannedCarriers,allowed->second);
             value.plannedCarriers=std::clamp(value.plannedCarriers,0,
-                std::min(AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.assignmentLimit,strategy.staffing.control_maximum_workers));
+                carrierCeiling(AIEngine::ObservationQueries::buildingType(runtime.observation(),*building),strategy));
             std::copy_n(building->ratio,3,value.productionRatios);
         }
 		world.buildings.push_back(value);
@@ -4573,6 +4729,37 @@ AIMaximaPlacement::WorldState Maxima::collect_development_world(
 	}
 	std::sort(world.buildings.begin(),world.buildings.end(),
 		[](const WorldBuilding& a,const WorldBuilding& b){return a.id<b.id;});
+	std::sort(world.enemyStructures.begin(),world.enemyStructures.end());
+	world.enemyStructures.erase(std::unique(world.enemyStructures.begin(),
+		world.enemyStructures.end()),world.enemyStructures.end());
+	// A tower under repair is a site and cannot shoot: hold its repair while a
+	// visible enemy fighter (warrior or attacking explorer) is close to it.
+	if(const int radius=strategy.repairs.tower_enemy_radius)
+	{
+		std::vector<std::pair<int,int>> fighters;
+		for(int team=0;team<Team::MAX_COUNT;++team)
+		{
+			if(std::size_t(team)>=runtime.observation().teams.size()
+			   || !(runtime.observedTeam().enemies&runtime.observation().teams[team].mask))continue;
+			for(const AIEngine::UnitView* unit:runtime.observation().unitsForTeam(team))
+			{
+				if(!unit||!AIEngine::ObservationQueries::visible(runtime.observation(),
+					unit->posX,unit->posY,runtime.observedTeam().mask))continue;
+				if(AIEngine::ObservationQueries::matchesStrategyUnitRole(runtime.observation(),*unit,WARRIOR)
+				   ||unit->performance[MAGIC_ATTACK_GROUND]>0)
+					fighters.emplace_back(unit->posX,unit->posY);
+			}
+		}
+		for(const WorldBuilding& building:world.buildings)
+		{
+			if(building.site||building.hp>=building.hpMax)continue;
+			const auto* type=profile_variant(building.buildingType,building.level);
+			if(!type||!(type->roles&AIMaximaBuildings::roleBit(AIMaximaBuildings::ProjectileDefense)))continue;
+			for(const auto& [x,y]:fighters)
+				if(world.wrappedManhattan(x,y,building.centerX,building.centerY)<=radius)
+				{world.contestedBuildings.push_back(building.id);break;}
+		}
+	}
 	for(size_t i=0;i<world.buildings.size();++i)
 	{
 		const WorldBuilding& building=world.buildings[i];
@@ -4719,6 +4906,64 @@ Maxima::collect_development_intents(
 			}
 		}
 	}
+    // Forward support is an additional, explicitly enabled demand. The ordinary
+    // feeding/healing intents and their placement scores above stay unchanged.
+    if((strategy.forward_support.inns_enabled || strategy.forward_support.hospitals_enabled)
+        && !context.observation().configuration->isPeacefulModeEnabled()
+        && tactical_mission.flagId>=0 && tactical_mission.kind!=Tactics::MissionNone
+        && timer-tactical_mission.phaseSinceTick>=strategy.tactics.dwell_ticks
+        && snapshot.warriors>=12 && snapshot.workers>=24
+        && !budget.recovery_active && !severe_colony_emergency())
+    {
+        const int coverageDistance=strategy.forward_support.coverage_distance_tiles;
+        for(int role:{AIMaximaBuildings::Feeding,AIMaximaBuildings::Healing})
+        {
+            if(role==AIMaximaBuildings::Feeding
+                ? !strategy.forward_support.inns_enabled || context.observation().configuration->isHungerDisabled()
+                : !strategy.forward_support.hospitals_enabled) continue;
+            int nearest=INT_MAX,completed=0;
+            for(const auto& building:world.buildings)
+                if(profile_serves(building.buildingType,role,building.level))
+                {
+                    nearest=std::min(nearest,ForwardSupport::distance(world,building.centerX,building.centerY,
+                        tactical_mission.targetX,tactical_mission.targetY));
+                }
+            for(const auto& [id,action]:development_planner.actions())
+                if(action.purpose==AIMaximaPlacement::ForwardSupport && action.state==Completed
+                    && world.building(action.buildingId) && profile_serves(action.buildingType,role,action.targetLevel)) ++completed;
+            if(nearest<coverageDistance || completed>=2
+                || development_planner.activeRoleBuildCount(role,AIMaximaPlacement::ForwardSupport)>0) continue;
+            const int type=preferred_profile(role);
+            const auto* shape=profile_variant(type,1);
+            if(!shape || !shape->available || shape->requiredWorkerLevel>
+                AIEngine::ObservationQueries::maxBuildLevel(context.observation(),context.teamNumber())) continue;
+            DevelopmentIntent support;
+            support.purpose=AIMaximaPlacement::ForwardSupport;support.buildingType=type;
+            support.unmetCount=1;support.priority=35;
+            support.workers=std::min(shape->assignmentLimit,role==AIMaximaBuildings::Feeding
+                ? strategy.staffing.construction_inn_workers : strategy.staffing.construction_hospital_workers);
+            forward_support_constraints(context,support);result.push_back(support);
+        }
+    }
+    if(budget.prestige_priority>0 && budget.prestige_desired_buildings>0) {
+        const int root=budget.prestige_building_type;
+        const int current=development_planner.committedBuildingCount(world,root);
+        if(current<budget.prestige_desired_buildings) {
+            auto found=std::find_if(result.begin(),result.end(),[&](const auto& i){return i.buildingType==root && i.purpose==CoreCapacity;});
+            if(found!=result.end()) {
+                found->unmetCount=std::max(found->unmetCount,budget.prestige_desired_buildings-current);
+                found->priority=std::max(found->priority,budget.prestige_priority);
+            } else {
+                DevelopmentIntent intent;intent.buildingType=root;intent.purpose=CoreCapacity;
+                intent.unmetCount=budget.prestige_desired_buildings-current;intent.priority=budget.prestige_priority;
+                const auto* profile=profile_variant(root);
+                if(profile) {
+                    intent.workers=std::min(profile->assignmentLimit,strategy.staffing.construction_training_workers);
+                    result.push_back(intent);
+                }
+            }
+        }
+    }
 	// Once useful development is exhausted, idle builders fortify the colony.
 	// The planner ranks this purpose below every viable ordinary action.
 	const int spare=labour_observation.idle-labour_plan.trainingReserve;
@@ -4825,7 +5070,13 @@ AIMaximaPlacement::DevelopmentLimits Maxima::collect_development_limits(Context&
     ? trained>=budget.second_prestige_trained_workers && stat->totalUnit>=budget.second_prestige_population_min
     : trained>=budget.first_prestige_trained_workers;
    if(!prestigeAllowed)priority=0;
+   if(!prestige_action_allowed(runtime,p.buildingType,v.level,next->level,excludedAction))priority=0;
+   else if(prestigeAllowed && budget.prestige_completion_allowed && budget.prestige_priority>0 && p.buildingType==budget.prestige_building_type)
+       priority=std::max(priority,budget.prestige_priority);
   }
+  if(next && prestige_enabled(runtime) && p.buildingType==budget.prestige_building_type
+      && next->level<budget.prestige_target_level && budget.prestige_priority>0)
+      priority=std::max(priority,budget.prestige_priority);
   if(!next||!next->available||next->requiredWorkerLevel>qualification)priority=0;
   bool serviceLost=false;for(int role=0;role<RoleCount;++role)if((v.roles&roleBit(role))&&(role!=CombatTraining||combatTrainingNeeded)&&total[role]>=2&&operational[role]-1<(total[role]+1)/2)serviceLost=true;
   if(serviceLost){priority=0;limits.upgradePriorities[{p.buildingType,0}]=0;}
@@ -4839,11 +5090,44 @@ AIMaximaPlacement::DevelopmentLimits Maxima::collect_development_limits(Context&
 }
 
 
+void Maxima::forward_support_constraints(const Context& runtime,
+    AIMaximaPlacement::DevelopmentIntent& intent) const
+{
+    intent.supportX=tactical_mission.targetX;intent.supportY=tactical_mission.targetY;
+    intent.supportDistance=strategy.forward_support.distance_tiles;
+
+}
+
+bool Maxima::forward_support_authorized(Context& runtime,
+    const AIMaximaPlacement::DevelopmentAction& action) const
+{
+    auto observation=runtime.scopeOwnerObservation();
+        const bool feeding=profile_serves(action.buildingType,AIMaximaBuildings::Feeding,action.targetLevel);
+        const bool healing=profile_serves(action.buildingType,AIMaximaBuildings::Healing,action.targetLevel);
+        const int d=AIEngine::ObservationQueries::distanceMax(runtime.observation(),action.centerX,action.centerY,
+            tactical_mission.targetX,tactical_mission.targetY);
+    if(tactical_mission.flagId<0 || tactical_mission.kind==Tactics::MissionNone
+            || severe_colony_emergency() || budget.recovery_active
+            || runtime.observation().configuration->isPeacefulModeEnabled()
+            || !((feeding && strategy.forward_support.inns_enabled && !runtime.observation().configuration->isHungerDisabled())
+                || (healing && strategy.forward_support.hospitals_enabled))
+            || d<std::max(8,strategy.forward_support.distance_tiles-8)
+            || d>strategy.forward_support.distance_tiles+8)return false;
+    return true;
+}
+
 bool Maxima::issue_development_action(Context& runtime,
-	AIMaximaPlacement::DevelopmentAction& action)
+	AIMaximaPlacement::DevelopmentAction& action,
+    const AIMaximaPlacement::WorldState* placementWorld)
 {
     auto ownerObservation=runtime.scopeOwnerObservation();
 	using namespace AIMaximaPlacement;int buildingId=-1;
+    if(!prestige_action_allowed(runtime,action.buildingType,action.fromLevel,action.targetLevel,action.id))return false;
+    if(action.purpose==AIMaximaPlacement::ForwardSupport && !forward_support_authorized(runtime,action))
+    {
+        emit_telemetry(runtime,"forward_support_rejected","\treason=front_or_authority_changed\taction="+telemetryText(action.id));
+        return false;
+    }
 	if(action.type==BuildCampusMember||action.type==BuildStandalone)
 	{
 		const auto* shape=profile_variant(action.buildingType,action.targetLevel);if(!shape)return false;
@@ -4852,6 +5136,36 @@ bool Maxima::issue_development_action(Context& runtime,
 		const int y=runtime.observation().normalizeY(action.centerY+placement->decTop);
 		buildingId=runtime.issue_building_at(shape->engineType,action.workers,x,y);
 		if(buildingId<0)return false;
+        if(action.purpose==AIMaximaPlacement::ForwardSupport)
+        {
+            std::ostringstream placement;
+            placement<<"\tstandoff="<<strategy.forward_support.distance_tiles
+                <<"\tcoverage_distance="<<strategy.forward_support.coverage_distance_tiles
+                <<"\tobjective_x="<<tactical_mission.targetX<<"\tobjective_y="<<tactical_mission.targetY;
+            if(telemetry_enabled() && placementWorld)
+            {
+                DevelopmentIntent intent;forward_support_constraints(runtime,intent);
+                // Diagnostics use the decision's existing snapshot. Do not
+                // refresh Maxima's mutable planning caches just for logging.
+                const auto& world=*placementWorld;
+                bool canSwim=true,hasWarrior=false;
+                for(const auto* unit:runtime.observation().unitsForTeam(runtime.teamNumber()))
+                    if(unit && !unit->isDead && AIEngine::ObservationQueries::matchesStrategyUnitRole(
+                        runtime.observation(),*unit,WARRIOR))
+                    {hasWarrior=true;canSwim&=unit->performance[SWIM]>0;}
+                canSwim&=hasWarrior;
+                const ForwardSupport::Routes routes(world,intent,canSwim);
+                const auto site=routes.site(ForwardSupport::front(intent),action.accessTiles);
+                placement<<"\tobjective_route="<<(site.objective==INT_MAX?-1:site.objective)
+                    <<"\tsupply_route="<<(site.support==INT_MAX?-1:site.support)
+                    <<"\troute_detour="<<(site.detour==INT_MAX?-1:site.detour)
+                    <<"\tsupply_building="<<routes.supportBuilding<<"\tcommon_swimming="<<canSwim
+                    <<"\tcorridor_accepted="<<site.accepted;
+            }
+            emit_telemetry(runtime,"forward_support_issued","\taction="+telemetryText(action.id)
+                +"\tbuilding="+telemetryText(buildingId)+"\ttarget_team="+telemetryText(tactical_mission.targetTeam)
+                +"\tx="+telemetryText(action.centerX)+"\ty="+telemetryText(action.centerY)+placement.str());
+        }
 		if(profile_serves(action.buildingType,AIMaximaBuildings::Feeding,action.targetLevel))
 		{
 			ManagementOrder* update=new Notify(RuntimeEvent(RuntimeEvent::UpdateInn,buildingId));
@@ -4932,7 +5246,8 @@ void Maxima::emit_placement_diagnostics(Context& runtime,const char* outcome,
 	if(action)fields<<"\taction="<<action->id<<"\taction_type="<<action->type
 		<<"\tbuilding_type="<<action->buildingType
 		<<"\tpurpose="<<(action->purpose==ColonySeed ? "colony_seed"
-			: action->purpose==Fortification ? "fortification" : "core_capacity")
+			: action->purpose==Fortification ? "fortification"
+            : action->purpose==AIMaximaPlacement::ForwardSupport ? "forward_support" : "core_capacity")
 		<<"\ttemplate="<<action->templateId<<"\tcampus="<<action->campusId
 		<<"\tslot="<<action->slotId<<"\tbuilding="<<action->buildingId
 		<<"\tx="<<action->centerX<<"\ty="<<action->centerY
@@ -5070,6 +5385,12 @@ void Maxima::development_cycle(Context& runtime)
 			development_planner.actions().find(reservedActions[i]);
 		if(found==development_planner.actions().end())continue;
 		DevelopmentAction pending=found->second;RejectionReason reason=RejectedReservation;
+        if(pending.purpose==AIMaximaPlacement::ForwardSupport && !forward_support_authorized(runtime,pending))
+        {
+            development_planner.markInvalidated(pending.id,InvalidatedBeforeIssue,worldSignature);
+            emit_telemetry(runtime,"forward_support_rejected","\treason=front_or_authority_changed\taction="+telemetryText(pending.id));
+            continue;
+        }
 		if((pending.type==UpgradeBuilding || pending.type==RepairBuilding)
 		   &&!development_planner.revalidateSelection(refreshedWorld,{},
 			collect_development_limits(runtime,pending.id),pending,&reason))
@@ -5079,7 +5400,7 @@ void Maxima::development_cycle(Context& runtime)
 		}
 			if(development_planner.revalidate(refreshedWorld,pending,&reason,true))
 			{
-				if(!issue_development_action(runtime,pending))
+				if(!issue_development_action(runtime,pending,&refreshedWorld))
 					development_planner.markInvalidated(pending.id,
 						pending.type==UpgradeBuilding||pending.type==RepairBuilding
 						?UpgradeBlocked:EngineRejected,worldSignature,
@@ -5107,6 +5428,7 @@ void Maxima::development_cycle(Context& runtime)
 					pending.type==UpgradeBuilding?UpgradeBlocked:InvalidatedBeforeIssue,
 					worldSignature,
 					(reason!=RejectedClearableResource
+                     && !(pending.purpose==AIMaximaPlacement::ForwardSupport && reason==RejectedAuthorization)
 					 &&(pending.type==BuildCampusMember||pending.type==BuildStandalone))
 						? refreshedWorld.index(pending.centerX,pending.centerY) : -1);
 		}
@@ -5141,6 +5463,11 @@ void Maxima::development_cycle(Context& runtime)
 			refreshedIntents=collect_development_intents(world);
 		const std::vector<DevelopmentIntent>& intents=continuingSelection
 			? development_planner.selectionIntents() : refreshedIntents;
+        if(!continuingSelection && telemetry_enabled())
+            for(const auto& intent:intents) if(intent.purpose==AIMaximaPlacement::ForwardSupport)
+                emit_telemetry(runtime,"forward_support_offered","\tbuilding_type="+telemetryText(intent.buildingType)
+                    +"\tx="+telemetryText(intent.supportX)+"\ty="+telemetryText(intent.supportY)
+                    +"\tdistance="+telemetryText(intent.supportDistance));
 		DevelopmentAction action;
 		const SelectionProgress selection=
 			development_planner.selectActionIncremental(world,intents,limits,action,
@@ -5223,11 +5550,12 @@ void Maxima::development_cycle(Context& runtime)
 			development_planner.markInvalidated(action.id,
 				action.type==UpgradeBuilding?UpgradeBlocked:InvalidatedBeforeIssue,
 				issueSignature,
-				action.type==BuildCampusMember||action.type==BuildStandalone
-					? issueWorld.index(action.centerX,action.centerY) : -1);
+                (action.type==BuildCampusMember||action.type==BuildStandalone)
+                    && !(action.purpose==AIMaximaPlacement::ForwardSupport && revalidationReason==RejectedAuthorization)
+                    ? issueWorld.index(action.centerX,action.centerY) : -1);
 			emit_placement_diagnostics(runtime,"revalidation_failed",&action);continue;
 		}
-		if(!issue_development_action(runtime,action))
+		if(!issue_development_action(runtime,action,&issueWorld))
 		{
 			development_planner.markInvalidated(action.id,
 				action.type==UpgradeBuilding||action.type==RepairBuilding
@@ -5264,6 +5592,49 @@ void Maxima::development_cycle(Context& runtime)
 				std::chrono::duration_cast<std::chrono::microseconds>(
 					std::chrono::steady_clock::now()-profileStarted).count()));
 }
+
+
+// The ledger already measures wheat-route quality; larger distances are worse.
+// Rank completed inns and swarms separately and leave the odd building normal.
+void Maxima::update_worker_priorities(Context& runtime,
+    const AIMaximaPlacement::WorldState& world,
+    const AIMaximaFoodLedger::Result& ledger)
+{
+    auto ownerObservation=runtime.scopeOwnerObservation();
+    std::vector<const AIMaximaFoodLedger::ConsumerResult*> groups[2];
+    for(const auto& value:ledger.consumers)
+    {
+        const auto* building=world.building(value.key);
+        if(!building || building->site || building->upgrading)continue;
+        if(profile_serves(building->buildingType,AIMaximaBuildings::Feeding,building->level))
+            groups[0].push_back(&value);
+        else if(profile_serves(building->buildingType,AIMaximaBuildings::Production,building->level))
+            groups[1].push_back(&value);
+    }
+    auto setPriority=[&](int id,int priority)
+    {
+        const auto* building=runtime.get_building_register().get_building(id);
+        if(building && building->priority!=priority)
+            runtime.add_management_order(new ChangePriority(priority,id));
+    };
+    for(auto& group:groups)
+    {
+        std::sort(group.begin(),group.end(),[](const auto* a,const auto* b)
+        {
+            return a->quality!=b->quality ? a->quality>b->quality : a->key<b->key;
+        });
+        for(size_t i=0;i<group.size();++i)
+            setPriority(group[i]->key,i<group.size()/2 ? -1 : 0);
+    }
+    // Upgrades keep their existing high-priority lifecycle. Ordinary inn sites
+    // recruit first only while the current director budget reports a food crisis.
+    for(const auto& building:world.buildings)
+        if(building.site && !building.upgrading
+           && profile_serves(building.buildingType,AIMaximaBuildings::Feeding,building.level))
+            setPriority(building.id,budget.food_emergency ? 1 : 0);
+}
+
+
 void Maxima::update_food_retirement(Context& runtime,
 	const AIMaximaPlacement::WorldState& world)
 {
@@ -5273,6 +5644,7 @@ void Maxima::update_food_retirement(Context& runtime,
 		development_planner.evaluateFoodLedger(world);
 	const AIMaximaPlacement::PlacementPolicy& policy=development_planner.policy();
 	food_ledger_valid=true;
+    update_worker_priorities(runtime,world,ledger);
 
 	const std::set<int> establishing=establishing_colony_buildings();
 
@@ -5969,7 +6341,8 @@ int Maxima::update_staffing_request(Context& runtime, int id)
 	policy.highPermille=budget.staffing_high_permille;
 	policy.slack=budget.staffing_slack;
 	policy.minimumWorkers=budget.staffing_minimum_workers;
-	policy.maximumWorkers=std::min({MAXIMA_MAX_UNIT_WORKING,budget.staffing_maximum_workers,AIEngine::ObservationQueries::buildingType(runtime.observation(),*building).semantics.assignmentLimit});
+	policy.maximumWorkers=std::min({MAXIMA_MAX_UNIT_WORKING,budget.staffing_maximum_workers,
+        carrierCeiling(AIEngine::ObservationQueries::buildingType(runtime.observation(),*building),strategy)});
 	policy.minimumWorkers=std::min(policy.minimumWorkers,policy.maximumWorkers);
 	policy.cooldownPasses=budget.staffing_cooldown_passes;
 	// A building that has just been built starts where it is useful rather

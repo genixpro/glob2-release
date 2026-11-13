@@ -77,10 +77,13 @@ team's fields. `ring-flag` puts an exploration flag, with its goal disc kept ins
 the ring, at the centre: a flag is never written into the building tile grid, so
 walking the changed footprint could not discover its field at any distance.
 
-Each scenario has to let `GRADIENT_DIRTY_REBUILD_TICKS` (`src/engine/EngineTiming.h`)
-elapse before it can judge a field, and takes the constant from that header rather
-than copying it — when the interval was raised from 25 to 100, a local copy here
-silently stopped covering it and the regression passed stale fields.
+Each scenario has to let a field come due before it can judge it: building
+routes at `BUILDING_FIELD_REFRESH_TICKS` of age, flag routes once
+`GRADIENT_DIRTY_REBUILD_TICKS` have passed since a change (both in
+`src/engine/EngineTiming.h`). The harness takes the constants from that header
+rather than copying them — when the dirty interval was raised from 25 to 100, a
+local copy here silently stopped covering it and the regression passed stale
+fields.
 
 The scheduled cases run the suite's worlds with the default scheduled building
 pipeline: worker kernels match the synchronous seeding and search for every route,
@@ -97,7 +100,7 @@ forked with `--fork-rule buildingGradientDelay=N` (delays 1/4/8, workers 0/1/2/4
 save/resume at every phase, full/table/lazy depth, rejected delays 0 and 9).
 
 To see the harness fail, drop `gradientGeneration[swimClass] != topologyGeneration`
-from `Map::buildingGradient`: `ring-after`, `ring-other-team` and `ring-flag` all
+from `MapRouting::buildingGradient`: `ring-after`, `ring-other-team` and `ring-flag` all
 fail. `ring-before` passes either way by construction — nothing is cached before
 the ring exists — which is why it is not on its own sufficient.
 
@@ -217,9 +220,11 @@ plus the carry home.
 `LegacyRoundTripSave/*` loads
 [`greedy-fetching/round-trip-143.game.gz`](../../../test/fixtures/greedy-fetching/README.md), a
 mid-game save written when fetching still routed by round trip, with round-trip
-fields live. The loader discards those fields; the game plays 1,000 more ticks
-against a golden per-tick trace and continues identically after a binary or text
-save in the current format.
+fields live. The loader discards those fields and must reach a pinned load
+digest (the compatibility contract for that existing save); the game then plays
+1,000 more ticks with both colonies harvesting and every material balancing,
+records the per-tick trace for sim-diff (`[sim-trace]`), and continues
+identically after a binary or text save in the current format.
 
 ## Building material demand
 
@@ -253,7 +258,7 @@ It runs headlessly in disposable profile directories in Linux and Windows CI.
 
 ## Shared compute executor
 
-Build `scons release=1 server=0 unit-tests path-gradient-test
+Build `python3 tools/dev_build.py release=1 unit-tests path-gradient-test
 building-gradient-invalidation-test`. The `ComputeExecutor` unit suite checks exclusive
 slots, barriers, nested batches, exception propagation, reuse and reconfiguration.
 For deferred batches it checks earliest-due ordering (ties and lane order by
@@ -309,7 +314,7 @@ admitted jobs and queued demand also checks that text serialization preserves
 the two inventories independently.
 
 The publication suite is included in `web-tests`. After building the serial
-and threaded Wasm harnesses, run from `browser/`:
+and threaded Wasm harnesses, run from `platforms/web/`:
 
 ```sh
 npx playwright test determinism.spec.js --grep 'ground gradient publication'
@@ -329,12 +334,13 @@ checks seeding and cold input preparation separately from reader expansion.
 `HiringPlanner` verifies that background ranking extends only the required
 frontier, leaves distant cells unresolved, and lets live admission reuse the work.
 
-Intentional routing changes can also move Maxima's fixed army-birth and rally
-trajectories. Their legacy checksum adapters normalize representation, not
-simulation behavior. Refresh them with `GLOB2_RECORD_ARMY_CHECKSUMS=1` and
-`GLOB2_RECORD_RALLY_CHECKSUMS=1` respectively, running the focused
-`Maxima.Economy/army births*` and `Maxima.Combat/rally assembles by movement`
-cases. Then rerun both without those variables to verify the recorded traces.
+Intentional routing changes can also move Maxima's fixed rally trajectory. Its
+legacy checksum adapter normalizes representation, not simulation behavior.
+Refresh it with `GLOB2_RECORD_RALLY_CHECKSUMS=1`, running the focused
+`Maxima.Combat/rally assembles by movement` case, then rerun it without that
+variable to verify the recorded trace. The army-birth scenario has no committed
+trace: `Maxima.Economy/army births are warriors only*` asserts its behavior and
+`army births sim trace` records its checksums for sim-diff.
 
 
 `benchmark_gradient_pipeline.py --verify` compares real-game per-tick traces across
@@ -362,9 +368,10 @@ settings page. See [experimental features](../../features/experimental-features.
 for the `guard-area-balancing` experiment: spawn, drain, patches, size, three
 areas, erase, settled-guard movement, a save/load continuation and the crowding
 box sum against brute force, plus a `[benchmark]` timing case. Its first case
-runs spawn and drain without the experiment, expects the old outcome, and compares
-the default game's per-100-tick checksums with
-`test/fixtures/guard-area/off-path-checksums.txt` (`[golden]`). Games start with the experiment through
+runs spawn and drain without the experiment, expects the old outcome, checks a
+save/load continuation of the default game, and records its per-100-tick
+checksums as the `guard-area/off-path-checksums.txt` sim-diff trace
+(`[sim-trace]`). Games start with the experiment through
 `glob2test::GameOptions::experiments`; `GameOptions::header` installs the
 one-local-player header and seed they need. Design and numbers:
 [guard-area balancing](../../features/guard-area-balancing.md).
@@ -405,7 +412,7 @@ routes, and binary/text continuation. Simulation traces compare every checksum
 part except the MapHeader part, which includes the deliberately changed file-format
 version. The benchmark cases report identical market delivery workloads (including
 heavy checksums and save/load) and isolated resource-gradient refresh CPU/time and
-field memory. `browser/tests/determinism.spec.js` runs the same Markets V2 cases
+field memory. `platforms/web/tests/determinism.spec.js` runs the same Markets V2 cases
 and frozen traces in serial and threaded Wasm builds.
 
 

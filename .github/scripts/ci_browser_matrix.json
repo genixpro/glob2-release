@@ -45,7 +45,7 @@
     "name": "chromium webgl2 viewport",
     "browsers": "chromium",
     "renderer": "webgl2",
-    "command": "xvfb-run -a npx playwright test viewport.spec.js --project=chromium"
+    "command": "xvfb-run -a npx playwright test viewport.spec.js graphics-diagnostics.spec.js --project=chromium"
   },
   {
     "name": "chromium webgl2 damaged load",
@@ -56,7 +56,7 @@
   {
     "name": "lifecycle",
     "browsers": "chromium",
-    "command": "python3 ../test/ci_run_commands.py \\\n  --check 'browser unit tests' 'node --test unit/*.test.js' \\\n  --check 'software visibility' 'GLOB2_TEST_RENDERER=software xvfb-run -a npx playwright test --config visibility.config.js' \\\n  --check 'WebGL visibility' 'GLOB2_TEST_RENDERER=webgl2 xvfb-run -a npx playwright test --config visibility.config.js'\n"
+    "command": "python3 ../../test/ci_run_commands.py \\\n  --check 'browser unit tests' 'node --test unit/*.test.js' \\\n  --check 'software visibility' 'GLOB2_TEST_RENDERER=software xvfb-run -a npx playwright test --config visibility.config.js' \\\n  --check 'WebGL visibility' 'GLOB2_TEST_RENDERER=webgl2 xvfb-run -a npx playwright test --config visibility.config.js'\n"
   },
   {
     "name": "chromium settings storage",

@@ -1,0 +1,96 @@
+{
+  "key": "dark_water",
+  "sprite": "data/gfx/terrain-dark_water",
+  "profile": "still",
+  "class": "pool",
+  "preview": [32, 26, 76],
+  "variants": [
+    {
+      "frame": 0,
+      "weight": 1
+    },
+    {
+      "frame": 1,
+      "weight": 1
+    },
+    {
+      "frame": 2,
+      "weight": 1
+    },
+    {
+      "frame": 3,
+      "weight": 1
+    },
+    {
+      "frame": 4,
+      "weight": 1
+    },
+    {
+      "frame": 5,
+      "weight": 1
+    },
+    {
+      "frame": 6,
+      "weight": 1
+    },
+    {
+      "frame": 7,
+      "weight": 1
+    },
+    {
+      "frame": 8,
+      "weight": 1
+    },
+    {
+      "frame": 9,
+      "weight": 1
+    },
+    {
+      "frame": 10,
+      "weight": 1
+    },
+    {
+      "frame": 11,
+      "weight": 1
+    },
+    {
+      "frame": 12,
+      "weight": 1
+    },
+    {
+      "frame": 13,
+      "weight": 1
+    },
+    {
+      "frame": 14,
+      "weight": 1
+    },
+    {
+      "frame": 15,
+      "weight": 1
+    }
+  ],
+  "animation_frames": 16,
+  "animation_stride": 16,
+  "animation_ticks": 6,
+  "edges": "periodic",
+  "variant_grid": 4,
+  "minimap": [16, 12, 52],
+  "seam": {
+    "height": 7,
+    "cast_q8": 80,
+    "cast_width_q8": 704
+  },
+  "surf": {
+    "period": 340,
+    "reach_q8": 896,
+    "shallow_q8": 70,
+    "shallow_width_q8": 1536,
+    "shallow": [64, 104, 150],
+    "wet_q8": 88,
+    "wet_width_q8": 1792,
+    "foam_q8": 110,
+    "foam_width_q8": 400,
+    "foam": [236, 244, 248]
+  }
+}

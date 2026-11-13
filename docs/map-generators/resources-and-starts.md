@@ -29,13 +29,13 @@ were counts of their own until that audit and are percentages since.
 | Old random | The area of each colony's wheat, wood, stone and algae squares | Colony meadows (on): the cleared grass square round each colony |
 | Old islands | The area of each island's deposits | Extra starting deposit (on): the fourth deposit, of whichever of wheat or wood came out smaller |
 | Contested commons | How many of the commons' zones are wheat, wood or fruit, its quarry's size and the moat's algae; home islands' fields are unscaled | Moat bridges (on); Jagged coastlines (on) |
-| Maze | The shore scatter's wheat, wood and stone (48, 24 and 16 tiles per 256 shore tiles at 100), every dead end's treasure (9 fruit tiles) and the channels' algae (24 per 400 water tiles); the homes' kits are unscaled | Sand roads (on); Treasure in dead ends (on): off, the same fruit is scattered along the passages' shores |
-| Fjord continent | The ambient scatter, the core's stone and fruit clumps, the lake's and open sea's algae, and the banks' extra clumps; starter kits and bank guarantees are unscaled | Lake connects to fjords (off); Sandy lake shore (on); Fjord bank deposits (on) |
-| Watershed | Separate wheat and wood farmland budgets, stone outcrops, confluence fruit groves, and algae at the mouths and in the shallows; starter kits are unscaled | River delta (on); Meandering rivers (on) |
+| Maze | The ambient wheat, wood and stone over the loam beds and water banks (40, 20 and 8 tiles per 256 growing tiles at 100), every dead end's treasure (9 fruit tiles), the rubble beside each side of every breach (6 stone tiles) and the algae (24 per 400 water tiles); the homes' kits and quarries are unscaled | Paved roads (on); Treasure in dead ends (on): off, the same fruit is scattered over the growing ground |
+| Fjord continent | The ambient scatter (no fruit), the nunataks' fruit groves, the sea's algae, and the banks' extra clumps; starter kits, bank guarantees and quarry faces are unscaled | Nunatak orchards (on); Fjord bank deposits (on) |
+| Watershed | Separate wheat and wood farmland budgets, stone outcrops, the share of divide knots with a quarry face, confluence fruit groves, and algae at the mouths and in the shallows; starter kits and the rock are unscaled | River delta (on); Meandering rivers (on); Deep channels (on): no algae in the deep cores; Divide outcrops (on) |
 | Stone highlands | The ponds' farmland (wheat and wood) and algae, how much of the ridgeline is two tiles thick (stone, 0 to 200), and the valleys' fruit groves (four per 128×128 at 100); kits are unscaled | Fruit in home valleys (off) |
 | Symmetric arena | The farmland's wheat and wood, stone outcrops and algae, on top of Resource richness; fruit (0 to 100) keeps that share of the orchard's groves nearest the centre, never fewer than three | Moat (on); Stone in the orchard (on) |
-| Ring world | The ambient scatter's wheat, wood, stone and fruit, and the shallows' algae; starter patches and island prizes are unscaled | Winding belt (on); Colonies on both coasts (on) |
-| City states | Every home's ambient fields, outcrops and grove, everything on the commons (farmland, outcrops, groves, the orchard), the sea's algae; every home's kit, the islets' full wheat cover and the walls' stone are unscaled | Stone walls (on): off, the causeways are plain roads and the homes' coasts are open |
+| Ring world | The ambient scatter's wheat, wood, stone and fruit, and the shallows' algae; starter patches, island prizes and every colony's five-stone quarry face are unscaled | Winding belt (on); Colonies on both coasts (on); Deep ocean (on): no algae in the deep core; Rock spine (on): off, no rock and no quarry faces; Ring road (on) |
+| City states | Every home's ambient fields, outcrops and grove, everything on the commons (farmland, outcrops, groves, the orchard), the sea's algae; every home's kit and quarry faces and the islets' full wheat cover are unscaled | Cliff walls (on): off, no sea cliffs, parapets or quarry faces, and the homes' coasts are open beaches |
 | Tidal flats | Every island's ambient fields and outcrops and every island's prize; each home's kit is unscaled | Central island (on): off, the middle of the map is flats and there is no orchard |
 | Everglades | The swamp's standing wood and wheat, its outcrops and groves, and the pools' algae; every home's kit is unscaled | None |
 | Spider web | The threads' standing wheat and wood, the share of knots carrying stone, whether the dew drops and the hub carry fruit and stone, and the shallows' algae; every pad's kit is unscaled | Spiral (on): off, the capture threads are closed rings; Sand roads (on): off, the threads are grass from shore to shore |
@@ -48,7 +48,7 @@ were counts of their own until that audit and are percentages since.
 | Allotments | The field lots' wheat and wood, the woodlots, the quarry and grove lots and the ditches' algae; every city's sites, wood stacks, stock and home fields are unscaled | Garrison (on) |
 | Caravanserai | The outposts' quarry, orchard and algae; every capital's fields, stock and towers, and the oases' and outposts' wheat, are unscaled | Garrison (on) |
 | Continents | Every kind of land's kit (`scaledBiome`): its farmland's wheat and wood shares, its dry reserve, its outcrops, its groves, and its cover (wood over forest, stone over the ranges); the shallows' algae; the islets' prizes are drawn unscaled and every colony's kit is unscaled. `oases` (0-200) scales the pond dug for a colony that starts with no water in reach | Mountain ranges (on): off, a range is savanna; Great rivers (on); Islets (on) |
-| Braided Delta | Two wheat-field and two woodland target reaches per island, compact mixed orchards, island quarries and algae; starter wheat/wood budgets remain at zero | Resource amounts scale coherent groups; towns and sand ford approaches remain clear |
+| Braided Delta | Fixed wheat and wood kits in every home clearing; wheat on levee loam, woods on lush ground and swamp islands, a three-fruit orchard on the great island, a quarry at each kopje, algae | Resource amounts scale the ambient layers and prizes; the starter kits stay fixed |
 | Braided river | Every bar's farmland and the terraces' thin bank-strip farmland, the dry terraces' woodlots and outcrops, the deep bars' fruit groves and the channels' algae; every home's kit, every promised bar's wheat and wood, the bluffs and the moraine are unscaled | Moraine hummocks (on): off, the terrace edges are open bank. Dry patches (12): the share of the terraces' inland grass turned to sand patches, 0 for the plain sheet of grass |
 
 `scaledCount` and `scaledShare` (`shared/Resources.h`) apply a percentage to a count or a share and
@@ -133,9 +133,8 @@ fixed resource pass:
   RuggedArchipelago, ShatteredCoast, Fjord, Watershed, Braided river, Stone highlands, Ring world, City states,
   Tidal flats, Everglades, Spider web and Coral call this, as do the height-field generators, and Concrete islands and Isles at any wheat or wood amount
   other than 100.
-  Maze doesn't need it: its deposits are placed only along passage shores, leaving a clear lane
-  down every passage, and its `validateWorld` confirms every colony can still walk to every
-  other.
+  Maze doesn't need it: its deposits stay off the road down every passage, its doorways and its
+  breaches, and its `validateWorld` confirms every colony can still walk to every other.
 
 Every guaranteed placement (starter kits, bank guarantees, per-team clumps) keeps wheat and wood
 at a 1:1 ratio, since those exist for reachability fairness between colonies. Ambient/bonus

@@ -4,8 +4,10 @@
 
 #pragma once
 
-#include "GraphicContext.h"
-#include "Game.h"
+#include <ui/Geometry.h>
+
+struct PresentationFrame;
+namespace GAGCore { class DrawableSurface; }
 
 
 ///This class is used to represent a minimap
@@ -41,6 +43,15 @@ public:
 
 	///This tells whether the given on-screen coordinates are inside the minimap itself
 	bool insideMinimap(int x, int y);
+	/// Image bounds shared by painting, domain inspection and hit testing.
+	GAGGUI::ui::Rect imageBounds()
+	{
+		if (noX) return {};
+		if (mapW<=0 || mapH<=0) return {originX(),originY(),width,height};
+		computeMinimapPositioning();
+		return {mini_x,mini_y,mini_w,mini_h};
+	}
+
 	
 	///This converts the given on-screen coordinate (provided its within the minimap itself)
 	///to a coordinate on the map. The nx and ny variables are the on-screen coordinates,
@@ -92,7 +103,7 @@ private:
 	const PresentationFrame* scene = nullptr; //!< valid only while draw() runs
 	int mapW = 0, mapH = 0;       //!< size of the shown map, in tiles
 
-	DrawableSurface *surface;
+	GAGCore::DrawableSurface *surface;
 };
 
 

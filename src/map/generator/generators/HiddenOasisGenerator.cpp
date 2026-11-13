@@ -2,12 +2,11 @@
 #include "HiddenOasisGenerator.h"
 #include "ResourceSemantics.h"
 #include "Biomes.h"
-#include "Building.h"
 #include "Contact.h"
 #include "DesignCache.h"
 #include "Drawing.h"
 #include "Farmland.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "Grid.h"
@@ -1019,9 +1018,9 @@ Layout designAttempt(const GenerationRequest &request, GenerationContext &contex
 		L.failure = "The gorge does not open onto the country.";
 		return L;
 	}
-	std::vector<unsigned char> walkable(n, 0);
+	auto walkable = walkableTiles(beached, t);
 	for (int i = 0; i < n; ++i)
-		walkable[i] = !pureWater[i] && !L.rock[i] && !L.buttes[i];
+		walkable[i] = walkable[i] && !L.rock[i] && !L.buttes[i];
 
 	// Every tile's walk to the mouth: the one whole-map flood the design needs (profiling, 2026-09-17:
 	// whole-map floods were half of generation, most of them proving facts about the plateau alone).
@@ -1268,7 +1267,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return cachedDesign<Layout>(request, context, designAfresh);
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "hidden-oasis layout";
 	const HiddenOasisOptions o(context.request);
@@ -1278,7 +1277,7 @@ bool generate(Game &game, GenerationContext &context)
 		context.detail = L.failure;
 		return false;
 	}
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const Torus &t = L.t;
 	const int n = t.size(), teams = context.request.nbTeams;
 	for (int k = 0; k < teams; ++k)
@@ -1654,11 +1653,11 @@ std::string validateRequest(const GenerationRequest &request)
 	return "";
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	if (const std::string mismatch = designMismatch(L, map, "hidden oasis"); !mismatch.empty())
 		return mismatch;
 	const HiddenOasisOptions o(context.request);
@@ -1743,7 +1742,8 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 			const Post &post = L.posts[k];
 			const int tx = t.remainderX(post.tower), ty = post.tower / t.w;
 			const Uint16 gbid = map.getBuilding(tx, ty);
-			if (gbid == NOGBID || Building::GIDtoTeam(gbid) != k || countBuildings(game, k, "defencetower") != 1)
+			if (gbid == NOGBID || GenerationWorld::buildingTeamOf(gbid) != k ||
+				countBuildings(game, k, "defencetower") != 1)
 				return "Colony " + std::to_string(k) + " has no tower on its ledge.";
 			for (int c : post.cover)
 				if (beyondFootprint(t, tx, ty, t.remainderX(c), c / t.w) > range)
@@ -1873,7 +1873,7 @@ GeneratorDefinition hiddenOasisDefinition()
 		"hidden-oasis",
 		57,
 		"Hidden Oasis",
-		2,
+		3,
 		false,
 		{GeneratorControl{"pond-size", "Pond size", 5, 12, 1, 8, ControlGroup::Terrain}
 			 .withSearchRange(7, 11),

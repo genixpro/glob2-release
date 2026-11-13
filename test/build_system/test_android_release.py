@@ -13,7 +13,7 @@ from unittest import mock
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "mobile"))
+sys.path.insert(0, str(ROOT / "platforms/mobile"))
 import android_release
 import fdroid_monitor
 
@@ -77,27 +77,27 @@ class NativeAlignmentTests(unittest.TestCase):
 class AndroidReleaseTests(unittest.TestCase):
     def test_candidate_accepts_existing_version_but_publication_rejects_tag_collision(self):
         with mock.patch.object(android_release.subprocess, "check_output", side_effect=[
-                "v0.11.4.0\n", "candidate\n", "published\n"]):
+                "v0.11.5.0\n", "candidate\n", "published\n"]):
             with self.assertRaisesRegex(ValueError, "already points"):
                 android_release.check_prior_tags()
         with mock.patch.object(android_release.subprocess, "check_output", side_effect=AssertionError("Candidate must not inspect release tags")):
-            self.assertEqual(android_release.check_candidate()["versionName"], "0.11.4.0")
+            self.assertEqual(android_release.check_candidate()["versionName"], "0.11.5.0")
     def test_version_codes_and_desktop_version(self):
-        self.assertEqual(android_release.release_identity()["versionName"], "0.11.4.0")
+        self.assertEqual(android_release.release_identity()["versionName"], "0.11.5.0")
         self.assertEqual({arch: android_release.version_code(arch) for arch in android_release.ABI_CODES},
-                         {"armeabi-v7a": 1104001, "arm64-v8a": 1104002, "x86_64": 1104003})
+                         {"armeabi-v7a": 1105001, "arm64-v8a": 1105002, "x86_64": 1105003})
         self.assertEqual(android_release.check_recipe(), [1100001, 1100002, 1100003])
 
     def test_recipe_rejects_missing_abi(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("mobile/android-release.json", "scons/build_layout.py",
-                         "mobile/toolchain.json",
-                         "fdroid/metadata/org.globulation2.glob2.yml"):
+            for path in ("platforms/mobile/android-release.json", "buildsys/build_layout.py",
+                         "platforms/mobile/toolchain.json",
+                         "platforms/stores/fdroid/metadata/org.globulation2.glob2.yml"):
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / path).read_bytes())
-            recipe = root / "fdroid/metadata/org.globulation2.glob2.yml"
+            recipe = root / "platforms/stores/fdroid/metadata/org.globulation2.glob2.yml"
             recipe.write_text(recipe.read_text().replace("versionCode: 1100003", "versionCode: 1100004"))
             with self.assertRaisesRegex(ValueError, "every ABI"):
                 android_release.check_recipe(root)
@@ -105,12 +105,12 @@ class AndroidReleaseTests(unittest.TestCase):
     def test_recipe_rejects_sdk_drift(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("mobile/android-release.json", "mobile/toolchain.json",
-                         "scons/build_layout.py", "fdroid/metadata/org.globulation2.glob2.yml"):
+            for path in ("platforms/mobile/android-release.json", "platforms/mobile/toolchain.json",
+                         "buildsys/build_layout.py", "platforms/stores/fdroid/metadata/org.globulation2.glob2.yml"):
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / path).read_bytes())
-            recipe = root / "fdroid/metadata/org.globulation2.glob2.yml"
+            recipe = root / "platforms/stores/fdroid/metadata/org.globulation2.glob2.yml"
             recipe.write_text(recipe.read_text().replace("platforms;android-36", "platforms;android-35"))
             with self.assertRaisesRegex(ValueError, "every ABI"):
                 android_release.check_recipe(root)
@@ -118,40 +118,40 @@ class AndroidReleaseTests(unittest.TestCase):
     def test_recipe_template_supports_later_tag(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("mobile/android-release.json", "scons/build_layout.py",
-                         "mobile/toolchain.json",
-                         "fdroid/metadata/org.globulation2.glob2.yml"):
+            for path in ("platforms/mobile/android-release.json", "buildsys/build_layout.py",
+                         "platforms/mobile/toolchain.json",
+                         "platforms/stores/fdroid/metadata/org.globulation2.glob2.yml"):
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / path).read_bytes())
-            (root / "mobile/android-release.json").write_text(
+            (root / "platforms/mobile/android-release.json").write_text(
                 json.dumps({"versionName": "0.11.0.6", "versionCodeBase": 110006}))
-            (root / "scons/build_layout.py").write_text('PACKAGE_VERSION = "0.11.0.6"\n')
+            (root / "buildsys/build_layout.py").write_text('PACKAGE_VERSION = "0.11.0.6"\n')
             self.assertEqual(android_release.check_recipe(root), [1100001, 1100002, 1100003])
 
     def test_version_manifest_rejects_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            (root / "mobile").mkdir()
-            (root / "scons").mkdir()
-            (root / "scons/build_layout.py").write_text('PACKAGE_VERSION = "0.9.5.4"\n')
-            (root / "mobile/android-release.json").write_text(json.dumps({"versionName": "0.9.5.4", "versionCodeBase": 90501}))
+            (root / "platforms/mobile").mkdir(parents=True)
+            (root / "buildsys").mkdir()
+            (root / "buildsys/build_layout.py").write_text('PACKAGE_VERSION = "0.9.5.4"\n')
+            (root / "platforms/mobile/android-release.json").write_text(json.dumps({"versionName": "0.9.5.4", "versionCodeBase": 90501}))
             with self.assertRaisesRegex(ValueError, "does not encode"):
                 android_release.release_identity(root)
 
     def test_preflight_rejects_reused_tag_at_other_commit(self):
         with mock.patch.object(android_release.subprocess, "check_output",
-                               side_effect=["v0.11.4.0\n", "new-commit\n", "old-commit\n"]):
+                               side_effect=["v0.11.5.0\n", "new-commit\n", "old-commit\n"]):
             with self.assertRaisesRegex(ValueError, "already points to another commit"):
                 android_release.check_prior_tags()
 
     def test_development_check_allows_released_version_but_not_lower_codes(self):
         with mock.patch.object(android_release.subprocess, "check_output",
-                               return_value="v0.10.0.0\nv0.11.4.0\n"):
+                               return_value="v0.10.0.0\nv0.11.5.0\n"):
             android_release.check_prior_tags(development=True)
         with mock.patch.object(android_release.subprocess, "check_output",
-                               return_value="v0.11.4.0\nv0.11.4.1\n"):
-            with self.assertRaisesRegex(ValueError, "would not increase past v0.11.4.1"):
+                               return_value="v0.11.5.0\nv0.11.5.1\n"):
+            with self.assertRaisesRegex(ValueError, "would not increase past v0.11.5.1"):
                 android_release.check_prior_tags(development=True)
 
     def test_development_cli_preserves_identity_and_recipe_validation(self):
@@ -168,10 +168,10 @@ class AndroidReleaseTests(unittest.TestCase):
         # the release workflows keep the strict check.
         mobile = (ROOT / ".github/workflows/mobile.yml").read_text()
         self.assertNotIn("android_release.py check", mobile)
-        self.assertNotIn("python3 mobile/android_release.py verify-apk", mobile)
+        self.assertNotIn("python3 platforms/mobile/android_release.py verify-apk", mobile)
         for name in ("release.yml", "fdroid-release-validation.yml"):
             workflow = (ROOT / ".github/workflows" / name).read_text()
-            self.assertIn("python3 mobile/android_release.py ${{ inputs.tag && 'check' || 'check-candidate' }}\n", workflow)
+            self.assertIn("python3 platforms/mobile/android_release.py ${{ inputs.tag && 'check' || 'check-candidate' }}\n", workflow)
             self.assertNotIn("check --development", workflow)
 
     def test_apk_rejects_second_abi_and_wrong_version(self):
@@ -198,7 +198,7 @@ class AndroidReleaseTests(unittest.TestCase):
     def test_apk_rejects_unexpected_same_abi_library(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("mobile/android-release.json", "mobile/toolchain.json", "scons/build_layout.py"):
+            for path in ("platforms/mobile/android-release.json", "platforms/mobile/toolchain.json", "buildsys/build_layout.py"):
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / path).read_bytes())
@@ -216,7 +216,7 @@ class AndroidReleaseTests(unittest.TestCase):
     def test_shared_apk_verification_preserves_release_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for path in ("mobile/android-release.json", "mobile/toolchain.json", "scons/build_layout.py"):
+            for path in ("platforms/mobile/android-release.json", "platforms/mobile/toolchain.json", "buildsys/build_layout.py"):
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes((ROOT / path).read_bytes())
@@ -228,7 +228,7 @@ class AndroidReleaseTests(unittest.TestCase):
                 for name in ("libmain.so", "libc++_shared.so"):
                     package.writestr("lib/arm64-v8a/" + name, native_elf())
                 package.writestr("assets/glob2-bundle/index.list", hashlib.sha256(b"").hexdigest() + "\n")
-            badging = "package: name='org.globulation2.glob2' versionCode='1104002' versionName='0.11.4.0'\n"
+            badging = "package: name='org.globulation2.glob2' versionCode='1105002' versionName='0.11.5.0'\n"
             with (
                 mock.patch.object(android_release, "isolated", return_value=False),
                 mock.patch.object(android_release, "dependency_prefix", return_value=prefix),
@@ -240,12 +240,12 @@ class AndroidReleaseTests(unittest.TestCase):
 
     def test_monitor_state_transitions(self):
         now = dt.datetime(2026, 10, 4, tzinfo=dt.timezone.utc)
-        release = {"tag_name": "v0.11.4.0", "published_at": "2026-09-30T00:00:00Z"}
-        package = {"packages": [{"versionName": "0.11.4.0", "versionCode": 1104001},
-                                {"versionName": "0.11.4.0", "versionCode": 1104002}]}
+        release = {"tag_name": "v0.11.5.0", "published_at": "2026-09-30T00:00:00Z"}
+        package = {"packages": [{"versionName": "0.11.5.0", "versionCode": 1105001},
+                                {"versionName": "0.11.5.0", "versionCode": 1105002}]}
         self.assertEqual(fdroid_monitor.status(release, package, now)["state"], "overdue")
-        self.assertEqual(fdroid_monitor.status(release, package, now)["missing_codes"], [1104003])
-        package["packages"].append({"versionName": "0.11.4.0", "versionCode": 1104003})
+        self.assertEqual(fdroid_monitor.status(release, package, now)["missing_codes"], [1105003])
+        package["packages"].append({"versionName": "0.11.5.0", "versionCode": 1105003})
         self.assertEqual(fdroid_monitor.status(release, package, now)["state"], "complete")
 
 
@@ -255,7 +255,7 @@ class InviteLinkManifestTests(unittest.TestCase):
 
     def test_offline_editions_drop_both_invite_filters(self):
         import android
-        manifest = (ROOT / "mobile/android/app/src/main/AndroidManifest.xml").read_text()
+        manifest = (ROOT / "platforms/mobile/android/app/src/main/AndroidManifest.xml").read_text()
         self.assertIn('android:autoVerify="true"', manifest)
         self.assertIn('android:host="${officialInstanceHost}" android:pathPrefix="/j/"', manifest)
         self.assertIn('android:host="${officialInstanceHost}" android:pathPrefix="/play/"', manifest)

@@ -3,6 +3,9 @@
 
 #include <PerformanceTelemetry.h>
 #include "Map.h"
+#include "gradient/MapRouting.h"
+#include "gradient/GradientRuntime.h"
+#include "Game.h"
 #include "MapInternal.h"
 #include "Utilities.h"
 #include "field/TerrainMovementCosts.h"
@@ -28,21 +31,17 @@ int Map::swimClass(int walkSpeed, int swimSpeed)
 	return best;
 }
 
-int Map::minStepCost(int swimClass) const
+int MapRouting::stepCost(int dx, int dy, size_t targetIndex, int swimClass) const
 {
-	return terrainMinimumGround[swimClass];
-}
-
-int Map::stepCost(int dx, int dy, size_t targetIndex, int swimClass) const
-{
-	const auto cost = cellRule(targetIndex).ground[swimClass];
+	const auto cost = map.cellRule(targetIndex).ground[swimClass];
 	return dx != 0 && dy != 0 ? cost.diagonal : cost.cardinal;
 }
 
-bool Map::directionByGradient(EntityRandom& random, Uint32 teamMask, int swimClass, int x, int y, const Uint16 *gradient, int *dx, int *dy, bool strict, Uint32 guardAreaMask) const
+bool MapRouting::directionByGradient(EntityRandom& random, Uint32 teamMask, MovementAccess movementAccessValue, int x, int y, const Uint16 *gradient, int *dx, int *dy, bool strict, Uint32 guardAreaMask) const
 {
+    int swimClass=accessClass(movementAccessValue);
 	PERF_SCOPE_TIME(PathDirection);
-	Uint16 here = gradient[coordToIndex(x, y)];
+	Uint16 here = gradient[map.coordToIndex(x, y)];
 	// Settling the whole cost layer of `here` also finalizes every better or
 	// equal-valued neighbor inspected below; worse neighbors cannot be selected.
 	if (here <= GRADIENT_UNREACHABLE)
@@ -53,6 +52,7 @@ bool Map::directionByGradient(EntityRandom& random, Uint32 teamMask, int swimCla
 		*dy = 0;
 		return true;
 	}
+    const int costClass=publishedCostClass(gradient,swimClass);
 	int best = -1;
 	int bestD = -1;
 	int sidesteps[8];
@@ -61,16 +61,16 @@ bool Map::directionByGradient(EntityRandom& random, Uint32 teamMask, int swimCla
 	{
 		int ddx = tabClose[d][0];
 		int ddy = tabClose[d][1];
-		size_t n = coordToIndex(x + ddx, y + ddy);
+		size_t n = map.coordToIndex(x + ddx, y + ddy);
 		Uint16 g = gradient[n];
         if (g <= GRADIENT_UNREACHABLE) continue;
-		if (!isFreeForMovement(x+ddx,y+ddy,swimClass,teamMask)) continue;
-		if (guardAreaMask && !(areaCells[n].guard & guardAreaMask))
+		if (!map.isFreeForMovement(x+ddx,y+ddy,swimClass,teamMask)) continue;
+		if (guardAreaMask && !(map.areaCells[n].guard & guardAreaMask))
 			continue;
 		if (g > here)
 		{
 			// Worth of going through n: its value less the step to get there.
-			int score = g - stepCost(ddx, ddy, n, swimClass);
+			int score = g - stepCost(ddx, ddy, n, costClass);
 			if (score > best)
 			{
 				best = score;
@@ -96,3 +96,45 @@ bool Map::directionByGradient(EntityRandom& random, Uint32 teamMask, int swimCla
 	*dy = tabClose[pick][1];
 	return true;
 }
+
+bool MapRouting::staleCellStep(const Uint16* gradient, MovementAccess movementAccessValue, Uint32 teamMask, int x, int y,
+	int* dx, int* dy, Uint32 guardAreaMask) const
+{
+	const int swimClass=accessClass(movementAccessValue);
+	if (swimClass==AIR_MOVEMENT_CLASS || gradient[map.coordToIndex(x, y)]>GRADIENT_UNREACHABLE) return false;
+	// Really blocked for this unit (forbidden paint, terrain): callers keep
+	// their own handling, such as the forbidden-area escape.
+	if (!map.isHardSpaceForGroundUnit(x, y, swimClass>0, teamMask)) return false;
+	if (swimClass==WATER_ONLY_CLASS && !map.terrainPropertiesAt(x, y).swimmable) return false;
+	const int costClass=publishedCostClass(gradient,swimClass);
+	int best=-1, bestD=-1;
+	for (int d=0; d<8; ++d)
+	{
+		const int ddx=tabClose[d][0], ddy=tabClose[d][1];
+		const size_t n=map.coordToIndex(x+ddx, y+ddy);
+		const Uint16 g=gradient[n];
+		if (g<=GRADIENT_UNREACHABLE || !map.isFreeForMovement(x+ddx, y+ddy, swimClass, teamMask)) continue;
+		if (guardAreaMask && !(map.areaCells[n].guard & guardAreaMask)) continue;
+		const int score=int(g)-stepCost(ddx, ddy, n, costClass);
+		if (score>best) { best=score; bestD=d; }
+	}
+	if (bestD<0) return false;
+	*dx=tabClose[bestD][0];
+	*dy=tabClose[bestD][1];
+	return true;
+}
+
+int MapRouting::preparationCostClass(int team,int access) const
+{
+    if(access!=int(MovementAccess::Amphibious) || !map.game || team<0 || team>=map.game->teamsCount())return access;
+    const auto& state=map.game->teams[team]->routingRatio;
+    return state.known ? int(state.selected) : Map::SWIM_CLASS_EVEN;
+}
+
+int MapRouting::publishedCostClass(const Uint16* field,int access) const
+{
+    const auto it=gradientRuntime->fieldCosts.find(field);
+    return it!=gradientRuntime->fieldCosts.end()?it->second:access;
+}
+void MapRouting::recordFieldCost(const Uint16* field,int cost)
+{ if(field) {if(cost<0)gradientRuntime->fieldCosts.erase(field);else gradientRuntime->fieldCosts[field]=cost;} }

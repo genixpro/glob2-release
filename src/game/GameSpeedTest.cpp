@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Game speed settings, controls and playback; the display cases need OpenGL.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "DrawFixtures.h"
 #include "ScopedEnvironment.h"
 #include <vector>
 #include <string>
@@ -21,8 +23,15 @@
 #include <iostream>
 #include <regex>
 #include <set>
+#include "Game.h"
 
 using namespace GAGGUI;
+
+// The pause check counts client frames: a paused session at Maximum speed
+// must survive PausedFrames frames (at least 1 ms apart), then resume and
+// finish. PauseDeadline is a hang guard, not a measurement.
+static constexpr unsigned PausedFrames=200;
+static constexpr Uint64 PauseDeadline=60000;
 
 namespace
 {
@@ -47,9 +56,39 @@ std::vector<SDL_Event> shortcutEvents(const PauseShortcut& shortcut) {
     return events;
 }
 
-static Uint32 SDLCALL resumeGame(void* data, SDL_TimerID, Uint32) {
-    for(auto event:shortcutEvents(*static_cast<PauseShortcut*>(data))) SDL_PushEvent(&event);
-    return 0;
+// Plays an initialized engine on an injected clock the way Engine::run() does:
+// one session step per loop, then wait the delay sessionDelay() asks for. It
+// returns the delay requested after each of `steps` ticks, so pacing is checked
+// without reading the wall clock. Stays below the automatic ending target, so
+// it prints no checksum.
+std::vector<Uint32> sessionDelays(Engine& engine, unsigned steps) {
+    REQUIRE(int(steps)<globalContainer->automaticEndingSteps);
+    engine.prepareRun();
+    Uint64 now=1000;
+    engine.beginSession(now);
+    const auto first=engine.gui.game.stepCounter;
+    std::vector<Uint32> delays;
+    for(unsigned i=0;i<steps;++i) {
+        REQUIRE(engine.simulationStep(now));
+        const Uint32 delay=engine.sessionDelay(now);
+        delays.push_back(delay);
+        now+=std::max<Uint32>(delay,1);
+    }
+    CHECK(engine.gui.game.stepCounter-first==steps);
+    engine.gui.isRunning=false;
+    REQUIRE_FALSE(engine.finishSession());
+    engine.restoreCursor();
+    return delays;
+}
+
+// Normal speed asks the loop to wait out the rest of each 33 ms tick (the
+// remainder rounds up to whole milliseconds); Maximum never asks it to wait.
+void requirePaced(const std::vector<Uint32>& delays, bool uncapped) {
+    for(size_t i=0;i<delays.size();++i) {
+        INFO("tick " << i << " delay " << delays[i] << "ms");
+        if(uncapped) CHECK(delays[i]==0);
+        else CHECK(std::abs(int(delays[i])-GAME_TICK_MS)<=1);
+    }
 }
 
 glob2test::GlobalsOptions displayOptions()
@@ -295,6 +334,72 @@ TEST_CASE("settings screen; in-game slider; shortcuts and camera cadence [displa
     NET_Quit();
 }
 
+TEST_CASE("desktop statistics spacing and speed hit target [display][artifacts][writes-preferences]")
+{
+    glob2test::ScopedEnvironment desktop("GLOB2_MOBILE_UI", "0");
+    glob2test::HeadlessGlobals globals(displayOptions());
+    GameGUI gui;
+    auto map=Engine::loadMapHeader("maps/balanced.map");
+    GameHeader header;
+    header.setNumberOfPlayers(1);
+    header.setRandomSeed(123456);
+    header.getBasePlayer(0)=BasePlayer(0,"Test",0,BasePlayer::P_LOCAL);
+    REQUIRE(gui.loadFromHeaders(map,header,true,true));
+    gui.localPlayer=gui.localTeamNo=0;
+    gui.adjustLocalTeam();
+    auto* gfx=globalContainer->gfx;
+    globals->settings.translucentPanels=false;
+    for (int width : {640, 1280})
+    {
+        REQUIRE(SDL_SetWindowSize(SDL_GetWindowFromID(gfx->windowID()),width,480));
+        REQUIRE(SDL_SyncWindow(SDL_GetWindowFromID(gfx->windowID())));
+        SDL_Event resize{}; resize.type=SDL_EVENT_WINDOW_PIXEL_SIZE_CHANGED;
+        GAGCore::GraphicContext::translateMouseEvent(&resize);
+        REQUIRE(gfx->getW()==width);
+        for (int count : {0, 12345})
+        {
+            CAPTURE(width); CAPTURE(count);
+            gui.game.teams[0]->prestige=count;
+            gui.game.teams[0]->unitConversionGained=count;
+            gui.game.teams[0]->unitConversionLost=count;
+            gui.game.prestigeToReach=20000;
+            gui.game.totalPrestige=count;
+            glob2test::drawGUI(gui,0);
+            // Native GL's completedFrame() is its CPU facade, not a readback.
+            GAGCore::Sprite::flushBatches(gfx);
+            GAGCore::DrawableSurface capture(gfx->getW(),gfx->getH());
+            capture.drawSurface(0,0,gfx);
+            auto* image=capture.getSDLSurface(); REQUIRE(image);
+            gfx->nextFrame();
+            const int speedX=gui.topBarSpeedX();
+            unsigned visible=0;
+            for (int y=0;y<16;++y) for (int x=0;x<speedX;++x)
+            {
+                Uint8 r,g,b,a;
+                REQUIRE(SDL_ReadSurfacePixel(image,x,y,&r,&g,&b,&a));
+                visible += r!=0 || g!=0 || b!=0;
+            }
+            CHECK(visible>100);
+            // The loss counter must leave a clear gutter before speed, even
+            // at minimum desktop width with five-digit conversion totals.
+            // Native GL antialiasing extends the chevrons one pixel left.
+            for (int y=0;y<16;++y) for (int x=speedX-11;x<speedX-1;++x)
+            {
+                Uint8 r,g,b,a;
+                REQUIRE(SDL_ReadSurfacePixel(image,x*image->w/gfx->getW(),y*image->h/gfx->getH(),&r,&g,&b,&a));
+                CHECK((r==0 && g==0 && b==0));
+            }
+            REQUIRE(SDL_SaveBMP(image,(glob2test::artifactDir()/("desktop-stats-"+
+                std::to_string(width)+"-"+std::to_string(count)+".bmp")).string().c_str()));
+            globals->settings.gameSpeed=0;
+            SDL_Event click{}; click.type=SDL_EVENT_MOUSE_BUTTON_DOWN;
+            click.button.button=SDL_BUTTON_LEFT; click.button.x=speedX+10; click.button.y=8;
+            gui.processEvent(&click);
+            CHECK(globals->settings.gameSpeed==3);
+        }
+    }
+}
+
 TEST_CASE("live engine speed; pause; hard pause and replay playback [display][writes-preferences]")
 {
     glob2test::HeadlessGlobals globals(displayOptions());
@@ -305,7 +410,6 @@ TEST_CASE("live engine speed; pause; hard pause and replay playback [display][wr
     {
         // The engine prints one simulation checksum per run; compare them below.
         glob2test::CapturedStdout captured;
-        Uint64 normal=0, maximum=0;
         for(int speed:{0,10}) {
             settings.gameSpeed=speed;
             Engine engine;
@@ -313,14 +417,21 @@ TEST_CASE("live engine speed; pause; hard pause and replay playback [display][wr
             globalContainer->automaticEndingGame=true;
             globalContainer->automaticEndingSteps=50;
             globalContainer->automaticGameGlobalEndConditions=true;
-            Uint64 start=SDL_GetTicks();
+            // Reported only: pacing is checked on an injected clock below.
+            const Uint64 start=SDL_GetTicks();
             engine.run();
-            const Uint64 elapsed=SDL_GetTicks()-start;
-            if(speed==0) normal=elapsed; else maximum=elapsed;
-            std::cout<<"Engine speed="<<speed<<" elapsed="<<elapsed<<"ms\n";
+            std::cout<<"Engine speed="<<speed<<" elapsed="<<SDL_GetTicks()-start<<"ms\n";
         }
-        REQUIRE((normal>=1500 && maximum<normal));
-        std::cout<<"PASS: live engine runs faster at Maximum\n";
+        // The live loop's pacing, on an injected clock: Normal waits out each
+        // tick, Maximum runs uncapped.
+        for(int speed:{0,10}) {
+            INFO("game speed " << speed);
+            settings.gameSpeed=speed;
+            Engine engine;
+            REQUIRE(engine.initCampaign("maps/balanced.map")==Engine::EE_NO_ERROR);
+            requirePaced(sessionDelays(engine,12),speed==10);
+        }
+        std::cout<<"PASS: live engine paces Normal and runs uncapped at Maximum\n";
         // Exercise hard pause through a configurable, portable shortcut.
         KeyboardShortcut hardPause;
         hardPause.interpret("<f12>=hard pause",GameGUIShortcuts);
@@ -338,36 +449,42 @@ TEST_CASE("live engine speed; pause; hard pause and replay playback [display][wr
             REQUIRE(engine.serialClientFrame(SDL_GetTicks(),shortcutEvents(shortcut),4));
             REQUIRE(engine.presentationPaused());
             const bool threaded=engine.startSimulationThread(SDL_GetTicks());
-            struct TimerScope {
-                SDL_TimerID id;
-                ~TimerScope() { if(id) SDL_RemoveTimer(id); }
-            };
-            // Include any scheduling delay after arming the resume callback.
+            // Count frames rather than time them: for PausedFrames frames the
+            // uncapped session must stay paused and running; then the resume
+            // shortcut goes through SDL's event queue and the session must
+            // finish. PauseDeadline only guards against a hang.
             const Uint64 start=SDL_GetTicks();
-            TimerScope timer{SDL_AddTimer(240,resumeGame,&shortcut)};
-            REQUIRE(timer.id);
             bool running=true;
-            while(running && SDL_GetTicks()-start<3000) {
+            unsigned frames=0;
+            while(running && SDL_GetTicks()-start<PauseDeadline) {
+                if(frames==PausedFrames)
+                    for(auto resume:shortcutEvents(shortcut)) REQUIRE(SDL_PushEvent(&resume));
                 std::vector<SDL_Event> events;
                 SDL_Event event;
                 while(SDL_PollEvent(&event)) events.push_back(event);
+                if(frames<PausedFrames)
+                    REQUIRE_MESSAGE(engine.presentationPaused(),
+                        "pause key=" << key << " released at paused frame " << frames);
                 running=threaded ? engine.threadedClientFrame(SDL_GetTicks(),events)
                     : engine.serialClientFrame(SDL_GetTicks(),events,4);
+                if(frames<PausedFrames)
+                    REQUIRE_MESSAGE(running,
+                        "pause key=" << key << ": the session ended at paused frame " << frames);
                 if(running && globalContainer->gfx->beginRenderFrame()) engine.drawSession();
+                ++frames;
                 SDL_Delay(1);
             }
-            SDL_RemoveTimer(timer.id); timer.id=0;
-            REQUIRE_FALSE(running);
+            std::cout<<"Pause key="<<key<<" frames="<<frames
+                <<" elapsed="<<SDL_GetTicks()-start<<"ms"<<std::endl;
+            REQUIRE_MESSAGE(frames>PausedFrames, "pause key=" << key << ": the "
+                << PauseDeadline << "ms hang guard expired while paused");
+            REQUIRE_MESSAGE(!running, "pause key=" << key << ": the session did not finish within the "
+                << PauseDeadline << "ms hang guard after resuming");
             REQUIRE_FALSE(engine.finishSession());
             engine.restoreCursor();
-            const Uint64 elapsed=SDL_GetTicks()-start;
-            std::cout<<"Pause key="<<key<<" elapsed="<<elapsed<<"ms"<<std::endl;
-            REQUIRE_MESSAGE((elapsed>=200 && elapsed<3000),
-                "pause key=" << key << " elapsed=" << elapsed << "ms");
         }
         std::cout<<"PASS: pause and hard pause accept resume input at Maximum\n";
         // The last run recorded a replay; stop playback before its end screen.
-        Uint64 replayNormal=0;
         for(int mode=0;mode<3;++mode) {
             settings.gameSpeed=mode==1?10:0;
             Engine engine;
@@ -377,15 +494,19 @@ TEST_CASE("live engine speed; pause; hard pause and replay playback [display][wr
             globalContainer->automaticEndingSteps=25;
             const Uint64 start=SDL_GetTicks();
             engine.run();
-            const Uint64 elapsed=SDL_GetTicks()-start;
-            std::cout<<"Replay mode="<<mode<<" elapsed="<<elapsed<<"ms\n";
-            if(mode==0) { REQUIRE(elapsed>=800); replayNormal=elapsed; }
-            // Compare the same replay on this renderer/build: instrumented
-            // decoding and drawing can exceed a fixed throughput deadline.
-            else REQUIRE_MESSAGE(elapsed<replayNormal,
-                "accelerated replay mode="<<mode<<" took "<<elapsed
-                <<"ms versus normal "<<replayNormal<<"ms");
+            std::cout<<"Replay mode="<<mode<<" elapsed="<<SDL_GetTicks()-start<<"ms\n";
         }
+        // Playback pacing on an injected clock: 1x waits out each tick;
+        // Maximum and fast-forward run uncapped.
+        for(int mode=0;mode<3;++mode) {
+            INFO("replay mode " << mode);
+            settings.gameSpeed=mode==1?10:0;
+            Engine engine;
+            REQUIRE(engine.loadReplay("replays/last_game.replay")==Engine::EE_NO_ERROR);
+            globalContainer->replayFastForward=mode==2;
+            requirePaced(sessionDelays(engine,12),mode!=0);
+        }
+        globalContainer->replayFastForward=false;
         std::cout<<"PASS: replay playback at 1x, Maximum and fast-forward\n";
         output=captured.text();
     }

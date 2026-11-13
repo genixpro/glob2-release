@@ -8,8 +8,8 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'mobile'))
-sys.path.insert(0, str(ROOT / 'scons'))
+sys.path.insert(0, str(ROOT / 'platforms/mobile'))
+sys.path.insert(0, str(ROOT / 'buildsys'))
 import dependencies
 import android
 import ios
@@ -35,7 +35,7 @@ class MobileDependencyManifestTests(unittest.TestCase):
                     with patch.object(sys, 'argv', argv), patch.object(ios, 'ROOT', root), \
                          patch.object(ios, 'discover', return_value={'fingerprint': 'pinned'}) as discover, \
                          patch.object(ios, 'dependency_prefix', return_value=prefix) as resolve, \
-                         patch.object(ios.shutil, 'which', side_effect=PrefixResolved):
+                         patch.object(ios.subprocess, 'run', side_effect=PrefixResolved):
                         with self.assertRaises(PrefixResolved): ios.main()
                         resolve.assert_called_once_with(root, expected, 'pinned')
 
@@ -54,8 +54,8 @@ class MobileDependencyManifestTests(unittest.TestCase):
                     output = root / default_directory(identity)
                     (output / 'lib').mkdir(parents=True)
                     (output / 'lib/libmain.so').write_bytes(b'native client')
-                    (root / 'mobile').mkdir()
-                    (root / 'mobile/android').mkdir()
+                    (root / 'platforms/mobile').mkdir(parents=True)
+                    (root / 'platforms/mobile/android').mkdir()
                     prefix = root / 'deps'
                     (prefix / 'share/glob2/sdl-java').mkdir(parents=True)
                     library = prefix / 'library.a'

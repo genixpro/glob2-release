@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "AmphitheatreGenerator.h"
+#include "Climates.h"
 #include "Drawing.h"
 #include "FertilityField.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "Grid.h"
@@ -106,13 +107,13 @@ constexpr int kLakeReach = 60;
 // A swarm stands at least this many steps from its ramp's mouth, and this many short of the nearest
 // bay, measured from the ramp.
 constexpr int kHomeRampDepth = 14;
-// Every home's starter kit: this much wheat and wood facing its nearest sea, unscaled; no stone, since
-// the territory is walled in it.
-constexpr int kHomeWheat = 30;
-constexpr int kHomeWood = 30;
-// Ambient farmland on a territory, as percentages of its tiles at 100.
-constexpr int kHomeWheatShare = 3;
-constexpr int kHomeWoodShare = 2;
+// Every home's starter kit: this much wheat and wood facing its nearest sea, unscaled; its stone is
+// its quarry faces (kQuarryFace).
+constexpr int kHomeWheat = 45;
+constexpr int kHomeWood = 45;
+// Ambient farmland on a territory's watered ground, as percentages of its tiles at 100.
+constexpr int kHomeWheatShare = 6;
+constexpr int kHomeWoodShare = 4;
 // Nothing is planted within this many steps of a ramp.
 constexpr int kRampClearance = 5;
 // Open 2x2 pads beside every colony's `tower-count` towers, and the spacing between sites.
@@ -128,6 +129,23 @@ constexpr int kTowerRoom = 4;
 constexpr int kAreaTolerance = 5;
 // The most the colonies' walks to their ramps and to the pit may differ.
 constexpr int kWalkSpread = 12;
+// THE GROUND (revision 6). The pit's floor is a sand track from this share of its radius out to the
+// first wall: an arena floor round the orchard that nothing can be built on. Every territory has two
+// quarry faces of this many stone at the foot of its side borders, as deep from its ramp as its swarm:
+// the walls were the colonies' stone when they were built of it. The bays are one plain water: no
+// deep water.
+constexpr double kArenaFloorShare = 0.75;
+constexpr int kQuarryFace = 12;
+// Every starting tower also has a face of this much stone at the foot of the wall it stands against,
+// seeded within this many tiles of it and kept this many steps from the ramp (plantTowerStone): the
+// faces above stand deep in the territory, a long walk from the towers by the ramp.
+constexpr int kTowerStone = 6;
+constexpr int kTowerStoneReach = 4;
+constexpr int kTowerStoneRampGap = 2;
+// A territory is grass but for a paved square this far round its swarm. The volcanic pit's lava
+// pool, as a share of the pit's radius.
+constexpr double kCore = 7;
+constexpr double kLavaPoolShare = 0.25;
 
 struct Geometry
 {
@@ -169,11 +187,12 @@ struct Layout
 	Torus t{1, 1};
 	Geometry g;
 	double phase = 0, cx = 0, cy = 0;
+	int climate = 0;
 	// zone: -1 wall, 0 the pit, j the terrace outside ring j - 1, rings the ground outside.
 	std::vector<int> zone, territory, depth;
 	// rampOf: the colony whose outer ramp a tile is (or -1); innerRamp marks every other ramp tile.
 	std::vector<int> rampOf;
-	// ring: the ring walls' stone; border: the stone between territories; unclaimed: ground no territory
+	// ring: the ring walls' rock; border: the cliffs between territories; unclaimed: ground no territory
 	// took, also stone; bay: every territory's inland seas (the water the `bay-size` control sizes);
 	// pocket: land a sea closed off from its ramp, also stone.
 	std::vector<unsigned char> ring, innerRamp, border, unclaimed, bay, pocket;
@@ -202,6 +221,8 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	L.cx = t.w / 2;
 	L.cy = t.h / 2;
 	L.phase = context.bounded("amphitheatre-phase", 3600) / 3600.0 * 2 * kPi;
+	L.climate = drawClimate(context, "amphitheatre-climate");
+	context.telemetry.choice("amphitheatre.climate", kClimateLooks[L.climate].name);
 	L.zone.assign(n, g.rings);
 	L.rampOf.assign(n, -1);
 	L.ring.assign(n, 0);
@@ -403,17 +424,88 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return L;
 }
 
-// The design's stone: every ring outside its ramps, every border and every unclaimed tile, and any
-// land a bay closed off. Rings, borders and unclaimed ground all keep clear of the bays, so all of
-// it lies on grass; a closed-off pocket may touch a beach, where its sand simply stays sand.
-std::vector<unsigned char> stoneTiles(const Map &map, const Layout &L)
+// THE GROUND, as the finished world must hold it: a pure function of the design, so validateWorld
+// rebuilds it and compares every vertex. Revision 6 draws every wall from the terrain catalogue
+// (TerrainGroup.h) where earlier revisions stood stone on grass:
+//  - the rings are rock towers shoot over (Ridges), every other ring in the climate's second rock, so
+//    the tiers read as steps and the towers at the outer wall still cover the arena over it;
+//  - the borders between territories, unclaimed ground and closed-off pockets are cliffs
+//    (Obstacles), which no tower shoots through (FEEDBACK 2026-09-14: towers along the borders "make
+//    no sense");
+//  - every ramp is rough ground, so nothing can be built in a gate, and the pit's floor is a sand track round
+//    its orchard; walls lean away from the open ground beside them (wallVertices), so no ramp,
+//    terrace or territory loses a tile to them.
+// The climate (Climates.h) paints the looks last.
+TerrainSketch sketchTerrain(const Layout &L)
 {
-	const int n = L.t.size();
-	std::vector<unsigned char> wall(n, 0), stone(n, 0);
+	const Torus &t = L.t;
+	const Geometry &g = L.g;
+	const int n = t.size();
+	TerrainSketch terrain(n, GRASS);
+	std::vector<unsigned char> ramp(n, 0), floor(n, 0), paved(n, 0), ring(n, 0), cliff(n, 0),
+		open(n, 0), tier(n, 0);
+	std::vector<double> radius(n, 0);
 	for (int i = 0; i < n; ++i)
-		wall[i] = L.ring[i] || L.border[i] || L.unclaimed[i] || L.pocket[i];
-	const DesignedStone designed = designedStone(map, L.t, wall);
-	return designed.stone;
+	{
+		radius[i] = std::hypot(t.offsetX(int(L.cx), t.remainderX(i)), t.offsetY(int(L.cy), i / t.w));
+		if (L.bay[i])
+			terrain[i] = WATER;
+		// A lava pool in the middle of the pit in the volcanic climate.
+		if (L.climate == kVolcanicClimate && L.zone[i] == 0 && radius[i] < kLavaPoolShare * g.pitR)
+			terrain[i] = LAVA;
+		ramp[i] = L.rampOf[i] >= 0 || L.innerRamp[i];
+		floor[i] = L.zone[i] == 0 && radius[i] >= kArenaFloorShare * g.pitR;
+		ring[i] = L.ring[i];
+		cliff[i] = L.border[i] || L.unclaimed[i] || L.pocket[i];
+		open[i] = !L.bay[i] && !ring[i] && !cliff[i];
+	}
+	// Every ramp is rough ground, so nothing can be built in a gate; the pit's floor is arena sand.
+	paveTiles(terrain, t, ramp, ramp, paved, MUD);
+	paveTiles(terrain, t, floor, floor, paved);
+	const std::vector<unsigned char> rings = wallVertices(t, ring, &open, &ramp),
+									 cliffs = wallVertices(t, cliff, &open, &ramp);
+	for (int i = 0; i < n; ++i)
+	{
+		if (terrain[i] == WATER || (!rings[i] && !cliffs[i]))
+			continue;
+		terrain[i] = rings[i] ? RIDGE_ROCK : CLIFFS;
+	}
+	// Every ring at least three vertices thick, so its rock draws peaks; never into a ramp.
+	thickenRidges(terrain, t, [&](int i) { return terrain[i] == GRASS && !cornerOf(t, ramp, i); });
+	for (int i = 0; i < n; ++i)
+	{
+		if (terrain[i] != RIDGE_ROCK)
+			continue;
+		// Which ring a rock vertex belongs to: every other one in the second rock.
+		int nearest = 0;
+		for (int j = 1; j < g.rings; ++j)
+			if (std::abs(radius[i] - g.ringR[j]) < std::abs(radius[i] - g.ringR[nearest]))
+				nearest = j;
+		tier[i] = nearest % 2;
+	}
+	// Every territory is grass with a paved square round its swarm: its wings, the ground round the
+	// inland seas either side of its home, are open farmland. (Revisions 7-9 laid barren ground over
+	// everything beyond ten steps of the seas, which left most of a territory dead.)
+	for (int k = 0; k < g.teams; ++k)
+		paveCore(terrain, t, t.remainderX(L.anchor[k]), L.anchor[k] / t.w, kCore,
+				 [&](int i) { return L.territory[i] == k; });
+	LookRoles roles;
+	roles.tended = [&](int i) { return L.territory[i] >= 0; };
+	roles.rockAccent = [&](int i) { return tier[i] != 0; };
+	paintClimate(terrain, t, kClimateLooks[L.climate], roles);
+	return terrain;
+}
+
+// The tiles a terrain wall blocks: no unit walks or swims them.
+std::vector<unsigned char> blockedTiles(const GenerationMap &map, const Torus &t)
+{
+	std::vector<unsigned char> blocked(t.size(), 0);
+	for (int i = 0; i < t.size(); ++i)
+	{
+		const TerrainProperties &p = map.terrainPropertiesAt(t.remainderX(i), i / t.w);
+		blocked[i] = !p.walkable && !p.swimmable;
+	}
+	return blocked;
 }
 
 // The towers every colony starts with and the open pads beside them (chooseTowerSites): all in the
@@ -423,16 +515,19 @@ std::vector<unsigned char> stoneTiles(const Map &map, const Layout &L)
 // own ground or its neighbours': the starting towers hold the door, and a colony that wants towers on
 // its borders builds them (FEEDBACK 2026-09-14: towers scattered along the border walls "make no
 // sense"; they should be "concentrated around the inner stone wall ... nearby the entrance").
-TowerPlan planTowers(const Map &map, const Layout &L, const GenerationContext &context,
+TowerPlan planTowers(const GenerationMap &map, const Layout &L, const GenerationContext &context,
 					 const AmphitheatreOptions &o, const std::vector<unsigned char> &stone)
 {
 	const Torus &t = L.t;
 	const int n = t.size(), teams = L.g.teams;
 	std::vector<unsigned char> ramps(n, 0), ringStone(n, 0);
+	// A ring's rock is thickened beyond its tiles (thickenRidges), so its stone is every blocked tile
+	// within two steps of them.
+	const std::vector<int> fromRing = stepsFrom(t, L.ring);
 	for (int i = 0; i < n; ++i)
 	{
 		ramps[i] = L.rampOf[i] >= 0 || L.innerRamp[i];
-		ringStone[i] = L.ring[i] && stone[i];
+		ringStone[i] = stone[i] && fromRing[i] >= 0 && fromRing[i] <= 2;
 	}
 	const std::vector<int> fromRamps = stepsFrom(t, ramps);
 	const std::vector<unsigned char> swarms = swarmSurroundings(t, context, 0);
@@ -462,10 +557,11 @@ TowerPlan planTowers(const Map &map, const Layout &L, const GenerationContext &c
 					   fromRamps[i] > kRampClearance && fromMouth[i] >= 0 &&
 					   fromMouth[i] <= kEntranceReach && !map.isResource(x, y);
 	}
-	// No tower on a shore strip narrow enough for it to close.
+	// No tower on a shore strip narrow enough for it to close. A wall is land here: only water makes
+	// a strip.
 	std::vector<unsigned char> land(n, 0);
 	for (int i = 0; i < n; ++i)
-		land[i] = map.terrainPropertiesAt(t.remainderX(i), i / t.w).walkable;
+		land[i] = map.terrainPropertiesAt(t.remainderX(i), i / t.w).walkable || stone[i];
 	const std::vector<unsigned char> roomy = roomyGround(t, land, kTowerRoom);
 	for (int i = 0; i < n; ++i)
 		buildable[i] = buildable[i] && roomy[i];
@@ -476,11 +572,11 @@ TowerPlan planTowers(const Map &map, const Layout &L, const GenerationContext &c
 	return chooseTowerSites(t, owner, buildable, target, swarms, teams, request);
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "amphitheatre layout";
 	const AmphitheatreOptions o(context.request);
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const int teams = context.request.nbTeams;
 	map.fillTerrain(GRASS);
 	for (int i = 0; i < teams; ++i)
@@ -496,16 +592,9 @@ bool generate(Game &game, GenerationContext &context)
 	const Geometry &g = L.g;
 
 	context.stage = "amphitheatre terrain";
-	TerrainSketch terrain(n, GRASS);
-	for (int i = 0; i < n; ++i)
-		if (L.bay[i])
-			terrain[i] = WATER;
-	layBeaches(terrain, t);
-	writeVertices(map, terrain);
-	const std::vector<unsigned char> stone = stoneTiles(map, L);
-	for (int i = 0; i < n; ++i)
-		if (stone[i])
-			map.setResourceByIndex(t.remainderX(i), i / t.w, STONE, 1);
+	writeVertices(map, sketchTerrain(L));
+	// The walls are terrain: the towers stand against them, and no repair below can clear one.
+	const std::vector<unsigned char> stone = blockedTiles(map, t), none(n, 0);
 
 	context.stage = "amphitheatre colonies";
 	const auto home = [&](int team)
@@ -543,9 +632,20 @@ bool generate(Game &game, GenerationContext &context)
 	const Fertility::Field fertility = Fertility::forMap(map, false);
 	const PeriodicNoise patch(t.w, t.h, 12, context.stream("amphitheatre-patch"));
 	const PeriodicNoise split(t.w, t.h, 6, context.stream("amphitheatre-split"));
+	int faceTiles = 0, towerTiles = 0;
 	for (int k = 0; k < teams; ++k)
 	{
 		const auto eligible = [&](int i) { return L.territory[i] == k && free(i); };
+		// The towers' ammunition first, at the foot of the arena wall beside the ramp they guard: the
+		// ramp's own clearance is kept only for its mouth here, where the towers stand.
+		if (k < int(towers.towers.size()))
+			towerTiles += plantTowerStone(
+				map, t, towers.towers[k], kTowerStone, kTowerStoneReach,
+				[&](int i)
+				{
+					return L.territory[i] == k && !reserved[i] && !pads[i] && fromRamps[i] > kTowerStoneRampGap &&
+						   clearGround(map, t.remainderX(i), i / t.w);
+				});
 		// The kit faces the nearest sea: wheat and wood between the swarm and its shore.
 		const int ax = t.remainderX(L.anchor[k]), ay = L.anchor[k] / t.w;
 		int bayTile = -1;
@@ -558,6 +658,40 @@ bool generate(Game &game, GenerationContext &context)
 			bayTile < 0 ? 0
 						: std::atan2(t.offsetY(ay, bayTile / t.w), t.offsetX(ax, t.remainderX(bayTile)));
 		const KitFrame frame{ax, ay, facing};
+		// The quarry faces first, one at the foot of either side border, as deep from the ramp as the
+		// swarm: the border tile's neighbour in the territory nearest that depth on each side.
+		{
+			const int homeDepth = L.depth[L.anchor[k]];
+			const double axis = L.phase + g.wedge * k;
+			int best[2] = {-1, -1}, bestScore[2] = {INT_MAX, INT_MAX};
+			for (int i = 0; i < n; ++i)
+			{
+				if (!eligible(i) || L.depth[i] < 0)
+					continue;
+				bool foot = false;
+				for (int dy = -1; dy <= 1 && !foot; ++dy)
+					for (int dx = -1; dx <= 1 && !foot; ++dx)
+					{
+						const int j = t.at(t.remainderX(i) + dx, i / t.w + dy);
+						foot = L.border[j] || L.unclaimed[j];
+					}
+				if (!foot)
+					continue;
+				const double a = std::atan2(t.offsetY(int(L.cy), i / t.w), t.offsetX(int(L.cx), t.remainderX(i)));
+				const int side = std::sin(a - axis) > 0 ? 1 : 0;
+				const int score = std::abs(L.depth[i] - homeDepth);
+				if (score < bestScore[side])
+				{
+					bestScore[side] = score;
+					best[side] = i;
+				}
+			}
+			std::vector<KitSeed> seeds;
+			for (const int seed : best)
+				if (seed >= 0)
+					seeds.push_back({t.remainderX(seed), seed / t.w, 4});
+			faceTiles += plantQuarryFaces(map, t, seeds, kQuarryFace, eligible);
+		}
 		plantKit(map, t, context,
 				 Kit{frame.at(9, -6, 12), frame.at(9, 6, 12), frame.at(-8, 0, 10), kHomeWheat,
 					 kHomeWood, -1},
@@ -573,6 +707,8 @@ bool generate(Game &game, GenerationContext &context)
 			},
 			"amphitheatre-home-stone", "amphitheatre-home-fruit");
 	}
+	context.telemetry.measure("amphitheatre.quarry-faces.tiles", faceTiles);
+	context.telemetry.measure("amphitheatre.tower-stone.tiles", towerTiles);
 	// The arena's prizes, the same in every wedge (plantOrchard, plantRound): groves of the three fruits
 	// on the innermost terrace and in the pit, a quarter-wedge round from the ramps, and a stone outcrop
 	// on every terrace.
@@ -600,9 +736,9 @@ bool generate(Game &game, GenerationContext &context)
 			bayOf[i] = L.territory[i];
 	seedAlgae(map, context, t, "amphitheatre-algae", o.algae, AlgaeBand::shallows(1, 4), bayOf,
 			  teams);
-	secureStartingCrops(game, context, t, 24, 32, 0, &stone);
+	secureStartingCrops(game, context, t, 24, 32, 0, &none);
 	reopenCrampedStarts(game, context, {o.wheat, o.wood, o.stone, o.algae, o.fruit}, 24, 32, 0,
-						&stone);
+						&none);
 
 	// Keep every colony's walk open, clearing only deposits on it: home to its ramp, ramp to the pit.
 	context.stage = "amphitheatre roads";
@@ -624,8 +760,11 @@ bool generate(Game &game, GenerationContext &context)
 				ramp[i] = 1;
 				rampTiles.push_back(i);
 			}
-		if (!openRoad(map, t, workers[team], ramp, &stone) ||
-			!openRoad(map, t, rampTiles, pit, &stone))
+		// Home to ramp is a straight trail (openTrail without a lie, a tile either side cleared):
+		// the cheapest-to-clear walk (openRoad) bent round the farmland round a territory's seas, and
+		// on large maps one colony's way to its ramp ran tens of steps longer than its rivals'.
+		if (!openTrail(map, t, workers[team], ramp, none, none, nullptr, 0, 1) ||
+			!openRoad(map, t, rampTiles, pit, &none))
 		{
 			context.detail =
 				"colony " + std::to_string(team) + " has no walk to its ramp and the pit";
@@ -651,11 +790,11 @@ std::string validateRequest(const GenerationRequest &r)
 // ramp is open; every colony walks to colony 0; the territories are equal to within a few percent and
 // every colony's seas have the same number of tiles; with the outer ramps shut, no territory reaches another or
 // the arena; and the colonies' walks to their ramps and to the pit are even.
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	if (const std::string mismatch = designMismatch(L, map, "amphitheatre"); !mismatch.empty())
 		return mismatch;
 	const Torus &t = L.t;
@@ -663,13 +802,15 @@ std::string validateWorld(const Game &game, const GenerationContext &context)
 	const int n = t.size(), teams = context.request.nbTeams;
 	const auto where = [&](int i)
 	{ return "(" + std::to_string(t.remainderX(i)) + ", " + std::to_string(i / t.w) + ")"; };
-	const std::vector<unsigned char> stone = stoneTiles(map, L);
+	// Every wall, ramp and floor stands as designed, vertex for vertex.
+	const TerrainSketch designed = sketchTerrain(L);
+	for (int i = 0; i < n; ++i)
+		if (map.vertexTerrainAt(t.remainderX(i), i / t.w) != designed[i])
+			return "The ground at " + where(i) + " is not as designed.";
 	const std::vector<unsigned char> open = walkableTiles(map);
 	std::vector<int> area(teams, 0), water(teams, 0);
 	for (int i = 0; i < n; ++i)
 	{
-		if (stone[i] && map.getResource(t.remainderX(i), i / t.w).type != STONE)
-			return "The stone at " + where(i) + " is missing.";
 		if ((L.rampOf[i] >= 0 || L.innerRamp[i]) && !open[i])
 			return "The ramp at " + where(i) + " is blocked.";
 		if (L.territory[i] >= 0)
@@ -760,7 +901,7 @@ GeneratorDefinition amphitheatreDefinition()
 		"amphitheatre",
 		23,
 		"Amphitheatre",
-		4,
+		11, // 11: every starting tower opens with full bullets and a full stone reserve
 		false,
 		// Rings of wall; each ramp's width in tiles; the pit's radius and each terrace's width as
 		// shares of the half side; every colony's inland seas together as a percentage of the smallest
@@ -785,7 +926,7 @@ GeneratorDefinition amphitheatreDefinition()
 		 GeneratorControl{"tower-count", "Towers per colony", 0, 12, 1, 3, ControlGroup::Layout}
 			 .withSearchRange(2, 4),
 		 // Every territory's ambient fields and grove, the arena's fruit and outcrops, and the
-		 // bays' algae; every home's kit and the walls' stone are unscaled.
+		 // bays' algae; every home's kit and quarry faces are unscaled.
 		 GeneratorControl::percentage("wheat-amount", "Wheat amount"),
 		 GeneratorControl::percentage("wood-amount", "Wood amount"),
 		 GeneratorControl::percentage("stone-amount", "Stone amount"),

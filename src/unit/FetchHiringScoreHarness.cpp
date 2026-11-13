@@ -1,9 +1,12 @@
 #include "HiringPipeline.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "gradient/MapRouting.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Real-engine regression for hiring a fetcher: the hunger check that decides
 // whether a unit may be hired for a resource measures the walk to that resource,
 // not the whole fetch-and-carry trip, and the score estimates that whole trip.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "GradientFixture.h"
 #include "GlobalContainer.h"
 #include "FileManager.h"
@@ -25,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <climits>
+#include "sim/EntityRefOf.h"
 
 // Named in a friend declaration, so it stays outside the anonymous namespace.
 class FetchHiringScoreHarness
@@ -33,7 +37,7 @@ public:
     static std::vector<Unit*> candidates(Building* building)
     {
         for(auto* unit:building->owner->liveUnits.entries())
-            glob2test::awaitBuildingGradient(*building->owner->game,building,unit->swimClass(),BuildingRoute::Footprint);
+            glob2test::awaitBuildingGradient(*building->owner->game,building,accessClass(unit->movementAccess()),BuildingRoute::Footprint);
         building->resetFailureTallies();
         std::vector<Unit*> units;
         for(auto* unit:building->owner->liveUnits.entries()) {
@@ -51,7 +55,7 @@ public:
         auto& game=*building->owner->game;game.snapshotStore().invalidateBoundary();
         HiringPlanner::Planner cache;
         const auto output=cache.rank(HiringPipeline::bindRoutes(game,game.captureReadBoundary()),building->owner->teamNumber,8);
-        for(const auto& b:output.buildings)if(b.building==Game::refOf(building))
+        for(const auto& b:output.buildings)if(b.building==refOf(building))
             for(const auto& list:b.jobs)if(list.key.job==Hiring::Job::Delivery && !list.candidates.empty())return game.resolveUnit(list.candidates.front().unit);
         return nullptr;
     }
@@ -104,15 +108,15 @@ static void aUnitIsJudgedOnTheWalkToTheResource()
 	unit->displacement = Unit::DIS_RANDOM;
 	unit->medical = Unit::MED_FREE;
 	unit->attachedBuilding = NULL;
-	const int swimClass = unit->swimClass();
+	const int swimClass = accessClass(unit->movementAccess());
 
-	game.map.buildingGradient(site,swimClass);
-	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,WOOD,swimClass); });
+	game.map.routing().buildingGradient(site,movementAccessFromLegacy(swimClass));
+	glob2test::awaitGradient(game, [&] { return game.map.routing().getMaterialGradientSlot(0,WOOD,movementAccessFromLegacy(swimClass)); });
 	int distBuilding = 0, distResource = 0;
 	glob2test::awaitBuildingGradient(game,site,swimClass);
-	require(game.map.buildingAvailable(site, swimClass, unit->posX, unit->posY, &distBuilding),
+	require(game.map.routing().buildingAvailable(site, movementAccessFromLegacy(swimClass), unit->posX, unit->posY, &distBuilding),
 		"the site is reachable");
-	require(game.map.materialAvailableSlot(0, WOOD, swimClass, unit->posX, unit->posY, &distResource),
+	require(game.map.routing().materialAvailableSlot(0, WOOD, movementAccessFromLegacy(swimClass), unit->posX, unit->posY, &distResource),
 		"the wood is reachable");
 
 	const int wholeTrip = distResource + std::max(distBuilding, distResource);
@@ -174,14 +178,14 @@ static void theScoreEstimatesTheWholeTrip()
 	unit->trigHungry = 100;
 	unit->hungry = unit->trigHungry + 1000 * unit->race->hungriness;
 
-	const int swimClass = unit->swimClass();
-	game.map.buildingGradient(site,swimClass);
-	glob2test::awaitGradient(game, [&] { return game.map.getMaterialGradientSlot(0,WOOD,swimClass); });
+	const int swimClass = accessClass(unit->movementAccess());
+	game.map.routing().buildingGradient(site,movementAccessFromLegacy(swimClass));
+	glob2test::awaitGradient(game, [&] { return game.map.routing().getMaterialGradientSlot(0,WOOD,movementAccessFromLegacy(swimClass)); });
 	int distBuilding = 0, distResource = 0;
 	glob2test::awaitBuildingGradient(game,site,swimClass);
-	require(game.map.buildingAvailable(site, swimClass, unit->posX, unit->posY, &distBuilding),
+	require(game.map.routing().buildingAvailable(site, movementAccessFromLegacy(swimClass), unit->posX, unit->posY, &distBuilding),
 		"the site is reachable");
-	require(game.map.materialAvailableSlot(0, WOOD, swimClass, unit->posX, unit->posY, &distResource),
+	require(game.map.routing().materialAvailableSlot(0, WOOD, movementAccessFromLegacy(swimClass), unit->posX, unit->posY, &distResource),
 		"the wood is reachable");
 	require(distBuilding < distResource, "the unit is nearer the site than the wood");
 
@@ -212,12 +216,12 @@ TEST_SUITE("FetchHiringScore")
         auto* unit=world.addUnit(WORKER,6,8);
         REQUIRE(unit);
         unit->activity=Unit::ACT_RANDOM; unit->medical=Unit::MED_FREE;
-        world.game.map.buildingGradient(inn,unit->swimClass());
-        glob2test::awaitGradient(world.game, [&] { return world.game.map.getMaterialGradientSlot(0,WHEAT,unit->swimClass()); });
+        world.game.map.routing().buildingGradient(inn,unit->movementAccess());
+        glob2test::awaitGradient(world.game, [&] { return world.game.map.routing().getMaterialGradientSlot(0,WHEAT,unit->movementAccess()); });
         int buildingDistance=0,resourceDistance=0;
-        glob2test::awaitBuildingGradient(world.game,inn,unit->swimClass());
-        REQUIRE(world.game.map.buildingAvailable(inn,unit->swimClass(),unit->posX,unit->posY,&buildingDistance));
-        REQUIRE(world.game.map.materialAvailableSlot(0,WHEAT,unit->swimClass(),unit->posX,unit->posY,&resourceDistance));
+        glob2test::awaitBuildingGradient(world.game,inn,accessClass(unit->movementAccess()));
+        REQUIRE(world.game.map.routing().buildingAvailable(inn,unit->movementAccess(),unit->posX,unit->posY,&buildingDistance));
+        REQUIRE(world.game.map.routing().materialAvailableSlot(0,WHEAT,unit->movementAccess(),unit->posX,unit->posY,&resourceDistance));
         REQUIRE(buildingDistance<resourceDistance);
         REQUIRE(resourceDistance>1);
         const int expectedScore=(resourceDistance+std::max(buildingDistance,resourceDistance))<<Q8_FIXED_POINT_SHIFT;
@@ -298,9 +302,9 @@ TEST_SUITE("FetchHiringScore")
         CHECK(team->myUnits[Unit::MAX_COUNT-1]->destinationPurpose == -1);
         REQUIRE(world.game.map.incResourceByIndex(16, 8, WHEAT, 0));
         glob2test::awaitGradient(world.game,[&] {
-            return world.game.map.getMaterialGradientSlot(0,WHEAT,team->myUnits[3]->swimClass());
+            return world.game.map.routing().getMaterialGradientSlot(0,WHEAT,team->myUnits[3]->movementAccess());
         });
-        world.game.map.prepareBuildingGradient(inn,team->myUnits[3]->swimClass(),BuildingRoute::Footprint);
+        world.game.map.routing().prepareBuildingGradient(inn,team->myUnits[3]->movementAccess(),BuildingRoute::Footprint);
         // Membership is sorted by gid; the ranked delivery choice above
         // independently proves that equal scores prefer low gid.
         CHECK(FetchHiringScoreHarness::candidates(inn) == std::vector<Unit*>{team->myUnits[3], team->myUnits[Unit::MAX_COUNT-1]});

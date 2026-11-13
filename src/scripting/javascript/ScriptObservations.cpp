@@ -1,4 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "Version.h"
+#include "Map.h"
+#include "TerrainBuiltins.h"
 #include <type_traits>
 #include "PowerOfTwo.h"
 #include "ScriptObservations.h"
@@ -7,7 +10,6 @@
 #include "FileFormatVersions.h"
 #include "TerrainProperties.h"
 #include "TerrainPresentation.h"
-#include "TerrainExperiments.h"
 #include "LegacyTerrainFrames.h"
 #include "Game.h"
 #include "GameRuleOverrides.h"
@@ -19,6 +21,8 @@
 #include "Stream.h"
 #include <algorithm>
 #include <stdexcept>
+#include "GameObjectives.h"
+#include "GameHints.h"
 namespace Script
 {
 Observations::Observations(Game &g, int t) : game(g), team(t) {}
@@ -404,7 +408,6 @@ Value Observations::query(const std::string &name, const std::vector<Value> &arg
 					const auto type = static_cast<TerrainType>(id);
 					const auto &p = world().terrain->properties(type);
 					const auto &presentation = world().terrain->presentation(type);
-					const auto experiment = terrainExperiment(type);
 					Value resources = Value::array();
 					for (unsigned resource = 0; resource < world().resourceRegistry->size(); ++resource)
 						if (MapState::terrainSupportsResourceType(world().state(), type, static_cast<ResourceId>(resource)))
@@ -416,9 +419,6 @@ Value Observations::query(const std::string &name, const std::vector<Value> &arg
 							.set("group", id < TERRAIN_COUNT
 											 ? Value(terrainGroupDefinition(terrainGroup(type)).key)
 											 : Value())
-							.set("experiment", experiment
-												   ? Value(experimentDefinition(*experiment).key)
-												   : Value())
 							.set("editorSelectable", presentation.editorSelectable)
 							.set("walkable", p.walkable)
 							.set("swimmable", p.swimmable)
@@ -436,7 +436,6 @@ Value Observations::query(const std::string &name, const std::vector<Value> &arg
 							.set("growthQ8", int(p.growthQ8))
 							.set("fertilityQ8", int(p.fertilityQ8))
 							.set("inhibitionQ8", int(p.inhibitionQ8))
-							.set("shoreSupportQ8", int(p.shoreSupportQ8))
 							.set("allowedResources", resources)
 							.set("farmMaterial", p.farmMaterial == 255 ? Value() : Value(std::string(materialKey(static_cast<MaterialId>(p.farmMaterial))))));
 				}
@@ -758,6 +757,8 @@ void Observations::save(GAGCore::OutputStream *s) const
 	}
 	s->writeLeaveSection();
 }
+void Observations::load(GAGCore::InputStream *s) { load(s, VERSION_MINOR); }
+
 void Observations::load(GAGCore::InputStream *s, int version)
 {
 	auto observation = captureObservation();
@@ -790,11 +791,12 @@ void Observations::load(GAGCore::InputStream *s, int version)
 			for (unsigned corner = 0; corner < 4; ++corner)
 			{
 				s->readEnterSection(corner);
-				const auto type = s->readUint16("corner");
+				const auto type = TerrainRegistry::currentTerrainId(TerrainRegistry::savedBuiltinCount(version),
+																   s->readUint16("corner"));
 				s->readLeaveSection();
-				if (!world().terrain->valid(type))
+				if (!type || !world().terrain->valid(*type))
 					throw std::runtime_error("Invalid remembered terrain type");
-				t.corners[corner] = static_cast<TerrainType>(type);
+				t.corners[corner] = static_cast<TerrainType>(*type);
 			}
 		else
 		{

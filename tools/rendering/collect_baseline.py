@@ -63,6 +63,8 @@ def main():
     parser.add_argument('--build-command', help='exact release build command; required with --binary')
     parser.add_argument('--base', default='HEAD', help='recorded integration base revision')
     parser.add_argument('--workload', choices=['flat-warm','flat-streaming','torus'], default='flat-warm')
+    parser.add_argument('--animation', choices=['paused', 'animated'], default='paused',
+                        help='paused preserves the original baseline; animated exercises terrain and other presentation updates')
     parser.add_argument('--renderer', default='gpu', help='existing benchmark renderer selector')
     parser.add_argument('--zoom', type=float, help='fixed zoom for native-scale composition measurements')
     parser.add_argument('--save', type=Path, help='optional saved game instead of seeded flat fixture')
@@ -87,16 +89,18 @@ def main():
               'base': capture(['git', 'rev-parse', args.base]),
               'working_tree': capture(['git', 'status', '--porcelain']),
               'build_command': args.build_command, 'workload': args.workload,
+              'animation': args.animation,
               'requested_backend':args.renderer, 'zoom':args.zoom, 'probes': [], 'runs': [],
               'limitations': ['Inventory/device creation do not establish rendered feature coverage.',
-                              'Torus benchmark excludes presentation and simulation; see its guide.',
+                              'Frame timings include asset polling, drawing, submission, and GPU completion, including any completion readback. '
+                              'They exclude final presentation and live simulation and cannot establish display cadence or input latency.',
                               'Release flags are declared provenance, not inferred from the executable.']}
     for command in [['g++', '--version'], ['clang++', '--version'], ['emcc', '--version'],
                     ['pkg-config', '--modversion', 'sdl3'], ['nvidia-smi', '--query-gpu=name,driver_version',
                      '--format=csv,noheader'], ['vulkaninfo', '--summary'], ['glxinfo', '-B']]:
         report['probes'].append(capture(command))
     report['pins'] = {str(p.relative_to(ROOT)): {'sha256': digest(p), 'contents': json.loads(p.read_text())}
-                      for p in [ROOT / 'scons/sdl3-versions.json', ROOT / 'browser/toolchain.json']}
+                      for p in [ROOT / 'buildsys/sdl3-versions.json', ROOT / 'platforms/web/toolchain.json']}
     report['drm_devices'] = []
     for device in sorted(Path('/sys/class/drm').glob('card[0-9]*/device')):
         if not (device / 'vendor').is_file():
@@ -127,8 +131,10 @@ def main():
                 env = {k: v for k, v in os.environ.items() if not k.startswith('GLOB2_BENCH_')}
                 env.update(GLOB2_USER_DATA_DIR=profile,
                            GLOB2_BENCH_FRAMES=str(args.frames), GLOB2_BENCH_WARMUP_FRAMES=str(args.warmup),
-                           GLOB2_BENCH_FRAME_TIMES='1', GLOB2_BENCH_PAUSE_PRESENTATION='1',
+                           GLOB2_BENCH_FRAME_TIMES='1',
                            GLOB2_BENCH_CAPTURE=str((args.output / f'frame-{repeat}.ppm').resolve()))
+                if args.animation == 'paused':
+                    env['GLOB2_BENCH_PAUSE_PRESENTATION'] = '1'
                 if args.zoom is not None:
                     env['GLOB2_BENCH_ZOOM']=str(args.zoom)
                 if args.workload.startswith('flat'):

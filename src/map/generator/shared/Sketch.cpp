@@ -1,15 +1,17 @@
+#include <array>
 #include "GenerationWork.h"
 #include "GenerationNumeric.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Sketch.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
-#include "Map.h"
+#include "GenerationWorld.h"
+#include "TerrainProperties.h"
 #include <algorithm>
 #include <cmath>
 namespace MapGeneration
 {
-std::vector<unsigned char> pureTiles(const Map &map, TerrainType type)
+std::vector<unsigned char> pureTiles(const GenerationMap &map, TerrainType type)
 {
 	const Torus t(map);
 	std::vector<unsigned char> result(t.size(), 0);
@@ -49,14 +51,27 @@ void layBeaches(TerrainSketch &terrain, const Torus &t)
 	}
 }
 
-void writeVertices(Map &map, const TerrainSketch &terrain)
+void writeVertices(GenerationMap &map, const TerrainSketch &terrain)
 {
 	std::vector<TerrainType> vertices(terrain.size());
 	std::transform(terrain.begin(), terrain.end(), vertices.begin(), [](unsigned char t) { return TerrainType(t); });
 	map.assignVertexTerrain(vertices);
 }
 
-void paintTile(Map &map, int x, int y, TerrainType type)
+TerrainSketch composeLooks(const TerrainSketch &mechanics, const TerrainSketch &looks)
+{
+	TerrainSketch paint(mechanics);
+	for (size_t i = 0; i < paint.size(); ++i)
+	{
+		::MapGeneration::generationCheckpoint();
+		const TerrainType mechanic = TerrainType(mechanics.at(i)), look = TerrainType(looks.at(i));
+		if (look != WATER && terrainGroup(look) == terrainGroup(mechanic))
+			paint.at(i) = look;
+	}
+	return paint;
+}
+
+void paintTile(GenerationMap &map, int x, int y, TerrainType type)
 {
 	map.paintVertices({{x, y}, {x + 1, y}, {x, y + 1}, {x + 1, y + 1}}, type, false);
 }
@@ -64,6 +79,23 @@ void paintTile(Map &map, int x, int y, TerrainType type)
 int countTiles(const TerrainSketch &terrain, TerrainType type)
 {
 	return int(std::count(terrain.begin(), terrain.end(), (unsigned char)type));
+}
+
+int paveRoute(TerrainSketch &sketch, const Torus &t, const std::vector<unsigned char> &route, int width,
+			  TerrainType type, const std::function<bool(int)> &allowed)
+{
+	const std::vector<unsigned char> corners = width >= 2 ? tileCorners(t, route) : route;
+	int changed = 0;
+	for (int i = 0; i < t.size(); ++i)
+	{
+		::MapGeneration::generationCheckpoint();
+		if (corners.at(i) && sketch.at(i) != type && allowed(i))
+		{
+			sketch.at(i) = type;
+			++changed;
+		}
+	}
+	return changed;
 }
 
 std::vector<unsigned char> tileCorners(const Torus &t, const std::vector<unsigned char> &tiles)
@@ -98,6 +130,49 @@ std::vector<unsigned char> pureTiles(const TerrainSketch &terrain, const Torus &
 		}
 	}
 	return pure;
+}
+
+std::vector<unsigned char> walkableTiles(const TerrainSketch &terrain, const Torus &t)
+{
+	std::vector<unsigned char> walkable(terrain.size(), 0);
+	if (!generationWorkActive())
+	{
+		// Native generation: most tiles have four equal corners, whose combined rule depends
+		// only on that terrain, so combine each terrain's once; mixed tiles combine as before.
+		std::array<signed char, 256> uniform;
+		uniform.fill(-1);
+		for (int i = 0; i < t.size(); ++i)
+		{
+			const int x = t.remainderX(i), y = i / t.w;
+			const unsigned char a = terrain.at(i), b = terrain.at(t.at(x + 1, y)),
+								c = terrain.at(t.at(x, y + 1)), d = terrain.at(t.at(x + 1, y + 1));
+			if (a == b && a == c && a == d)
+			{
+				if (uniform[a] < 0)
+				{
+					const auto &p = terrainProperties(TerrainType(a));
+					uniform[a] = combineCornerRules(p, p, p, p).walkable;
+				}
+				walkable[i] = uniform[a];
+			}
+			else
+				walkable[i] = combineCornerRules(terrainProperties(TerrainType(a)), terrainProperties(TerrainType(b)),
+												 terrainProperties(TerrainType(c)), terrainProperties(TerrainType(d)))
+								  .walkable;
+		}
+		return walkable;
+	}
+	for (int i = 0; i < t.size(); ++i)
+	{
+		::MapGeneration::generationCheckpoint();
+		const int x = t.remainderX(i), y = i / t.w;
+		walkable.at(i) = combineCornerRules(
+			terrainProperties(TerrainType(terrain.at(i))),
+			terrainProperties(TerrainType(terrain.at(t.at(x + 1, y)))),
+			terrainProperties(TerrainType(terrain.at(t.at(x, y + 1)))),
+			terrainProperties(TerrainType(terrain.at(t.at(x + 1, y + 1))))).walkable;
+	}
+	return walkable;
 }
 
 std::vector<Island> raiseIslands(TerrainSketch &terrain, const Torus &t, GenerationContext &context,

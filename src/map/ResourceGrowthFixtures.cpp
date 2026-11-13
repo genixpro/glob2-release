@@ -1,13 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Deliberately uses pre-pipeline APIs: compile this harness against the baseline
 // to emit starting saves that both baseline and candidate executables can load.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
 #include "Engine.h"
 #include <BinaryStream.h>
 #include <FileManager.h>
 #include <Toolkit.h>
 #include <nlohmann/json.hpp>
 #include <cstdlib>
+#include "Game.h"
 
 TEST_CASE("controlled full-engine growth fixtures [benchmark][resources]" *
 		  doctest::test_suite("ResourceGrowthFixtures"))

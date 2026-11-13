@@ -27,13 +27,19 @@
 #include <TouchText.h>
 #include <Toolkit.h>
 #include <StringTable.h>
+#include <ui/TextLayout.h>
+#include "Building.h"
+#include "render/scene/ScenePanels.h"
+#include "render/scene/Scene.h"
+#include "render/ViewState.h"
+#include "GameGUIToolManager.h"
 using namespace GAGCore;
 
 void GameGUITouch::drawNavigationIcon(int icon, ViewPoint center, bool selected, double points)
 {
 	auto *gfx = globalContainer->gfx;
 	const double unit = gfx->logicalUnitsPerPoint(), density = std::max(.25, double(gfx->getRasterScale()));
-	const auto ink = icon == 9 ? Color(232, 194, 107) : InGameTouchTheme::ink();
+	const auto ink = icon >= 9 ? Color(232, 194, 107) : InGameTouchTheme::ink();
 	const Color accent(232, 194, 107);
 	const auto packed = [](Color c) { return double((Uint32(c.r) << 24) | (Uint32(c.g) << 16) | (Uint32(c.b) << 8) | c.a); };
 	const std::array<double, 4> key{unit, density, packed(InGameTouchTheme::ink()), packed(accent)};
@@ -90,11 +96,17 @@ void GameGUITouch::drawNavigationIcon(int icon, ViewPoint center, bool selected,
 				case 8:
 					for (int j = 0; j < 2; ++j) { const double xx = -9 + j * 11;
 						line(xx, -8, xx + 7, 0); line(xx + 7, 0, xx, 8); } break;
-				case 9: // Trophy, with handles and a broad pedestal.
+				case 9: // Trophy, with handles and a broad pedestal: the local win chance.
 					line(-6, -9, 6, -9); line(-6, -9, -5, 0); line(-5, 0, 0, 4);
 					line(0, 4, 5, 0); line(5, 0, 6, -9); line(0, 4, 0, 9);
 					line(-5, 10, 5, 10); line(-6, -6, -10, -6); line(-10, -6, -10, -2);
 					line(-10, -2, -5, 2); line(6, -6, 10, -6); line(10, -6, 10, -2); line(10, -2, 5, 2); break;
+				case 10: // Open book: prestige comes from fully upgraded schools.
+					for (int side = -1; side <= 1; side += 2) {
+						line(0, -6, 5 * side, -8); line(5 * side, -8, 10 * side, -7); line(10 * side, -7, 10 * side, 8);
+						line(10 * side, 8, 5 * side, 7); line(5 * side, 7, 0, 9);
+					}
+					line(0, -6, 0, 9); break;
 
 				}
 				const Uint32 alpha = Uint8(std::round(255 * std::clamp(.5 - distance * density * unit, 0., 1.)));
@@ -108,6 +120,16 @@ void GameGUITouch::drawNavigationIcon(int icon, ViewPoint center, bool selected,
 			std::max(1, int(2 * unit)), accent);
 	gfx->drawSurface(float(center.x - points / 2 * unit), float(center.y - points / 2 * unit), float(points * unit),
 		float(points * unit), navigationIcons[icon].get());
+}
+
+void GameGUITouch::drawPrestigeIcon(ViewPoint center, double logicalSize)
+{
+	drawNavigationIcon(10, center, false, logicalSize / globalContainer->gfx->logicalUnitsPerPoint());
+}
+
+void GameGUITouch::drawWinChanceIcon(ViewPoint center, double logicalSize)
+{
+	drawNavigationIcon(9, center, false, logicalSize / globalContainer->gfx->logicalUnitsPerPoint());
 }
 
 void GameGUITouch::drawControls()
@@ -323,9 +345,17 @@ void GameGUITouch::drawHUD()
 	const auto rate = gui.tickRate.rate();
 	const bool chevrons = gui.canChangeGameSpeed();
 	stats.push_back({rate ? TickRateMeter::format(*rate) : "-", -1, gui.tickRateShortfall() == 2});
+	stats.push_back({gui.localWinChanceText()});
 	const auto paper = InGameTouchTheme::paper();
 	const Color backdrop(paper.r, paper.g, paper.b, 245);
-	gfx->drawFilledRect(int(hud.stats.x), int(hud.stats.y), int(hud.stats.w), int(hud.stats.h), backdrop);
+	// Portrait's win chance row covers only its own cell, beneath prestige,
+	// joined to the rows above like they are joined to each other.
+	const bool thirdRow = hud.cells[6].y > hud.cells[4].y;
+	const double band = thirdRow ? hud.cells[4].y + hud.cells[4].h - hud.stats.y : hud.stats.h;
+	gfx->drawFilledRect(int(hud.stats.x), int(hud.stats.y), int(hud.stats.w), int(band), backdrop);
+	if (thirdRow)
+		gfx->drawFilledRect(int(hud.cells[6].x), int(hud.stats.y + band), int(hud.cells[6].w),
+			int(std::ceil(hud.cells[6].y - hud.stats.y - band)), backdrop);
 	const auto drawUnitImage = [&](ViewRect box, int frame, Color color) {
 		auto *sprite = globalContainer->unitmini;
 		sprite->setBaseColor(color);
@@ -366,7 +396,7 @@ void GameGUITouch::drawHUD()
 		return font->getStringWidth(text) * gfx->textUnitsPerPoint();
 	};
 	const auto eachMetric = [&](const auto &visit) {
-		for (int i : {0, 1, 2, 3, 5})
+		for (int i : {0, 1, 2, 3, 5, 6})
 			visit(hud.cells[i], stats[i].text, false, i != 5 || chevrons);
 		for (int side = 0; side < 2; ++side)
 			visit(conversionCell(side),
@@ -428,11 +458,13 @@ void GameGUITouch::drawHUD()
 		if (stat.icon >= 0)
 			unitIcon(center, stat.icon);
 		else if (i == 3)
+			drawNavigationIcon(10, center, false, iconPoints);
+		else if (i == 6)
 			drawNavigationIcon(9, center, false, iconPoints);
 		else if (chevrons)
 		{
 			// The full speed symbol shares the same icon box as the
-			// unit portraits and trophy, regardless of the active speed.
+			// unit portraits and prestige book, regardless of the active speed.
 			const int lit = gui.litSpeedChevrons();
 			const double pitch = iconPoints / GameSpeedControl::CHEVRONS;
 			for (int c = 0; c < GameSpeedControl::CHEVRONS; ++c)
@@ -449,13 +481,13 @@ void GameGUITouch::drawHUD()
 		drawValue(r, left + iconWidth(false, hasIcon) + (hasIcon ? valueGap : 0), stat.text);
 		if (i == 3)
 		{
-			// Secondary match progress stays below the common primary row.
+			// Secondary match progress stays below the common primary row: a
+			// gold fill only, with no empty track while nobody has prestige.
 			const double barY = r.y + 36 * unit, barW = r.w - 16 * unit;
 			const double barX = r.x + 8 * unit;
 			if (match.state().prestigeWinCondition && match.state().prestigeToReach > 0)
 			{
 				const double progress = std::clamp(double(match.totalPrestige()) / match.state().prestigeToReach, 0., 1.);
-				gfx->drawFilledRect(int(barX), int(barY), int(barW), int(2 * unit), InGameTouchTheme::dialTrack());
 				gfx->drawFilledRect(int(barX), int(barY), int(barW * progress), int(2 * unit), Color(232, 194, 107));
 			}
 		}
@@ -466,9 +498,10 @@ void GameGUITouch::drawHUD()
 		drawScenarioMessage();
 		drawPanel();
 	}
+	drawMinimap();
+    // Match interfaceRegion(): the sheet owns the overlap with the minimap.
 	if (statsOpen && !activeDialog())
 		drawStats();
-	drawMinimap();
 	if (!activeDialog())
 	{
 		drawOverlayLegend();
@@ -482,14 +515,16 @@ void GameGUITouch::drawHUD()
 	if (gui.selectionMode == GameGUI::TOOL_SELECTION ||
 		gui.selectionMode == GameGUI::BRUSH_SELECTION)
 		return; // Active tools own this strip.
-	const std::string labels[] = {globalContainer->replaying ? "[Pause]" : "[Build]",
-		globalContainer->replaying ? "[Speed]" : "[Flags]", "[Editor tools]", "[Goals]", "[Teams]", "[Menu]"};
 	gfx->drawFilledRect(int(ui.actions.x), int(ui.actions.y), int(ui.actions.w), int(ui.actions.h),
 		InGameTouchTheme::paper());
 	gfx->drawHorzLine(int(ui.actions.x), int(ui.actions.y), int(ui.actions.w), InGameTouchTheme::border());
+	const auto *strings = Toolkit::getStringTable();
+	const bool fitBulgarianCaptions = strings && strings->doesStringExist("[language-code]") &&
+		strings->getString("[language-code]") == "bg";
 	for (int i = 0; i < 6; ++i)
 	{
-		const double x = ui.actions.x + i * ui.actions.w / 6, width = ui.actions.w / 6;
+		const auto button = navigationButtonRect(ui, i);
+		const double x = button.x, width = button.w;
 		const bool selected = i == 0 ? panelOpen && !inspecting() && !inspectingReadOnly() && gui.displayMode == GameGUI::CONSTRUCTION_VIEW
 			: i == 1 ? panelOpen && !inspecting() && !inspectingReadOnly() && gui.displayMode == GameGUI::FLAG_VIEW
 			: i == 2 && (lensOpen || (panelOpen && gui.displayMode == GameGUI::STAT_TEXT_VIEW));
@@ -501,12 +536,130 @@ void GameGUITouch::drawHUD()
             if(i==1 && ((anchor>=GameGUI::HighlightForbiddenZoneOnPanel && anchor<=GameGUI::HighlightBrushSelector) ||
                 anchor==GameGUI::HighlightBuildingOnPanel+8 || anchor==GameGUI::HighlightBuildingOnPanel+9 || anchor==GameGUI::HighlightBuildingOnPanel+10)) guided=true;
         }
-        if(guided) gfx->drawRect(int(x+2*unit),int(ui.actions.y+2*unit),int(width-4*unit),int(ui.actions.h-4*unit),Color(255,220,80));
-		drawNavigationIcon(icon, {x + width / 2, ui.actions.y + 17 * unit}, selected);
-		drawPointLabel({x + 2 * unit, ui.actions.y + 32 * unit, width - 4 * unit, 16 * unit},
-			Toolkit::getStringTable()->getString(labels[i]), .86);
+        if(guided) gfx->drawRect(int(x+2*unit),int(button.y+2*unit),int(width-4*unit),int(button.h-4*unit),Color(255,220,80));
+		drawNavigationIcon(icon, {x + width / 2, button.y + 17 * unit}, selected);
+		auto rect = navigationLabelRect(ui, i);
+		const auto text = navigationLabel(i);
+		double textScale = .86;
+		// Keep natural single-word captions whole when they only just exceed
+		// a slot. Borrow one point from each label inset, leaving hit areas,
+		// icons and the existing accessible navigation height unchanged.
+		if (fitBulgarianCaptions && text.find_first_of(" \t\r\n") == std::string::npos)
+		{
+			auto *font = globalContainer->standardFont;
+			InGameTouchTheme::TextStyle style(font);
+			const double advance = font->getStringWidth(text) + 8;
+			if (advance * textScale * gfx->textUnitsPerPoint() > rect.w)
+			{
+				rect.x -= unit;
+				rect.w += 2 * unit;
+				// standard is authored at 13px (GlobalContainer::loadGameFonts).
+				// Retain at least 10px and the player's text-size multiplier;
+				// words that still cannot fit keep production cluster wrapping.
+				textScale = std::clamp((rect.w - .25 * unit) / (advance * gfx->textUnitsPerPoint()),
+					10.0 / 13.0, .86);
+			}
+		}
+		drawPointLabel(rect, text, textScale, false,
+			navigationLabelLineHeight(pointLines(text, rect.w, textScale)));
 	}
 
+}
+
+std::string GameGUITouch::navigationLabel(int index) const
+{
+	const char *keys[] = {globalContainer->replaying ? "[Pause]" : "[Build]",
+		globalContainer->replaying ? "[Speed]" : "[Flags]", "[Editor tools]", "[Goals]", "[Teams]", "[Menu]"};
+	return Toolkit::getStringTable()->getString(keys[index]);
+}
+int GameGUITouch::navigationLabelLineHeight(const std::vector<std::string> &lines) const
+{
+	auto *font = globalContainer->standardFont;
+	InGameTouchTheme::TextStyle style(font);
+	int height = std::max(font->getStringHeight(""), font->getStringHeight("Ag"));
+	for (const auto &line : lines)
+		height = std::max(height, font->getStringHeight(line));
+	return height;
+}
+const GameGUITouch::NavigationMeasurement &GameGUITouch::measureNavigation(double width) const
+{
+	const auto unit = globalContainer->gfx->logicalUnitsPerPoint();
+	auto *font = globalContainer->standardFont;
+	InGameTouchTheme::TextStyle style(font);
+	NavigationMeasurement next;
+	next.font = font;
+	next.width = width;
+	next.unit = unit;
+	next.growth = InGameTouchTheme::textGrowth();
+	next.language = Toolkit::getStringTable()->getLang();
+	next.replay = globalContainer->replaying;
+	next.lineHeight = std::max(font->getStringHeight(""), font->getStringHeight("Ag"));
+	// Whole-label metrics use the font's bounded metrics cache. Probe them
+	// before reusing the last layout so reloading the same font object also
+	// invalidates wrapping when its advances or line metrics change.
+	for (int i = 0; i < 6; ++i)
+	{
+		next.labels[i] = navigationLabel(i);
+		next.metrics[i] = {font->getStringWidth(next.labels[i]), font->getStringHeight(next.labels[i])};
+	}
+	if (navigationMeasurement)
+	{
+		const auto &last = *navigationMeasurement;
+		if (last.font == next.font && last.width == next.width && last.unit == next.unit &&
+			last.growth == next.growth && last.language == next.language &&
+			last.replay == next.replay && last.lineHeight == next.lineHeight &&
+			last.labels == next.labels && last.metrics == next.metrics)
+			return last;
+	}
+	// Measure whole words only when the bounded layout cache changes. Keep
+	// normal captions in one row; use balanced rows before splitting words.
+	double wordWidth = 0;
+	for (const auto &label : next.labels)
+		for (size_t at = 0; at < label.size();)
+		{
+			const auto end = label.find_first_of(" \n\t", at);
+			wordWidth = std::max(wordWidth, double(font->getStringWidth(label.substr(at, end - at))));
+			at = end == std::string::npos ? label.size() : end + 1;
+		}
+	const double minimumWidth = (wordWidth + 8) * .86 * next.growth + 4;
+	for (const int columns : {6, 3, 2, 1})
+		if (width / columns >= minimumWidth || columns == 1)
+		{
+			next.columns = columns;
+			break;
+		}
+	const double labelWidth = width / next.columns - 4;
+	double height = 16;
+	for (int i = 0; i < 6; ++i)
+	{
+		const auto lines = pointLines(next.labels[i], labelWidth * unit, .86);
+		height = std::max(height, lines.size() * navigationLabelLineHeight(lines) *
+			.86 * InGameTouchTheme::textGrowth());
+	}
+	next.height = std::ceil(height);
+	navigationMeasurement = std::move(next); // One bounded last result per HUD.
+	return *navigationMeasurement;
+}
+ViewRect GameGUITouch::navigationButtonRect(const MobileLayout &ui, int index) const
+{
+	const int columns = navigationMeasurement ? navigationMeasurement->columns : 6;
+	const double width = ui.actions.w / columns, height = ui.actions.h / (6 / columns);
+	return {ui.actions.x + (index % columns) * width,
+		ui.actions.y + (index / columns) * height, width, height};
+}
+int GameGUITouch::navigationButtonAt(const MobileLayout &ui, ViewPoint point) const
+{
+	for (int index = 0; index < 6; ++index)
+		if (navigationButtonRect(ui, index).contains(point))
+			return index;
+	return -1;
+}
+ViewRect GameGUITouch::navigationLabelRect(const MobileLayout &ui, int index) const
+{
+	const auto unit = globalContainer->gfx->logicalUnitsPerPoint();
+	const auto button = navigationButtonRect(ui, index);
+	return {button.x + 2 * unit, button.y + 32 * unit,
+		button.w - 4 * unit, std::max(0.0, button.h - (button.h > 48 * unit ? 36 : 32) * unit)};
 }
 
 ViewRect GameGUITouch::scenarioMessageRect() const
@@ -517,14 +670,34 @@ ViewRect GameGUITouch::scenarioMessageRect() const
 	auto rect = layout().world;
 	rect.x += 8 * unit;
 	rect.y = minimapRect().y + minimapRect().h + 8 * unit;
-	rect.w = std::min(rect.w - 16 * unit, 560 * unit);
+	rect.w = std::max(0.0, std::min(rect.w - 16 * unit, 560 * unit));
 	rect.h = std::max(0.0, layout().actions.y - rect.y);
-	rect.h = scenarioMessageCollapsed ? 48 * unit
+	InGameTouchTheme::TextStyle textStyle(globalContainer->standardFont);
+	const int labelHeight = globalContainer->standardFont->getStringHeight(
+		Toolkit::getStringTable()->getString("[scenario messages]"));
+	// drawPointLabel uses a 1.15 text scale. Its collapsed target must grow
+	// with the actual translated label too, not clip a tall script at 48pt.
+	rect.h = scenarioMessageCollapsed ? std::min(rect.h, std::max(48.0, labelHeight * 1.15 * InGameTouchTheme::textGrowth() + 16) * unit)
 							   : std::min(rect.h, (std::min<size_t>(3, scenarioMessageLines.size()) *
-														   InGameTouchTheme::scenarioMessagePitch() +
-													   16 + (gui.swallowSpaceKey ? 48 : 0)) *
+														   scenarioMessagePitch() +
+													   16 + scenarioMessageFooterHeight()) *
 													  unit);
 	return rect;
+}
+ViewRect GameGUITouch::scenarioMessageContinueRect() const
+{
+	auto rect = scenarioMessageRect();
+	const double height = scenarioMessageCollapsed ? 0 :
+		std::min(rect.h, scenarioMessageFooterHeight() * globalContainer->gfx->logicalUnitsPerPoint());
+	return {rect.x, rect.y + rect.h - height, rect.w, height};
+}
+ViewRect GameGUITouch::scenarioMessageCollapseRect() const
+{
+	const auto rect = scenarioMessageRect();
+	const double size = 48 * globalContainer->gfx->logicalUnitsPerPoint();
+	const double width = std::min(rect.w, size);
+	return {rect.x + rect.w - width, rect.y, width,
+		std::min(size, std::max(0.0, rect.h - scenarioMessageContinueRect().h))};
 }
 void GameGUITouch::prepareScenarioMessage()
 {
@@ -538,49 +711,46 @@ void GameGUITouch::prepareScenarioMessage()
 	const double width =
 		(std::min(layout().world.w / globalContainer->gfx->logicalUnitsPerPoint() - 16, 560.0) - 64) /
 		InGameTouchTheme::textGrowth();
-	if (text == scenarioMessageText && width == scenarioMessageWidth)
+	auto *font = globalContainer->standardFont;
+	InGameTouchTheme::TextStyle textStyle(font);
+	const int language = Toolkit::getStringTable()->getLang();
+	const int fontHeight = font->getStringHeight("");
+	const int textWidth = font->getStringWidth(text), textHeight = font->getStringHeight(text);
+	if (text == scenarioMessageText && width == scenarioMessageWidth && font == scenarioMessageFont &&
+		language == scenarioMessageLanguage && fontHeight == scenarioMessageFontHeight &&
+		textWidth == scenarioMessageTextWidth && textHeight == scenarioMessageTextHeight)
 		return;
+
 	scenarioMessageCollapsed = false;
 	scenarioMessageText = text;
 	scenarioMessageWidth = width;
+	scenarioMessageFont = font;
+	scenarioMessageLanguage = language;
+	scenarioMessageFontHeight = fontHeight;
+	scenarioMessageTextWidth = textWidth;
+	scenarioMessageTextHeight = textHeight;
 	scenarioMessageLines.clear();
 	scenarioMessageScroll = 0;
-	std::string line;
-	auto *font = globalContainer->standardFont;
-	InGameTouchTheme::TextStyle textStyle(font);
-	// Break at whitespace when possible, otherwise at UTF-8 character boundaries.
-	for (size_t at = 0; at < text.size();)
+	scenarioMessageLineStep = std::max(int(InGameTouchTheme::scenarioMessageLine), fontHeight);
+	if (text.empty()) return;
+	struct TutorialMeasurer final : GAGGUI::ui::TextMeasurer
 	{
-		size_t end = at + 1;
-		while (end < text.size() && (static_cast<unsigned char>(text[end]) & 0xc0) == 0x80)
-			++end;
-		if (text[at] == '\n')
-		{
-			scenarioMessageLines.push_back(line);
-			line.clear();
-			at = end;
-			continue;
-		}
-		const std::string next = text.substr(at, end - at);
-		if (!line.empty() && font->getStringWidth(line + next) * 1.0 > width)
-		{
-			const auto space = line.find_last_of(' ');
-			if (space != std::string::npos)
-			{
-				scenarioMessageLines.push_back(line.substr(0, space));
-				line.erase(0, space + 1);
-			}
-			else
-			{
-				scenarioMessageLines.push_back(line);
-				line.clear();
-			}
-		}
-		line += next;
-		at = end;
-	}
-	if (!line.empty())
-		scenarioMessageLines.push_back(line);
+		Font *font;
+		explicit TutorialMeasurer(Font *value) : font(value) {}
+		int width(GAGGUI::ui::FontRole, const std::string &line) const override
+		{ return font->getStringWidth(line); }
+		int lineHeight(GAGGUI::ui::FontRole) const override
+		{ return font->getStringHeight(""); }
+		std::vector<std::size_t> clusterEnds(GAGGUI::ui::FontRole, const std::string &line) const override
+		{ return font->getStringClusterEnds(line); }
+	} measurer(font);
+	// Tutorial prose uses the shared word/cluster wrapper. Explicit paragraph
+	// breaks remain; a conjunct wider than its slot stays whole rather than
+	// splitting a combining mark from its base.
+	scenarioMessageLines = GAGGUI::ui::wrapText(measurer, GAGGUI::ui::FontRole::Body, text,
+		std::max(1, int(std::floor(width))));
+	for (const auto &line : scenarioMessageLines)
+		scenarioMessageLineStep = std::max(scenarioMessageLineStep, font->getStringHeight(line));
 }
 void GameGUITouch::drawScenarioMessage()
 {
@@ -597,23 +767,24 @@ void GameGUITouch::drawScenarioMessage()
 		drawPointLabel(rect, GAGCore::Toolkit::getStringTable()->getString("[scenario messages]"));
 		return;
 	}
-	const double footerHeight = gui.swallowSpaceKey ? 48 * unit : 0;
-	SDL_Rect clip{int(rect.x), int(rect.y), int(rect.w - 48 * unit),
+	const auto continueRect = scenarioMessageContinueRect();
+	const double footerHeight = continueRect.h;
+	SDL_Rect clip{int(rect.x), int(rect.y), int(std::max(0.0, rect.w - 48 * unit)),
 				  int(std::max(0.0, rect.h - footerHeight))};
-	// Lines are scenarioMessageLine authored pixels apart and drawn at the text unit,
-	// so they sit scenarioMessagePitch() points apart.
-	const double pitch = InGameTouchTheme::scenarioMessagePitch();
+	// The cached font-aware step is in authored pixels; pitch converts it
+	// to the same point units used by layout and scrolling.
+	const double pitch = scenarioMessagePitch();
 	const size_t first = std::min(scenarioMessageLines.size(), size_t(std::max(0.0, scenarioMessageScroll) / pitch));
 	gfx->setUITransform(gfx->textUnitsPerPoint(), rect.x + 8 * unit,
 						rect.y + (8 - scenarioMessageScroll + first * pitch) * unit, &clip);
 	const size_t end = std::min(scenarioMessageLines.size(), first + size_t(rect.h / unit / pitch) + 1);
 	for (size_t i = first; i < end; ++i)
-		gfx->drawString(0, int((i - first) * InGameTouchTheme::scenarioMessageLine), globalContainer->standardFont,
+		gfx->drawString(0, int((i - first) * scenarioMessageLineStep), globalContainer->standardFont,
 						scenarioMessageLines[i]);
 	gfx->setUITransform();
 	gfx->setClipRect();
 	const double textHeight = std::max(1.0, rect.h - footerHeight),
-				 content = scenarioMessageLines.size() * pitch * unit;
+				 content = (scenarioMessageLines.size() * pitch + 16) * unit;
 	if (content > textHeight)
 	{
 		gfx->drawFilledRect(int(rect.x + rect.w - 3 * unit),
@@ -621,15 +792,19 @@ void GameGUITouch::drawScenarioMessage()
 							std::max(1, int(2 * unit)), int(textHeight * textHeight / content),
 							Color(170, 185, 190));
 	}
-	drawPointLabel({rect.x + rect.w - 48 * unit, rect.y, 48 * unit, 48 * unit}, "−", 1.2);
+	const auto collapseRect = scenarioMessageCollapseRect();
+	if (collapseRect.w > 0 && collapseRect.h > 0)
+		drawPointLabel(collapseRect, "−", 1.2);
 	if (gui.swallowSpaceKey)
 	{
-		gfx->drawFilledRect(int(rect.x), int(rect.y + rect.h - 48 * unit), int(rect.w),
-							int(48 * unit), InGameTouchTheme::selected());
-		SDL_Rect footer{int(rect.x), int(rect.y + rect.h - 48 * unit), int(rect.w), int(48 * unit)};
-		// 16 points below the footer's top at the authored size, centred as text grows.
+		gfx->drawFilledRect(int(rect.x), int(rect.y + rect.h - footerHeight), int(rect.w),
+							int(footerHeight), InGameTouchTheme::selected());
+		SDL_Rect footer{int(rect.x), int(rect.y + rect.h - footerHeight), int(rect.w), int(footerHeight)};
+		// Keep the original 48-point target for smaller fonts, but allow taller
+		// script text and accessibility sizes to grow it. Hit testing shares it.
 		gfx->setUITransform(gfx->textUnitsPerPoint(), rect.x + 12 * unit,
-							rect.y + rect.h - (24 + 8 * InGameTouchTheme::textGrowth()) * unit, &footer);
+							rect.y + rect.h - footerHeight +
+							(footerHeight - scenarioMessageFontHeight * gfx->textUnitsPerPoint()) / 2, &footer);
 		gfx->drawString(0, 0, globalContainer->standardFont,
 						Toolkit::getStringTable()->getString("[ok]"));
 		gfx->setUITransform();
@@ -681,7 +856,7 @@ std::vector<std::string> GameGUITouch::pointLines(const std::string &text, doubl
 						 width / (textScale * globalContainer->gfx->textUnitsPerPoint()) - 8);
 }
 void GameGUITouch::drawPointLabel(ViewRect rect, const std::string &text, double textScale,
-								  bool leading)
+								  bool leading, int lineHeight)
 {
 	auto *gfx = globalContainer->gfx;
 	const double unit = textScale * gfx->textUnitsPerPoint();
@@ -699,7 +874,7 @@ void GameGUITouch::drawPointLabel(ViewRect rect, const std::string &text, double
 	auto *font = globalContainer->standardFont;
 	InGameTouchTheme::TextStyle textStyle(font);
 	const auto lines = pointLines(text, rect.w, textScale);
-	const int height = font->getStringHeight("Ag");
+	const int height = lineHeight > 0 ? lineHeight : font->getStringHeight("Ag");
 	gfx->setUITransform(unit, rect.x,
 						rect.y + std::max(0.0, (rect.h / unit - lines.size() * height) / 2) * unit,
 						&clip);
@@ -825,7 +1000,7 @@ GameGUITouch::HudLayout GameGUITouch::hudLayout(const MobileLayout &ui) const
 	HudLayout hud;
 	const bool wide = safe.w > safe.h || safe.w / unit >= 680;
 	const bool identity = (inspecting() || inspectingReadOnly()) && !ui.persistentPanel;
-	const bool stackedWide = wide && ((safe.w / unit - 92) * .25 - 4) / 2 < 82;
+	const bool stackedWide = wide && ((safe.w / unit - 92) * .23 - 4) / 2 < 82;
 	const double side = (wide ? (safe.h / unit < 360 && !identity ? 72 : stackedWide ? 104 : 84) : 104) * unit, gap = 4 * unit;
 	const double x = safe.x, y = safe.y + gap, rowHeight = 40 * unit;
 	hud.minimap = {safe.x + safe.w - side - gap, wide ? y : y + rowHeight + gap, side, side};
@@ -833,12 +1008,14 @@ GameGUITouch::HudLayout GameGUITouch::hudLayout(const MobileLayout &ui) const
 	if (wide)
 	{
 		// Prestige and conversion imagery get more room than simple counters.
-		const double weights[] = {.14, .14, .14, .21, .25, .12};
+		// Win chance (cell 6) follows prestige; its two digits need little room.
+		const int order[] = {0, 1, 2, 3, 6, 4, 5};
+		const double weights[] = {.13, .13, .13, .16, .12, .23, .10};
 		double left = x;
-		for (int i = 0; i < 6; ++i)
+		for (int slot = 0; slot < 7; ++slot)
 		{
-			const double width = available * weights[i];
-			hud.cells[i] = {left, y, width - gap, rowHeight};
+			const double width = available * weights[slot];
+			hud.cells[order[slot]] = {left, y, width - gap, rowHeight};
 			left += width;
 		}
 		hud.stats = {x, y, available - gap, rowHeight};
@@ -853,7 +1030,10 @@ GameGUITouch::HudLayout GameGUITouch::hudLayout(const MobileLayout &ui) const
 		const double prestige = available / 3;
 		hud.cells[3] = {x, y + rowHeight + gap, prestige - gap, rowHeight};
 		hud.cells[4] = {x + prestige, y + rowHeight + gap, available - prestige - gap, rowHeight};
-		hud.stats = {x, y, available - gap, 2 * rowHeight + gap};
+		// Win chance takes a third row under prestige: still within the
+		// minimap's height, and the conversion composition keeps its width.
+		hud.cells[6] = {x, y + 2 * (rowHeight + gap), prestige - gap, rowHeight};
+		hud.stats = {x, y, available - gap, 3 * rowHeight + 2 * gap};
 	}
 	const double header = InGameTouchTheme::inspectorHeader * unit;
 	hud.identity = {hud.stats.x, hud.stats.y + hud.stats.h + gap, hud.stats.w, header};
@@ -1049,7 +1229,9 @@ void GameGUITouch::drawResourceInfo()
 	const auto info = resourceInfo();
 	const auto rect = allocationRect();
 	if (!info || rect.h <= 0) return;
-	auto *sprite = ResourceSprites::resolve(gui.drawnScene().map.frozenResourceRegistry()).sprites[info->resource];
+	const auto &map = gui.drawnScene().map;
+	auto *sprite = ResourceSprites::resolve(map.frozenResourceRegistry(), map.frozenAssetBundle())
+		.sprite(static_cast<ResourceId>(info->resource));
 	drawSelectionHeader(rect, sprite, info->sprite,
 		info->name + (info->amount.empty() ? "" : "\n" + info->amount));
 }

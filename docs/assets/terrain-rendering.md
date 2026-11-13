@@ -25,17 +25,41 @@ All materials share this field so multi-material junctions remain joined. Wrappe
 world coordinates determine its control points, independently of texture variants,
 camera position, animation and simulation randomness.
 
+### Boundary rules
+
+Version-4 catalogs choose the profile of every contact from what the two
+materials are, without per-pair entries. `border_classes` lists the classes
+strongest first; each material names its `class` and its edge `profile`:
+
+1. The stronger class shapes the contact with its own edge profile. The shipped
+   order is `cover` (raised foliage that hides its edge), `cut` (holes and
+   chasms), `built` (roads, tracks, boardwalks), `flow` (lava, which overruns
+   its surroundings), `solid` (natural ground) and `pool` (standing water).
+2. A class marked `"shoreline": true` takes the shape of its basin: against it
+   the stronger side draws its edge profile's `coast` when it names one. Grass
+   therefore meets water with `shore`, sand with `beach` and rock with `rock`,
+   while lava and roads keep their own edges.
+3. Within one class the edge profile with the higher `precedence` (0–255) wins,
+   with the profile key as a stable tie break: rock over soil over ice, brush and
+   turf; the three waters all use `still`.
+4. A `pair_treatments` entry still overrides one pair. The shipped catalog needs
+   none.
+5. A class marked `"cuts_stones": true` cuts laid stone paths along its smooth
+   edge instead of meeting them on whole stones; see
+   [Whole-stone edges](#whole-stone-edges).
+
+`python3 tools/terrain_tileset.py --border-table` lists the profile of every
+material pair; `--compare OLD.json` lists only the pairs that changed. Version
+1–3 catalogs keep the earlier rule: the rougher profile wins, and contextual
+geometry requires both materials' profiles and the chosen one to opt in.
+
 ### Contextual natural borders
 
 Version-3 profiles may set `"shape": "contextual"`; omission or `"patch"` retains
-existing patch geometry. The shipped sand, shore, organic, soft, rock, brush,
-liquid and frozen profiles use contextual geometry. Ice uses frozen, which shares
-fractured's authored detail but enables natural curves; lava retains fractured.
-Chasm uses the cliff profile, which preserves rock's authored detail with patch
-geometry and prevents new natural materials from rounding a chasm boundary.
-Both materials' own profiles and their selected pair treatment must opt in.
-Constructed paths, lava, and crisp holes/chasm borders therefore retain their
-existing treatment even against a rougher natural material.
+existing patch geometry. The shipped rock, soil, frozen, brush, turf, sand, shore
+and beach profiles use contextual geometry. In version 4 a contact uses it when
+its chosen profile does; the class order keeps natural profiles from rounding
+roads, holes and lava.
 
 The compositor reads a 4×4 vertex neighbourhood, including one vertex beyond each
 side of the cell. Ordinary two-material cells use marching-square edge midpoints
@@ -142,11 +166,161 @@ junctions. Textures use straight alpha only after coverage and source alpha have
 been combined. Feathering is narrow,
 not a broad blur over the square boundary.
 
-By default the rougher boundary profile wins, with a stable key tie break. Optional
+[Boundary rules](#boundary-rules) choose the profile of a contact. Optional
 `pair_treatments` entries contain `a`, `b` and `profile`; these choose another
 contour family for that pair without changing material connectivity. Pairs are
-unordered, unique and must reference existing materials and profiles. Most
-materials need no pair entries.
+unordered, unique and must reference existing materials and profiles.
+
+### Smooth borders
+
+Version-4 catalogs draw every contact with smooth geometry, whatever the
+profile's `shape`. One algorithm and one distance measure therefore cover every
+tile edge, whichever terrains meet, and a new terrain needs no boundary code of
+its own: its profile only sets parameters. The patch and contextual geometry
+described above remain for version 1–3 catalogs.
+
+A profile takes `wiggle_q8` (0–2048, the Q8 pixels a straight contour meanders),
+`wiggle_period` (32, 64, 128 or 256 logical pixels between the broadest bends),
+`squareness_q8` (0 round to 256 square corners), `detail_q8` (0–1024, Q8 pixels
+of fine roughness on a 16-pixel lattice) and `jagged_q8` (0–2048, Q8 pixels of
+light grit on 16- and 8-pixel lattices, the finer ridged). These are noises of
+each material's own field, so they roughen both sides alike.
+
+Most of a natural edge's shape comes from its **teeth**, which belong to the
+contact rather than to either material. One side of every contact shapes it
+(`Catalog::shapes`): the dominant material by border class and precedence, as
+in the real world, where the resistant side of an eroding contact keeps the
+headlands, the land shapes a pooled liquid's shore, and an advancing flow pushes
+its own front. `teeth_q8` (0–2560) of the contact's profile sets the
+displacement in Q8 pixels. The teeth are value noise of world position on 32-,
+16- and 8-pixel lattices along the edge, most of the energy at about one
+feature per tile edge and falling steeply at finer scales, folded at zero into
+crests. `teeth_form` chooses the polarity: `points` (the default) push sharp
+crests of the shaping material into its neighbour, with rounded bays between;
+`lobes` turn them round, so rounded tongues advance with sharp cusps pointing
+back, as lava fronts do. `facets` interpolates the teeth linearly so their
+flanks run straight, as broken rock does; the finest octave is faceted always.
+The lattice is fine along the edge and 128 pixels across it, blended by the
+bare splines' slope direction, so a contour displaced by teeth cannot fold back
+into islands or overhangs.
+
+**Clasts** are grains a material sheds across its own edges, whatever it meets:
+`clasts` is `none`, `round` (soil; the shipped sand and snow set `none`) or `angular` (irregular chips at a
+hashed rotation, for rock and ice), and `speckle_q8` of the material's own
+profile sets their reach. Half the cells of an 8-pixel world grid hold one,
+2.5 to 5.5 pixels across, and each pushes its material's border out by a hashed
+share of twice the reach, so fewer grains reach the far side. Turf and brush
+shed none.
+
+Teeth and clasts are added to the pair's distance antisymmetrically, so
+weights still sum to one and seams and surf follow them, and they fade in only
+where both fields have risen, so they never reach a vertex or a uniform
+neighbouring cell. `feather_q8` and `bridge_q8` keep their meanings.
+
+A rough profile that names none of these takes them from its contour strength,
+`amplitude_q8 × roughness_q8 / 256`: a quarter of it as `wiggle_q8`, an eighth
+as `detail_q8`, that strength times `(roughness_q8 + 256) / 512` as
+`jagged_q8`, and twice it as `teeth_q8`. From `roughness_q8` 320 its teeth are
+faceted and its clasts angular; below, a profile with `speckle_q8` sheds rounded
+grains. Rock therefore breaks up most, soil, sand and turf roughen, and a beach
+is only slightly irregular. A profile without roughness (foliage that hides its
+own edge) gets square corners. Smooth profiles (roads, tracks, liquids) keep
+their clean lines; lava sets lobed teeth. `roughness_q8` and `contours_q12` no
+longer shape version-4 contacts directly.
+
+### Physical properties
+
+A version-4 profile describes what its edge family is made of, and the contact
+parameters above follow from that, so a new terrain names a few physical
+numbers rather than tuning contours. Each is Q8 from 0 to 256 except `grain_q8`:
+
+| Property | Meaning | Drives |
+| --- | --- | --- |
+| `resistance_q8` | Hardness against erosion and wear | Who shapes a contact within a class (`precedence`), faceted teeth and angular clasts from 128, grit (`jagged_q8` = 256 + 6 × resistance) |
+| `cohesion_q8` | How well the material holds together (roots, binding) | With resistance, the teeth: `teeth_q8` = 384 + 9 × (resistance + cohesion) / 2, so loose sand makes smooth arcs and rock a broken edge |
+| `grain_q8` | Q8 pixels its loose grains reach (0 for continuous material) | `speckle_q8` and `clasts` |
+| `spread_q8` | How much it advances over its neighbours (flow, growth) | Lobed teeth from 128 |
+
+Meander and fine detail follow the teeth (`wiggle_q8` an eighth of them,
+`detail_q8` a sixteenth). Any parameter a profile names explicitly overrides
+its derived value, and profiles without physical properties (built surfaces,
+canopy) keep their explicit parameters. Border classes still give the order
+across forms (cover, cut, built, flow, solid, pool), and coast profiles still
+let the land draw its shore with its own physical properties.
+
+The shipped natural families:
+
+| Profile | Resistance | Cohesion | Grain | Spread | Result |
+| --- | --- | --- | --- | --- | --- |
+| `rock` | 230 | 230 | 448 | | Large faceted teeth, angular chips |
+| `frozen` | 150 | 150 | 128 | | Faceted teeth, fine angular chips |
+| `soil` | 100 | 180 | 320 | | Rounded teeth, rounded grains |
+| `brush` | 80 | 200 | | | Rounded teeth, no grains |
+| `turf` | 64 | 220 | | | Rooted edge that shapes loose sand |
+| `sand` | 24 | 40 | 512 | | Gentle arcs, scattered grains |
+| `shore` | 40 | 140 | | | Vegetated or soil coast |
+| `beach` | 10 | 20 | | | Smooth beach arcs |
+| `molten` | 60 | 160 | | 230 | Lobed lava fronts |
+
+The noises of one field together stay within the bound that keeps every field
+positive where its vertices reach, scaled down alike when a profile asks for
+more.
+
+Seams and surf need the distance to a contour that may lie beyond the tile
+edge. A cell therefore also gives a field to each material of its 4×4 vertex
+window that is no corner but draws a band against one (`Recipe::halo`, at most
+three, in free palette slots): a seam shadow, a fringe or surf
+(`Catalog::bandsBetween`). Halo fields never take coverage, so weights are
+unchanged; they make the distance and band neighbour equal on both sides of
+every tile edge, and a cell whose corners all agree draws the bands of a
+contour just beyond it instead of cutting them off. Distances measure only to
+materials that draw a band with the sample's material, so a contour without a
+band neither hides one behind it nor depends on which tile measures, and skip a
+field that has not risen at the sample. They use the smooth slope of the
+fields: fine detail and grit move the contour through the score, but a
+first-order distance extrapolating their steep slopes would put every contour
+within a few pixels.
+
+`SmoothBorders` gives each corner material of a cell a field interpolated
+through the 4×4 vertex neighbourhood with Catmull-Rom splines; the strongest
+field owns a sample. The splines pass through their vertices, so every vertex
+keeps its own material, and their slopes agree across cell edges, so a contour
+continues across the map instead of restarting in every cell. Ambiguous
+diagonals and junctions need no fallback: the fields decide them. At a diagonal
+saddle the dominant material (stronger class, then precedence, then a seeded
+choice) joins its two lobes through a neck sized by `bridge_q8`, so roads and
+rivers continue diagonally.
+
+Squareness remaps each cell coordinate toward a step at the cell's midline (a
+blend of the coordinate and a triple smoothstep) before the splines are
+evaluated. The remap keeps both cell ends and one slope at each, so fields stay
+continuous across cells while contours hug the midlines and corners tighten from
+arcs toward right angles; roads use 224, tracks 128 and liquids and lava 0.
+Corner shares take the squarest smooth contact around a vertex and interpolate
+like wiggle. A square vertex whose 3×3 neighbourhood is two materials split by a
+45-degree line (a staircase edge, or one step off it) takes a squareness of -0.2
+instead, which runs the contour along the staircase straight to within a pixel.
+Right-angled corners keep their profile squareness, and round profiles are
+unchanged. Shallower staircases (2:1 and steeper) still step.
+
+Meanders multiply each field by world-anchored value noise of the material's own
+`wiggle_period`, in two octaves. Noise never reaches a zero field, so a material
+cannot appear where its vertices do not reach. The pair's meander is the
+difference of its two fields' noise, at most `wiggle_q8` along a straight
+contour and bounded so a vertex always wins its own sample. Weights ramp over the
+two materials' mean feather from a first-order distance to the competing field,
+and seams and surf read that distance to the nearest field of any neighbourhood
+material, including vertices beyond the cell edge.
+
+Seams and surf follow the teeth, which shift the pair's distance, and measure
+across the contour with the smooth slope.
+
+In version 1–3 catalogs, a vertex is smooth when every contact with its eight
+neighbours resolves to a smooth profile. A cell interpolates its four corner
+shares bilinearly (with a smoothstep) and blends smooth coverage with the patch
+or contextual coverage by that share.
+Version-4 cells with more than one material read the one-vertex halo; earlier
+catalogs keep halo-free recipes outside two-material contextual cells.
 
 Textures are kept separate from boundary masks. Runtime preparation blends each
 material's variant borders toward one periodic master while keeping interior
@@ -154,24 +328,141 @@ texture detail. The four-pixel border blend operates on premultiplied RGBA, so b
 color and opacity agree across variants without introducing dark transparent fringes.
 The compositor does not bake a texture-by-mask-by-material-pair product.
 
+### Whole-stone edges
+
+Laid stone paths end on whole stones: where trail, brick path, mossy setts,
+sandstone tiles or the ashlar, causeway, scoria, lozenge and pinwheel paths meet
+other ground, each stone is kept or dropped as a unit, so the edge runs along
+the joints instead of cutting a stone. Boardwalk keeps the cut border, as sawn
+planks would. A material opts in with `"stones"`, the data path of its stone
+map (see [Stone maps](terrain-production.md#stone-maps)).
+
+A stone follows the smooth border at its centre: it is dropped only when land
+covers more of its centre than the stone material does. The decision is made
+once per stone, not per pixel, from the cell holding its centre, so every cell
+the stone reaches agrees. `Compositor::describe` records, for a cell and its
+eight neighbours, one bit per stone centred in each (`Recipe::StoneLayer::kept`),
+because a stone reaches at most one cell beyond the one holding its centre.
+Cached pages that compare recipes rebuild when any decision changes.
+
+Each stone path whose stones can reach a cell is one of its stone layers, up to
+three (`Recipe::stoneLayers`): paths among the cell's own corners first, then
+the dominant one. Layers apply from the last to the first, so where two paths
+meet the dominant path's kept stones lie over the other's and the subordinate
+is cut along their outline. Other stone paths never drop a stone, so two paths
+leave no gap between them.
+
+Some border classes cut stones instead (`"cuts_stones": true`; the shipped
+`cut`, `flow` and `pool` classes): water, lava, holes and chasms never drop a
+stone and are never revealed. Against them the path keeps its stones and the
+smooth edge cuts them, as a quay or a drop would, and samples a cutting material
+covers keep the smooth border (`Recipe::stoneCutCorners`).
+
+A dropped stone reveals the nearest land: the most common land among the cell's
+corners, else its 4×4 window, else its 6×6 one. Paths are discovered from that
+6×6 window (vertices −2…3), because a stone centred in a neighbouring cell
+reaches this one from that cell's window; `Compositor::prepareVisible` prepares
+every material of the same window near a stone path, so no layer or ground
+draws from an unprepared texture. A cell whose palette cannot hold its corners
+and a layer's stone material and ground leaves that layer out; the continuity
+test counts any stone this leaves inconsistent.
+
+Sampling a pixel then costs one stone-map lookup and a bit test. A kept stone's
+face fades into the ground it borders over one logical pixel, half on either
+side of the joint. The seam distance measures from the stone edge, so the path's seam
+cast draws a contact shadow along the stones. Kept stones may overhang into a
+cell whose corners all show other ground, so such cells are not uniform
+(`Recipe::uniform`) and draw a mask; their palette lists the stone material and
+the revealed ground after the corners (`Recipe::palette`). Every pipeline,
+software and GPU pages at any oversampling and direct terrain, reads the same
+masks. Overview recipes leave stones out.
+
+Stone maps are decoded on first use (four bytes per texel, 4 MiB for an 8×8
+block at HD resolution) and kept; a map without stone paths decodes none.
+
 ### Seams
 
 Textures are never cross-faded across a boundary; a wide fade averages unrelated
 textures into a smear. Instead the compositor tones a narrow contact band, as the
 original tiles did with a dark lip on sand under grass and a wet line along the
-shore. The resolver reports, per sample, the nearest other material and an
-estimate of the distance to it (the score gap grows by 12288 per Q8 pixel along a
-straight edge). Each material's optional `seam` object sets `height` (0–255, a
+shore. The resolver reports, per sample, the nearest other material and the
+distance to it: the Euclidean distance to the contour curve for contextual borders
+(also in their one-pixel cell-edge band), otherwise an estimate from the patch
+score gap, which grows by 12288 per Q8 pixel along a straight edge. Each material's optional `seam` object sets `height` (0–255, a
 stacking rank), `cast_q8` (0–256) and `cast_width_q8` (0–2048 Q8 pixels): a
 material darkens lower-ranked neighbors by up to `cast_q8`/256 at the contact,
 fading to nothing at that width. Equal ranks cast nothing, so sand beside sand
 of another variant is untouched. `fringe` (RGB), `fringe_q8` and
 `fringe_width_q8` tint any neighbor toward that color, which ice uses for a
 faint frost rim on grass. The shipped ranks place water highest so sand and
-grass take a wet band at the waterline, then ice, trail and grass, with sand
+grass take a dark contact line at the waterline, then ice, trail and grass, with sand
 lowest. Keep casts short
 (two to three pixels) and under about a third strength; the goal is a sense of
 thickness, not an outline.
+
+### Surf
+
+A liquid material's optional `surf` object animates its shoreline wherever it
+meets a material without surf; liquids beside each other (water and deep water)
+take none. On the liquid side, `shallow` (RGB) tints the water by up to
+`shallow_q8`/256 at the edge, fading over `shallow_width_q8`. On the land side,
+`wet_q8` darkens a wet band `wet_width_q8` wide. Every `period` animation ticks a
+wash climbs up to `reach_q8` onto the land, covering it with a thin sheet of the
+shallow color, and drains back; `foam` (RGB) at `foam_q8` marks its leading edge
+over `foam_width_q8` on either side. Washes rush up over the first 30% of the
+period and drain over the rest, staggered along the coast by a smooth world-space
+field whose 256- and 512-pixel wavelengths divide every map size, so the pattern
+wraps cleanly; another field breaks the foam line into patches.
+
+The land side sets how far the wash breaks on it: a material's optional
+`shore_wash_q8` (0–256, default 256) scales the wash's reach, and so how far it
+swings with each wave, wherever a liquid's surf meets it. The bands (shallows,
+wet band, sheet and foam) keep their full strength, so the shoreline stays as
+visible as a beach's. Laid paths (the `built` border class: trail, brick and
+stone paths and boardwalk) take 77, about 30%, so water laps against a quay or
+a road instead of washing over it. The page shader receives each palette slot's value
+in `surfLand`; direct terrain stores its damping (256 minus the wash) in the
+otherwise unused fourth field of the foam record, so hand-built records keep the
+full wash.
+
+Seams and surf measure the distance to the shaped contour: the smooth field's
+distance plus the contact's teeth and the sample's own clasts, divided by the
+slope of that whole shaped distance. Teeth and clasts change within a few
+pixels along an edge, so without their slope a band would stand wide in front
+of each crest and vanish along its flanks. A sample counts only its own
+material's clasts: a neighbour's grain that stops short of the surface would
+otherwise ring the water with surf. Against surf a sample leaves out its own
+clasts too: the wash front runs at a fixed distance inside the contour, and
+inside each rounded grain that line is a crescent of foam. Surf therefore
+follows the coast without its chips, and washes over the chips themselves.
+
+In desktop Legacy GL every visible mixed cell takes a coverage mask at the display
+density (8 to 128 texels a side), built by background workers nearest the view
+centre first. Until a cell's mask lands it draws its mask from the previous
+density, if a zoom just changed it, or else its base mask: a low-density mask
+of every mixed cell on the map (8 texels a side, 4 or 2 on large maps), laid
+out like the map and built by the workers whenever visible cells leave them
+idle, nearest the first view first. A cell whose base mask is not built yet,
+just after a map loads or an edit, or on a map too large for one, splits
+straight between its corners: each border crosses the cell's edges at their
+midpoints, a lone corner is cut off along the diagonal and diagonal corners keep
+their quadrants, without seams or surf. The previous atlas is
+released once the new density covers the view; its textures are reused by the
+next zoom.
+
+Surf reads the same per-sample distance as seams, which is exact only within
+eight logical pixels of the edge, so each band and `reach_q8` plus
+`foam_width_q8` must end within 2048. Water/sand edges use the `beach` coast
+profile, a low-roughness contour, so the waterline is a gentle curve the wash can
+follow instead of a row of teeth. A material with surf counts as
+animated: its pages re-blend whenever the wash advances, also without texture
+animation. The optional `ticks` (default 1, at most `period`) advances the wash
+only once per that many animation ticks, so a material with still artwork can
+re-blend its pages about ten times a second (`ticks` 6) instead of every frame.
+The shipped waters all animate and re-blend every frame for their texture
+crossfade, so they keep `ticks` 1 for the smoothest wash. Surf is presentation only and never touches the
+simulation. `TerrainVisual::applySurf` is the integer reference that the
+`terrain-compose` shader mirrors exactly.
 
 ## Caches and compatibility
 
@@ -202,9 +493,19 @@ These are maximum memory allowances, not up-front allocations.
 Generated/edited pages keep alpha-weighted mip filtering but upload uncompressed
 textures. Driver-side DXT encoding is reserved for artwork with prepared mip
 chains; repeating that encoding on animated terrain updates stalls rendering.
-Crossfades update material revisions on each visual tick, so pages containing
-animated materials recompose at that cadence. Repeating the same animation time
-reuses their pixels. Pages also keep the coverage of mixed cells that touch an animated material (`Compositor::CellMask`, 10 bytes per
+Crossfades update material revisions on each visual tick. CPU-composed animation
+pages recompose at that cadence; `animation_blend_steps` lowers it
+to that many recompositions per phase (see
+[terrain materials](terrain-materials.md)). Repeating the same animation time
+reuses their pixels. Interactive HD terrain on Legacy OpenGL draws animated
+cells, including mixed shorelines, through the atlas shader. A separate source
+atlas holds visible current/next HD phases within 16 MiB and blends every frame.
+Static page draws omit those complete cells, so alpha and fog apply once.
+Shore calming fades wave contrast over two tiles from the shoreline.
+Device composition keeps up to 1024 material source
+textures and never evicts one the current frame already drew, so a view with
+several four-layout materials (256 variants each) does not re-upload its own
+sources within one frame. Pages also keep the coverage of mixed cells that touch an animated material (`Compositor::CellMask`, 10 bytes per
 composed pixel), so a phase change re-blends their textures instead of
 re-sampling the boundary; coverage depends only on the cell, never on the phase.
 These masks have their own budget (16 MiB software, 32 MiB GPU, or 128 MiB for

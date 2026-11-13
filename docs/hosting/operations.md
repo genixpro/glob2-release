@@ -69,7 +69,7 @@ with the real binary, applied by the worker and stored as a blob. It then remove
 the project and its volumes. `--no-build --tag <tag>` reuses built images; `--keep`
 leaves the stack running. Hosted verification selects this coverage when
 requested for affected deployment boundaries or full runs; routine PR checks
-remain lightweight. See [verification policy](../../AGENTS.md#validation-and-ci-feedback).
+remain lightweight. See [verification policy](../../AGENTS.md#validation-and-ci).
 `--match-e2e` also plays a rated quick match through the stack; see
 [End-to-end test of the stack](operations.md#end-to-end-test-of-the-stack).
 
@@ -137,9 +137,9 @@ smoke checks, and under `match-e2e/` the clients' logs, results and checksum
 traces, plus the end-to-end `results.json`. The exit status is 0 only if every
 check passed. Add `--keep` to leave the stack running for inspection.
 
-The web app's browser suites (`platform/apps/web/e2e`: page smoke tests and axe
+The web app's browser suites (`services/online/apps/web/e2e`: page smoke tests and axe
 accessibility checks on desktop and phone) run separately, against a seeded API:
-`npm run build -w @glob2/web && npm run e2e -w @glob2/web` in `platform/`, with the
+`npm run build -w @glob2/web && npm run e2e -w @glob2/web` in `services/online/`, with the
 test Postgres running.
 
 [Hosting index](README.md) · [Documentation index](../README.md).

@@ -30,20 +30,28 @@ decision threshold: fitting it to 1.0 and calling at 97% gives the same error
 and the same saving as leaving it flat and calling at 95%. One dial is enough,
 and the threshold is the one a player can read.
 
-Features come only from TeamStat -- the per-team state the simulation itself
-maintains. The richer GameplayMeasurements and the per-AI telemetry are
-deliberately excluded: both are documented as diagnostic only and must never
-feed the simulation, and a winning condition built on this model does exactly
-that. Anything fitted here has to be computable in-engine.
+Features come from TeamStat and from the published gameplay measurements, both
+computed by the simulation at fixed sample deadlines, so the engine can evaluate
+exactly what was fitted. The measurement values the model reads are covered by
+the routine statistics checksum because a winning condition acts on them. Windowed
+measurements are per-team changes over WINDOW_SAMPLES samples, taken before allies
+are summed. At a decision tick T the engine has not yet published the gameplay
+sample for T, so the model reads the one for T - 512, and the fitter joins that
+same sample to the decision. Per-AI telemetry stays excluded. Anything fitted here has to be
+computable in-engine.
 
-Commands:
-  dataset  extract the per-sample dataset from tournament results and cache it
-  screen   report what each candidate state measurement predicts on its own
-  fit      select features, fit the coefficients and emit the C++ header
-  savings  what the winning condition would have saved on games already played
+Collect calibration/refit games with --win-probability 0 (or the tournament
+setting win_probability_permille=0). Probability-called winners and final-
+probability adjudication are predictions, not independent outcome labels.
+
+Programmatic entry points:
+  build_dataset  extract the per-sample dataset from tournament results
+  screen/select compare candidate measurements and select fitted terms
+  emit_header   emit the fitted model as the C++ header
+  savings       estimate early-victory savings on independently labelled games
 """
-import argparse
 import gzip
+import hashlib
 import json
 import math
 import sys
@@ -58,7 +66,7 @@ from tools.tournaments.analysis import adjudicate
 from tools.tournaments.game_telemetry import parse
 from tools.tournaments.results import Results
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 # The cadence TeamStats samples at (END_OF_GAME_STAT_INTERVAL_MASK in
 # src/team/stats/TeamStat.h). The model is only ever evaluated on these boundaries, in the
 # fit and in the engine alike.
@@ -84,6 +92,17 @@ TIMELINE_FIELDS = {
     'need_food': ('econ', 'needFood'), 'swarms': ('econ', 'swarm'), 'inns': ('econ', 'inn'),
     'schools': ('econ', 'school'), 'barracks': ('econ', 'barracks'), 'towers': ('econ', 'tower'),
 }
+# Gameplay measurements the engine reads (WinProbability::teamInputs), from the
+# GLOB2_MEASURE record of the periodic sample published before the decision:
+# PUBLICATION_LAG_SAMPLES behind it. Windowed values are the change over
+# WINDOW_SAMPLES samples (WinProbability::ACTIVITY_WINDOW_SAMPLES). The layout
+# constants below mirror the C++ enums; a test checks them against the headers.
+WINDOW_SAMPLES = 4
+PUBLICATION_LAG_SAMPLES = 1
+GAMEPLAY_MEASUREMENTS = ('feeding', 'barracks_levels', 'delivered_window',
+                         'inn_walk_distance_window', 'swarm_filling_window')
+ATTACK_BUILDING, BUILDING_LEVELS, MATERIAL_SLOTS, SWARM_JOB, LABOUR_PHASES = 5, 6, 15, 0, 4
+
 # Fields the engine prints as "stored/capacity"; split into two measurements.
 PAIR_FIELDS = {'food': ('food_stored', 'food_capacity'), 'fooded': ('fed', 'feedable')}
 
@@ -95,19 +114,22 @@ RATIOS = {
 }
 
 MEASUREMENTS = tuple(TIMELINE_FIELDS) + tuple(
-    name for pair in PAIR_FIELDS.values() for name in pair) + tuple(RATIOS)
+    name for pair in PAIR_FIELDS.values() for name in pair) + tuple(RATIOS) + GAMEPLAY_MEASUREMENTS
 
-# Measurements that say the same thing in different words. Greedy selection will
-# otherwise take three readings of the same army and leave a model whose
-# coefficients cannot be read. One term per family, as the fairness model does.
+# Measurements that say the same thing in different words. Greedy selection takes
+# one term per family so it cannot fill a model with readings of the same army;
+# the stepwise refinement that follows may add a second term from a family when
+# cross-validated fit says it carries separate information, and the published
+# model has two economy and two food terms.
 FAMILIES = {
     'army': ('hp', 'attack', 'defense', 'warriors', 'warrior_ratio'),
-    'economy': ('units', 'workers', 'buildings', 'swarms'),
+    'economy': ('units', 'workers', 'buildings', 'swarms', 'delivered_window', 'swarm_filling_window'),
     'food': ('food_stored', 'food_capacity', 'fed', 'feedable', 'fed_ratio', 'food_fill',
-             'food_critical', 'need_food', 'inns', 'starving_ratio'),
+             'food_critical', 'need_food', 'inns', 'starving_ratio', 'feeding',
+             'inn_walk_distance_window'),
     'prestige': ('prestige',),
     'schooling': ('schools',),
-    'fortification': ('barracks', 'towers'),
+    'fortification': ('barracks', 'towers', 'barracks_levels'),
     'exploration': ('explorers',),
 }
 FAMILY_OF = {name: label for label, names in FAMILIES.items() for name in names}
@@ -126,40 +148,44 @@ FAMILY_OF = {name: label for label, names in FAMILIES.items() for name in names}
 RATIO_TRANSFORMS = ('identity',)
 COUNT_TRANSFORMS = ('identity', 'sqrt', 'share')
 
-# The selected, hand-checked model. Order is the order terms were added, which is
-# also decreasing order of what each one contributed.
+# The selected, hand-checked model: greedy forward selection followed by
+# stepwise add/drop/swap refinement on cross-validated fit. Ordered by how much a
+# typical within-contest gap on the term moves the odds, largest first.
 FINAL_FEATURES = [
-    ('units', 'share'),
-    ('prestige', 'identity'),
-    ('barracks', 'sqrt'),
+    ('barracks_levels', 'identity'),
     ('explorers', 'sqrt'),
-    ('starving_ratio', 'identity'),
     ('attack', 'share'),
+    ('feeding', 'sqrt'),
+    ('delivered_window', 'share'),
+    ('swarm_filling_window', 'sqrt'),
+    ('inn_walk_distance_window', 'share'),
 ]
 
 # What each term reads, for the in-game breakdown. Phrases a player can read.
 LABELS = {
-    'units': 'Share of everyone alive',
-    'prestige': 'Prestige',
-    'barracks': 'Barracks',
+    'barracks_levels': 'Barracks, counted by level',
     'explorers': 'Explorers',
-    'starving_ratio': 'Share of your people starving',
     'attack': 'Share of all attack strength',
+    'feeding': 'Units eating at inns',
+    'delivered_window': 'Share of recent deliveries',
+    'swarm_filling_window': 'Recent work feeding swarms',
+    'inn_walk_distance_window': 'Share of recent walking to inns',
 }
 
 # How the engine reads each measurement off a competitor, as a C++ expression on
-# a WinProbabilitySlot. Every one is a non-negative integer.
+# a WinProbability::Slot. Every one is a non-negative integer.
 CPP_MEASUREMENT = {
-    'units': 'slot.units',
-    'prestige': 'slot.prestige',
-    'barracks': 'slot.barracks',
+    'feeding': 'slot.feeding',
     'explorers': 'slot.explorers',
-    'food_critical': 'slot.foodCritical',
+    'barracks_levels': 'slot.barracksLevels',
+    'delivered_window': 'slot.delivered',
+    'inn_walk_distance_window': 'slot.innWalkDistance',
+    'swarm_filling_window': 'slot.swarmFilling',
     'attack': 'slot.attack',
 }
 # Ratios are a division of two of those, done as an integer division in the
-# engine and as the same division here.
-CPP_RATIO = {'starving_ratio': ('slot.foodCritical', 'slot.units')}
+# engine and as the same division here. The published model uses none.
+CPP_RATIO = {}
 
 
 def transform_candidates(name):
@@ -169,16 +195,41 @@ def transform_candidates(name):
 # ---------------------------------------------------------------------------
 # Dataset
 # ---------------------------------------------------------------------------
+def gameplay_fields(line):
+    """The raw GLOB2_MEASURE counters the engine's model inputs are built from.
+
+    A measurement record carries well over a thousand fields; only these are
+    kept, and the rest are never converted.
+    """
+    wanted = {'feeding', 'eatWalkDistance'}
+    wanted.update(f'buildings_{ATTACK_BUILDING}_{level}' for level in range(BUILDING_LEVELS))
+    wanted.update(f'delivered_{material}' for material in range(MATERIAL_SLOTS))
+    wanted.update(f'filling_{SWARM_JOB}_{phase}' for phase in range(LABOUR_PHASES))
+    wanted.update(('team', 'tick', 'final'))
+    fields = {}
+    for token in line.split()[1:]:
+        key, _, value = token.partition('=')
+        if key in wanted:
+            fields[key] = int(value)
+    return fields
+
+
 def timeline(source, record):
     """Per-team state by tick, from one game's verified log.
 
-    Only the two TeamStat-derived record types are read. The prefix test comes
-    before the parser because a game's log is tens of megabytes of mostly
-    performance and per-AI samples, and this has to run over a thousand games.
+    TeamStat state comes from GLOB2_TL/GLOB2_ECON and gameplay measurements from
+    the periodic (non-final) GLOB2_MEASURE records. The prefix test comes before
+    the parser because a game's log is tens of megabytes of mostly performance
+    and per-AI samples, and this has to run over a thousand games.
     """
     samples = defaultdict(dict)
     with source.open_artifact(record, 'stdout.log') as stream:
         for line in stream:
+            if line.startswith('GLOB2_MEASURE '):
+                fields = gameplay_fields(line)
+                if fields.get('final') == 0 and 'tick' in fields and 'team' in fields:
+                    samples[(fields['tick'], fields['team'])]['gameplay'] = fields
+                continue
             if not (line.startswith('GLOB2_TL ') or line.startswith('GLOB2_ECON ')):
                 continue
             parsed = parse(line)
@@ -192,8 +243,35 @@ def timeline(source, record):
     return samples
 
 
-def measurements_of(pair):
-    """One entry's measurements, or None if either record type is missing."""
+def gameplay_inputs(now, then):
+    """The engine's WinProbability::teamInputs, from one team's raw records.
+
+    `then` is the same team's record WINDOW_SAMPLES samples earlier, or None
+    when it was not retained, in which case the window runs from coverage start.
+    """
+    then = then or {}
+
+    def window(key):
+        return float(max(now.get(key, 0) - then.get(key, 0), 0))
+
+    return {
+        'feeding': float(now.get('feeding', 0)),
+        'barracks_levels': float(sum(now.get(f'buildings_{ATTACK_BUILDING}_{level}', 0) * (level + 1)
+                                     for level in range(BUILDING_LEVELS))),
+        'delivered_window': sum(window(f'delivered_{material}') for material in range(MATERIAL_SLOTS)),
+        'inn_walk_distance_window': window('eatWalkDistance'),
+        'swarm_filling_window': sum(window(f'filling_{SWARM_JOB}_{phase}') for phase in range(LABOUR_PHASES)),
+    }
+
+
+def measurements_of(pair, published=None, earlier=None):
+    """One entry's measurements, or None if a TeamStat record type is missing.
+
+    `published` is the team's sample PUBLICATION_LAG_SAMPLES before this one --
+    the gameplay record the engine can read at this decision -- and `earlier` the
+    one WINDOW_SAMPLES before that. Either may be None; with no published sample
+    the gameplay inputs are zero, as in the engine.
+    """
     if 'tl' not in pair or 'econ' not in pair:
         return None
     values = {}
@@ -213,7 +291,27 @@ def measurements_of(pair):
             return None
     for name, (top, bottom) in RATIOS.items():
         values[name] = values[top] / values[bottom] if values[bottom] > 0 else 0.0
+    values.update(gameplay_inputs((published or {}).get('gameplay', {}), (earlier or {}).get('gameplay')))
     return values
+
+
+CALIBRATION_POLICIES = ('prestige', 'survivor_draw', 'military')
+
+
+def _validate_calibration_labels(policy, game=None):
+    if policy not in CALIBRATION_POLICIES:
+        raise ValueError('probability-model calibration requires independent outcome labels; '
+                         'use prestige, survivor_draw or military, not win_probability')
+    if game is not None and game.get('termination') == 'win_probability':
+        raise ValueError('probability-called games cannot label probability-model calibration; '
+                         'collect games with --win-probability 0 (win_probability_permille=0)')
+
+
+def _validate_calibration_dataset(data):
+    policy = data.get('policy', 'prestige')
+    _validate_calibration_labels(policy)
+    for game in data.get('games', []):
+        _validate_calibration_labels(policy, game)
 
 
 def game_slices(source, record, policy='prestige'):
@@ -221,11 +319,12 @@ def game_slices(source, record, policy='prestige'):
 
     The label is the game's finishing order, not anything about the sample: that
     is the whole point, since what we want to predict at tick T is the result
-    that only arrives later. Tick-capped games are labelled by the same economic
-    adjudication the ratings use, so the games that most need calling early are
-    not the ones missing from the fit.
+    that only arrives later. Tick-capped games default to the historical economic
+    adjudication, keeping their labels independent of the model being fitted.
+    Probability-ended games and probability-based labels are rejected.
     """
     result = record.get('result') or {}
+    _validate_calibration_labels(policy, result)
     if result.get('job_type') != 'game' or not result.get('teams'):
         return []
     labels = record['job'].get('labels', {})
@@ -247,7 +346,10 @@ def game_slices(source, record, policy='prestige'):
         gone = eliminated.get(team, -1)
         if gone is not None and gone >= 0 and tick > gone:
             continue  # left the game before this sample; not a competitor here
-        values = measurements_of(pair)
+        lag = PUBLICATION_LAG_SAMPLES * SAMPLE_INTERVAL
+        published = samples.get((tick - lag, team))
+        earlier = samples.get((tick - lag - WINDOW_SAMPLES * SAMPLE_INTERVAL, team))
+        values = measurements_of(pair, published, earlier)
         if values is not None:
             by_tick[tick][team] = values
     slices = []
@@ -274,6 +376,8 @@ def game_slices(source, record, policy='prestige'):
 
 
 def build_dataset(roots, output, policy='prestige', limit=None):
+    """Extract independent labels; reject model-called outcomes, including old logs."""
+    _validate_calibration_labels(policy)
     games, skipped = [], defaultdict(int)
     for root in roots:
         source = Results(root)
@@ -283,6 +387,9 @@ def build_dataset(roots, output, policy='prestige', limit=None):
             if not record.get('accepted') or (record.get('result') or {}).get('job_type') != 'game':
                 skipped['not an accepted game'] += 1
                 continue
+            # Reject before the unreadable-log handler: this is an unsuitable
+            # experiment design, not missing diagnostic data to skip silently.
+            _validate_calibration_labels(policy, record['result'])
             if not any(a['path'] == 'stdout.log' for a in record['artifacts']):
                 skipped['no log'] += 1
                 continue
@@ -310,11 +417,14 @@ def build_dataset(roots, output, policy='prestige', limit=None):
 
 def load_cache(path):
     with gzip.open(path, 'rt') as stream:
-        return json.load(stream)
+        data = json.load(stream)
+    _validate_calibration_dataset(data)
+    return data
 
 
 def contests(cache, stride=1, formats=None, minimum_tick=0):
     """Flatten the cached games into the estimator's contest list."""
+    _validate_calibration_dataset(cache)
     games = []
     for game in cache['games']:
         if formats and game['format'] not in formats:
@@ -325,7 +435,7 @@ def contests(cache, stride=1, formats=None, minimum_tick=0):
             games.append({'job_id': game['job_id'], 'map': game['map'], 'format': game['format'],
                           'tick': piece['tick'], 'tick_cap': game['tick_cap'],
                           'termination': game['termination'], 'entries': piece['entries']})
-    return {'games': games, 'skipped': cache.get('skipped', {})}
+    return {'games': games, 'policy': cache.get('policy', 'prestige'), 'skipped': cache.get('skipped', {})}
 
 
 def by_game(game):
@@ -337,6 +447,7 @@ def by_game(game):
 # ---------------------------------------------------------------------------
 def screen(data, folds=5, ridge=1e-3):
     """What each candidate measurement and transform predicts on its own."""
+    _validate_calibration_dataset(data)
     rows = []
     for name in MEASUREMENTS:
         for transform in transform_candidates(name):
@@ -352,6 +463,7 @@ def screen(data, folds=5, ridge=1e-3):
 
 def select(data, candidates, limit=6, folds=5, ridge=1e-3, tolerance=0.0005):
     """Greedy forward selection on cross-validated fit, one term per family."""
+    _validate_calibration_dataset(data)
     chosen, used, history, current = [], set(), [], 0.0
     while len(chosen) < limit:
         trials = []
@@ -431,6 +543,7 @@ def savings(cache, features, threshold=0.97, dwell=3, folds=4, ridge=1e-3, seed=
     model has met each game's own outcome and would report a precision the engine
     would not reproduce.
     """
+    _validate_calibration_dataset(cache)
     import random as _random
     games = [g for g in cache['games'] if g['slices']]
     ids = sorted({g['job_id'] for g in games})
@@ -491,6 +604,7 @@ def summarise_savings(rows):
 
 def calibration(model, data, buckets=12):
     """Predicted against observed win rate, pooled over every entry of every contest."""
+    _validate_calibration_dataset(data)
     pairs = []
     for row, game in zip(probabilities(model, data), data['games']):
         for probability, entry in zip(row['probability'], game['entries']):
@@ -668,6 +782,10 @@ def emit_header(model, path, provenance):
     add('')
     add('namespace WinProbability')
     add('{')
+    identity = json.dumps({'intercept': to_fixed(model['intercept']),
+                           'features': [(f['name'], f['transform'], to_fixed(f['coefficient'])) for f in features]},
+                          sort_keys=True, separators=(',', ':')).encode()
+    add('inline constexpr char MODEL_ID[] = "conditional-logit-v1-' + hashlib.sha256(identity).hexdigest() + '";')
     add('/// Softmax fixes the scale of F but not its zero, so this level is a')
     add('/// convention and cancels between competitors. Differences are what the')
     add('/// games determined.')

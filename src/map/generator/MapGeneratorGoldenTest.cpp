@@ -1,38 +1,36 @@
 #include <SDL3/SDL_main.h>
+#include "Team.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
-// Golden maps and a colony-count sweep for every registered generator.
+// Map fingerprints and a colony-count sweep for every registered generator.
 //
-//   MapGeneratorGoldenTest <profile-dir>                check this platform's rows of the table
-//   MapGeneratorGoldenTest <profile-dir> --require-rows the same, failing when this platform
-//                                                      lacks current rows for any generator (CI)
-//   MapGeneratorGoldenTest <profile-dir> --update       regenerate this platform's rows
+//   MapGeneratorGoldenTest <profile-dir> --print        print this platform's fingerprint rows
+//                                                      (platform id revision wDec hDec teams seed
+//                                                      status hash) to stdout
+//   MapGeneratorGoldenTest <profile-dir> --print --only=id,...
+//                                                      the same for the named generators only
 //   MapGeneratorGoldenTest <profile-dir> --inventory    print all request keys without generation
-//   MapGeneratorGoldenTest <profile-dir> --print        print this platform's rows to stdout
 //   MapGeneratorGoldenTest <profile-dir> --sweep        every playable landscape at the colony
 //                                                      counts and sizes the lobby offers
 //   MapGeneratorGoldenTest <profile-dir> --telemetry    compare telemetry off/on worlds and RNG,
 //                                                      repeat observations, and print timings
+//   MapGeneratorGoldenTest <profile-dir> --performance  time every generator at its defaults
 //   MapGeneratorGoldenTest <profile-dir> --sweep K/N    only every Nth landscape from the Kth,
 //                                                      so N processes can share the sweep
+//   MapGeneratorGoldenTest <profile-dir> --sweep K/N --quick
+//                                                      without the 512 cells, for PRs
 //
-// The table (test/map-generator-golden.txt) records, per platform, the fingerprint of the map
-// each generator produces for a few seeds, sizes and colony counts, keyed by the generator's
-// revision. A generator whose output changes without its revision moving fails the check; a
-// revision bump makes --update accept the new maps. Generation is deterministic per platform,
-// not across platforms, so rows carry the platform they were made on. A platform without rows
-// is reported and passes by default, so a new machine can run the check before its rows exist;
-// CI passes --require-rows so that the platforms it runs on cannot pass vacuously.
+// --print rolls each generator for a few seeds, sizes and colony counts. Nothing is compared
+// against a committed table: tools/sim_fingerprint.py runs --print on the merge base and the
+// pull request, and tools/sim_diff.py reports every row that moved. Generation is deterministic
+// per platform, not across platforms, so rows carry the platform they were made on.
 #include "Game.h"
-#include "MapGeneratorGoldenCoverage.h"
-#include <stdexcept>
 #include <cstdlib>
 #include <cstdint>
-#include <exception>
 #include "GenerationContext.h"
 #include "GenerationService.h"
 #include "GeneratorRegistry.h"
 #include "GlobalContainer.h"
-#include "MapGeneratorFrameworkChecks.h"
+#include "MapFingerprint.h"
 #include "Utilities.h"
 #include <BinaryStream.h>
 #include <SDL3/SDL.h>
@@ -43,9 +41,7 @@
 #include <PerformanceTelemetry.h>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 #include <iostream>
-#include <map>
 #include <set>
 #include <sstream>
 #include <string>
@@ -55,8 +51,6 @@ GlobalContainer *globalContainer = nullptr;
 
 namespace
 {
-const char *const kTablePath = "test/map-generator-golden.txt";
-
 std::string platformTag()
 {
 #if defined(_WIN32)
@@ -93,38 +87,6 @@ struct Row
 			   std::to_string(hDec) + " " + std::to_string(teams) + " " + std::to_string(seed);
 	}
 };
-
-std::vector<Row> readTable(const std::string &path)
-{
-	std::vector<Row> rows;
-	std::ifstream in(path);
-	std::string line;
-	while (std::getline(in, line))
-	{
-		if (line.empty() || line[0] == '#')
-			continue;
-		std::istringstream fields(line);
-		Row row;
-		if (fields >> row.platform >> row.id >> row.revision >> row.wDec >> row.hDec >> row.teams >>
-			row.seed >> row.status >> row.hash)
-			rows.push_back(row);
-		else
-			throw std::runtime_error("Malformed golden row: " + line);
-	}
-	return rows;
-}
-
-void writeTable(const std::string &path, const std::vector<Row> &rows)
-{
-	std::ofstream out(path);
-	out << "# Golden map fingerprints per generator: platform id revision wDec hDec teams seed"
-		   " status hash\n"
-		   "# Regenerate this platform's rows with MapGeneratorGoldenTest <profile> --update"
-		   " after a revision bump.\n";
-	for (const auto &r : rows)
-		out << r.platform << ' ' << r.id << ' ' << r.revision << ' ' << r.wDec << ' ' << r.hDec
-			<< ' ' << r.teams << ' ' << r.seed << ' ' << r.status << ' ' << r.hash << '\n';
-}
 
 // One roll, as the lobby and editor would ask for it.
 Row requestRow(int id, int wDec, int hDec, int teams, std::uint32_t seed)
@@ -197,141 +159,35 @@ std::vector<Row> goldenRows(const std::set<int> &selected = {})
 	return rows;
 }
 
-int check(const std::string &path, bool requireRows)
+int print(const std::set<int> &selected = {})
 {
-	const auto table = readTable(path);
-	const auto platform = platformTag();
-	std::map<std::string, Row> expected;
-	for (const auto &r : table)
-	{
-		if (r.platform == platform)
-			expected[r.key()] = r;
-	}
-	int failures = 0;
-	for (int id : GeneratorRegistry::builtins().methods(true))
-	{
-		const auto &definition = GeneratorRegistry::builtins().at(id);
-		const auto coverage = mapGoldenCoverage(table, platform, id, definition.revision);
-		if (coverage == MapGoldenCoverage::Missing)
-		{
-			std::printf("MISSING %s generator %s (%d): no local golden rows; run --update%s\n",
-				platform.c_str(), definition.id, id, requireRows ? " (--require-rows)" : "");
-			if (requireRows) ++failures;
-		}
-		else if (coverage == MapGoldenCoverage::Stale)
-		{
-			std::printf("STALE %s generator %s (%d): local rows are not all revision %u; run --update\n",
-				platform.c_str(), definition.id, id, definition.revision);
-			++failures;
-		}
-	}
-	if (expected.empty())
-	{
-		std::printf("No golden rows for %s; nothing to compare. Run --update on this platform"
-					" and commit its rows%s.\n",
-					platform.c_str(),
-					requireRows ? " (--require-rows: this counts as a failure)" : "");
-		return failures || requireRows ? 1 : 0;
-	}
-	int compared = 0;
-	for (const auto &[key, row] : expected)
-	{
-		if (row.revision != GeneratorRegistry::builtins().at(row.id).revision)
-			continue; // already reported as stale
-		const Row now = roll(row.id, row.wDec, row.hDec, row.teams, row.seed);
-		++compared;
-		if (now.status != row.status || now.hash != row.hash)
-		{
-			std::printf("CHANGED %s (%d) %dx%d %d colonies seed %u: was %s %llu, now %s %llu at"
-						" the same revision %u\n",
-						GeneratorRegistry::builtins().at(row.id).id, row.id, 1 << row.wDec,
-						1 << row.hDec, row.teams, row.seed, row.status.c_str(),
-						(unsigned long long)row.hash, now.status.c_str(),
-						(unsigned long long)now.hash, row.revision);
-			++failures;
-		}
-	}
-	std::printf("%s: %d golden rows compared, %d failures\n", platform.c_str(), compared, failures);
-	return failures ? 1 : 0;
-}
-
-int update(const std::string &path, bool toStdout, bool force, const std::set<int> &selected = {})
-{
-	std::vector<Row> table;
-	try
-	{
-		table = readTable(path);
-	}
-	catch (const std::exception &error)
-	{
-		std::fprintf(stderr, "%s\n", error.what());
-		return 1;
-	}
-	const auto platform = platformTag();
-	std::map<std::string, Row> previous;
-	for (const auto &r : table)
-		if (r.platform == platform)
-			previous[r.key()] = r;
-	const auto fresh = goldenRows(selected);
-	int silent = 0;
-	for (const auto &row : fresh)
-	{
-		auto it = previous.find(row.key());
-		if (it == previous.end() || it->second.revision != row.revision)
-			continue;
-		if (it->second.status != row.status || it->second.hash != row.hash)
-		{
-			std::printf("%s (%d) %dx%d %d colonies seed %u changed at unchanged revision %u\n",
-						GeneratorRegistry::builtins().at(row.id).id, row.id, 1 << row.wDec,
-						1 << row.hDec, row.teams, row.seed, row.revision);
-			++silent;
-		}
-	}
-	if (silent && !force)
-	{
-		std::printf("%d rows changed without a revision bump. Bump the generator's revision, or"
-					" pass --force if the change is intended to stay unversioned.\n",
-					silent);
-		return 1;
-	}
-	std::vector<Row> merged;
-	for (const auto &r : table)
-		if (r.platform != platform || (!selected.empty() && !selected.count(r.id)))
-			merged.push_back(r);
-	merged.insert(merged.end(), fresh.begin(), fresh.end());
-	std::stable_sort(merged.begin(), merged.end(),
-					 [](const Row &a, const Row &b)
-					 {
-						 if (a.platform != b.platform)
-							 return a.platform < b.platform;
-						 if (a.id != b.id)
-							 return a.id < b.id;
-						 return a.key() < b.key();
-					 });
-	if (toStdout)
-	{
-		for (const auto &r : fresh)
-			std::cout << r.platform << ' ' << r.id << ' ' << r.revision << ' ' << r.wDec << ' '
-					  << r.hDec << ' ' << r.teams << ' ' << r.seed << ' ' << r.status << ' '
-					  << r.hash << '\n';
-		return 0;
-	}
-	writeTable(path, merged);
-	std::printf("Wrote %zu rows for %s to %s\n", fresh.size(), platform.c_str(), path.c_str());
+	for (const auto &r : goldenRows(selected))
+		std::cout << r.platform << ' ' << r.id << ' ' << r.revision << ' ' << r.wDec << ' '
+				  << r.hDec << ' ' << r.teams << ' ' << r.seed << ' ' << r.status << ' ' << r.hash
+				  << '\n';
 	return 0;
 }
 
 // The lobby offers 64 to 512 and 1 to Team::MAX_COUNT colonies and rolls five seeds, keeping the best. At
-// its 256 default every playable landscape must seat every colony count it accepts on at
-// least one of five seeds; the small and large sizes are checked at the counts a player is
-// likely to ask for. The per-cell rates are printed so a landscape that only just scrapes by
-// is visible before it starts failing.
-int sweep(int shard, int shards)
+// its 256 default every playable landscape must seat every colony count it accepts; the small
+// and large sizes are checked at the counts a player is likely to ask for. A cell fails below
+// its success floor: three of the five seeds at 128 and 256, one of the three at 512. The
+// floors come from the full sweep on master (linux-x86_64): no 128 or 256 cell generated fewer
+// than four of its five seeds (lava-shield 128/2, orchard-commons 256/6, central-quarry and
+// concrete-islands 256/12) and no 512 cell fewer than two of three (concrete-islands 512/12,
+// gauntlet 512/15, even-ground 512/15 and 512/16). Three of five leaves one seed of margin below the worst; at 512 the old
+// one-of-three floor stays, since three seeds leave no room for a margin. The per-cell rates
+// are printed so a landscape that only just scrapes by is visible before it starts failing.
+// The quick sweep that pull requests run keeps every 128 and 256 cell with all its seeds, so
+// it fails only where the full sweep would, and leaves the costly 512 cells to the scheduled
+// run.
+int sweep(int shard, int shards, bool quick)
 {
 	struct Cell
 	{
 		int wDec, teams;
 		std::vector<std::uint32_t> seeds;
+		std::size_t floor() const { return seeds.size() >= 5 ? 3 : 1; }
 	};
 	const std::vector<std::uint32_t> five{1, 2, 3, 4, 5}, three{1, 2, 3};
 	const std::vector<Cell> cells = {
@@ -341,6 +197,8 @@ int sweep(int shard, int shards)
 	};
 	int failures = 0;
 	const auto methods = GeneratorRegistry::builtins().methods(false);
+	if (quick)
+		std::printf("quick sweep: no %dx%d cells\n", 1 << 9, 1 << 9);
 	for (std::size_t index = 0; index < methods.size(); ++index)
 	{
 		if (int(index % shards) != shard)
@@ -350,6 +208,8 @@ int sweep(int shard, int shards)
 		std::string line;
 		for (const auto &cell : cells)
 		{
+			if (quick && cell.wDec > 8)
+				continue;
 			int ok = 0;
 			bool invalid = false;
 			for (auto seed : cell.seeds)
@@ -367,11 +227,12 @@ int sweep(int shard, int shards)
 				std::snprintf(cellText, sizeof cellText, " %d/%d:%d/%zu", 1 << cell.wDec,
 							  cell.teams, ok, cell.seeds.size());
 			line += cellText;
-			if (!invalid && ok == 0)
+			if (!invalid && std::size_t(ok) < cell.floor())
 			{
-				std::printf("FAIL %s (%d) at %dx%d with %d colonies: no seed of %zu generated\n",
-							definition.id, id, 1 << cell.wDec, 1 << cell.wDec, cell.teams,
-							cell.seeds.size());
+				std::printf("FAIL %s (%d) at %dx%d with %d colonies: %d of %zu seeds generated,"
+							" below the floor of %zu\n",
+							definition.id, id, 1 << cell.wDec, 1 << cell.wDec, cell.teams, ok,
+							cell.seeds.size(), cell.floor());
 				++failures;
 			}
 		}
@@ -560,8 +421,8 @@ int main(int argc, char **argv)
 	if (argc < 2)
 	{
 		std::fprintf(stderr,
-					 "usage: %s <profile-dir> [--require-rows|--inventory|--update [--force|--only=id,...]|--print [--only=id,...]|--sweep "
-					 "[K/N]|--telemetry]\n",
+					 "usage: %s <profile-dir> --print [--only=id,...]|--inventory|--sweep [K/N [--quick]]|"
+					 "--telemetry|--performance\n",
 					 argv[0]);
 		return 2;
 	}
@@ -572,17 +433,22 @@ int main(int argc, char **argv)
 	globals.settings.rememberUnit = false;
 	globals.load();
 	std::string mode = argc > 2 ? argv[2] : "";
-	const bool force = argc > 3 && std::strcmp(argv[3], "--force") == 0;
 	if (mode == "--sweep")
 	{
 		int shard = 0, shards = 1;
+		const bool quick = argc > 4 && std::strcmp(argv[4], "--quick") == 0;
+		if (argc > 4 && !quick)
+		{
+			std::fprintf(stderr, "--sweep K/N takes only --quick after it, not %s\n", argv[4]);
+			return 2;
+		}
 		if (argc > 3 && (std::sscanf(argv[3], "%d/%d", &shard, &shards) != 2 || shards < 1 ||
 						 shard < 0 || shard >= shards))
 		{
 			std::fprintf(stderr, "--sweep takes K/N with 0 <= K < N, not %s\n", argv[3]);
 			return 2;
 		}
-		return sweep(shard, shards);
+		return sweep(shard, shards, quick);
 	}
 	if (mode == "--inventory")
 	{
@@ -596,7 +462,18 @@ int main(int argc, char **argv)
 	if (mode == "--telemetry")
 		return telemetryCheck();
 	std::set<int> selected;
-	if ((mode == "--update" || mode == "--print") && argc > 3 && std::string(argv[3]).starts_with("--only="))
+	if (mode != "--print")
+	{
+		std::fprintf(stderr, "unknown mode '%s'; pass --print, --inventory, --sweep, --telemetry or"
+					 " --performance\n", mode.c_str());
+		return 2;
+	}
+	if (argc > 3 && !std::string(argv[3]).starts_with("--only="))
+	{
+		std::fprintf(stderr, "--print takes only --only=id,... after it, not %s\n", argv[3]);
+		return 2;
+	}
+	if (argc > 3)
 	{
 		std::istringstream list(std::string(argv[3]).substr(7));
 		std::string id;
@@ -608,9 +485,5 @@ int main(int argc, char **argv)
 		}
 		if (selected.empty()) return 2;
 	}
-	if (mode == "--update")
-		return update(kTablePath, false, force, selected);
-	if (mode == "--print")
-		return update(kTablePath, true, false, selected);
-	return check(kTablePath, mode == "--require-rows");
+	return print(selected);
 }

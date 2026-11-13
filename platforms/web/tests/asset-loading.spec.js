@@ -1,0 +1,71 @@
+const {waitForMainMenu}=require('./main-menu');
+const {test, expect} = require('@playwright/test');
+const {gameURL} = require('./main-menu');
+
+const snapshot = page => page.evaluate(() => glob2Diagnostics.snapshot());
+const exists = (page, path) => page.evaluate(path => FS.analyzePath(path).exists, path);
+
+test('the loading page shows download progress and the game starts with core and game sprites', async ({page}) => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  await page.route('**/assets/core.*.data', async route => {
+    await gate;
+    await route.continue();
+  });
+  const navigation = page.goto(gameURL());
+  await expect(page.locator('#loading-progress')).toBeVisible();
+  await expect(page.locator('#loading-detail')).toContainText(' MB');
+  await expect(page.locator('#loading-bar')).toHaveAttribute('aria-valuemax', '100');
+  await expect(page.locator('#loading-status')).toHaveText('Downloading the game…');
+  release();
+  await navigation;
+  await waitForMainMenu(page);
+  expect((await snapshot(page)).assets.core).toBe('ready');
+  expect((await snapshot(page)).assets.game).toBe('ready');
+  // Simulation data starts with the game; build files never ship.
+  for (const path of ['/data/maxima/base.strategy', '/data/nicowar.txt', '/data/usl/Glob2/Runtime/Game.usl',
+                      '/data/texts.list.txt', '/data/fonts/sans.ttf', '/maps', '/scripts/tutorials/catalog.json'])
+    expect(await exists(page, path), path).toBe(true);
+  for (const path of ['/data/SConscript', '/data/check_translations.py', '/data/fonts/README.md', '/data/screenshots'])
+    expect(await exists(page, path), path).toBe(false);
+  // In-game music follows in the background.
+  await expect.poll(async () => (await snapshot(page)).assets.music, {timeout: 60000}).toBe('ready');
+  expect(await exists(page, '/data/zik/original/a1.opus')).toBe(true);
+  const {renderer, assets} = await snapshot(page);
+  if (renderer === 'software') expect(assets.hd).toBe('skipped');
+  else await expect.poll(async () => (await snapshot(page)).assets.hd, {timeout: 120000}).toBe('ready');
+});
+
+for (const name of ['core', 'game']) test(`a failed ${name} download says so and offers to try again`, async ({page}) => {
+  const errors = [];
+  page.on('console', message => { if (message.type() === 'error') errors.push(message.text()); });
+  await page.route(`**/assets/${name}*.data`, route => route.fulfill({status: 503, body: ''}));
+  await page.goto(gameURL());
+  await expect(page.locator('#loading-status')).toHaveText('The game could not be downloaded.');
+  await expect(page.locator('#loading-detail')).toHaveText('Check the connection, then try again.');
+  expect(errors.join('\n')).toContain('HTTP 503');
+  await expect(page.locator('#loading-retry')).toBeVisible();
+  expect((await snapshot(page)).assets[name]).toBe('failed');
+  await page.unroute(`**/assets/${name}*.data`);
+  await page.locator('#loading-retry').click();
+  await waitForMainMenu(page);
+});
+
+test('a second visit starts from the packages cached on the device', async ({page, browserName}) => {
+  // Playwright's WebKit profile drops Cache Storage across reloads; the loader then
+  // falls back to the HTTP cache, which this test server does not make immutable.
+  test.skip(browserName === 'webkit', 'automation WebKit does not keep Cache Storage across reloads');
+  await page.goto(gameURL());
+  await waitForMainMenu(page);
+  // Every background package, including artwork where it is wanted. Skin meshes
+  // and terrain families are requested on demand and stay idle on this menu.
+  await expect.poll(async () => Object.entries((await snapshot(page)).assets)
+    .filter(([name]) => name !== 'skins' && !name.startsWith('hd-terrain-')).every(([, state]) => state === 'ready' || state === 'skipped'),
+    {timeout: 180000}).toBe(true);
+  const downloads = [];
+  page.on('request', request => { if (/\/assets\/.*\.data$/.test(request.url())) downloads.push(request.url()); });
+  await page.reload();
+  await waitForMainMenu(page);
+  await expect.poll(async () => (await snapshot(page)).assets.music, {timeout: 60000}).toBe('ready');
+  expect(downloads).toEqual([]);
+});

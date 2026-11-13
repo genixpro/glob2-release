@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "Game.h"
+#include "Map.h"
 #include "BuildingType.h"
 #include "MapEdit.h"
 #include "Unit.h"
 #include "GlobalContainer.h"
 #include <algorithm>
+#include "Building.h"
 
 namespace
 {

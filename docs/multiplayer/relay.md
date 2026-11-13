@@ -24,7 +24,7 @@ The code lives in `src/relay/`. The turn core it hosts lives in `src/net/turn/`.
 ## Building and running
 
 ```sh
-scons role=relay release=1 relay      # glob2-relay and glob2-relay-tests
+python3 tools/dev_build.py role=relay release=1 relay      # glob2-relay and glob2-relay-tests
 build/<toolchain>/relay/release/src/glob2-relay
 ```
 
@@ -180,7 +180,7 @@ Compare the same workload/build inputs and retain profiler traces under
 
 ## Tickets
 
-Tickets are EdDSA (Ed25519) JWTs defined in `platform/packages/protocol/src/ticket.ts`.
+Tickets are EdDSA (Ed25519) JWTs defined in `services/online/packages/protocol/src/ticket.ts`.
 `TicketVerifier` makes the same checks, in the same order, with the same reason
 names as the platform's `verifyJwt`:
 
@@ -228,7 +228,7 @@ or fails with the manifest's reason.
 ## Platform calls
 
 When `GLOB2_RELAY_PLATFORM_URL` is set, the relay calls the platform's internal API.
-The shapes are defined in `platform/packages/protocol/src/relay.ts`. Every call
+The shapes are defined in `services/online/packages/protocol/src/relay.ts`. Every call
 carries `Authorization: Bearer <GLOB2_RELAY_KEY>`.
 
 | Call | When |
@@ -320,7 +320,7 @@ All metric names start with `glob2_relay_`.
 ## Tests
 
 ```sh
-scons role=relay release=1 relay
+python3 tools/dev_build.py role=relay release=1 relay
 build/<toolchain>/relay/release/src/glob2-relay-tests
 python3 -m unittest discover -s test/relay_service -v
 ```
@@ -352,7 +352,7 @@ tests cover:
 
 Requested hosted native-program verification covers both suites. Choose focused
 local verification from the affected relay boundaries; see
-[verification policy](../../AGENTS.md#validation-and-ci-feedback).
+[verification policy](../../AGENTS.md#validation-and-ci).
 
 ## Limits and follow-ups
 

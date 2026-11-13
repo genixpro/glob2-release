@@ -61,7 +61,8 @@ class MaximaStrategyPolicyTest(unittest.TestCase):
         )
 
     def test_maxima_keeps_id_and_owns_save_sections(self) -> None:
-        ai_header = (ROOT / "src/ai/AI.h").read_text()
+        # The implementation ids live in their own header since the AI registry split.
+        ai_header = (ROOT / "src/ai/AI.h").read_text() + (ROOT / "src/common/AIImplementationId.h").read_text()
         ai_source = (ROOT / "src/ai/AI.cpp").read_text()
         self.assertRegex(ai_header, r"MAXIMA\s*=\s*7")
         self.assertNotIn("NICOWAR_V2", ai_header + ai_source)
@@ -82,7 +83,7 @@ class MaximaStrategyPolicyTest(unittest.TestCase):
             self.assertGreaterEqual(len(strings), 4, line)
             specifications.append((strings[0], strings[-1]))
         schema_keys = [key for key, _description in specifications]
-        base = (ROOT / "data/maxima/base.strategy").read_text()
+        base = (ROOT / "content/data/maxima/base.strategy").read_text()
         base_keys = re.findall(r"^([a-z][a-z0-9_.]+)\s*=", base, re.M)
         self.assertEqual(len(schema_keys), len(set(schema_keys)))
         self.assertEqual(len(base_keys), len(set(base_keys)))
@@ -92,7 +93,7 @@ class MaximaStrategyPolicyTest(unittest.TestCase):
     def test_global_swarm_staffing_caps_are_removed(self) -> None:
         for source in (self.strategy, self.maxima,
                        (ROOT / "src/ai/maxima/AIMaximaStrategy.h").read_text(),
-                       (ROOT / "data/maxima/base.strategy").read_text()):
+                       (ROOT / "content/data/maxima/base.strategy").read_text()):
             self.assertNotIn("swarm_worker_cap", source)
 
     def test_active_members_have_consumers_and_legacy_members_are_explicit(self) -> None:
@@ -108,6 +109,10 @@ class MaximaStrategyPolicyTest(unittest.TestCase):
             "model.inn_capacity_level3", "economy.sustainable_inn_floor",
             "economy.sustainable_inn_corn_divisor", "economy.sustainable_inn_offset",
             "food.ticks_per_meal",
+            # Superseded by role-sited towers.
+            "placement.tower_critical_distance_weight", "placement.tower_spacing_target",
+            "placement.tower_spacing_weight", "placement.tower_threat_target",
+            "placement.tower_threat_weight",
         }
         unused = []
         for line in self.strategy.splitlines():

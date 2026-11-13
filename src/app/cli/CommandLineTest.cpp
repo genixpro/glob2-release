@@ -1,10 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Glob2Test.h"
+#include <nlohmann/json.hpp>
 #include "CommandLine.h"
 #include <sstream>
 #include <algorithm>
 TEST_SUITE("CommandLine")
 {
+    TEST_CASE("tournament probability defaults to 95 percent with an explicit zero opt-out")
+    {
+        const std::vector<std::string> base = {"game", "run", "--map-file", "test.map",
+            "--game-seed", "42", "--player", "castor", "--output-dir", "out"};
+        const auto request = Cli::parse(base);
+        CHECK(request.get("--win-probability") == "950");
+        CHECK_FALSE(request.has("--win-probability"));
+        for (const char *threshold : {"0", "950", "1000"})
+        {
+            auto args = base;
+            args.insert(args.end(), {"--win-probability", threshold});
+            CHECK(Cli::parse(args).get("--win-probability") == threshold);
+        }
+        for (const char *threshold : {"1", "500", "1001"})
+        {
+            auto args = base;
+            args.insert(args.end(), {"--win-probability", threshold});
+            CHECK_THROWS_AS(Cli::parse(args), std::invalid_argument);
+        }
+        CHECK_THROWS_AS(Cli::parse({"game", "run", "--load-game", "test.game",
+            "--output-dir", "out", "--win-probability", "950"}), std::invalid_argument);
+    }
 	TEST_CASE("registry describes every executable command and help is asset independent")
 	{
 		const auto schema = Cli::describe();
@@ -236,4 +259,21 @@ TEST_CASE("interval exploration requires explicit headless collection") {
         CHECK_THROWS(Cli::parse({"game","run","--output-dir","artifacts/gradient-cli-test","--load-game","checkpoint.game.gz","--resource-gradient-probe",
             "--resource-gradient-exploration",invalid}));
 }
+}
+
+TEST_CASE("resource claims switch selects the default or a claims-off new game" * doctest::test_suite("CommandLine"))
+{
+    const std::vector<std::string> base={"game","run","--output-dir","artifacts/claims-switch-cli","--map-file","test.map","--game-seed","42","--player","castor"};
+    auto with=[&](std::initializer_list<std::string> extra){auto args=base;args.insert(args.end(),extra);return args;};
+    CHECK_NOTHROW(Cli::parse(base));
+    CHECK_NOTHROW(Cli::parse(with({"--resource-claims","default"})));
+    CHECK_NOTHROW(Cli::parse(with({"--resource-claims","default","--write-replay"})));
+    CHECK_NOTHROW(Cli::parse(with({"--resource-claims","off"})));
+    CHECK_THROWS(Cli::parse(with({"--resource-claims","on"})));
+    // A replay restores claims on playback, so a claims-off game cannot record one.
+    CHECK_THROWS(Cli::parse(with({"--resource-claims","off","--write-replay"})));
+    // A saved game keeps the claim setting it was started with.
+    for(const auto* value:{"default","off"})
+        CHECK_THROWS(Cli::parse({"game","run","--output-dir","artifacts/claims-switch-cli","--load-game","test.game","--resource-claims",value}));
+    CHECK_NOTHROW(Cli::parse({"game","run","--output-dir","artifacts/claims-switch-cli","--load-game","test.game"}));
 }

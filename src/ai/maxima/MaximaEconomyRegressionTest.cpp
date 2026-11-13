@@ -1,5 +1,10 @@
 #include "MaximaObservationFixture.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
+#include "Property.h"
+#include "SimulationInvariants.h"
 #include "AI.h"
 #include <algorithm>
 #include "Version.h"
@@ -14,11 +19,13 @@
 #include "../../src/team/Team.h"
 #include "../../src/ai/AIImplementation.h"
 #include "../../src/map/Map.h"
+#include "gradient/MapRouting.h"
 #include "Order.h"
 #include "Player.h"
 #include "TeamStat.h"
 #include "Utilities.h"
 #include <memory>
+#include <optional>
 #include <limits>
 #include <locale>
 #include <tuple>
@@ -51,6 +58,8 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include "Unit.h"
+#include "Building.h"
 
 using namespace AIMaximaRuntime;
 
@@ -523,7 +532,9 @@ void barracksUpgradesKeepTrainingOpen()
     REQUIRE(limits.upgradePriority(f.game.buildingsTypes.getPlaceableTypeNum("barracks"),1)>0);
 }
 
-void armyBirthsMatchPlatformChecksums()
+// The army-birth scenario's per-tick checksums, kept in sim-diff only. The
+// behaviour they stand for is asserted by armyBirthsFollowTheRecipe below.
+void armyBirthsSimTrace()
 {
     setSyncRandSeed(5489);
     Fixture f;
@@ -546,40 +557,109 @@ void armyBirthsMatchPlatformChecksums()
     REQUIRE((swarm->ratio[WORKER]==0 && swarm->ratio[WARRIOR]>0));
     swarm->setMaterial(WHEAT, swarm->type->maxMaterial[WHEAT]);
     swarm->productionTimeout=-1;
-    const std::string fixtureFile=(glob2test::sourceRoot() / "test/maxima/fixtures/army-birth-checksums.txt").string();
-    const char* path=fixtureFile.c_str();
-    const bool record=std::getenv("GLOB2_RECORD_ARMY_CHECKSUMS")!=nullptr;
-    std::ifstream expected;
-    std::ofstream output;
-    // Record the same delayed schedule used by normal verification. Dedicated
-    // gradient-publication suites vary executor counts and check every tick.
-    f.game.map.configureGradientPipeline(0,8);
-    if(record) output.open(path);
-    else expected.open(path);
-    REQUIRE((record?output.good():expected.good()));
+    // Keep the delayed schedule used by normal play. Dedicated gradient-publication
+    // suites vary executor counts and check every tick.
+    f.game.map.routing().configureGradientPipeline(0,8);
+    std::string trace;
     for(int tick=1;tick<=512;++tick) {
         f.game.step(0);REQUIRE(f.game.stepCounter==unsigned(tick));
-        // Normalize the header to 115; the fixture uses eight-tick publication. With one
-        // team and no players, the header version is rotated six times.
-        // Normalize representation only; routing changes still require a fixture refresh.
-        const Uint32 checksum=f.game.checkSum(nullptr,nullptr,nullptr,true,true)
-            ^ std::rotr(Uint32(f.game.mapHeader.getVersionMinor()^115),6);
-        if(record)output<<tick<<' '<<checksum<<'\n';
-        else {
-            int expectedTick;Uint32 expectedChecksum;
-            REQUIRE((expected>>expectedTick>>expectedChecksum));
-            if(expectedTick!=tick || expectedChecksum!=checksum)
-                std::cerr<<"Army birth checksum mismatch: tick="<<tick
-                    <<" actual="<<checksum<<" expected="<<expectedChecksum<<'\n';
-            REQUIRE((expectedTick==tick && expectedChecksum==checksum));
-        }
+        const Uint32 checksum=f.game.checkSum(nullptr,nullptr,nullptr,true);
+        trace+=std::to_string(tick)+' '+std::to_string(checksum)+'\n';
     }
+    glob2test::recordSimTrace("maxima/army-birth-checksums.txt",trace);
     int workers=0,warriors=0;
     for(int i=0;i<Unit::MAX_COUNT;++i)if(auto* u=f.player.team->myUnits[i]) {
         workers+=u->typeNum==WORKER;warriors+=u->typeNum==WARRIOR;
     }
     REQUIRE((workers==50 && warriors>0));
-    if(!record){expected>>std::ws;REQUIRE(expected.eof());}
+}
+
+// The behaviour the sim trace above stands for, stated directly: with the
+// AI's birth mix funded for the army, the swarm produces warriors only, one per
+// production cycle while wheat lasts, and each birth spends exactly the recipe's
+// wheat. The material ledger balances at every tick.
+void armyBirthsFollowTheRecipe(std::uint32_t seed)
+{
+    setSyncRandSeed(seed);
+    Fixture f;
+    f.game.gameHeader.setHungerDisabled(true);
+    auto* swarm=f.swarm(10,10,6);f.supply(10,10);
+    REQUIRE(f.game.addBuilding(18,10,globalContainer->buildingsTypes
+        .getTypeNum("barracks",0,false),0));
+    for(int i=0;i<50;++i)REQUIRE(f.game.addUnit(24+i%10,24+i/10,0,WORKER,0,0,0,0));
+    f.player.team->playersMask=1;
+    f.player.team->createLists();
+    auto& a=*f.ai;auto& c=a.context;c.initialize();
+    a.snapshot.population=50;a.snapshot.workers=50;a.snapshot.barracks=1;
+    a.labour_observation=a.observe_labour(c);
+    auto& growth=a.policy_bids[AIMaxima::Maxima::PolicyGrowth];
+    auto& defense=a.policy_bids[AIMaxima::Maxima::PolicyDefense];
+    growth.worker_ratio=5;growth.swarm_workers=6;
+    defense.desired_warriors=12;defense.warrior_ratio=3;defense.utility=100;
+    glob2test::withMaximaObservation(a.context,[&]() -> decltype(auto) {return a.arbitrate_policy_bids();});a.manage_swarm(c,0);f.applyStaffing();
+    REQUIRE((swarm->ratio[WORKER]==0 && swarm->ratio[WARRIOR]>0));
+    swarm->setMaterial(WHEAT, swarm->type->maxMaterial[WHEAT]);
+    swarm->productionTimeout=-1;
+    f.game.map.routing().configureGradientPipeline(0,8);
+
+    const auto& recipes=swarm->type->semantics.production.recipes;
+    const int warriorCost=recipes[WARRIOR].cost[WHEAT];
+    const int cycle=recipes[WARRIOR].duration+1;
+    REQUIRE(warriorCost>0);
+    // Read the counters afresh: events() switches to the live collector once the
+    // first engine step starts statistics collection.
+    const auto events=[&]() -> const GameplayMeasurements& { return std::as_const(f.player.team->stats).events(); };
+    const auto count=[&](int type) {
+        int n=0;
+        for(int i=0;i<Unit::MAX_COUNT;++i)if(auto* u=f.player.team->myUnits[i]) n+=u->typeNum==type;
+        return n;
+    };
+    const int initialWheat=swarm->material(WHEAT), initialWarriors=count(WARRIOR);
+    const Uint64 initialBirths=events().births[WARRIOR], initialSpent=events().consumed[GameplayMeasurements::SPAWNING][WHEAT];
+    const Uint64 initialDelivered=events().delivered[WHEAT], initialWithdrawn=events().withdrawn[WHEAT];
+    // The ledger needs live counters, which the first engine step switches on.
+    std::optional<glob2test::MaterialLedger> ledger;
+    int lastBirthTick=0, previousWarriors=initialWarriors, gaps=0;
+    for(int tick=1;tick<=512;++tick) {
+        f.game.step(0);
+        CAPTURE(tick);
+        const int workers=count(WORKER), warriors=count(WARRIOR);
+        const int born=int(events().births[WARRIOR]-initialBirths);
+        // No worker is born and nobody dies: every new unit is a counted warrior birth.
+        REQUIRE(events().births[WORKER]==0);
+        REQUIRE(workers==50);
+        REQUIRE(warriors==initialWarriors+born);
+        REQUIRE(warriors>=previousWarriors);
+        REQUIRE(warriors<=previousWarriors+1);
+        // Each birth spends the recipe's wheat; deliveries are the only other change.
+        const int spent=born*warriorCost;
+        REQUIRE(Uint64(spent)==events().consumed[GameplayMeasurements::SPAWNING][WHEAT]-initialSpent);
+        REQUIRE(swarm->material(WHEAT)==initialWheat+int(events().delivered[WHEAT]-initialDelivered)
+            -int(events().withdrawn[WHEAT]-initialWithdrawn)-spent);
+        if(warriors>previousWarriors) {
+            // Steady production: one warrior per production cycle (the recipe's
+            // duration plus the tick that spawns), neither faster nor slower.
+            if(lastBirthTick) {
+                REQUIRE(tick-lastBirthTick==cycle);
+                ++gaps;
+            }
+            lastBirthTick=tick;
+        }
+        // And no stall while the swarm can still afford the next warrior.
+        else if(lastBirthTick && swarm->availableMaterial(WHEAT)>=warriorCost)
+            REQUIRE(tick-lastBirthTick<cycle);
+        previousWarriors=warriors;
+        if(!ledger) ledger.emplace(f.game);
+        else if(!ledger->check("army births tick "+std::to_string(tick))) break;
+    }
+    // Every warrior the wheat paid for within the run was born.
+    const int affordable=(initialWheat+int(events().delivered[WHEAT]-initialDelivered))/warriorCost;
+    CHECK(count(WARRIOR)-initialWarriors==std::min(affordable,1+(512-1)/cycle));
+    CHECK(gaps>0);
+    REQUIRE(ledger);
+    INFO(ledger->inexactReasons());
+    CHECK(ledger->colonyExact());
+    CHECK(ledger->mapExact());
 }
 
 void crisisProductionPause()
@@ -709,7 +789,7 @@ void trackerLogicalCadence()
 void holidayHarvestCapacity()
 {
     Game game(NULL);
-    BinaryInputStream input(GAGCore::openInflatingFileStreamBackend((glob2test::sourceRoot() / "maps/Holiday_Island_2.map.gz").string()));
+    BinaryInputStream input(GAGCore::openInflatingFileStreamBackend((glob2test::contentRoot() / "maps/Holiday_Island_2.map.gz").string()));
     REQUIRE(input.isValid()); REQUIRE(game.load(&input));
     Player player; player.setTeam(game.teams[0]);
     AIMaxima::Maxima ai(&player); auto& c=ai.context; c.initialize();
@@ -964,7 +1044,12 @@ TEST_SUITE("Maxima.Economy")
 	TEST_CASE("explorer target always gets production") { glob2test::HeadlessGlobals globals; explorerTargetAlwaysGetsProduction(); }
 	TEST_CASE("army demand funds training and birth mix") { glob2test::HeadlessGlobals globals; armyDemandFundsTrainingAndBirthMix(); }
 	TEST_CASE("barracks upgrades keep training open") { glob2test::HeadlessGlobals globals; barracksUpgradesKeepTrainingOpen(); }
-	TEST_CASE("army births match platform checksums") { glob2test::HeadlessGlobals globals; armyBirthsMatchPlatformChecksums(); }
+	TEST_CASE("army births sim trace [sim-trace]") { glob2test::HeadlessGlobals globals; armyBirthsSimTrace(); }
+	TEST_CASE("army births are warriors only, steady and paid per the recipe")
+	{
+		glob2test::HeadlessGlobals globals;
+		glob2test::forEachSeed(3,[](std::uint32_t seed) { armyBirthsFollowTheRecipe(seed); },5489);
+	}
 	TEST_CASE("crisis production pause") { glob2test::HeadlessGlobals globals; crisisProductionPause(); }
 	TEST_CASE("completion reallocates colony") { glob2test::HeadlessGlobals globals; completionReallocatesColony(); }
 	TEST_CASE("tracker logical cadence") { glob2test::HeadlessGlobals globals; trackerLogicalCadence(); }

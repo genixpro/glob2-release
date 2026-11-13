@@ -19,6 +19,7 @@
 #include "OnlineMapsScreen.h"
 #include "RoomMapPickerScreen.h"
 #include "Order.h"
+#include "LanProtocol.h"
 #include "ConnectionQuality.h"
 #include "ThumbSide.h"
 #include "ui/OnlineUI.h"
@@ -651,7 +652,7 @@ Element RoomScreen::seats(const Presentation &p, bool phone)
 			TextOptions readyText;
 			readyText.role = FontRole::Support;
 			readyText.color = slot.ready ? palette.success : palette.warning;
-			readyLabel = label(slot.ready ? tr("[room ready]") : tr("[room not ready]"), readyText);
+			readyLabel = expanded(label(slot.ready ? tr("[room ready]") : tr("[room not ready]"), readyText));
 			if (slot.progress >= 0 && slot.progress < 100)
 				add(formatted("[room downloading %0]", std::to_string(slot.progress)));
 			if (phone)
@@ -896,6 +897,8 @@ Element RoomScreen::chatPanel(const Presentation &p, bool phone)
 {
 	TextFieldOptions chatOptions;
 	chatOptions.maxLength = ORDER_TEXT_MESSAGE_MAX_LEN;
+	if (room->kind() == RoomBackend::Kind::Lan)
+		chatOptions.maxBytes = Lan::MAX_CHAT_BYTES;
 	chatOptions.placeholder = tr("[room say something]");
 	chatOptions.submit = [this](const std::string &) { sendChat(chatDraft); };
 	ButtonOptions send;

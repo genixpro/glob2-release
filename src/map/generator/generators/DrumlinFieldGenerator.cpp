@@ -2,7 +2,7 @@
 #include "DrumlinFieldGenerator.h"
 #include "Drawing.h"
 #include "FertilityField.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "GraphMaze.h"
@@ -95,9 +95,9 @@ constexpr int kReferenceGap = 6, kSmallestSpacing = 16;
 // a quarter of the map; with it, two fifths.
 constexpr int kSiteMinimumPercent = 83, kRelaxRounds = 3;
 // An esker is a wandering line of sand `kEskerHalfWidth` tiles either side of its centre: three
-// terrain vertices of sand, which is four walkable tiles across (a tile with any sand corner is
-// land), so a column of units crosses it two abreast, while a defender's towers on the landing
-// cover the whole of it (a level-1 tower reaches 5 tiles). It wanders by up to `kEskerWander`
+// terrain vertices of sand, with at least two sand corners needed per walking tile. A defender's
+// towers on the landing cover the narrow crossing (a level-1 tower reaches 5 tiles).
+// It wanders by up to `kEskerWander`
 // tiles from the straight line between its two drumlins, enough to read as a ridge the meltwater
 // left rather than a ruled causeway, little enough that it does not stray into a third drumlin's
 // water in the usual gap (`water-gap` is 6 by default); its width swells and narrows by a fifth.
@@ -121,7 +121,7 @@ constexpr int kTilesPerOutcrop = 2000, kTilesPerGrove = 1500;
 constexpr int kOrchardsPerTwoColonies = 1;
 constexpr double kOrchardRadius = 3.0, kOrchardSmallestHalfWidth = 5.5;
 // Algae: one clump per this many water tiles, on the half of the water where it regrows best
-// (Planting.h's algaeGrowthChance wants sand within 30 tiles, which every beach and esker gives).
+// (Planting.h's algaeGrowthChance wants a coast within 30 tiles, which every shore gives).
 constexpr int kWaterPerAlgae = 50;
 
 struct Drumlin
@@ -384,7 +384,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 	return L;
 }
 
-bool generate(Game &game, GenerationContext &context)
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "drumlin field layout";
 	const DrumlinFieldOptions o(context.request);
@@ -395,7 +395,7 @@ bool generate(Game &game, GenerationContext &context)
 		context.detail = L.failure;
 		return false;
 	}
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const Torus &t = L.t;
 	const int n = t.size(), teams = context.request.nbTeams;
 	for (int k = 0; k < teams; ++k)
@@ -477,18 +477,18 @@ bool generate(Game &game, GenerationContext &context)
 	return true;
 }
 
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	if (const std::string mismatch = designMismatch(L, map, "drumlin field"); !mismatch.empty())
 		return mismatch;
 	const Torus &t = L.t;
 	const int teams = context.request.nbTeams;
 	// The promise the map makes: with the eskers shut, no colony can walk to another. An esker is
-	// sand on terrain vertices and a tile with any sand corner is walkable, so the tiles to shut
-	// are every tile touching an esker corner (roadTiles), not the corners alone.
+	// sand on terrain vertices; close every tile touching an esker corner (roadTiles),
+	// covering the whole walking crossing even where its boundary cells are water-majority.
 	if (const std::array<int, 2> leak = colonyLeak(map, t, teams, roadTiles(t, L.esker));
 		leak[0] >= 0)
 		return "Colony " + std::to_string(leak[0]) + " can walk to colony " +
@@ -529,7 +529,7 @@ GeneratorDefinition drumlinFieldDefinition()
 		"drumlin-field",
 		43,
 		"Drumlin field",
-		2,
+		4, // 4: algae now regrows near any coast, so its best-growing water moved
 		false,
 		// Sites 20 apart across the grain and drumlins two and a half times as long as wide give a
 		// 256 map some fifty drumlins of about 16 by 40 tiles round four homes of 22 by 55, with

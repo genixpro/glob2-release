@@ -29,11 +29,19 @@ claims during a shortage. Free services consume no hauling allowance.
 Completed providers use their requested staffing after the controller's shared
 producer allowance, and their active output ratios. Empty stores and temporarily
 absent workers do not erase demand. New providers and upgrade targets use the
-strategy's initial staffing request, clamped to the target's assignment limit;
+strategy's initial staffing request, clamped to the target's carrier ceiling;
 a presentation default is only a fallback where the strategy has no request.
 A separate planned hauling estimate bounds usable feeding throughput. Neither
 that forecast nor the operating farm claim changes the mechanical capability
 ceiling used to compare recipes.
+
+Operating carrier requests remain adaptive, with ceilings of **8 for inns** and
+**12 for swarms**. Providers combining feeding and production use the swarm
+ceiling. The engine assignment limit and any lower
+`staffing.control_maximum_workers` still apply. Initial requests, planner food
+claims and subsequent control passes use the same ceiling. Saved controllers
+adopt it on their next staffing update. Construction and upgrade crews are
+separate.
 
 A nominal production mix gives each permitted output equal job weight and uses
 the sum of complete job durations. Training forecasts separate recipient classes
@@ -83,6 +91,11 @@ there is no additional route walk or catalog scan. Cumulative prefixes support
 bounded arithmetic queries while solving the common production fraction. Other
 materials use the existing prepared distance fields and unreachable penalty. Profile, requested staffing, output ratios and colony demand state
 are included in planner signatures and continuation.
+
+Ledger evaluation is a pure function of its input and mode, and a development
+cycle rebuilds the same ledger several times (relocation, retirement, scoring and
+revalidation). The planner keeps the three most recent evaluations and reuses one
+whose input is identical; the result is unchanged, only the work is skipped.
 
 Within one synchronous upgrade/repair scan of the captured world, hypothetical
 upgrades share the unexcluded baseline claims, keyed by the excluded pending

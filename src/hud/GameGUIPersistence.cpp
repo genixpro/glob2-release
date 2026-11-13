@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <stdio.h>
+#include "Map.h"
 #include <stdarg.h>
 #include <math.h>
 
@@ -27,6 +28,10 @@
 #include "ReplayReader.h"
 #include "ReplayWriter.h"
 #include <glob2/BuildConfig.h>
+#include "MapScript.h"
+#include "render/scene/Scene.h"
+#include "TorusView.h"
+#include "GameGUIToolManager.h"
 
 
 bool GameGUI::loadFromHeaders(MapHeader& mapHeader, GameHeader& gameHeader, bool setGameHeader, bool ignoreGUIData, bool saveAI, const std::string& sourceFileName)

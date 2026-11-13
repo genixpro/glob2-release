@@ -3,7 +3,7 @@
 #include "Centrepieces.h"
 #include "Drawing.h"
 #include "FertilityField.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "GraphMaze.h"
 #include "Geometry.h"
@@ -329,11 +329,10 @@ Layout design(const GenerationRequest &r, GenerationContext &c)
 	// the largest distance cache is 64 MiB, local to this reconstructible design call.
 	if (r.nbTeams > 1 && r.nbTeams < g.cellCount())
 	{
-		const auto water = pureTiles(L.terrain, t, WATER);
-		std::vector<unsigned char> walkable(t.size(), 0);
+		auto walkable = walkableTiles(L.terrain, t);
 		std::vector<int> samples, origins;
 		for (int i = 0; i < t.size(); ++i)
-			walkable[i] = !water[i] && !L.hedge[i] && !L.plot[i];
+			walkable[i] = walkable[i] && !L.hedge[i] && !L.plot[i];
 		for (int y = 2; y < t.h; y += 4)
 			for (int x = 2; x < t.w; x += 4)
 				if (walkable[t.at(x, y)])
@@ -423,7 +422,7 @@ Layout design(const GenerationRequest &r, GenerationContext &c)
 	c.telemetry.measure("hedgerow.hedge-radius", o.hedgeThickness - 1);
 	return L;
 }
-bool generate(Game &game, GenerationContext &c)
+bool generate(GenerationWorld &game, GenerationContext &c)
 {
 	c.stage = "hedgerow layout";
 	const Layout L = design(c.request, c);
@@ -435,7 +434,7 @@ bool generate(Game &game, GenerationContext &c)
 	const HedgerowCountryOptions o(c.request);
 	const Village v = villageFor(o.fieldSize);
 	const Torus &t = L.t;
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	writeVertices(map, L.terrain);
 	for (int k = 0; k < c.request.nbTeams; ++k)
 		game.addTeam();
@@ -526,7 +525,7 @@ bool generate(Game &game, GenerationContext &c)
 	secureStartingCrops(game, c, t, 24, 32, 0, &L.hedge);
 	return true;
 }
-std::string validateWorld(const Game &game, const GenerationContext &c)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &c)
 {
 	GenerationContext replay(c.request);
 	const Layout L = design(c.request, replay);
@@ -572,7 +571,7 @@ GeneratorDefinition hedgerowCountryDefinition()
 		"hedgerow-country",
 		38,
 		"Hedgerow Country",
-		8,
+		9,
 		false,
 		{GeneratorControl{"field-size", "Field size", 48, 96, 16, 64, ControlGroup::Layout}
 			 .withSearchRange(48, 80),

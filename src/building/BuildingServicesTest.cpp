@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "BuildingType.h"
 #include <BinaryStream.h>
 #include <StreamBackend.h>
 #include <nlohmann/json.hpp>
+#include "Unit.h"
+#include "Building.h"
 
 namespace
 {

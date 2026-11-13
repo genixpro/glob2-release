@@ -3,6 +3,9 @@
 // Copyright (C) 2007 Bradley Arsenault
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
+#include "Game.h"
+#include "Map.h"
+#include "TerrainBuiltins.h"
 #include "PowerOfTwo.h"
 #include <PerformanceTelemetry.h>
 #include "Minimap.h"

@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SpiderWebGenerator.h"
 #include "Drawing.h"
-#include "Game.h"
+#include "GenerationWorld.h"
 #include "GenerationContext.h"
 #include "Geometry.h"
 #include "Grid.h"
+#include "HeightFieldLooks.h"
+#include "Morphology.h"
 #include "LatticeNoise.h"
 #include "Pipeline.h"
 #include "Planting.h"
@@ -12,6 +14,7 @@
 #include "Roads.h"
 #include "Settlements.h"
 #include "Sketch.h"
+#include "Walls.h"
 #include "Wedge.h"
 #include <algorithm>
 #include <cmath>
@@ -21,12 +24,21 @@
 #include <vector>
 using namespace MapGeneration;
 
-// Spider web: an orb web of land spun over open water. Spokes run out from a hub at the centre of
+// Spider web: a frost web spun over a frozen sea. Spokes run out from a glacier dome at the centre of
 // the map to a frame thread, and capture threads cross between the spokes, sagging towards the hub
-// the way silk does; every colony starts on a pad where a spoke meets the frame. Threads are wide
-// enough to build on but every ground route follows them, so the knots where threads cross are the
-// places to hold, the hub with its orchard is the prize, and the water between is only crossed once
-// colonies can swim. Dew drops, small islets in the web's cells, carry a prize each.
+// the way silk does; every colony starts on a green pad, a hot-spring valley where a spoke meets the
+// frame. The threads are snow-drifted tundra with a white road down every one: fast to walk and
+// buildable, but nothing grows on them. The cells between the threads are frozen: walkable without
+// swimming, but at half speed and in a cold that slowly wears units down, and nothing can be built
+// on them, so they are shortcuts with a price. A share of the cells stays open water (the leads),
+// where algae grows and the threads beside them turn green with fields; the open sea beyond the
+// frame does the same for the pads. The dew drops are hot-spring islets in the ice, and the hub is a
+// glacier dome walled against feet and arrows, climbed by a ramp at every spoke to the orchard round
+// its spring: the prize every road leads to.
+//
+// REVISION 7 (FEEDBACK 2026-11-11: "a full remake of this map in terms of appearance and gameplay"
+// around ice and snow: tundra, arctic tundra, white snow and the white roads, still with grassy
+// ground for the resources). Before it, the web was grass over open water, crossed only by swimmers.
 //
 // With the spiral on, the capture threads are a spiral with one arm per colony, climbing one ring
 // spacing per wedge, so it maps onto itself under a turn of one wedge. Every other choice (which
@@ -35,13 +47,14 @@ using namespace MapGeneration;
 // the centre and the layout is fair for any colony count. The design is a pure function of the
 // request, so validateWorld rebuilds it and checks the finished world.
 //
-// GAME RULES BEHIND IT (docs/map-generators/game-rules-for-map-design.md): every thread is land in
-// water, so wheat and wood regrow along its whole length, which is why threads carry fields, and
-// why a sand road runs down their middle: growth refuses where its probe finds sand, and nothing
-// grows on sand itself, so the road stays a lane and a thread never grows shut. Buildings need pure
-// grass, so a thread must be wide enough to keep grass either side of that road. Fruit lets an inn
-// pull hungry enemy units across, which makes the hub's orchard the prize at the one place every
-// spoke leads.
+// GAME RULES BEHIND IT (docs/map-generators/game-rules-for-map-design.md, TerrainGroup.h): ice
+// (Ice) is walkable at half speed, wears ground units down a little every step (8/256 of a hit
+// point) and holds nothing and no building, so a frozen cell is a crossing, never a home; tundra
+// (Barren) is building room where nothing grows and which holds crops back like sand; wheat and wood
+// regrow only within reach of liquid water, which is why the green ground lies along the open water
+// and round the springs; stone stands only on grass, so every quarry has a clearing; glacier
+// (Obstacles) stops feet and arrows; and fruit lets an inn pull hungry enemy units across, which
+// makes the dome's orchard the prize at the one place every spoke leads.
 namespace
 {
 
@@ -76,28 +89,39 @@ constexpr int kHomeWood = 30;
 // Knots carrying stone, in tenths of a percent at 100, and each one's size in tiles.
 constexpr int kKnotStone = 280;
 constexpr int kKnotStoneTiles = 5;
-// The threads' standing wheat and wood, as shares of their grass at 100: enough that walking any
-// stretch of thread passes a field or a copse, since the threads are all the land there is.
-constexpr int kWheatShare = 20;
+// The green threads' standing wheat and wood, as shares of their grass at 100: the open ground is
+// the web's breadbasket (three times revision 6's wheat, FEEDBACK 2026-11-11).
+constexpr int kWheatShare = 60;
 constexpr int kWoodShare = 13;
-// Dry patches of sand inside the threads, as a share of their inland grass, at least this many
-// steps from water so a strip of grass always lies between patch and beach; and the size of the
-// noise the patches follow, in tiles.
-constexpr double kSandShare = 0.07;
-constexpr int kSandInland = 3;
-constexpr double kSandCell = 10;
 // One algae clump per this many tiles of shallows at 100, all on the share of each colony's
 // shallows where algae regrows most readily.
 constexpr int kAlgaeTilesPerClump = 30;
 constexpr double kAlgaeBestShare = 0.3;
 // The thread width control is the width on a 256-tile map. A smaller map thins its threads with
 // the square root of its size, down to this share, so a 128-tile web still reads as threads rather
-// than one blob of land, while its threads keep grass either side of their sand road; bigger maps
+// than one blob of land, while its threads keep grass either side of their road; bigger maps
 // keep the control's width, which already reads as a web.
 constexpr double kMinimumThreadScale = 0.75;
-// Dew drops and the water kept round them.
-constexpr double kDewRadius = 3;
+// Dew drops: hot-spring islets in the ice, with a spring of this share of their radius at the
+// middle, and the ice kept round them.
+constexpr double kDewRadius = 6;
 constexpr double kDewMoat = 3;
+constexpr double kDewSpringShare = 0.3;
+// THE FROST WEB (revision 7). Of the cells' distinct keys (a cell's sector in its wedge and its
+// radius, shared by its image in every wedge), the share in tenths of a percent left open water as
+// leads, so every wedge gets the same leads. Thread ground within kShoreGrass steps of open water (a lead or the sea) is grass, the rest
+// tundra. Every pad has a hot spring kPadSpringShare of its radius across, kPadSpringOut of its radius
+// to one side of its axis; a stone knot is a grass clearing kKnotClearing tiles across. The dome's
+// glacier wall is kGlacierWall tiles thick, broken by a ramp kRampHalf either side of each colony's
+// home spoke.
+constexpr int kLeadShare = 250;
+constexpr int kShoreGrass = 7;
+constexpr double kPadSpringShare = 0.18;
+constexpr double kPadSpringOut = 0.55;
+constexpr double kKnotClearing = 3;
+constexpr int kGlacierWall = 4;
+constexpr double kRampHalf = 3.5;
+constexpr int kSpringSpokeGap = 3;
 
 struct Geometry
 {
@@ -203,6 +227,11 @@ struct Layout
 	std::vector<double> bow;                // per spoke of a wedge, in radians
 	std::vector<unsigned char> land, water; // per tile
 	std::vector<unsigned char> hub, thread; // per tile
+	// The frost: liquid water (the sea, the leads and the springs) of `water`, the rest of it ice;
+	// the innermost cells' ice drawn as wind-swept snow; the dome's glacier wall and its ramps;
+	// grass on the threads by open water and round the stone knots.
+	std::vector<unsigned char> open, snow, wall, ramp, green;
+	int leads = 0, frozen = 0;
 	std::vector<int> padOf;                 // pad tiles: the colony, else -1
 	std::vector<int> dewOf;                 // dew drop tiles: the drop, else -1
 	std::vector<ShapePoint> pads, knots;    // pad centres by colony; stone knots
@@ -210,6 +239,7 @@ struct Layout
 	std::vector<Drop> drops;
 	std::vector<std::vector<ShapePoint>> spokeLines; // every spoke's centre line
 	std::vector<std::vector<StrokePoint>> roads;     // every thread's centre line, on the map
+	std::vector<int> roadWidth;                      // each road's width in vertices: 2 or 1
 	std::string failure;
 
 	/// Where spoke j crosses radius r: it bows sideways most at mid-length and not at all at the
@@ -261,14 +291,17 @@ struct Layout
 
 // Strokes a thread onto the mask, and records its centre line as road unless it is torn.
 void strokeThread(std::vector<unsigned char> &mask, const Torus &t, Layout &L, const Thread &thread,
-				  double halfWidth)
+				  double halfWidth, int roadWidth)
 {
 	// A torn strand's stubs are dead ends and carry no traffic, so only whole threads get a road.
 	const auto stroke = [&](std::vector<StrokePoint> path, bool road)
 	{
 		strokePath(mask, t, path);
 		if (road)
+		{
 			L.roads.push_back(std::move(path));
+			L.roadWidth.push_back(roadWidth);
+		}
 	};
 	const double length = std::hypot(thread.to.x - thread.from.x, thread.to.y - thread.from.y);
 	const int segments = std::max(4, int(length / 3));
@@ -283,6 +316,165 @@ void strokeThread(std::vector<unsigned char> &mask, const Torus &t, Layout &L, c
 	const int stub = std::max(1, int(std::lround(kTornStub * segments)));
 	stroke(std::vector<StrokePoint>(path.begin(), path.begin() + stub + 1), false);
 	stroke(std::vector<StrokePoint>(path.end() - stub - 1, path.end()), false);
+}
+
+// Where the round design frame puts tile i, relative to the centre.
+ShapePoint roundOf(const Layout &L, int i)
+{
+	const Torus &t = L.t;
+	return L.stretch.undo(t.offsetX(L.cx, t.remainderX(i)), t.offsetY(L.cy, i / t.w));
+}
+
+void planFrost(Layout &L, const GenerationRequest &request, GenerationContext &context)
+{
+	const Torus &t = L.t;
+	const Geometry &g = L.g;
+	const int n = t.size();
+	L.open.assign(n, 0);
+	L.snow.assign(n, 0);
+	L.wall.assign(n, 0);
+	L.ramp.assign(n, 0);
+	L.green.assign(n, 0);
+	// The springs: the hub's pond, one on every pad and one in every dew drop.
+	for (int i = 0; i < n; ++i)
+		L.open[i] = L.water[i] && L.hub[i];
+	// A spring keeps kSpringSpokeGap tiles off every spoke's centre line, so it never cuts the way in
+	// (a squeezed pad on a stretched map can bring its spoke past the spring).
+	std::vector<unsigned char> spokeLine(n, 0);
+	for (const std::vector<ShapePoint> &line : L.spokeLines)
+		for (const ShapePoint &p : line)
+			spokeLine[t.at(int(std::lround(p.x)), int(std::lround(p.y)))] = 1;
+	const std::vector<int> fromSpoke = stepsFrom(t, spokeLine);
+	const auto spring = [&](double x, double y, double radius, const char *stream)
+	{
+		const RadialShape shape(radius, 0.2, context, stream);
+		std::vector<unsigned char> pool(n, 0);
+		fillShape(pool, t, int(std::lround(x)), int(std::lround(y)), shape, 0, 1);
+		for (int i = 0; i < n; ++i)
+			if (pool[i] && (fromSpoke[i] < 0 || fromSpoke[i] > kSpringSpokeGap))
+				L.water[i] = L.open[i] = 1;
+	};
+	for (int k = 0; k < g.teams; ++k)
+	{
+		const double a = L.padAngle[k], across = kPadSpringOut * g.padRadius;
+		spring(L.pads[k].x - across * std::sin(a), L.pads[k].y + across * std::cos(a),
+			   std::max(1.5, kPadSpringShare * g.padRadius), "web-springs");
+	}
+	for (const Drop &drop : L.drops)
+		spring(drop.x, drop.y, std::max(1.5, kDewSpringShare * kDewRadius), "web-springs");
+	// The cells: every body of water off the land but the springs. One reaching past the pads is
+	// the open sea; every other is a cell, frozen unless its sector of the wedge and its radius roll
+	// a lead.
+	struct Cell
+	{
+		std::vector<int> members;
+		bool sea = false, dew = false;
+		double radius = 0;
+		long long key = 0;
+	};
+	std::vector<Cell> cells;
+	std::vector<int> body(n, -1), stack;
+	for (int start = 0; start < n; ++start)
+	{
+		if (!L.water[start] || L.open[start] || body[start] >= 0)
+			continue;
+		Cell cell;
+		body[start] = start;
+		stack.assign(1, start);
+		double sx = 0, sy = 0;
+		while (!stack.empty())
+		{
+			const int i = stack.back();
+			stack.pop_back();
+			cell.members.push_back(i);
+			const ShapePoint p = roundOf(L, i);
+			sx += p.x;
+			sy += p.y;
+			cell.sea = cell.sea || std::hypot(p.x, p.y) > g.frameRadius + g.padReach;
+			const int x = t.remainderX(i), y = i / t.w;
+			for (const auto &[dx, dy] : {std::pair{1, 0}, {-1, 0}, {0, 1}, {0, -1}})
+			{
+				const int j = t.at(x + dx, y + dy);
+				cell.dew = cell.dew || L.dewOf[j] >= 0;
+				if (L.water[j] && !L.open[j] && body[j] < 0)
+				{
+					body[j] = start;
+					stack.push_back(j);
+				}
+			}
+		}
+		// A cell's key is its sector in the wedge and its radius, in half spacings, the same for its
+		// image in every wedge.
+		const double cx = sx / cell.members.size(), cy = sy / cell.members.size();
+		cell.radius = std::hypot(cx, cy);
+		const double turn = std::fmod(std::atan2(cy, cx) - L.phase + 8 * kPi, 2 * kPi);
+		const int sector =
+			int(std::floor(turn / g.spokeAngle - g.offset + 1e-9 + 2 * g.spokes)) % g.perColony;
+		cell.key = std::lround(2 * (cell.radius - g.firstRing) / g.spacing) * 16 + sector;
+		cells.push_back(std::move(cell));
+	}
+	// The leads: of the distinct keys of the cells that may open (not the sea, nor a cell holding a
+	// dew drop, whose islet is reached on foot, nor the innermost round the dome), the kLeadShare
+	// with the lowest rolls, at least one; every cell with one of those keys opens.
+	std::vector<std::pair<int, long long>> keys;
+	for (const Cell &cell : cells)
+		if (!cell.sea && !cell.dew && cell.radius >= g.firstRing)
+			keys.push_back({roll(request, "web-lead/", cell.key), cell.key});
+	std::sort(keys.begin(), keys.end());
+	keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+	const size_t leadKeys =
+		keys.empty() ? 0 : std::max<size_t>(1, size_t(std::lround(keys.size() * kLeadShare / 1000.0)));
+	std::vector<long long> leadKey;
+	for (size_t k = 0; k < leadKeys; ++k)
+		leadKey.push_back(keys[k].second);
+	for (const Cell &cell : cells)
+	{
+		const bool lead =
+			cell.sea || (!cell.dew && cell.radius >= g.firstRing &&
+						 std::find(leadKey.begin(), leadKey.end(), cell.key) != leadKey.end());
+		if (!cell.sea)
+			++(lead ? L.leads : L.frozen);
+		for (const int i : cell.members)
+		{
+			L.open[i] = lead;
+			L.snow[i] = !lead && cell.radius < g.firstRing;
+		}
+	}
+	// The dome: its glacier wall round the hub's edge, broken by a ramp along every spoke.
+	std::vector<unsigned char> outside(n, 0);
+	for (int i = 0; i < n; ++i)
+		outside[i] = !L.hub[i];
+	const std::vector<int> fromOutside = stepsFrom(t, outside);
+	for (int i = 0; i < n; ++i)
+	{
+		if (!L.hub[i] || L.water[i] || fromOutside[i] > kGlacierWall)
+			continue;
+		const ShapePoint p = roundOf(L, i);
+		bool ramp = false;
+		// One ramp per colony, up its home spoke (the middle spoke of its wedge); the other spokes end
+		// at the wall.
+		for (int j = g.perColony / 2; j < g.spokes && !ramp; j += g.perColony)
+		{
+			const double a = L.phase + (j + g.offset) * g.spokeAngle;
+			const double along = p.x * std::cos(a) + p.y * std::sin(a),
+						 across = -p.x * std::sin(a) + p.y * std::cos(a);
+			ramp = along > 0 && std::abs(across) <= kRampHalf;
+		}
+		(ramp ? L.ramp : L.wall)[i] = 1;
+	}
+	// Green ground on the threads: within reach of open water (a lead or the sea), and a clearing
+	// round every stone knot.
+	std::vector<unsigned char> liquid(n, 0);
+	for (int i = 0; i < n; ++i)
+		liquid[i] = L.open[i] && !L.hub[i] && L.padOf[i] < 0 && L.dewOf[i] < 0;
+	const std::vector<int> fromLiquid = stepsFrom(t, liquid);
+	for (int i = 0; i < n; ++i)
+		L.green[i] = L.thread[i] && fromLiquid[i] >= 0 && fromLiquid[i] <= kShoreGrass;
+	for (const ShapePoint &knot : L.knots)
+		for (int i = 0; i < n; ++i)
+			if (L.thread[i] && t.dist2(t.remainderX(i), i / t.w, int(std::lround(knot.x)), int(std::lround(knot.y))) <=
+								   kKnotClearing * kKnotClearing)
+				L.green[i] = 1;
 }
 
 Layout design(const GenerationRequest &request, GenerationContext &context)
@@ -327,6 +519,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 		std::vector<StrokePoint> placed = stretchPath(path, L.cx, L.cy, L.stretch);
 		strokePath(L.land, t, placed);
 		L.roads.push_back(std::move(placed));
+		L.roadWidth.push_back(2);
 		L.spokeLines.push_back(std::move(line));
 	}
 	// The frame: a thread between every two neighbouring spoke ends, sagging inwards.
@@ -341,7 +534,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 					  {mx + (L.cx - mx) / inward * 2 * pull, my + (L.cy - my) / inward * 2 * pull},
 					  to,
 					  false},
-					 g.spokeHalf);
+					 g.spokeHalf, 2);
 	}
 	// The capture threads: every turn of the spiral, or every ring, from spoke to spoke. A torn
 	// strand keeps its two ends hanging from the spokes. Where a thread leaves a spoke is a knot.
@@ -366,7 +559,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 				continue;
 			const long long id = L.key(k, j);
 			thread.torn = std::find(torn.begin(), torn.end(), id) != torn.end();
-			strokeThread(L.land, t, L, thread, g.threadHalf);
+			strokeThread(L.land, t, L, thread, g.threadHalf, 1);
 			if (roll(request, "web-knot/", id) <
 				std::min<std::int64_t>(1000, scaledCount(kKnotStone, o.stone)))
 				L.knots.push_back(L.stretch.apply(L.cx, L.cy, thread.from));
@@ -468,6 +661,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 		L.water[i] = L.water[i] || !L.land[i];
 		L.thread[i] = L.land[i] && !L.hub[i] && L.padOf[i] < 0 && L.dewOf[i] < 0;
 	}
+	planFrost(L, request, context);
 	context.telemetry.measure("spider-web.spokes.actual", g.spokes);
 	context.telemetry.measure("spider-web.home.radius-fitted", g.padRadius);
 	context.telemetry.measure("spider-web.thread.half-width", g.threadHalf);
@@ -484,7 +678,7 @@ Layout design(const GenerationRequest &request, GenerationContext &context)
 
 // Every colony's kit, identical and unscaled: wheat and wood on the hub side of the swarm, either
 // side of the spoke, and a quarry out beyond the swarm.
-void furnishPads(Map &map, const Layout &L, GenerationContext &context)
+void furnishPads(GenerationMap &map, const Layout &L, GenerationContext &context)
 {
 	const Torus &t = L.t;
 	const std::vector<unsigned char> reserved = swarmSurroundings(t, context);
@@ -507,11 +701,14 @@ void furnishPads(Map &map, const Layout &L, GenerationContext &context)
 // Stone at the knots, a prize on every dew drop, the orchard of all three fruits round the hub's
 // pond with a quarry, then the threads' own wheat and wood in patches. The patches are sampled in
 // the wedge's frame, so every colony's stretch of web is farmed alike.
-void stockWeb(Map &map, const Layout &L, GenerationContext &context, const SpiderWebOptions &o)
+void stockWeb(GenerationMap &map, const Layout &L, GenerationContext &context,
+			  const SpiderWebOptions &o)
 {
 	const Torus &t = L.t;
 	const int n = t.size();
-	const auto onThread = [&](int i) { return L.thread[i] && clearGround(map, t.remainderX(i), i / t.w); };
+	// Fields and stone stand only on the threads' green ground: tundra holds nothing.
+	const auto onThread = [&](int i)
+	{ return L.thread[i] && L.green[i] && clearGround(map, t.remainderX(i), i / t.w); };
 	for (const ShapePoint &knot : L.knots)
 		if (const int seed =
 				seedNear(t, int(std::lround(knot.x)), int(std::lround(knot.y)), 3, onThread);
@@ -533,7 +730,9 @@ void stockWeb(Map &map, const Layout &L, GenerationContext &context, const Spide
 			growPatch(map, t, seed, stone ? STONE : CHERRY + drop.prize, 9, onDrop);
 	}
 
-	const auto onHub = [&](int i) { return L.hub[i] && clearGround(map, t.remainderX(i), i / t.w); };
+	// The orchard and the quarry stand on the dome's plateau, inside its wall and off its ramps.
+	const auto onHub = [&](int i)
+	{ return L.hub[i] && !L.wall[i] && !L.ramp[i] && clearGround(map, t.remainderX(i), i / t.w); };
 	// The orchard's groves stand 4 tiles past the pond's fullest outline (1.25), clear of its
 	// beach, or halfway out on a hub without a pond.
 	const double rho = L.g.pondRadius > 0 ? L.g.pondRadius * 1.25 + 4 : 0.5 * L.g.hubRadius;
@@ -583,11 +782,109 @@ void stockWeb(Map &map, const Layout &L, GenerationContext &context, const Spide
 				[&](int i) { return splitKey[i]; });
 }
 
-bool generate(Game &game, GenerationContext &context)
+// The web's terrain, a pure function of the layout: `mechanics` holds one canonical type per rule
+// (GRASS, SAND, DIRT, WATER, ICE, CLIFFS, TRAIL), which every placement and check below reads, and `looks`
+// the artwork painted over it last (composeLooks), which can never change a rule.
+struct WebTerrain
+{
+	TerrainSketch mechanics, looks;
+	int spokeRoad = 0, threadRoad = 0, ice = 0, tundra = 0, glacier = 0, beach = 0;
+};
+
+WebTerrain sketchTerrain(const Layout &L, GenerationContext &context)
+{
+	const Torus &t = L.t;
+	const int n = t.size();
+	WebTerrain T;
+	TerrainSketch &terrain = T.mechanics;
+	terrain.assign(n, GRASS);
+	for (int i = 0; i < n; ++i)
+	{
+		if (L.wall[i])
+			terrain[i] = CLIFFS;
+		else if (L.water[i])
+			terrain[i] = L.open[i] ? WATER : ICE;
+		else if (L.thread[i] && !L.green[i])
+			terrain[i] = DIRT;
+	}
+	// Pale beaches where grass meets open water (the sea, a lead or a spring), as layBeaches lays
+	// them but on grass alone: the tundra and the ice run straight into the water.
+	{
+		const TerrainSketch original(terrain);
+		for (int i = 0; i < n; ++i)
+		{
+			if (original[i] != GRASS)
+				continue;
+			const int x = t.remainderX(i), y = i / t.w;
+			bool shore = false;
+			for (int dy = -1; dy <= 1 && !shore; ++dy)
+				for (int dx = -1; dx <= 1 && !shore; ++dx)
+					shore = original[t.at(x + dx, y + dy)] == WATER;
+			if (shore)
+			{
+				terrain[i] = SAND;
+				++T.beach;
+			}
+		}
+	}
+	// The white roads, off the pads and the dew drops so the homes keep their building room, and
+	// stopping at the dome, which they climb by its ramps. Nothing grows on or across a road.
+	std::vector<unsigned char> spoke(n, 0);
+	if (SpiderWebOptions(context.request).sandRoads)
+	{
+		std::vector<unsigned char> wide(n, 0), narrow(n, 0);
+		for (size_t r = 0; r < L.roads.size(); ++r)
+			tracePath(L.roadWidth[r] >= 2 ? wide : narrow, t, L.roads[r]);
+		const auto onSilk = [&](int i)
+		{ return (terrain[i] == GRASS || terrain[i] == DIRT) && !L.hub[i] && L.padOf[i] < 0 && L.dewOf[i] < 0; };
+		T.spokeRoad = paveRoute(terrain, t, wide, 2, TRAIL, onSilk);
+		T.threadRoad = paveRoute(terrain, t, narrow, 1, TRAIL, onSilk);
+	}
+	for (int i = 0; i < n; ++i)
+		if (L.ramp[i])
+			terrain[i] = TRAIL;
+
+	// The looks, one per rule group: lush grass, pale sand, snow-drifted arctic tundra, frozen lake (wind-swept
+	// snow on the innermost cells round the dome, a named feature), the glacier and the white
+	// moonstone road.
+	T.looks.assign(n, 0);
+	for (int i = 0; i < n; ++i)
+	{
+		switch (terrain[i])
+		{
+		case GRASS:
+			T.looks[i] = LUSH_GRASS;
+			break;
+		case SAND:
+			T.looks[i] = PALE_SAND;
+			break;
+		case DIRT:
+			T.looks[i] = ARCTIC_TUNDRA;
+			++T.tundra;
+			break;
+		case ICE:
+			T.looks[i] = L.snow[i] ? WIND_SWEPT_SNOW : FROZEN_LAKE;
+			++T.ice;
+			break;
+		case CLIFFS:
+			T.looks[i] = GLACIER;
+			++T.glacier;
+			break;
+		case TRAIL:
+			T.looks[i] = MOONSTONE_LOZENGE;
+			break;
+		default:
+			break;
+		}
+	}
+	return T;
+}
+
+bool generate(GenerationWorld &game, GenerationContext &context)
 {
 	context.stage = "web layout";
 	const SpiderWebOptions o(context.request);
-	Map &map = game.map;
+	GenerationMap &map = game.map;
 	const int teams = context.request.nbTeams;
 	map.fillTerrain(WATER);
 	for (int i = 0; i < teams; ++i)
@@ -602,37 +899,16 @@ bool generate(Game &game, GenerationContext &context)
 	const int n = t.size();
 
 	context.stage = "web terrain";
-	TerrainSketch terrain(n, GRASS);
-	for (int i = 0; i < n; ++i)
-		if (L.water[i])
-			terrain[i] = WATER;
-	// A few dry patches along the threads, sampled in the wedge frame so every colony's stretch of
-	// web gets the same ones; never on the pads, the hub or the dew drops.
-	{
-		const WedgeFrame wedges(t, L.phase, L.g.teams, L.stretch);
-		const PeriodicNoise dry(t.w, t.h, kSandCell, context.stream("web-sand"));
-		sprinkleSand(terrain, t, L.thread, kSandShare, kSandInland,
-					 [&](int i)
-					 {
-						 const WedgeFrame::Cell cell = wedges.cell(t.remainderX(i), i / t.w);
-						 return dry.at(cell.s, cell.d);
-					 });
-	}
-	// The sand roads: a line of sand one tile thick (tracePath, the thinnest there is) down the
-	// middle of every spoke and whole thread, off the pads and the dew drops, so the homes keep
-	// their building room. Every tile touching a sand corner loses the pure grass a deposit or a
-	// building needs, so nothing can grow or be built across a thread and close it.
-	if (o.sandRoads)
-	{
-		std::vector<unsigned char> road(n, 0);
-		for (const std::vector<StrokePoint> &line : L.roads)
-			tracePath(road, t, line);
-		for (int i = 0; i < n; ++i)
-			if (road[i] && terrain[i] == GRASS && L.padOf[i] < 0 && L.dewOf[i] < 0)
-				terrain[i] = SAND;
-	}
-	layBeaches(terrain, t);
-	writeVertices(map, terrain);
+	const WebTerrain terrain = sketchTerrain(L, context);
+	writeVertices(map, terrain.mechanics);
+	context.telemetry.measure("spider-web.silk.spoke-vertices", terrain.spokeRoad);
+	context.telemetry.measure("spider-web.silk.thread-vertices", terrain.threadRoad);
+	context.telemetry.measure("spider-web.frost.ice-vertices", terrain.ice);
+	context.telemetry.measure("spider-web.frost.tundra-vertices", terrain.tundra);
+	context.telemetry.measure("spider-web.frost.glacier-vertices", terrain.glacier);
+	context.telemetry.measure("spider-web.frost.beach-vertices", terrain.beach);
+	context.telemetry.measure("spider-web.frost.leads", L.leads);
+	context.telemetry.measure("spider-web.frost.frozen-cells", L.frozen);
 
 	context.stage = "web colonies";
 	const auto pad = [&](int team)
@@ -655,13 +931,12 @@ bool generate(Game &game, GenerationContext &context)
 	context.stage = "web resources";
 	furnishPads(map, L, context);
 	stockWeb(map, L, context, o);
-	// Algae only grows in water with solid sand within reach (see algaeGrowthChance), so it is
-	// counted over the shallows but seeded on each colony's best-growing water, the same number of
-	// clumps in every wedge.
+	// Algae only grows in liquid water with a coast within reach (see algaeGrowthChance): the sea,
+	// the leads and the springs. It is counted over their shallows but seeded on each colony's
+	// best-growing water, the same number of clumps in every wedge.
 	const WedgeFrame algaeWedges(t, L.phase, L.g.teams, L.stretch);
 	seedAlgae(map, context, t, "web-algae", o.algae,
-			  AlgaeBand::shallows(1, 10, kAlgaeTilesPerClump).thriving(kAlgaeBestShare),
-			  &algaeWedges);
+			  AlgaeBand::shallows(1, 10, kAlgaeTilesPerClump).thriving(kAlgaeBestShare), &algaeWedges);
 	secureStartingCrops(game, context, t);
 
 	// Beaches keep the threads walkable, but a small hub can be stocked shut: keep a way open from
@@ -669,7 +944,10 @@ bool generate(Game &game, GenerationContext &context)
 	context.stage = "web roads";
 	const std::vector<std::vector<int>> workers = unitTilesByTeam(map, teams);
 	if (teams < 1 || workers[0].empty())
+	{
+		writeLayeredTerrain(map, terrain.mechanics, terrain.looks);
 		return true;
+	}
 	if (!openRoad(map, t, workers[0], L.hub))
 	{
 		context.detail = "no walk from colony 0 reaches the hub";
@@ -681,6 +959,9 @@ bool generate(Game &game, GenerationContext &context)
 			context.detail = "no walk from colony 0 reaches colony " + std::to_string(team);
 			return false;
 		}
+	// The looks last: every placement and repair above read the canonical terrain.
+	context.stage = "web looks";
+	writeLayeredTerrain(map, terrain.mechanics, terrain.looks);
 	return true;
 }
 
@@ -696,18 +977,37 @@ std::string validateRequest(const GenerationRequest &r)
 // Checked on the finished world: every spoke is still land from the hub to the frame, and colony 0
 // can walk to every other colony and onto the hub, with water, buildings and every resource
 // blocking.
-std::string validateWorld(const Game &game, const GenerationContext &context)
+std::string validateWorld(const GenerationWorld &game, const GenerationContext &context)
 {
 	GenerationContext replay(context.request);
 	const Layout L = design(context.request, replay);
-	const Map &map = game.map;
+	const GenerationMap &map = game.map;
 	if (const std::string mismatch = designMismatch(L, map, "web"); !mismatch.empty())
 		return mismatch;
 	const Torus &t = L.t;
+	// Every road, wall, ice field and green patch stands as designed, vertex for vertex, looks
+	// included.
+	{
+		const WebTerrain designed = sketchTerrain(L, replay);
+		const TerrainSketch terrain = composeLooks(designed.mechanics, designed.looks);
+		for (int i = 0; i < t.size(); ++i)
+			if (map.vertexTerrainAt(t.remainderX(i), i / t.w) != terrain[i])
+				return "The web at (" + std::to_string(t.remainderX(i)) + ", " + std::to_string(i / t.w) +
+					   ") is not as designed.";
+	}
+	// Every spoke is land from the dome to the frame (the dome is checked below: a spoke other than
+	// a colony's home spoke ends at its glacier wall).
 	for (size_t j = 0; j < L.spokeLines.size(); ++j)
 		for (const ShapePoint &p : L.spokeLines[j])
-			if (!map.terrainPropertiesAt(t.x(int(std::lround(p.x))), t.y(int(std::lround(p.y)))).walkable)
-				return "Spoke " + std::to_string(j) + " is broken by water.";
+		{
+			const int x = t.x(int(std::lround(p.x))), y = t.y(int(std::lround(p.y)));
+			const bool dome = L.hub[size_t(y) * t.w + x] || cornerOf(t, L.wall, t.at(x, y)) ||
+							  L.wall[t.at(x, y)] || L.wall[t.at(x + 1, y)] || L.wall[t.at(x, y + 1)] ||
+							  L.wall[t.at(x + 1, y + 1)];
+			if (!dome && !map.terrainPropertiesAt(x, y).walkable)
+				return "Spoke " + std::to_string(j) + " is broken by water at (" + std::to_string(x) + ", " +
+					   std::to_string(y) + ").";
+		}
 	const ColonyWalk walk =
 		walkFromFirstColony(map, context.request.nbTeams, "the web", "along the web");
 	if (!walk.error.empty())
@@ -737,7 +1037,11 @@ GeneratorDefinition spiderWebDefinition()
 		"spider-web",
 		20,
 		"Spider web",
-		3,
+		// Revision 5: the frosted web, drawn from the terrain catalogue (paved silk, dark deep cells,
+		// moss dew drops and a hub meadow, pale beaches, no sand patches). Revision 6: algae regrows
+		// near any coast now, so its best-growing water moved. Revision 7: the frost web, frozen
+		// cells with open leads, tundra threads, hot-spring pads and islets, a glacier dome.
+		7,
 		false,
 		// Spokes per colony (more on a web with few colonies); the spacing between capture threads
 		// and every thread's width in tiles; how far the capture threads sag and the share of them
@@ -762,9 +1066,9 @@ GeneratorDefinition spiderWebDefinition()
 		 // Off, the capture threads are closed rings rather than a spiral.
 		 GeneratorControl::toggle("spiral", "Spiral", true, ControlGroup::Layout)
 			 .withSearchValues({0, 1}),
-		 // Off, the threads are grass from shore to shore, with no sand road down the middle.
-		 // Search keeps roads open as adjacent crops and trees regrow.
-		 GeneratorControl::toggle("sand-roads", "Sand roads", true, ControlGroup::Layout)
+		 // Off, the threads are grass from shore to shore, with no paved road down the middle.
+		 // Search keeps roads open as adjacent crops and trees regrow. The ID predates the paving.
+		 GeneratorControl::toggle("sand-roads", "Paved roads", true, ControlGroup::Layout)
 			 .withSearchValues({1}),
 		 // The threads' standing wheat and wood, the knots' stone and the drops' and hub's prizes;
 		 // every pad's kit is unscaled.
@@ -777,5 +1081,6 @@ GeneratorDefinition spiderWebDefinition()
 		true,
 		validateRequest,
 		validateWorld,
-		{"terrain:arena", "feature:islands", "style:contested-center", "fairness:repeated-wedge"}};
+		{"terrain:arena", "feature:snow", "feature:oases", "feature:islands", "style:contested-center",
+		 "fairness:repeated-wedge"}};
 }

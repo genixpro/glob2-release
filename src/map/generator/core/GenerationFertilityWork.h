@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "GenerationWork.h"
-#include "Map.h"
+#include "GenerationWorld.h"
 
 namespace MapGeneration
 {
@@ -9,7 +9,7 @@ namespace MapGeneration
 // their external work explicitly rather than changing simulation's inner loops.
 inline void generationFertilityRebuildWork(int width, int height)
 {
-	if (!generationWork)
+	if (!generationWorkActive())
 		return;
 	const auto tiles = std::uint64_t(width) * height;
 	// 31*31 offsets, four box passes and up to 61 padded samples per tile on
@@ -18,17 +18,13 @@ inline void generationFertilityRebuildWork(int width, int height)
 	generationAllocation(tiles * 32 + std::uint64_t(height) * (width + 60) * 2);
 }
 
-inline void generationFertilityMapWork(const Map &map)
+inline void generationFertilityMapWork(const GenerationMap &map)
 {
-	if (!generationWork)
+	if (!generationWorkActive())
 		return;
 	const auto width = map.getW(), height = map.getH();
 	const auto tiles = std::uint64_t(width) * height;
-	bool rebuild;
-	{
-		std::lock_guard lock(map.growthCacheMutex);
-		rebuild = !map.growthCache.validFor(map);
-	}
+	const bool rebuild = !map.growthCacheValid();
 	if (rebuild)
 	{
 		// A fresh cache computes land and aquatic kernels, local modifiers and

@@ -3,7 +3,9 @@
 
 #include "BuildingType.h"
 #include "FileFormatVersions.h"
-#include "Game.h"
+#include "GameHeader.h"
+#include "MapHeader.h"
+#include "Building.h"
 #include "Team.h"
 #include "Unit.h"
 #include "Utilities.h"
@@ -28,11 +30,20 @@ GAGCore::CooperativeTask Team::loadTask(GAGCore::InputStream *stream, BuildingsT
 		co_return false;
 
 	stream->readEnterSection("Team");
+    routingRatio={};
+    if(versionMinor>=FILE_FORMAT_VERSION_ROUTING_RATIO_POLICY) {
+        routingRatio.selected=stream->readUint8("routingRatioClass");
+        routingRatio.tick=stream->readUint32("routingRatioTick");
+        const auto known=stream->readUint8("routingRatioKnown");
+        if(!RoutingRatioState::amphibious(routingRatio.selected) || known>1)
+            throw std::runtime_error("Invalid saved routing ratio policy");
+        routingRatio.known=known;
+    }
 
 	// Bind immutable definitions before any entity takes a descriptor pointer.
 	// Older formats already bound their saved Race while reading BaseTeam.
 	if (versionMinor >= FILE_FORMAT_VERSION_RACE_FIELD)
-		race.setCatalog(game->gameHeader.getUnitCatalog());
+		race.setCatalog(ctx.gameHeader->getUnitCatalog());
 	stats.configureUnits(race.unitTypeCount());
 
 	// Current saves enumerate exact append order. Legacy formats encode the
@@ -137,7 +148,7 @@ GAGCore::CooperativeTask Team::loadTask(GAGCore::InputStream *stream, BuildingsT
 	for(int i=0; i<GESize; ++i)
 		eventCooldownTimers[i]=0;
 
-	if (!stats.load(stream, versionMinor,game->mapHeader.privateAdaptive174))
+	if (!stats.load(stream, versionMinor,ctx.mapHeader->privateAdaptive174))
 	{
 		stream->readLeaveSection();
 		co_return false;
@@ -281,6 +292,9 @@ void Team::save(GAGCore::OutputStream *stream)
 	BaseTeam::save(stream);
 
 	stream->writeEnterSection("Team");
+    stream->writeUint8(routingRatio.selected,"routingRatioClass");
+    stream->writeUint32(routingRatio.tick,"routingRatioTick");
+    stream->writeUint8(routingRatio.known,"routingRatioKnown");
 
 	// Entity record order is simulation state; never derive it from free IDs.
 	stream->writeEnterSection("myUnits");
@@ -390,11 +404,15 @@ void Team::save(GAGCore::OutputStream *stream)
 
 
 
-Uint32 Team::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> *checkSumsVectorForBuildings, std::vector<Uint32> *checkSumsVectorForUnits, bool legacy152)
+Uint32 Team::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> *checkSumsVectorForBuildings, std::vector<Uint32> *checkSumsVectorForUnits, ChecksumScheme scheme)
 {
+    const bool legacy152 = scheme == ChecksumScheme::Legacy152;
 	Uint32 cs=0;
 
 	cs^=BaseTeam::checkSum();
+    if (!legacy152) {
+        for(auto value:{routingRatio.selected,routingRatio.tick,unsigned(routingRatio.known)}) cs=rotr1(cs)^value;
+    }
 	if (!legacy152) { cs=rotr1(cs)^taskSwapNext; cs=rotr1(cs)^liveUnits.size(); cs=rotr1(cs)^liveBuildings.size(); }
 	cs=rotr1(cs);
 	if (checkSumsVector)
@@ -402,7 +420,7 @@ Uint32 Team::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 
 	for (Unit *unit : liveUnits.entries())
 	{
-		cs^=unit->checkSum(checkSumsVectorForUnits,legacy152);
+		cs^=unit->checkSum(checkSumsVectorForUnits,scheme);
 		cs=rotr1(cs);
 	}
 	if (checkSumsVector)
@@ -410,7 +428,7 @@ Uint32 Team::checkSum(std::vector<Uint32> *checkSumsVector, std::vector<Uint32> 
 
 	for (Building *building : liveBuildings.entries())
 	{
-		cs^=building->checkSum(checkSumsVectorForBuildings,legacy152);
+		cs^=building->checkSum(checkSumsVectorForBuildings,scheme);
 		cs=rotr1(cs);
 	}
 	if (checkSumsVector)

@@ -21,7 +21,7 @@ using B = SimulationSnapshot::BuildingView;
 using U = SimulationSnapshot::UnitView;
 int swimClass(const U &u)
 {
-	return u.performance[FLY] ? AIR_MOVEMENT_CLASS : Map::swimClass(u.performance[WALK], u.performance[SWIM]);
+	return accessClass(movementAccessForSpeeds(u.performance[WALK],u.performance[SWIM],u.performance[FLY]));
 }
 int food(const U &u)
 {
@@ -510,7 +510,7 @@ Output Planner::rank(const Inputs &input, unsigned team, unsigned capacity)
 					// modes keep the optimistic estimate used by live admission.
 					const auto plane = !(modes & 2) &&
 						!supply->consumerSpecific[key.material]
-						? world.resourceGradient(team, key.material, swim, modes & 1)
+						? world.resourceGradient(team, key.material, movementAccessFromLegacy(swim), modes & 1)
 						: std::span<const Uint16>{};
 					if (!plane.empty())
 					{
@@ -604,8 +604,7 @@ Output Planner::rank(const Inputs &input, unsigned team, unsigned capacity)
 		// Only an outstanding or imminent attraction round makes private offers.
 		// These reduce repeated shortlist exclusion between peers; they reserve
 		// nothing in the live simulation and use no gameplay randomness.
-		if (unsigned(std::max(0, b.subscriptionWorkingTimer)) + Hiring::PublicationDelay +
-				Hiring::RefreshInterval - 1 >= 32)
+		if (unsigned(std::max(0, b.subscriptionWorkingTimer)) + input.rules.lookahead() >= 32)
 		{
 			std::array<unsigned, 3> assigned{};
 			unsigned deliveries = 0;

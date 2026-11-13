@@ -31,11 +31,11 @@ are those of revision 2.
 | Ground | Where | Why |
 | --- | --- | --- |
 | Boardwalk | Supply piers over open water | Walkable and quick, nothing grows on it. The piers are the estate's only land link between its islands. |
-| Dirt track | Outer lanes on land, including the cross lanes that part each plantation's wheat from its timber | Parts the crops as sand did, and hauling along it is quicker. |
+| Brick path | Outer lanes on land, including the cross lanes that part each plantation's wheat from its timber | Parts the crops as sand did, and hauling along it is quicker. |
 | Sand | The folded gate corridor, and every lane that touches a beach | Nothing can be built on it, so a colony cannot wall in its own gate. The validator refuses a corridor vertex that has been dressed. |
-| Gravel, with dirt | A glacis band outside the ramparts; harbour arms; the stone battery keys | Barren ground holds crops back like sand, yet can be built on. |
+| Shale, with dirt | A glacis band outside the ramparts; harbour arms; the stone battery keys | Barren ground holds crops back like sand, yet can be built on. |
 | Outcrop | The far half of each harbour arm | Impassable rock that towers shoot over: the arms read as breakwaters. The sand shore beside it stays walkable. |
-| Dirt, clay, flower meadow | Dry scrub on island rims; meadow patches on open grass | Breaks up the lawn without touching any tile the economy needs. |
+| Dirt, clay, heath | Dry scrub on island rims; heath patches on open grass | Breaks up the lawn without touching any tile the economy needs. |
 | Loam, with moss | The wheat ground of neutral plantation keys | See the measurement below. |
 | Moss, spring meadow | Neutral orchard keys | Fertile ground for the fruit prize. |
 | Ridge rock and outcrop | Reefs: small shoals in open water | Seven or more steps from any land, with every vertex within three of them open water, so no channel is narrowed. |
@@ -43,10 +43,8 @@ are those of revision 2.
 A tile takes its rules from its four corner vertices, so ground is set on
 corners and kept off every tile that must stay pure grass: towns, ramparts,
 service courts, landing fields and lanes. The sea is shallow water throughout
-and deep water is deliberately absent: a tile whose corners are shallow and
-deep water is neither walkable nor swimmable, so a deep ring would seal every
-island from swimmers. A generated map declares the path, barren, fertile and
-ridge terrain experiments in its header.
+and this recipe does not add a deep-water band. Mixed water depths remain
+swimmable under the shared corner rules.
 
 ### A colony's own plantations stay grass
 
@@ -97,7 +95,7 @@ corridor vertex may have been dressed with buildable ground.
 The generator uses existing simulation rules. It changes no engine behavior,
 save format, replay acceptance, network protocol or AI, and no other generator.
 Revision 3 produces different maps from the same seed, so it moves the generator
-revision and the golden rows. It deliberately leaves `SIM_REVISION` alone for now
+revision. It deliberately leaves `SIM_REVISION` alone for now
 (a maintainer decision); Bastion Keys is not in the online fair-generator pool, and
 whether any path regenerates maps from a generator descriptor was not verified.
 
@@ -149,7 +147,7 @@ in the Forts reference.
 
 Automated games establish economy and combat behavior, not human enjoyment or
 exact competitive balance. Revision 3 has not been checked on Linux or Windows,
-so its golden rows exist for macOS arm64 only. The faster tracks and piers change
+so its map fingerprints were checked on macOS arm64 only. The faster tracks and piers change
 how the opening feels, which needs a person to play it. The longer, 60,000-tick
 games and the other AIs were not rerun for revision 3.
 

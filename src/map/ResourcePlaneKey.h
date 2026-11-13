@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "Material.h"
-#include "Team.h"
-#include "UnitConsts.h"
+#include "TeamCapacity.h"
+#include "MovementClass.h"
 #include <cstdint>
 
 // Published material planes (per team, material slot, swim class, natural or
@@ -11,7 +11,7 @@
 // without hashing.
 namespace MapState
 {
-constexpr int PlaneTeams = Team::MAX_COUNT;
+constexpr int PlaneTeams = TEAM_MAX_COUNT;
 constexpr unsigned LegacyPlaneCount = unsigned(PlaneTeams) * MaterialSlotCount * LEGACY_SWIM_CLASS_COUNT * 2;
 constexpr unsigned GroundPlaneCount = LegacyPlaneCount + unsigned(PlaneTeams) * MaterialSlotCount * 2;
 constexpr unsigned PlaneCount = GroundPlaneCount + unsigned(PlaneTeams) * MaterialSlotCount * 2;

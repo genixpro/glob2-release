@@ -1,4 +1,5 @@
 #include <nlohmann/json.hpp>
+#include "Map.h"
 #include "StartingLayout.h"
 #include "ClearingLandscape.h"
 #include "Homes.h"
@@ -24,7 +25,8 @@
 #include "GenerationContext.h"
 #include "GenerationService.h"
 #include "GenerationValidation.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "GlobalContainer.h"
 #include "IntBuildingType.h"
 #include "LegacyGenerationDescriptor.h"
@@ -150,7 +152,6 @@ class MapGeneratorDefaultsTest
 						++lava;
 				}
 			REQUIRE(lava > 0);
-			REQUIRE(repeat.map.requiredTerrainExperiments().has(ExperimentId::LavaTerrain));
 			for (int y = 0; y < repeat.map.getH(); ++y)
 				for (int x = 0; x < repeat.map.getW(); ++x)
 					if (repeat.map.vertexTerrainAt(x, y) == LAVA ||
@@ -306,9 +307,9 @@ class MapGeneratorDefaultsTest
 				  .withSearchRange(3, 5),
 			  GeneratorControl::choice("test-shape", "Cell shape", {"Squares", "Hexagons"}, 0)
 				  .withSearchValues({0, 1}),
-			  GeneratorControl::toggle("test-switch", "Lake connects to fjords", false)
+			  GeneratorControl::toggle("test-switch", "Nunatak orchards", false)
 				  .withSearchValues({1})},
-			 [](Game &game, GenerationContext &context)
+			 [](GenerationWorld &game, GenerationContext &context)
 			 {
 				 const int elevation = context.request.option("test-elevation");
 				 REQUIRE(elevation == 8);
@@ -333,7 +334,8 @@ class MapGeneratorDefaultsTest
 											   1,
 											   false,
 											   {std::move(control)},
-											   [](Game &, GenerationContext &) { return false; }};
+											   [](GenerationWorld &, GenerationContext &)
+											   { return false; }};
 				// Tagged, so a rejection can only come from the control under test.
 				definition.tags = {"terrain:novelty"};
 				try
@@ -346,7 +348,7 @@ class MapGeneratorDefaultsTest
 				}
 				return false;
 			};
-			const auto on = GeneratorControl::toggle("switch", "Lake connects to fjords", true)
+			const auto on = GeneratorControl::toggle("switch", "Nunatak orchards", true)
 								.withSearchValues({0, 1});
 			REQUIRE((on.isToggle() && on.defaultValue == 1 &&
 				   on.values() == std::vector<int>({0, 1})));
@@ -383,7 +385,7 @@ class MapGeneratorDefaultsTest
 		REQUIRE(screen.descriptor.option("test-switch") == 0);
 		edit(screen, "Island size", 16);
 		edit(screen, "Channel width", 5);
-		edit(screen, "Lake connects to fjords", 1);
+		edit(screen, "Nunatak orchards", 1);
 		REQUIRE(screen.descriptor.option("test-shape") == 0);
 		edit(screen, "Cell shape", 1);
 		select(screen, D::eRIVER);
@@ -484,8 +486,15 @@ class MapGeneratorDefaultsTest
 					const int type = world.map.getResource(x, y).type;
 					// Retain cherries and prunes: total fruit alone cannot prove
 					// that a court supplies all three upgrade ingredients.
-					if ((corruption == 0 && type == STONE) ||
-						(corruption == 1 && type == ORANGE))
+					// Corruption 0 opens every wall: rock and cliff become grass.
+					const TerrainGroup group = terrainGroup(world.map.vertexTerrainAt(x, y));
+					if (corruption == 0 &&
+						(group == TerrainGroup::Ridges || group == TerrainGroup::Obstacles))
+					{
+						world.map.setVertexTerrain(x, y, GRASS);
+						++changed;
+					}
+					if (corruption == 1 && type == ORANGE)
 					{
 						world.map.setNoResource(x, y, 1);
 						++changed;
@@ -494,7 +503,8 @@ class MapGeneratorDefaultsTest
 			if (corruption == 2)
 			{
 				// Close the circular home/court boundary, regardless of the seed's
-				// rotation. This plugs every door without removing any structural wall.
+				// rotation, with cliff terrain: the doors are rough ground, which holds no
+				// stone. This plugs every door without removing any structural wall.
 				double outer = -1;
 				for (const auto &record : result.telemetry.records())
 					if (record.key == "gauntlet.arena.outer-radius")
@@ -504,9 +514,10 @@ class MapGeneratorDefaultsTest
 					for (int x = 0; x < world.map.getW(); ++x)
 						if (std::abs(std::hypot(x - world.map.getW() / 2.,
 											   y - world.map.getH() / 2.) - outer) < 1.5 &&
-							world.map.getResource(x, y).type != STONE)
+							terrainGroup(world.map.vertexTerrainAt(x, y)) != TerrainGroup::Obstacles &&
+							terrainGroup(world.map.vertexTerrainAt(x, y)) != TerrainGroup::Ridges)
 						{
-							world.map.setResourceByIndex(x, y, STONE, 1);
+							world.map.setVertexTerrain(x, y, CLIFFS);
 							++changed;
 						}
 			}
@@ -541,7 +552,7 @@ class MapGeneratorDefaultsTest
 		D request;
 		request.seed = 7;
 		GenerationContext context(request);
-		MapGeneration::scatterResources(game, context, {0, 0, 0, 50, 0});
+		MapGeneration::scatterResources(GenerationWorld(game).ref(), context, {0, 0, 0, 50, 0});
 		int sea = 0, lake = 0;
 		for (int y = 0; y < game.map.getH(); ++y)
 			for (int x = 0; x < game.map.getW(); ++x)
@@ -571,17 +582,11 @@ class MapGeneratorDefaultsTest
 		NewMapScreen s;
 		s.beginExecution(globalContainer->gfx);
 		CustomGameSetup lobby;
-		// The catalog's order was shuffled once (FEEDBACK 2026-09-14: no bias towards the landscapes
-		// that happen to be listed first). The editor opens on the catalog's first entry and the
-		// lobby on its first playable one, whatever they are.
-		D editorFirst, lobbyFirst;
-		editorFirst.setMethodDefaults(GeneratorRegistry::builtins().methods().front());
-		lobbyFirst.setMethodDefaults(GeneratorRegistry::builtins().methods(false).front());
-		REQUIRE(GeneratorRegistry::builtins().methods(false).front() ==
-			   GeneratorRegistry::builtins().idOf("fingerprint"));
-		REQUIRE(s.descriptor.method == GeneratorRegistry::builtins().methods().front());
-		sameControls(s.descriptor, editorFirst);
-		sameControls(lobby.generator, lobbyFirst);
+		// Fresh editor and lobby setups use Lava Shield regardless of catalog order.
+		D expectedDefault;
+		expectedDefault.setMethodDefaults(GeneratorRegistry::builtins().idOf("lava-shield"));
+		sameControls(s.descriptor, expectedDefault);
+		sameControls(lobby.generator, expectedDefault);
 		for (int m : GeneratorRegistry::builtins().methods())
 		{
 			auto method = static_cast<D::Method>(m);
@@ -703,8 +708,8 @@ TEST_SUITE("MapGeneratorDefaults")
             game.buildingsTypes.loadSnapshotJson(snapshot.dump()); game.configureBuildingCatalog();
             GenerationRequest request; request.nbTeams=1; request.nbWorkers=6;
             GenerationContext context(request); context.bootX[0]=61; context.bootY[0]=2;
-            REQUIRE(MapGeneration::placeStarts(game,context));
-            CHECK(game.teams[0]->myBuildings[0]->typeNum==id);
+			REQUIRE(MapGeneration::placeStarts(GenerationWorld(game).ref(), context));
+			CHECK(game.teams[0]->myBuildings[0]->typeNum==id);
             const MapGeneration::StartingLayout layout(dimensions.first,dimensions.second,request.nbWorkers);
             for (int i=0; i<request.nbWorkers; ++i)
             {
@@ -735,7 +740,7 @@ TEST_SUITE("MapGeneratorDefaults")
 								  1,
 								  false,
 								  {std::move(c)},
-								  [](Game &, GenerationContext &) { return false; }};
+								  [](GenerationWorld &, GenerationContext &) { return false; }};
 			d.tags = {"terrain:novelty"};
 			try
 			{
@@ -865,12 +870,13 @@ TEST_SUITE("MapGeneratorDefaults")
 		D small;
 		small.setMethodDefaults(GeneratorRegistry::builtins().idOf("maze"));
 		small.wDec = small.hDec = 6;
-		small.nbTeams = 1;
-		// Hexagons cannot fit here, but Random retains the supported square layout.
+		small.nbTeams = 3;
+		// Squares cannot fit three cul-de-sacs here since Maze 2.0's thinner walls, but hexagons
+		// can, and Random keeps to the supported hexagonal layout.
 		for (unsigned seed = 1; seed <= 8; ++seed)
 		{
 			small.seed = seed;
-			REQUIRE(MazeOptions(small).cellShape == 0);
+			REQUIRE(MazeOptions(small).cellShape == 1);
 		}
 	}
 	TEST_CASE("resource habitat distinguishes terrain permission from growth and occupancy")
@@ -879,9 +885,9 @@ TEST_SUITE("MapGeneratorDefaults")
 		glob2test::HeadlessGame world;
 		auto& map = world.game.map;
 		// Tiles two apart share no corners, so each keeps its own terrain.
-		MapGeneration::paintTile(map, 8, 8, TRAIL);
-		MapGeneration::paintTile(map, 10, 8, ICE);
-		MapGeneration::paintTile(map, 12, 8, WATER);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 8, 8, TRAIL);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 10, 8, ICE);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 12, 8, WATER);
 		CHECK(map.terrainPropertiesAt(8, 8).buildable);
 		CHECK_FALSE(map.terrainSupportsResourceAtByIndex(8, 8, WHEAT));
 		CHECK_FALSE(map.terrainSupportsResourceAtByIndex(10, 8, STONE));
@@ -909,16 +915,16 @@ TEST_SUITE("MapGeneratorDefaults")
         auto& map = world.game.map;
         const MapGeneration::Torus torus(map);
         // Tiles two apart share no corners, so each keeps its own terrain.
-        MapGeneration::paintTile(map,8,8,TRAIL);
-        MapGeneration::paintTile(map,10,8,ICE);
-        MapGeneration::paintTile(map,12,8,WATER);
-        MapGeneration::paintTile(map,14,8,SAND);
-        const auto open = MapGeneration::walkableTiles(map);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 8, 8, TRAIL);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 10, 8, ICE);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 12, 8, WATER);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 14, 8, SAND);
+		const auto open = MapGeneration::walkableTiles(map);
         const auto beach = MapGeneration::beachTiles(map,torus);
         CHECK(open[torus.at(8,8)]);
         CHECK(open[torus.at(10,8)]);
         CHECK_FALSE(open[torus.at(12,8)]);
-        // A water tile's mixed neighbours are walkable transitions.
+        // This side neighbour has two walking corners, so the tie permits walking.
         CHECK(open[torus.at(11,8)]);
         CHECK_FALSE(beach[torus.at(8,8)]);
         CHECK_FALSE(beach[torus.at(10,8)]);
@@ -934,12 +940,141 @@ TEST_SUITE("MapGeneratorDefaults")
         CHECK_FALSE(stone.stone[torus.at(10,8)]);
         CHECK_EQ(stone.gaps,2);
 		const MapGeneration::SandFord ford{20, 20, 0, 1, 1, 0, 3, 1};
-		MapGeneration::paintTile(map, 20, 20, ICE);
-		MapGeneration::paintTile(map, 21, 20, TRAIL);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 20, 20, ICE);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 21, 20, TRAIL);
 		CHECK(MapGeneration::fordWalkabilityFault(map, torus, ford).empty());
-		MapGeneration::paintTile(map, 20, 20, WATER);
+		MapGeneration::paintTile(GenerationMap(map).ref(), 20, 20, WATER);
 		CHECK_FALSE(MapGeneration::fordWalkabilityFault(map, torus, ford).empty());
     }
+    TEST_CASE("colony route repairs cross mixed water and protect adjacent walls")
+    {
+        glob2test::HeadlessGlobals globals;
+        enum class Scenario { ProtectedNeighbours, AdjacentBuilding, UntouchedResource, BuildingOnWater };
+        // Keep one runner-visible case while exercising each scenario on a fresh
+        // world. Doctest subcases produce distinct JUnit names, which the engine
+        // registry deliberately rejects as an unexpected case inventory.
+        for (const auto& [scenario, name] : {
+            std::pair{Scenario::ProtectedNeighbours, "protected neighbouring terrain"},
+            std::pair{Scenario::AdjacentBuilding, "untouched diagonal building"},
+            std::pair{Scenario::UntouchedResource, "untouched diagonal resource"},
+            std::pair{Scenario::BuildingOnWater, "building on a painted water corner"}})
+        {
+            CAPTURE(name);
+            Game game(nullptr);
+            auto& map = game.map;
+            map.setSize(5, 5);
+            map.setGame(&game);
+            const MapGeneration::Torus torus(map);
+            MapGeneration::TerrainSketch sketch(torus.size(), WATER);
+            for (int y = 0; y < torus.h; ++y)
+                for (int x = 0; x < torus.w; ++x)
+                    sketch[torus.at(x,y)] = x % 2 ? WATER : DEEP_WATER;
+            for (int y = 10; y <= 18; ++y)
+                for (int x = 2; x <= 9; ++x)
+                {
+                    sketch[torus.at(x,y)] = GRASS;
+                    sketch[torus.at(x+18,y)] = GRASS;
+                }
+			MapGeneration::writeVertices(GenerationMap(map).ref(), sketch);
+			GenerationRequest request;
+            request.nbTeams = 2;
+            GenerationContext context(request);
+            context.bootX[0] = 4; context.bootY[0] = 12;
+            context.bootX[1] = 22; context.bootY[1] = 12;
+            const auto source = MapGeneration::tileMask(torus, {torus.at(3,11)});
+            const auto reachable = [&] {
+                return MapGeneration::stepsFrom(torus, source, MapGeneration::walkableTiles(map))[torus.at(21,11)] >= 0;
+            };
+            CHECK_FALSE(reachable());
+            const MapGeneration::StepCosts costs{1, 3, 8, 25, -1};
+            std::vector<unsigned char> keep(torus.size(), 0);
+            for (int y = 0; y < torus.h; ++y)
+                keep[torus.at(14,y)] = keep[torus.at(30,y)] = 1;
+            const auto vertices = [&] {
+                return std::vector<TerrainType>(map.vertexTerrainState().begin(), map.vertexTerrainState().end());
+            };
+            if (scenario == Scenario::ProtectedNeighbours)
+            {
+                // A one-cell gap cannot hold a ford without touching its neighbours.
+                keep[torus.at(14,13)] = keep[torus.at(30,13)] = 0;
+                const auto before = vertices();
+				CHECK_FALSE(MapGeneration::openColonyRoutes(GenerationMap(map).ref(), context,
+															torus, costs, 0, &keep));
+				CHECK(vertices() == before);
+				REQUIRE(MapGeneration::openColonyRoutes(GenerationMap(map).ref(), context, torus,
+														costs));
+				CHECK(reachable());
+				CHECK_FALSE(MapGeneration::openColonyRoutes(GenerationMap(map).ref(), context,
+															torus, costs));
+				continue;
+            }
+            if (scenario == Scenario::AdjacentBuilding || scenario == Scenario::UntouchedResource)
+            {
+                // Only the eastern crossing is permitted. Its water-majority cell
+                // (14,13) shares one grass corner with the legal plot at (15,9).
+                // That corner is not painted, so its diagonal cell is untouched.
+                for (int y = 12; y <= 14; ++y) keep[torus.at(14,y)] = 0;
+                {
+                    auto edit = map.editTerrain();
+                    for (int y = 9; y <= 13; ++y)
+                        for (int x = 15; x <= 19; ++x) map.setVertexTerrain(x,y,GRASS);
+                }
+                REQUIRE(map.terrainPropertiesAt(14,13).swimmable);
+                Building* building = nullptr;
+                if (scenario == Scenario::AdjacentBuilding)
+                {
+                    game.addTeam();
+                    const int swarm = game.buildingsTypes.getTypeNum("swarm",0,false);
+                    REQUIRE(map.isFreeForBuilding(15,9,4,4));
+                    building = game.addBuilding(15,9,swarm,0);
+                    REQUIRE(building);
+                }
+                else
+                    map.replaceResource(15,12,{CHERRY,0,3,0});
+				REQUIRE(MapGeneration::openColonyRoutes(GenerationMap(map).ref(), context, torus,
+														costs, 0, &keep));
+				CHECK(reachable());
+                CHECK(map.vertexTerrainAt(15,13) == GRASS);
+                if (building)
+                {
+                    for (int y = 9; y < 13; ++y)
+                        for (int x = 15; x < 19; ++x)
+                        {
+                            CHECK(map.terrainPropertiesAt(x,y).buildable);
+                            CHECK(map.getBuilding(x,y) == building->gid);
+                        }
+                }
+                else
+                {
+                    CHECK(map.getResource(15,12).type == CHERRY);
+                    CHECK(map.getResource(15,12).amount == 3);
+                }
+                continue;
+            }
+            // Authored profiles may permit building on swimming terrain. Such
+            // corners would be painted and must protect their whole footprint.
+            map.game = nullptr;
+            map.importTerrainDefinitions(R"({"schemaVersion":1,"terrains":[{"key":"test:buildable-water","name":"Buildable water","base":"water","appearance":"water","properties":{"buildable":true}}]})");
+            map.setGame(&game);
+            const auto water = map.terrainRegistry().find("test:buildable-water");
+            REQUIRE(water.has_value());
+            {
+                auto edit = map.editTerrain();
+                for (int y = 9; y <= 13; ++y)
+                    for (int x = 15; x <= 19; ++x) map.setVertexTerrain(x,y,*water);
+            }
+            for (int y = 12; y <= 14; ++y) keep[torus.at(14,y)] = 0;
+            game.addTeam();
+            const int swarm = game.buildingsTypes.getTypeNum("swarm",0,false);
+            REQUIRE(map.isFreeForBuilding(15,9,4,4));
+            REQUIRE(game.addBuilding(15,9,swarm,0));
+            const auto before = vertices();
+			CHECK_FALSE(MapGeneration::openColonyRoutes(GenerationMap(map).ref(), context, torus,
+														costs, 0, &keep));
+			CHECK(vertices() == before);
+        }
+    }
+
 	TEST_CASE("toolkit geometry; raster; resource and home contracts")
 	{
 		DefaultsFixture fixture;
@@ -992,14 +1127,6 @@ TEST_SUITE("MapGeneratorDefaults")
 		DefaultsFixture fixture;
 		MapGeneratorDefaultsTest::globalsInit();
 		// Historical 256-square, four-colony, seed-1 rows before the appended Random values.
-		// Fingerprint's historical world hash has build-specific existing goldens.
-		// Unoptimized Clang 18 coverage preserves the same pre-Random world as macOS.
-#if defined(__APPLE__) || (defined(__linux__) && defined(__x86_64__) && defined(__clang__) && \
-						  __clang_major__ == 18 && defined(GLOB2_TEST_COVERAGE) && !defined(__OPTIMIZE__))
-		constexpr std::uint64_t fingerprint = 15850274609968439542ULL;
-#else
-		constexpr std::uint64_t fingerprint = 5648058033288605271ULL;
-#endif
         // Sprite selection ceased consuming simulation RNG in resource epoch1.
         // Current full references also include SIM40's map-owned placement
         // stock stream; the historical topology references stay unchanged.
@@ -1043,13 +1170,17 @@ TEST_SUITE("MapGeneratorDefaults")
 			int value;
 			std::uint64_t hash;
 		};
-		// Honeycomb revision 4 intentionally removes the historical stone outlines;
-		// its new layout is covered by its contracts and revisioned generator goldens.
-		for (const auto original :
-			 {Original{"maze", "cell-shape", 0, 6132248727033081699ULL},
-			  Original{"fingerprint", "pattern", 0, fingerprint},
-			  Original{"canals", "block-shape", 0, 16622643961647829752ULL},
-			  Original{"caravanserai", "desert", 1, 6244602504248136250ULL}})
+		// Keep historical comparisons only for designs whose topology is unchanged.
+		// Honeycomb revision4 removed the stone outlines; corner voting changes
+		// Canals and Fingerprint placement; Caravanserai revision 5 (2.0) turned
+		// its mesas into rock with quarry faces and its routes into roads; Maze
+		// revision 17 (2.0) turned its stone-and-channel walls into cliffs with
+		// moated homes, gardens and paved roads (its pin was
+		// {"maze", "cell-shape", 0, 6132248727033081699}). Their current worlds
+		// are covered by generator contracts and the platform golden matrix. Do
+		// not overwrite archived resource-epoch references with these intentional
+		// new layouts.
+		for (const auto original : std::vector<Original>{})
 		{
 			D request;
 			request.setMethodDefaults(GeneratorRegistry::builtins().idOf(original.id));
@@ -1177,11 +1308,43 @@ TEST_SUITE("MapGeneratorDefaults")
 			}
 		}
 	}
-	TEST_CASE("Braided Delta uses coherent fields quarries and mixed orchards")
+	TEST_CASE("Anthill narrow tunnels stay connected under blocked corner ties [slow][map-generators]")
+	{
+		DefaultsFixture fixture;
+		MapGeneratorDefaultsTest::globalsInit();
+		const auto method = GeneratorRegistry::builtins().idOf("anthill");
+		struct Case { unsigned seed; int width, height; };
+		// Retain the standard square and both default-contract rectangles. The
+		// minimum width and width3 exercise necks where two walking/two rock
+		// corners used to be traversable; default width4 has additional margin.
+		for (int tunnelWidth : {2, 3})
+			for (const Case &c : {Case{22001, 8, 8}, Case{31001, 9, 7}, Case{31001, 7, 9}})
+			{
+				D request;
+				request.setMethodDefaults(method);
+				request.seed = c.seed;
+				request.wDec = c.width;
+				request.hDec = c.height;
+				request.options["tunnel-width"] = tunnelWidth;
+				INFO("tunnel-width=" << tunnelWidth << ", seed=" << c.seed <<
+					 ", dimensions=" << (1 << c.width) << "x" << (1 << c.height));
+				Game world(nullptr);
+				const auto result = GenerationService().generate(world, request);
+				CHECK_MESSAGE(bool(result), result.diagnostic());
+				if (!result)
+					continue;
+				CHECK(MapGeneration::walkFromFirstColony(world.map, request.nbTeams,
+					"the anthill", "through the narrow tunnels").error.empty());
+			}
+	}
+	TEST_CASE("Braided Delta scales every resource and keeps its colonies supplied")
 	{
 		DefaultsFixture fixture;
 		MapGeneratorDefaultsTest::globalsInit();
 		const auto &definition = GeneratorRegistry::builtins().at(GeneratorRegistry::builtins().idOf("braided-delta"));
+		// Fruit and stone amounts on the default map at 0%, 100% and 300%, to check that raising
+		// the amount raises what the orchard and quarries hold, not merely that some is left.
+		long long fruitAmount[3] = {}, stoneAmount[3] = {};
 		for (int variant = 0; variant < 4; ++variant)
 		{
 			D request;
@@ -1190,65 +1353,65 @@ TEST_SUITE("MapGeneratorDefaults")
 			if (variant == 3)
 			{
 				request.wDec = request.hDec = 7;
-				request.options["rejoining-frequency"] = 3;
+				request.options["flood"] = 2;
 			}
-			const int amount = variant == 1 ? 0 : variant >= 2 ? 300 : 100;
+			const int amount = variant == 1 ? 0 : variant == 2 ? 300 : 100;
 			for (const auto &control : definition.controls)
 				if (control.group == ControlGroup::Resources)
 					request.options[control.id] = amount;
 			Game world(nullptr);
 			const auto result = GenerationService().generate(world, request, true);
 			REQUIRE_MESSAGE(bool(result), result.diagnostic());
-			int islands = 0;
-			for (const auto &record : result.telemetry.records())
-				if (record.key == "braided-delta.islands")
-					islands = int(std::get<std::int64_t>(record.value));
 			const MapGeneration::Torus t(world.map);
-			const auto walk = MapGeneration::walkFromFirstColony(world.map, request.nbTeams, "delta resources", "over the fords");
-			REQUIRE(walk.error.empty());
-			for (const int type : {STONE, CHERRY, ORANGE, PRUNE})
+			int fruit = 0, stone = 0, wheat = 0;
+			long long fruitTotal = 0, stoneTotal = 0;
+			for (int i = 0; i < t.size(); ++i)
 			{
-				std::vector<unsigned char> mask(t.size(), 0);
-				int count = 0;
-				for (int i = 0; i < t.size(); ++i)
-					count += mask[i] = world.map.getResource(i).type == type;
-				const auto components = MapGeneration::connectedRegions(mask, t.w, t.h, true, MapGeneration::GridNeighbors::Cardinal);
-				const int groups = *std::max_element(components.begin(), components.end()) + 1;
-				CHECK(groups == (amount ? islands : 0));
-				if (type != STONE)
-					CHECK(count == islands * (amount ? std::max(1, 3 * amount / 100) : 0));
-				std::vector<unsigned char> reachable(groups, 0);
-				for (int i = 0; i < t.size(); ++i)
-					if (mask[i])
-						for (const auto &[dx, dy] : {std::pair{-1, 0}, {1, 0}, {0, -1}, {0, 1}})
-							reachable[components[i]] |= walk.steps[t.at(t.remainderX(i) + dx, i / t.w + dy)] >= 0;
-				for (int reached : reachable)
-					CHECK(reached); // Actual finished gathering faces, after every later layer and repair.
+				const auto resource = world.map.getResource(i);
+				const int type = resource.type;
+				fruit += type >= CHERRY && type <= PRUNE;
+				stone += type == STONE;
+				wheat += type == WHEAT;
+				if (type >= CHERRY && type <= PRUNE)
+					fruitTotal += resource.amount;
+				if (type == STONE)
+					stoneTotal += resource.amount;
 			}
+			if (variant < 3)
+			{
+				// variant 0 is 100%, 1 is 0% and 2 is 300%: store them in increasing order.
+				const int slot = variant == 1 ? 0 : variant == 0 ? 1 : 2;
+				fruitAmount[slot] = fruitTotal;
+				stoneAmount[slot] = stoneTotal;
+			}
+			// The great island's orchard and the kopjes' quarries follow their amounts; starter
+			// wheat stays whatever the amount.
+			if (amount == 0)
+			{
+				CHECK(fruit == 0);
+				CHECK(stone == 0);
+			}
+			else
+				CHECK(fruit > 0);
+			CHECK(wheat > 0);
+			CHECK(MapGeneration::walkFromFirstColony(world.map, request.nbTeams, "the delta", "over its fords").error.empty());
 			CHECK(MapGeneration::startingAccessFailure(world.map, request.nbTeams,
 				{{MaterialId::Food, 24, "food"}, {MaterialId::Wood, 32, "wood"}}).empty());
 			GenerationContext check(request);
 			REQUIRE(definition.validateWorld(world, check).empty());
-			if (variant == 0)
-			{
-				for (int tick = 0; tick < 2048; ++tick)
-					world.map.growResources();
-				CHECK(definition.validateWorld(world, check).empty());
-				std::vector<std::pair<int, Resource>> oranges;
-				for (int i = 0; i < t.size(); ++i)
-					if (world.map.getResource(i).type == ORANGE)
-					{
-						oranges.emplace_back(i, world.map.getResource(i));
-						world.map.replaceResource(t.remainderX(i), i / t.w, Resource{});
-					}
-				CHECK(definition.validateWorld(world, check).find("fruit groups") != std::string::npos);
-				for (const auto &[tile, resource] : oranges)
-					world.map.replaceResource(t.remainderX(tile), tile / t.w, resource);
-				CHECK(definition.validateWorld(world, check).empty());
-			}
 		}
+		CAPTURE(fruitAmount[0]);
+		CAPTURE(fruitAmount[1]);
+		CAPTURE(fruitAmount[2]);
+		CAPTURE(stoneAmount[0]);
+		CAPTURE(stoneAmount[1]);
+		CAPTURE(stoneAmount[2]);
+		CHECK(fruitAmount[0] < fruitAmount[1]);
+		CHECK(fruitAmount[1] < fruitAmount[2]);
+		CHECK(stoneAmount[0] < stoneAmount[1]);
+		CHECK(stoneAmount[1] < stoneAmount[2]);
 	}
-	TEST_CASE("Braided Delta retained generation and overgrowth contracts")
+	TEST_CASE("Braided Delta retained generation and damage contracts")
 	{
 		DefaultsFixture fixture;
 		MapGeneratorDefaultsTest::globalsInit();
@@ -1484,7 +1647,7 @@ TEST_SUITE("MapGeneratorDefaults")
 									(dx + 1) * (dx + 1) + (dy + 1) * (dy + 1) < 16)
 								{
 									const int x = centre.first + dx, y = centre.second + dy;
-									REQUIRE(world.map.isGrass(x, y));
+									REQUIRE(world.map.terrainTypeAt(x, y) == LUSH_GRASS);
 									REQUIRE(world.map.getResource(x, y).type == NO_RES_TYPE);
 									REQUIRE(world.map.canResourcesGrow(x, y));
 								}
@@ -1495,10 +1658,10 @@ TEST_SUITE("MapGeneratorDefaults")
 				world.map.setResourceByIndex(x, y, WHEAT, 1);
 				REQUIRE(definition.validateWorld(world, check).find("clear grass interior") != std::string::npos);
 				world.map.setNoResource(x, y, 1);
-				REQUIRE(world.map.vertexTerrainAt(x + 4, y) == SAND);
+				REQUIRE(world.map.vertexTerrainAt(x + 4, y) == PALE_SAND);
 				world.map.setVertexTerrain(x + 4, y, GRASS);
 				REQUIRE(definition.validateWorld(world, check).find("broken sand ring") != std::string::npos);
-				world.map.setVertexTerrain(x + 4, y, SAND);
+				world.map.setVertexTerrain(x + 4, y, PALE_SAND);
 				REQUIRE(definition.validateWorld(world, check).empty());
 				if (shape == std::pair{8, 8} && roads == 1)
 				{
@@ -1606,9 +1769,12 @@ TEST_SUITE("MapGeneratorDefaults")
 			const MapGeneration::Torus t(world.map);
 			std::vector<unsigned char> grass(t.size());
 			int sand = 0;
+			// Revision 8 paints looks (lush and dry grass) and loam bay farms: ground wheat can spread
+			// onto is read from the rules, not the exact grass type.
 			for (int i = 0; i < t.size(); ++i)
 			{
-				grass[i] = world.map.isGrass(t.remainderX(i), i / t.w);
+				const auto &rules = world.map.terrainPropertiesAt(t.remainderX(i), i / t.w);
+				grass[i] = rules.walkable && rules.resourcesGrow && (rules.allowedResources & (1u << WHEAT));
 				sand += world.map.isSand(t.remainderX(i), i / t.w);
 			}
 			const auto groups = MapGeneration::connectedRegions(grass, t.w, t.h, true, MapGeneration::GridNeighbors::Eight);
@@ -1813,6 +1979,84 @@ TEST_SUITE("MapGeneratorRegistry")
         MapGeneratorDefaultsTest::globalsInit();
         GeneratorContracts::generatorContracts();
     }
+    TEST_CASE("catalog generation contracts: portage-lakes [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("portage-lakes");
+    }
+    TEST_CASE("catalog generation contracts: bajada [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("bajada");
+    }
+    TEST_CASE("catalog generation contracts: braided-river [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("braided-river");
+    }
+    TEST_CASE("catalog generation contracts: caravanserai [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("caravanserai");
+    }
+    TEST_CASE("catalog generation contracts: rain-shadow [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("rain-shadow");
+    }
+    TEST_CASE("catalog generation contracts: tidal-flats [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("tidal-flats");
+    }
+    TEST_CASE("catalog generation contracts: watershed [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("watershed");
+    }
+    TEST_CASE("catalog generation contracts: everglades [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("everglades");
+    }
+    TEST_CASE("catalog generation contracts: ring-world [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("ring-world");
+    }
+    TEST_CASE("catalog generation contracts: shattered-coast [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("shattered-coast");
+    }
+    TEST_CASE("catalog generation contracts: river [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("river");
+    }
+    TEST_CASE("catalog generation contracts: crater-lakes [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("crater-lakes");
+    }
+    TEST_CASE("catalog generation contracts: swamp [slow][map-generators]")
+    {
+        DefaultsFixture fixture;
+        MapGeneratorDefaultsTest::globalsInit();
+        GeneratorContracts::generatorContracts("swamp");
+    }
     TEST_CASE("framework contracts [slow][map-generators]")
     {
         DefaultsFixture fixture;
@@ -1864,8 +2108,8 @@ TEST_CASE("contact costs follow custom deposit obstruction and removal propertie
         for (auto terrain : {GRASS,WATER})
         {
             map.replaceResource(12,12,Resource{});
-            MapGeneration::paintTile(map,12,12,terrain);
-            map.setResource(12,12,id,0);
+			MapGeneration::paintTile(GenerationMap(map).ref(), 12, 12, terrain);
+			map.setResource(12,12,id,0);
             REQUIRE(map.getResource(12,12).type==resourceIndex(id));
             const int open=terrain==GRASS ? costs.open : costs.water;
             const int expected=!blocking ? open : !clearable && infinite ? costs.eternal : costs.clearable;

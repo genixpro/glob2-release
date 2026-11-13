@@ -5,7 +5,7 @@ How the shared asset pipeline prepares runtime data and how to measure package c
 ## Release asset and bundle sizes
 
 Release packagers share `tools/package_assets.py`. Original artwork stays in
-`data/` and `datasrc/`; generated runtime trees and per-image caches stay under
+`content/data/` and `content-src/`; generated runtime trees and per-image caches stay under
 `build/`. Runtime artwork is WebP in every client build: units, buildings,
 terrain, resources, effects, UI, icons, wordmarks and browser menu art. Release
 bundles choose the smaller of lossless WebP Q75/method 4 and lossy WebP
@@ -18,21 +18,22 @@ both candidates. Unsupported higher-depth modes fail the export without
 quantization; their source artwork remains untouched. Fonts, meshes, music and
 platform icon containers are outside this policy.
 
-Independent image encodings and sprite-sheet packing run concurrently. SCons
-exports use the worker limit from `-j`; standalone exports use the CPUs available
+Independent image encodings and sprite-sheet packing run concurrently. Build
+exports use `GLOB2_ASSET_JOBS` workers (a CMake cache variable, default 8);
+standalone exports use the CPUs available
 to the process, or an explicit `tools/package_assets.py --jobs N` limit. Use
 `--jobs 1` for a serial export. These workers run alongside other scheduled build
-jobs; lower `-j` when compiler and encoder memory pressure requires it. Worker
+jobs; lower `-j` or `GLOB2_ASSET_JOBS` when compiler and encoder memory pressure requires it. Worker
 count does not change encoding recipes, audit order or exported bytes. Each
 candidate and sheet is verified before the export is published.
 
-Source PNG artwork stays in the repository. SCons prepares lossless WebP for
+Source PNG artwork stays in the repository. The build prepares lossless WebP for
 normal source/debug builds and exposes that generated tree to the client and
-native test programs. Release builds select the smaller permitted WebP encoding.
+native test programs. Release builds compare verified WebP and video candidates for packed sprite groups.
 Image lookup searches existing directories in order using the exact WebP name;
 custom artwork overrides must therefore use `.webp`. Theme backdrop and wordmark
-paths also use WebP. Sprite frames, sheets, and HD atlas loaders decode only WebP;
-there is no PNG fallback for bundled artwork. PNG/JPEG decoding remains available
+paths also use WebP. Bundled artwork uses WebP or packed H.264 sprite groups.
+PNG is used for source artwork. PNG/JPEG decoding remains available
 for end-user imports and screenshot tools. Online previews and skin textures use
 WebP wire renditions (see the platform architecture guide).
 
@@ -45,6 +46,14 @@ Mesh parsing and stereo Opus stream preparation use the same scheduler. Mutable
 music playback cursors belong to the dedicated music producer. GPU creation/upload,
 SDL renderer textures and live object publication run on the owner thread. Workers never wait on child
 jobs or call renderer APIs.
+
+Clients with H.264 asset decoding can use `AssetLoader::requestVideoFrames`
+to load an independently decodable Annex B group as CPU images. Each group
+begins with parameter sets and an IDR picture. The caller supplies the expected
+dimensions and frame count, then addresses decoded frames in presentation order.
+Use `AssetLoader::videoFramesSupported()` when choosing asset sources. The browser
+decodes optional groups in one lazy worker shared by both browser variants.
+Startup sprite sheets in browser exports use WebP.
 
 Use `requestSprite`/`findSprite` and `pollAssets` for asynchronous families;
 `SpriteLoad` publishes only complete prepared sprites. Existing synchronous APIs
@@ -116,7 +125,7 @@ APIs from it. Sprite estimates include padded atlas cells at the maximum frame
 dimensions and any upload copies. Expired weak cache keys are periodically removed
 so unique preview and music requests do not accumulate session metadata.
 Never wait inside a worker or capture a mutable screen, FileManager or renderer.
-Build `scons asset-loading-benchmark` and run the resulting tool against the same
+Build `python3 tools/dev_build.py asset-loading-benchmark` and run the resulting tool against the same
 runtime tree with different worker overrides. It reports wall time to final
 readiness, process CPU time, worker occupancy, estimated peak scratch and a
 fingerprint of native and selected HD base-layer pixels. Pixel hashing is outside
@@ -129,8 +138,8 @@ Leave the HD variable unset to measure a native startup followed by an HD toggle
 Use an external RSS
 measurement and distinguish warm filesystem cache from cold reads.
 
-Optimized exports also pack the frames of the sprites in `SPRITE_SHEETS`
-(currently `data/gfx/unit`, 2,816 files) into sprite sheets: runs of up to 256
+Legacy optimized exports pack the frames of the sprites in `SPRITE_SHEETS`
+(currently `content/data/gfx/unit`, 2,816 files) into sprite sheets: runs of up to 256
 consecutive frames of one layer and size, sixteen tiles to a row, each encoded like
 any other image. `<name>.sheet` beside them lists each sheet's file, layer
 (`image` or `rotated`), first frame, frame count and tile size. When that index
@@ -145,13 +154,44 @@ HD terrain/resource atlases also have exact source frame placement verified befo
 encoding; the renderer checks their exact alpha against decoded HD frames, allowing
 independently encoded lossy RGB to differ.
 
+Release packages use `sprite_packing=auto`. For each catalog terrain family
+and stock unit clip and layer, the exporter compares lossless and Q75 WebP
+sheets with one eligible RGB H.264 candidate. Native and HD resolutions are
+scored separately. Lossless must preserve RGBA exactly, and every candidate
+must preserve exact alpha and logical frame coverage. The sum of squared
+RGB errors over pixels with nonzero source alpha in the Q75 sheets sets the
+group's error ceiling. Video stores nonopaque alpha in separate zlib blocks.
+
+The exporter uses stored bytes for native packages and Brotli transfer sizes
+for browser sprite payload parts and group index blocks. The browser assembles
+each index at installation, merging the base and team layers by frame ID in
+optional HD indexes. The audit records size, error, rejections,
+and whether the verified group came from cache. Equal scores prefer lossless
+WebP, then Q75 WebP, then H.264. The native compiled terrain fingerprint uses
+the decoded pixels of the winning candidate.
+
+Use `sprite_packing=webp` for the same selection without video, or
+`sprite_packing=legacy` for the old layout. Mobile wrappers accept the same
+values via `--sprite-packing`. Standalone exports expose `--terrain-sheets`
+and `--packed-hd-sprites` for packed WebP, with `--video-sprites` to add the
+pinned host encoder. Pass `--lossless-images` to require exact RGBA. Existing
+`.sheet` and HD indexes are readable alongside the versioned packed indexes.
+Version 2 entries address a WebP page rectangle or a frame in an independent
+Annex B video group. Video entries can also name an alpha block and a crop.
+The encoder uses fixed CRFs and one attempt per eligible group.
+
 Packaging bootstraps a private Pillow 12.2.0/libwebp 1.6.0 encoder environment
-when the current Python lacks the pinned encoder. This is a build dependency,
-never application content. It requires network access on first setup; subsequent
+when the current Python lacks the pinned encoder. Browser candidate scoring
+uses pinned Brotli, and video exports build the host FFmpeg executable from
+the same pinned sources used by recording. These are build dependencies,
+separate from the shipped runtime. First setup may download source archives; subsequent
 exports reuse cached verified conversions. Image recipe identity includes the
 recipe version, encoder pins, Q90 quality/method and depth conversion policy;
 older recipes regenerate automatically. Corrupt cache entries regenerate from
-source artwork. Export/install ownership remains `runtime-assets-v1`, so older
+source artwork. Concurrent exporters accept an already-published cache file only
+when its bytes exactly match their own output, including when a Windows reader
+prevents replacement; conflicting or unreadable publications fail.
+Export/install ownership remains `runtime-assets-v1`, so older
 generated trees can be replaced and obsolete managed files removed safely.
 Flatpak supplies checksum-pinned encoder sources and build dependencies for its offline sandbox. RPM uses
 `tools/build_asset_encoder.py` with checksum-pinned Source archives; the helper
@@ -177,8 +217,8 @@ helpers and the HD source provenance manifest are omitted, while `frames.txt`,
 font coverage, notices, music and all HD images are retained. Linux's public
 AppStream screenshot remains original PNG because external metadata references
 it. Other platforms omit store screenshots. Android's installed asset
-index hashes the exported bytes. Run source `dist` and release `install` as
-separate SCons invocations; the latter installs the exported runtime tree.
+index hashes the exported bytes. Source archives come from `tools/release/release.py`; the release `install`
+target installs the exported runtime tree.
 Client installs retain a compact compressed ownership index to remove obsolete
 managed files on upgrades. Unrelated files and modified obsolete files are kept.
 On the first upgrade from an install without that index, PNGs at current shipped
@@ -187,9 +227,8 @@ releases. Keep custom image overrides in the user profile so they retain priorit
 
 Windows distributions stage assets and recursively imported DLLs through
 `tools/release/windows_runtime.py`. ZIP, Steam, Epic, Store and NSIS use this
-shared policy; missing non-system imports fail packaging. `scons release=1
-mingw=1 lean_images=1 windows-installer` builds the x64 NSIS installer from that
-same staged tree. It retains the machine installation/shortcuts and legacy
+shared policy; missing non-system imports fail packaging. The x64 NSIS installer
+is built from that same staged tree. It retains the machine installation/shortcuts and legacy
 installation directory lookup, uses solid LZMA, and inventories installed files
 for upgrades and uninstall. Unrelated files and saved games are preserved.
 Compile an existing portable stage with `tools/release/package_nsis.py --stage

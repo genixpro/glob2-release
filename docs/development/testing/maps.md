@@ -10,22 +10,18 @@ resource types, all three base terrains, overlapping strokes, and all four
 wrapped map corners. A whole-map oracle checks both removal and preservation.
 These are headless map-operation tests; they do not drive editor mouse events.
 
-## Map generator golden maps and colony sweep
+## Map generator fingerprints and colony sweep
 
-From the repository root, `scons --build=build/native-tests -j8 release=1 map-generator-golden-test` builds
-`build/native-tests/src/MapGeneratorGoldenTest`. Run it as `./build/native-tests/src/MapGeneratorGoldenTest <profile>`
-to compare this platform's rows of `test/map-generator-golden.txt` against fresh rolls, with
-`--update` after a revision bump, `--print` to bootstrap a platform's rows from a log, and
-`--sweep` to roll every playable landscape at the lobby's colony counts and sizes. A platform
-with no rows reports and passes, so a new machine can run the check before its rows exist;
-`--require-rows` makes that a failure instead, which is what CI runs, so the table must carry
-rows for every platform running that check in CI for the selected platform. The current
-table records vertex terrain (save format 146): every generated map changed when terrain
-moved to map vertices, without individual generator recipe revisions. The complete
+From the repository root, `python3 tools/dev_build.py --build=build/native-tests -j8 release=1 map-generator-golden-test` builds
+`build/native-tests/src/MapGeneratorGoldenTest`. Run it as
+`./build/native-tests/src/MapGeneratorGoldenTest <profile> --print [--only=id,...]` to print this
+platform's map fingerprint rows, and with `--sweep` to roll every playable landscape at the
+lobby's colony counts and sizes. No fingerprint rows are committed: the sim-diff workflow runs
+`--print` (through `tools/sim_fingerprint.py`) on the merge base and the pull request and
+reports every row that moved; a generator whose maps change should bump its revision. The
 pre-resource-epoch table, including historical `macos-arm64` rows, is retained in
-`test/fixtures/map-generators/pre-resource-epoch-golden.txt`. The current table includes
-native macOS arm64 rows; Linux hashes must not be used to bootstrap macOS coverage.
-Golden hashes establish behavior for their retained inputs. Compare topology separately when a serialized-format or resource-state change moves a complete map hash. See the [generator framework](../../map-generators/map-generator-framework.md).
+`test/fixtures/map-generators/pre-resource-epoch-golden.txt` as a historical reference.
+Fingerprints establish behavior for their retained inputs. Compare topology separately when a serialized-format or resource-state change moves a complete map hash. See the [generator framework](../../map-generators/map-generator-framework.md).
 
 `MapGeneratorGoldenTest <profile> --telemetry` compares telemetry enabled/disabled and repeated
 attempts for all registered generators at three seeds, including complete serialized worlds and
@@ -59,7 +55,7 @@ profiling tool, not a timing threshold in CI.
 
 ## Map generator profiling fixture
 
-`scons --build=build/native-tests -j8 release=1 map-generator-profile-fixture` builds
+`python3 tools/dev_build.py --build=build/native-tests -j8 release=1 map-generator-profile-fixture` builds
 `build/native-tests/src/MapGeneratorProfileFixture <profile-dir> <seed> <rounds>`, which round-robins every
 registered generator for `rounds` passes with parameters (shared and generator-specific) drawn
 at random the same way `GenerationRequest::randomizeControls` does, and prints a per-generator
@@ -139,7 +135,7 @@ A lone vertex makes the four cells around it mixed. Batch larger edits with
 ## Map repetition regression
 
 ```sh
-scons -j8 release=1 tests
+python3 tools/dev_build.py -j8 release=1 tests
 python3 test/run_tests.py --filter 'MapTiling/*'
 ```
 
@@ -152,7 +148,7 @@ advanced repetition dialog across desktop/touch viewports, safe insets and text 
 
 ## Map CLI
 
-Build the normal client with `scons --build=build/native-tests release=1`, then run
+Build the normal client with `python3 tools/dev_build.py --build=build/native-tests release=1`, then run
 `python3 test/test_map_cli.py build/native-tests/src/glob2` (use `.exe` on Windows).
 The test uses a disposable profile and the shared `MapPreview` software renderer
 with an invalid video driver, proving PNG export requires no display.
@@ -193,7 +189,7 @@ Linux and Windows CI run the native conversion suite.
 
 ### Map JSON reports
 
-Build `scons --build=build/native-tests release=1 map-report-test`, then run
+Build `python3 tools/dev_build.py --build=build/native-tests release=1 map-report-test`, then run
 `python3 test/test_map_report.py build/native-tests/src/glob2 build/native-tests/test/MapReportHarness`
 (add `.exe` to both binaries on Windows). The suite runs without graphics, checks
 the [published report contract](../../map-generators/report-format.md), recomputes fairness
@@ -282,7 +278,11 @@ behavior parity.
 `BuildingGradientBenchmark` is opt-in (`--tag benchmark --filter
 'BuildingGradientBenchmark/*'`). It measures actual building/resource field
 preparation and a fixed stock simulation without AI decisions. The source compiles
-unchanged against the pre-catalog engine for paired measurements. Kernel rows
+unchanged against the pre-catalog engine for paired measurements. Run it directly,
+not through `test/run_tests.py`: the runner's `GLOB2_BUILDING_SEED_AUDIT` adds a full
+scan behind every building seed. `BuildingSeedTemplatesBenchmark.cpp`, in the same
+suite, compares building seed templates with the full scan in one process (with the
+audit off), checks that their digests match, and reports a full template rebuild. Kernel rows
 include input dimensions, repetitions, iteration counts and output digests;
 simulation rows retain endpoint unit/building counts, health and inventory.
 Run matched release toolchains one process at a time on an otherwise idle host.
@@ -316,41 +316,43 @@ occur after the measured phases. This is a bounded component benchmark, not a
 statistical gameplay comparison or proof of no regression against the old engine.
 Run it on an otherwise idle host, separately from builds and tournaments.
 
-The five explicit-design generator regressions use
+The live explicit-design regressions compare Maze and Caravanserai against
 `test/map-generator-resource-epoch.json` to separate topology from initial stock.
 Resource epoch 1 removes resource-sprite draws from the simulation RNG; historical
-full hashes are retained, while new full hashes include the resulting stock
-quantities. Topology hashes still cover every underlying/render terrain tile,
-resource identity/location, and colony start. A stock-only change cannot silently
-approve a changed route or deposit layout.
+full hashes are retained, while epoch-1 full hashes include the resulting stock
+quantities. Topology hashes cover vertex terrain, resource identity/location, and
+colony starts. A stock-only change cannot silently approve a changed route or
+deposit layout.
 
-To record an epoch row, first generate the five historical explicit designs with
-the archived engine (256², four teams, seed 1: maze `cell-shape=0`, fingerprint
-`pattern=0,barrier=0`, canals `block-shape=0`, caravanserai `desert=1`, honeycomb-isle
-`block-shape=1`). Keep their `.map.gz` files under their generator names in an
+The archive retains all five original explicit designs (256², four teams, seed 1:
+maze `cell-shape=0`, fingerprint `pattern=0,barrier=0`, canals `block-shape=0`,
+caravanserai `desert=1`, honeycomb-isle `block-shape=1`). Honeycomb's redesign and
+the terrain movement and ecology changes to Canals and Fingerprint intentionally
+change their worlds, so those three no longer assert equality with the archived
+topology. Their current output is covered by generator contracts and the platform
+golden matrix; do not overwrite historical references with their new layouts.
+
+To record a retained epoch comparison, generate Maze and Caravanserai with the
+archived engine and keep their `.map.gz` files under their generator names in an
 ignored artifact directory. Set `GLOB2_RECORD_RESOURCE_DESIGN_GOLDENS` to that
 absolute directory and run the `MapGeneratorDefaults/Explicit designs*` test.
 Recording verifies the historical full hashes and compares topology before writing
 an `epoch1-<platform>.json` artifact. Review every comparison before copying rows
 into the fixture. Record other platform/compiler variants on those actual builds;
-unavailable full hashes produce an explicit unverified warning. The four designs
-whose historical full hashes matched across platforms retain portable topology
-checks; Fingerprint's known platform variant requires its own recorded topology.
+unavailable full hashes produce an explicit unverified warning. The retained
+Maze and Caravanserai cases also enforce their portable topology references.
 
 ### Generator fingerprint verification and observations
 
 `python3 test/collect_generator_evidence.py collect BINARY OUTPUT --platform macos-arm64`
 reads `MapGeneratorGoldenTest --inventory` and runs `--print` twice in fresh profiles.
-The request enumeration is shared with generation, including extended team counts
-without accepted fingerprints. Collection requires every committed Linux reference
-key to remain in that inventory and every requested row to be observed exactly once;
-it rejects missing or extra rows and changed revisions. It retains
+The request enumeration is shared with generation, including extended team counts.
+Collection requires every requested row to be observed exactly once; it rejects
+missing or extra rows and changed revisions. It retains
 raw logs, normalized rows, checkout provenance, host compiler, stable binary hash, and unchanged
-current/historical fixture hashes. Collection does not update expected output or
-replace the strict `--require-rows` gate. The macOS validation job runs that gate
-against its accepted platform rows before collecting observations; both checks
-and the five explicit-design checks are attempted even if another fails. Missing
-rows and full fingerprint changes fail verification. It uploads these
+historical fixture hashes. The macOS validation job collects these observations
+and runs the five explicit-design checks; each is attempted even if the other
+fails. It uploads these
 observations as `generator-observations-macos`. The collector cannot infer the
 binary's build inputs from the checkout; its manifest marks that association
 unverified. Retain the producing build job and compiler/flags/dependencies when
@@ -363,9 +365,9 @@ require investigation before acceptance. Agreement still does not establish
 historical topology preservation: independently verify against archived pre-epoch
 maps before adding new expected rows or the resource-epoch design hashes.
 
-The macOS job also runs the five explicit-design resource-epoch checks separately
-and retains `resource-design-observations.json` with every actual full and topology
-hash. Existing accepted-platform and portable-topology assertions still run;
+The macOS job also runs the retained Maze and Caravanserai resource-epoch checks
+separately and retains `resource-design-observations.json` with their actual full
+and topology hashes. Existing accepted-platform and portable-topology assertions still run;
 unverified full hashes are marked as observations, and the record distinguishes
 which references exist. The existing `GLOB2_RECORD_RESOURCE_DESIGN_GOLDENS`
 archived-map comparison remains available for independent historical validation.

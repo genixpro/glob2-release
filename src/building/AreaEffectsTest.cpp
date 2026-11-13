@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
 #include "AreaEffects.h"
 #include "BuildingType.h"
 #include "ResourceGrowth.h"
@@ -10,6 +14,8 @@
 #include <StreamBackend.h>
 #include <nlohmann/json.hpp>
 #include <fstream>
+#include "Unit.h"
+#include "Building.h"
 
 namespace
 {
@@ -41,7 +47,6 @@ std::vector<Uint32> components(Game &game)
 {
 	std::vector<Uint32> state, buildings, units;
 	game.checkSum(&state, &buildings, &units, true);
-	state.erase(state.begin());
 	state.insert(state.end(), buildings.begin(), buildings.end());
 	state.insert(state.end(), units.begin(), units.end());
 	return state;
@@ -601,7 +606,7 @@ TEST_SUITE("BuildingAreaEffects")
 		const int id = Building::GIDtoID(previous);
 		old->removeFromAbilitiesLists(b);
 		old->detachBuilding(id);
-		b->owner = next;
+		b->setOwner(next);
 		b->gid = Building::GIDfrom(id, 1);
 		next->attachBuilding(id, b);
 		next->addToStaticAbilitiesLists(b);

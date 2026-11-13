@@ -1,11 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Material.h"
-#include "EngineFixtures.h"
+#include "Map.h"
+#include "ProfileNeeds.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
+#include "Continuation.h"
+#include "SimulationInvariants.h"
 #include "BuildingType.h"
 #include <BinaryStream.h>
 #include <StreamBackend.h>
+#include <optional>
 #include <sstream>
 #include <nlohmann/json.hpp>
+#include "Unit.h"
+#include "Building.h"
 
 namespace
 {
@@ -27,36 +36,9 @@ Building* place(glob2test::HeadlessGame& world, const char* key, int x, int y)
     for (int resource=0; resource<MaterialCount; ++resource) building->setMaterial(resource, 64);
     return building;
 }
-std::vector<Uint32> components(Game& game, bool legacy152Representation=false)
-{
-    std::vector<Uint32> result, buildings, units;
-    game.checkSum(&result, &buildings, &units, true, legacy152Representation);
-    // Only map-header version metadata differs at an initial save boundary.
-    // Keep every simulation, scheduling, unit and building component untouched.
-    result.erase(result.begin());
-    result.insert(result.end(), buildings.begin(), buildings.end());
-    result.insert(result.end(), units.begin(), units.end());
-    return result;
-}
 // Keep the historical trace representation while save/resume comparisons retain
 // current simulation components except the normalized map-header version.
-std::vector<Uint32> historicalGoldenState(Game& game) { return components(game, true); }
-void invariants(Game& game)
-{
-    REQUIRE(game.integrity());
-    for (int team=0; team<game.mapHeader.getNumberOfTeams(); ++team)
-        for (auto* building : game.teams[team]->liveBuildings.entries())
-        {
-            if (!building) continue;
-            CHECK(building->unitsInside.size() <= std::size_t(building->maxUnitInside));
-            for (int resource=0; resource<MaterialCount; ++resource)
-            {
-                CHECK(building->material(resource) >= 0);
-                CHECK(building->reservedMaterials[resource] >= 0);
-                CHECK(building->reservedMaterials[resource] <= building->material(resource));
-            }
-        }
-}
+std::vector<Uint32> historicalTraceState(Game& game) { return glob2test::simulationComponents(game, true); }
 }
 TEST_SUITE("BuildingCatalogFixtures")
 {
@@ -75,7 +57,11 @@ TEST_CASE("ordinary building aliases never suppress sprite binding [display]")
     CHECK(catalog.get(1)->miniSpritePtr != nullptr);
 }
 
-TEST_CASE("retained seeded compositions preserve full simulation continuation [golden]")
+// Each retained seeded catalog runs 257 ticks with its capability-composed
+// buildings fully stocked: every building invariant and every material's ledger
+// holds at every tick, and a save continues identically for 257 more ticks. The
+// sampled state goes to sim-diff.
+TEST_CASE("retained seeded compositions keep their invariants and preserve full simulation continuation [sim-trace]")
 {
     glob2test::HeadlessGlobals globals;
     for (const int seed : {713, 714, 715})
@@ -93,42 +79,41 @@ TEST_CASE("retained seeded compositions preserve full simulation continuation [g
             for (int n=0; n<4; ++n) world.game.map.setResourceByIndex(5+resource*4, 22+n, resource, 5);
         world.team->createLists();
         world.game.setWaitingOnMask(0);
-        for (int tick=0; tick<257; ++tick) world.step();
-        invariants(world.game);
-        auto* memory=new GAGCore::MemoryStreamBackend;
-        GAGCore::BinaryOutputStream output(memory);
-        world.game.save(&output, false, "seeded capability composition"); output.flush();
-        const auto bytes=memory->takeContents();
-        std::vector<std::vector<Uint32>> states;
-        std::vector<MersenneTwister> random;
+        std::optional<glob2test::MaterialLedger> ledger; // from the first step on
+        for (int tick=0; tick<257; ++tick)
+        {
+            world.step();
+            glob2test::expectBuildingInvariants(world.game);
+            if (!ledger) ledger.emplace(world.game);
+            else ledger->check("seed " + std::to_string(seed) + " tick " + std::to_string(tick+1));
+        }
+        REQUIRE(ledger);
+        INFO(ledger->inexactReasons());
+        CHECK(ledger->checks() == 256);
+        // Wood and stone deposits here are not harvested one unit at a time, so
+        // the map compartment is excluded for them; the colony must stay exact.
+        CHECK(ledger->colonyExact());
         std::ostringstream golden;
-        for (int tick=0; tick<257; ++tick)
-        {
-            world.step(); invariants(world.game);
-            states.push_back(components(world.game)); random.push_back(world.game.syncRandom);
-            if (tick % 32 == 0)
-            {
-                golden << tick+258;
-                for (const auto value : historicalGoldenState(world.game)) golden << ' ' << value;
-                golden << '\n';
-            }
-        }
-        GameGUI restored(false);
-        GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(bytes.data(), bytes.size()));
-        input.seekFromStart(0);
-        REQUIRE(restored.game.load(&input)); restored.game.setWaitingOnMask(0);
-        CHECK(restored.game.buildingsTypes.fingerprint() == world.game.buildingsTypes.fingerprint());
-        for (int tick=0; tick<257; ++tick)
-        {
-            CAPTURE(tick);
-            restored.game.step(0); invariants(restored.game);
-            CHECK(components(restored.game) == states[tick]);
-            CHECK(restored.game.syncRandom == random[tick]);
-        }
-        glob2test::expectGolden("building-catalog/composition/seed-" + std::to_string(seed) + ".trace", golden.str());
+        const auto result=glob2test::expectContinuation(world.game, {.ticks=257,
+            .step=[](Game& game) { glob2test::stepEngine(game); return std::vector<std::string>{}; },
+            .name="seeded capability composition",
+            .afterLoad=[](Game& original, Game& loaded) {
+                CHECK(loaded.buildingsTypes.fingerprint() == original.buildingsTypes.fingerprint());
+            },
+            .each=[&](Game& original, Game& loaded, int tick) {
+                glob2test::expectBuildingInvariants(original); glob2test::expectBuildingInvariants(loaded);
+                if (tick % 32 == 0)
+                {
+                    golden << tick+258;
+                    for (const auto value : historicalTraceState(original)) golden << ' ' << value;
+                    golden << '\n';
+                }
+            }});
+        REQUIRE(result.matched);
+        glob2test::recordSimTrace("building-catalog/composition/seed-" + std::to_string(seed) + ".trace", golden.str());
     }
 }
-TEST_CASE("format136 terrain snapshot imports frozen buildings and continues after resave")
+TEST_CASE("format136 terrain snapshot imports frozen buildings and continues after resave" * glob2test::needs({"ai:castor"}))
 {
     glob2test::HeadlessGlobals globals;
     const auto bytes=glob2test::readFile(glob2test::inflated("building-catalog/terrain136.game.gz"));
@@ -137,28 +122,16 @@ TEST_CASE("format136 terrain snapshot imports frozen buildings and continues aft
     oldInput.seekFromStart(0);
     REQUIRE(imported.game.load(&oldInput)); imported.game.setWaitingOnMask(0);
     CHECK(imported.game.mapHeader.getVersionMinor()==136);
-    CHECK(imported.game.buildingsTypes.size()==55);
+    // A pre-snapshot file gets the frozen legacy table, never the repository catalog,
+    // whatever buildings have been added since.
+    BuildingsTypes legacy; legacy.initLegacy();
+    CHECK(imported.game.buildingsTypes.size()==legacy.size());
+    CHECK(imported.game.buildingsTypes.fingerprint()==legacy.fingerprint());
     CHECK(imported.game.map.terrainRegistry().size()>=7);
-    auto* memory=new GAGCore::MemoryStreamBackend;
-    GAGCore::BinaryOutputStream output(memory);
-    imported.game.save(&output,false,"imported format136"); output.flush();
-    const auto migrated=memory->takeContents();
-    std::vector<std::vector<Uint32>> states;
-    std::vector<std::vector<std::string>> orders;
-    for(int tick=0;tick<64;++tick)
-    {
-        orders.push_back(glob2test::stepAI(imported.game));
-        states.push_back(components(imported.game));
-    }
-    GameGUI restored(false);
-    GAGCore::BinaryInputStream input(new GAGCore::MemoryStreamBackend(migrated.data(),migrated.size()));
-    input.seekFromStart(0);
-    REQUIRE(restored.game.load(&input)); restored.game.setWaitingOnMask(0);
-    for(int tick=0;tick<64;++tick)
-    {
-        CHECK(glob2test::stepAI(restored.game)==orders[tick]);
-        CHECK(components(restored.game)==states[tick]);
-    }
+    // Resave in the current format, then continue both under the AI scheduler.
+    const auto result=glob2test::expectContinuation(imported.game, {.ticks=64, .step=glob2test::stepAI,
+        .name="imported format136"});
+    CHECK(result.matched);
 }
 TEST_CASE("retained split recipes conserve every charged resource through cancellation")
 {

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "GradientDeviceService.h"
+#include <chrono>
 #include "GradientAccelerators.h"
 #include <algorithm>
 #include <array>
@@ -166,6 +167,7 @@ class DeviceBroker
 	static bool compatible(const OwnedGradientField &a, const OwnedGradientField &b) noexcept
 	{
 		return a.session == b.session && a.decision.plan == b.decision.plan &&
+			   bool(a.destinations) == bool(b.destinations) &&
 			   a.decision.generation == b.decision.generation &&
 			   a.decision.configuration == b.decision.configuration && a.family == b.family &&
 			   a.grid.width() == b.grid.width() && a.grid.height() == b.grid.height() &&
@@ -268,6 +270,7 @@ class DeviceBroker
 					requests[i].executedOnDevice = &field.executedGPU;
 					requests[i].deviceExecutionObserved = &field.deviceExecutionObserved;
 					requests[i].requiredControl = field.requiredControl;
+					if (field.destinations) requests[i].destinations = field.destinations->planes();
 				}
 
 				const std::span batch(requests.data(), count);

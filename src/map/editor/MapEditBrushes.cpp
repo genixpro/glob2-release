@@ -2,12 +2,15 @@
 // The editor's brush catalogue, experiment gate and active-brush identity
 // (BrushCatalog.h). Presentations read these instead of the side-panel widgets.
 #include "BuildingPresentation.h"
+#include "SetLibraryDialog.h"
+#include "Map.h"
 #include "ExperimentalFeatures.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
 #include "StringTable.h"
 #include "Toolkit.h"
 #include "resource/ResourceRegistry.h"
+#include "Game.h"
 
 bool MapEdit::experimentEnabled(const std::string& key) const
 {

@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Exercise clearing arbitration and idle activity across a real game save/load.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
+#include "GameFixtures.h"
 #include "GradientFixture.h"
 #include <string>
 #include "GlobalContainer.h"
@@ -39,7 +42,6 @@ static std::vector<Uint32> state(Game& game)
 {
     std::vector<Uint32> result, buildings, units;
     game.checkSum(&result, &buildings, &units, true);
-    result.erase(result.begin()); // The loaded map header records the saved format.
     result.insert(result.end(), buildings.begin(), buildings.end());
     result.insert(result.end(), units.begin(), units.end());
     for (int t = 0; t < game.teamsCount(); ++t)
@@ -176,7 +178,7 @@ TEST_SUITE("UnitContinuation")
 			auto &game = world.game;
 			game.gameHeader.setBuildingGradientDelay(3);
 			game.map.configureCompute(participants);
-			game.map.configureGradientPipeline(participants - 1, 3);
+			game.map.routing().configureGradientPipeline(participants - 1, 3);
 			auto *unit = world.addUnit(WORKER, 16, 16);
 			auto *building = world.addBuilding("inn", 4, 4);
 			REQUIRE(unit);
@@ -206,18 +208,18 @@ TEST_SUITE("UnitContinuation")
             // Missing fields publish one advance after admission, regardless of refresh delay.
 			for (int tick = 0; tick < 1; ++tick)
 			{
-				game.map.advanceGradientPipeline();
+				game.map.routing().advanceGradientPipeline();
 				assertSteering();
 				++game.stepCounter;
-				game.map.stagePeriodicGradientPreparation();
-				game.map.preparePendingGradient(game.captureReadBoundary());
+				game.map.routing().stagePeriodicGradientPreparation();
+				game.map.routing().preparePendingGradient(game.captureReadBoundary());
 			}
-			game.map.advanceGradientPipeline();
+			game.map.routing().advanceGradientPipeline();
 			UnitActivityAccess::route(*unit);
 			CHECK(unit->attachedBuilding == building);
 			CHECK(!UnitActivityAccess::pending(*unit));
 			CHECK((unit->dx != 0 || unit->dy != 0));
-			game.map.finishGradientPipeline();
+			game.map.routing().finishGradientPipeline();
 		}
 	}
 
@@ -231,7 +233,7 @@ TEST_SUITE("UnitContinuation")
 		{
 			CAPTURE(blocked);
 			glob2test::HeadlessGame world({.clearImmobile = true, .header = true, .seed = 4921});
-			world.game.map.configureGradientPipeline(0, 3);
+			world.game.map.routing().configureGradientPipeline(0, 3);
 			auto *unit = world.addUnit(WORKER, 8, 8);
 			auto *building = world.addBuilding("inn", 20, 7);
 			REQUIRE(unit);
@@ -294,7 +296,7 @@ TEST_SUITE("UnitContinuation")
 		{
 			CAPTURE(clearing);
 			glob2test::HeadlessGame world({.clearImmobile = true, .header = true, .seed = 4921});
-			world.game.map.configureGradientPipeline(0, 3);
+			world.game.map.routing().configureGradientPipeline(0, 3);
 			auto *unit = world.addUnit(clearing ? WORKER : WARRIOR, 4, 16);
 			auto *flag = world.addBuilding(clearing ? "clearingflag" : "warflag", 20, 16);
 			REQUIRE(unit);
@@ -338,7 +340,7 @@ TEST_SUITE("UnitContinuation")
 				{.clearImmobile = true, .loadDefaultRace = true, .header = true, .seed = 4921});
 			auto &game = world.game;
 			game.gameHeader.setBuildingGradientDelay(3);
-			game.map.configureGradientPipeline(0, 3);
+			game.map.routing().configureGradientPipeline(0, 3);
 			auto *unit = world.addUnit(WORKER, 16, 16);
 			auto *building = world.addBuilding("inn", 4, 4);
 			REQUIRE(unit);
@@ -418,7 +420,7 @@ TEST_SUITE("UnitContinuation")
                 world.team->addToStaticAbilitiesLists(service);
                 service->update();
                 if (!unit->performance[FLY] || world.game.map.hasAirRoutingConstraints())
-                    glob2test::awaitBuildingGradient(world.game,service,unit->movementClass());
+                    glob2test::awaitBuildingGradient(world.game,service,accessClass(unit->movementAccess()));
                 REQUIRE((medical==Unit::MED_HUNGRY?world.team->findNearestFood(unit):world.team->findNearestHeal(unit))==service);
             }
             unit->medical=Unit::Medical(medical);

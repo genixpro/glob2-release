@@ -14,15 +14,25 @@
 - **Terrain lives on corners.** The map stores one terrain type per vertex (`Map::vertexTerrain`);
   vertex (x,y) is the top-left corner of tile (x,y). A tile's rules come from its four corners
   (`combineCornerRules`, `TerrainPropertiesLayout.h`, compiled once per combination by
-  `CellRuleTable`): equal corners keep that terrain's rules exactly; mixed corners are walkable
-  when any corner is, never swimmable or buildable, and otherwise as permissive as the weakest
-  corner. So a tile is pure grass only when all four of its corners are grass, and a single sand
+  `CellRuleTable`): equal property profiles keep their rules exactly; mixed profiles count
+  walking, swimming and blocked corners. Two or more blocked corners block ground movement;
+  otherwise walking or swimming wins by count, with walking winning their tie. Numeric
+  effects use the arithmetic mean of all four corners: ground/air speed and health, growth, fertility, inhibition and shoreline support.
+  Q8 averages round toward zero; damage and healing can offset each other. This blends speed
+  boundaries and gives mixed shores partial ecological effects. Mixed profiles are never
+  buildable, and other permissions remain conservative. A single walkable corner cannot open a blocked or water
+  cell. Two walking corners suffice unless both remaining corners are blocked. Both
+  two-land/two-blocked and two-water/two-blocked cells stay blocked, while
+  different water profiles can mix and still swim. So a tile is pure grass only when all four of its corners are grass, and a single sand
   vertex spoils the four tiles around it. This is why a one-vertex sand road (`tracePath`) blocks a
   strip about two tiles wide, and why generators stamp grass inside a one-tile sand ring. Read a
   vertex with `vertexTerrainAt`, a tile's corners with `cellCorners`, and a tile's rules with
   `terrainPropertiesAt`; `terrainTypeAt` answers `MIXED_TERRAIN` for a mixed tile.
-- **Beaches are a convention, not a rule.** Grass directly against water is legal: the tiles
-  between are walkable and unbuildable, exactly like a sand/water or grass/sand tile. The shipped
+- **Beaches are a convention, not a rule.** Grass directly against water is legal: mixed tiles
+  are unbuildable and walk with at least two grass corners, otherwise they swim. Sand/water
+  uses the same movement vote; grass/sand always walks. Any tile mixing walking and swimming
+  corners is a shoreline, as a beach would be, so it takes shore and water resources but never
+  land crops: wheat, wood and fruit stop one tile short of water whether or not sand lies between. The shipped
   maps keep sand between grass and water. `Map::layBeaches()` turns every grass vertex next to
   water, and every water vertex next to grass, into sand, reading the terrain as it was, so the
   result does not depend on scan order; the designed generators apply the same rule to their
@@ -34,11 +44,12 @@
   of farmable grass means four rows of grass laid down.
 - **Buildings need buildable tiles.** `Map::isFreeForBuilding` requires buildable terrain, no
   resource and no unit on every tile of the footprint (`Map::checkTile`). Among the classic
-  terrains only pure grass is buildable, and a mixed tile never is, so a map's building room is
-  its pure grass, not its land. A swarm is 4×4; the start scorer counts free 4×4 footprints as a
-  colony's room (`StartQuality`).
-- **Water blocks walking until a colony can swim.** Ground units cannot enter water
-  (cells whose four corners are all water) until they have trained at a swimming pool. Every island map, strait
+  terrains only pure grass is buildable. Mixed property profiles are never buildable, while
+  different terrain IDs sharing one buildable profile keep that permission. For classic terrain,
+  building room is pure grass, not all land. A swarm is 4×4; the start scorer counts free 4×4
+  footprints as a colony's room (`StartQuality`).
+- **Water blocks walking until a colony can swim.** Ground units without swimming cannot enter
+  swimmable cells, including water-majority shores. Swimming is earned by training at a pool. Every island map, strait
   and moat is therefore a *timing* rule: it separates colonies early and opens once pools are
   built. Sand and grass are both walkable.
 - **Resources block movement and building.** A unit cannot stand on a tile with a resource on it
@@ -79,10 +90,10 @@ of your game profile (the directory selected by `GLOB2_USER_DATA_DIR`, when set)
 Select the file in the import dialog; on desktop and tablet layouts the editor dock
 then shows the new types in its **Terrain** tab, and you paint them like built-in
 terrain. The dock shows a composed swatch of every brush, grouped into collapsible
-sections: classic ground, then each terrain group (see
-[experimental features](../features/experimental-features.md)) with the group's rules
-under its heading, then **Custom** for the map's imported definitions in natural name
-order with their own rules. Types whose experiment is off are shown locked, and their
+sections: one per terrain group, grass, sand, water and deep water first and the rest
+in table order (see [experimental features](../features/experimental-features.md)), with the
+group's rules on one line under its heading, then **Custom** for the map's
+imported definitions in natural name order with their own rules. Types whose experiment is off are shown locked, and their
 section offers **Enable for this map**. The editor action `open terrain palette <group>`
 switches the dock to the Terrain tab, expands that group and scrolls it to the top,
 keeping the brush you had; `open resource palette [group]` does the same for
@@ -115,9 +126,20 @@ painted, only the boundary shapes and texture variants change. For example:
 Both `base` and `appearance` name a paintable built-in terrain by its external name:
 the classic `water`, `sand`, `grass`, `ice` and `road` (the compatibility key for
 Trail) plus every terrain-catalogue type (`boulders`, `hedge`, `thicket`, `ridge_rock`,
-`outcrop`, `dirt`, `clay`, `gravel`, `flower_meadow`, `mud`, `marsh`, `deep_snow`,
-`scree`, `dirt_track`, `boardwalk`, `lava`, `ember_field`, `loam`, `moss`,
-`spring_meadow`, `deep_water`, `dark_water`, `void_hole`, `chasm`). There are no shore
+`outcrop`, `dirt`, `clay`, `shale`, `heath`, `mud`, `mudflat`, `deep_snow`,
+`scree`, `brick_path`, `boardwalk`, `lava`, `ember_field`, `loam`, `moss`,
+`spring_meadow`, `deep_water`, `dark_water`, `void_hole`, `chasm`, the grass and
+sand looks `lush_grass`, `dry_grass`, `dune_sand` and `pale_sand`, then `sandstone`,
+`pumice`, `frozen_lake`, `wind_swept_snow`, `weathered_sandstone`, `hardpan`, `tundra`, `volcanic_ash`, `glacier_ice`, `overgrown_road`, `laterite`, `cliffs`, `molten_lava_pool`, `slate_ashlar`, `basalt_causeway`, `scoria_blocks`, `rime_ashlar`, `moonstone_lozenge`, `frost_pinwheel`, `arctic_tundra`, `glacier`, `icefall`, `sandstone_benches`, `obsidian_ridge`, `granite_tors`, `travertine_terraces`, `penitentes`, `termite_mounds`, `hoodoos`, `petrified_stumps`, `steppe_grass` and `moor_grass`). The looks share every rule of grass or sand and differ only in artwork and
+colours; sandstone tiles, overgrown road, slate ashlar, basalt causeway, scoria blocks, rime ashlar, moonstone lozenges and frost pinwheel follow the path rules of road, brick path and boardwalk, and a
+pumice field and hardpan the rough-ground rules of mud, mudflat and scree; a frozen lake and glacier ice play exactly
+like ice, wind-swept snow exactly like deep snow, and weathered sandstone and tundra exactly like dirt, as do volcanic ash, laterite and arctic tundra; cliffs, glacier, icefall, sandstone benches, obsidian ridge, granite tors and travertine terraces play
+exactly like hedge and thicket: impassable, and they stop projectiles; penitentes, termite mounds, hoodoos
+and petrified stumps play exactly like rock spires: impassable on the ground, but towers shoot over them; a molten lava pool plays exactly like lava; steppe grass and moor grass play exactly like grass. The earlier names
+`gravel`, `flower_meadow`, `marsh` and `dirt_track` are still accepted as aliases of
+`shale`, `heath`, `mudflat` and `brick_path` (`LEGACY_TERRAIN_NAMES` in
+`src/map/TerrainCatalog.cpp`), but maps, saves and reports are written with the
+current names. There are no shore
 types: mixed corners make transitions. The base supplies all simulation
 defaults; appearance selects a shipped material and resolved preview colors independently.
 Detailed artwork and natural boundaries use the shared [material catalog](../assets/terrain-materials.md);
@@ -146,10 +168,13 @@ Property overrides use the existing fixed schema:
 | `walkable`, `swimmable`, `flyable`, `resourcesGrow`, `fertilitySource`, `nonGrowingResources`, `buildable`, `projectileBlocks`, `shoreline` | Booleans; walking and swimming cannot both be enabled |
 | `groundSpeedQ8`, `airSpeedQ8` | Integers 64–1024; 256 is normal speed |
 | `groundHealthQ8`, `airHealthQ8` | Signed 16-bit HP per tick divided by 256; negative damages, positive heals |
-| `growthQ8`, `inhibitionQ8`, `shoreSupportQ8` | Integers 0–1024; 256 is one |
+| `growthQ8`, `inhibitionQ8` | Integers 0–1024; 256 is one |
 | `fertilityQ8` | Integer −1024–1024; 256 is one |
 | `allowedResources` | Legacy import mask 0–255; prefer a top-level `allowedResourceKeys` list |
 | `farmMaterial` | Fixed material key such as `food` or `fabric`, or `null` for none |
+
+The retired `shoreSupportQ8` field is still accepted, so older sets and saves load, but it is
+ignored: algae regrowth now comes only from coasts, a derived property of each tile.
 
 Legacy resource bits are trees 0, wheat 1, papyrus 2, rocks 3, algae 4,
 cherry tree 5, orange tree 6 and prune tree 7. These import into a resource-key
@@ -173,12 +198,17 @@ outside this format.
 
 ## The rules of resources
 
+Loam, moss and spring meadow support land crops directly and each contribute
+48 Q8 fertility (18.75% of water’s 256). Their contributions also feed shore
+ecology, but they supply no shoreline support. Built-in terrain uses these values
+when existing maps and saves load; embedded custom terrain keeps its authored values.
+
 | Resource | Used for | Where it can be | How it grows |
 | --- | --- | --- | --- |
 | Wheat (corn) | Swarms turn it into units; inns store it to feed units | Grass | Grows and spreads, one visit in three, only where a random probe finds water and the opposite probe finds no sand |
 | Wood | Every building site's construction; many upgrades | Grass | Grows and spreads under the same water/no-sand test as wheat |
 | Stone | Upgrades of inns, hospitals, towers, barracks, schools, racetracks and pools; stone walls | Grass | Never grows and never runs out (not shrinkable): a quarry is permanent. Cannot be cleared |
-| Algae | School and swimming pool upgrades, the top defence tower | Water | Grows and spreads only where a random probe (up to 15 tiles) finds water and the probe turned a quarter and doubled (up to 30 tiles) finds solid sand (`algaeGrowthChance`) |
+| Algae | School and swimming pool upgrades, the top defence tower | Water | Grows and spreads only where a random probe (up to 15 tiles) finds water and the probe turned a quarter and doubled (up to 30 tiles) finds a coast, any tile mixing walking and swimming corners, beach or bare bank alike (`algaeGrowthChance`) |
 | Fruit (cherry, orange, prune) | Stocked in inns. Each kind an inn holds raises its happiness level (`Building::availableHappynessLevel`), and a hungry unit that can see a happier enemy inn than any of its own walks there and is converted to that team (`Team::findNearestFood`); traded at markets. A unit that ate fruit also carries less armour for it (`armorReductionPerHappyness`) | Grass | Regrows in place wherever it stands; never spreads, never cleared |
 
 The growth test lives in `Map::growResources` (`src/map/MapStep.cpp`), the resource table in
@@ -227,7 +257,9 @@ Consequences a generator has to design around:
   a map can offer, and fruit spread unevenly between colonies is a real unfairness.
 - **Stone is strategic, not consumable.** One quarry serves a colony forever, so stone placement
   decides *where* colonies go for upgrades rather than how long they last.
-- **Algae needs sand near its water.** Algae in open sea far from any beach never regrows.
+- **Algae needs a coast near its water.** A beach or grass straight against the water both
+  serve, and sand away from the water does not; algae in open sea far from any coast never
+  regrows.
 - **Every placed deposit draws from the gameplay RNG.** `Map::setResource` draws each tile's amount
   from the synchronised random stream in call order, so the order deposits are placed in is part of
   the map. Reordering placement changes the map even when the positions are the same.

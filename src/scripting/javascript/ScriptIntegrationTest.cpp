@@ -1,6 +1,10 @@
 #include <nlohmann/json.hpp>
+#include "Map.h"
+#include "sim/snapshot/SnapshotStore.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "DrawFixtures.h"
 #include "ScriptObservations.h"
 #include "ScriptOrders.h"
 #include "ScriptSpatial.h"
@@ -24,6 +28,10 @@
 #include <Toolkit.h>
 #include <FileManager.h>
 #include <iostream>
+#include "SGSL.h"
+#include "MapScript.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
 using namespace Script;
 using namespace GAGCore;
 static std::string save(Game &game)
@@ -1448,7 +1456,10 @@ TEST_CASE("JavaScript path fields use terrain travel costs and invalidate speed-
     CHECK_EQ(sample(spec),2);
     for(int x=0;x<16;++x) map.paintCell(x,1,ICE);
     ++world.game.stepCounter;
-    CHECK_EQ(sample(spec),8);
+    // The adjoining rows tie ice with water, so they remain walkable at
+    // mean speed 192. Three diagonal/shore steps cost 13 each and entry
+    // into the pure-ice source costs 20: ceil((3*13+20)/10) == 6.
+    CHECK_EQ(sample(spec),6);
     spec.set("metric","chebyshev");
     CHECK_EQ(sample(spec),4);
 }
@@ -1492,7 +1503,7 @@ TEST_CASE("JavaScript terrain registry exposes immutable property capabilities i
             "const all=ctx.game.terrainTypes(); const tile=ctx.game.map.tile(5,5);"
             "const ice=all[tile.corners[0]],road=all.find(t=>t.name==='road');"
             "s.name=ice.name;s.walk=ice.walkable;s.swim=ice.swimmable;s.air=ice.flyable;"
-            "s.speed=ice.groundSpeedQ8;s.health=ice.groundHealthQ8;s.experiment=ice.experiment;"
+            "s.speed=ice.groundSpeedQ8;s.health=ice.groundHealthQ8;s.noExperiment=!('experiment' in ice);"
             "s.road=road.buildable && road.groundSpeedQ8===512 && !road.resourcesGrow;"
             "s.grass=all.find(t=>t.name==='grass').allowedResources.includes(1);"
             "s.internal=all.some(t=>!t.editorSelectable);"
@@ -1504,7 +1515,7 @@ TEST_CASE("JavaScript terrain registry exposes immutable property capabilities i
         CHECK(state.get("name").text=="ice");CHECK(state.get("walk").number==1);
         CHECK(state.get("swim").number==0);CHECK(state.get("air").number==1);
         CHECK(state.get("speed").number==128);CHECK(state.get("health").number==-8);
-        CHECK(state.get("experiment").text=="ice-terrain");
+        CHECK(state.get("noExperiment").number==1);
         CHECK(state.get("road").number==1);CHECK(state.get("grass").number==1);
         CHECK(state.get("internal").number==0);CHECK(state.get("frozen").number==1);
         CHECK(state.get("unchanged").number==1);

@@ -7,7 +7,7 @@
 #include "Grid.h"
 #include "Sketch.h"
 #include <vector>
-class Map;
+class GenerationMap;
 namespace MapGeneration
 {
 // Water between two pieces of land, sized for what it is meant to do: a canal towers shoot across
@@ -44,12 +44,13 @@ int narrowestChannelTowersMiss(int level);
 std::vector<unsigned char> beachTiles(const TerrainSketch &, const Torus &);
 
 /// The same on a finished map.
-std::vector<unsigned char> beachTiles(const Map &, const Torus &);
+std::vector<unsigned char> beachTiles(const GenerationMap &, const Torus &);
 
 /// A sand bridge laid straight across water from `from` to `to`: every water corner within
-/// `halfWidth` of the line becomes sand (strokePath over corners). A tile is water only when all four
-/// of its corners are, so a bridge one corner wide already carries units on the two tiles either side
-/// of it. Run after layBeaches (a bridge's own sand needs no beach). Returns the corners changed.
+/// `halfWidth` of the line becomes sand (strokePath over corners). Walking needs at least two sand
+/// corners per crossed cell; a connected narrow strip can supply them along either straight or
+/// diagonal crossings. Run after layBeaches (a bridge's own sand needs no beach).
+/// Returns the corners changed.
 int bridgeAcross(TerrainSketch &, const Torus &, ShapePoint from, ShapePoint to, double halfWidth);
 
 /// The water that parts labelled cells into islands: a strait `corners` terrain vertices wide (4 to 8)
@@ -112,11 +113,11 @@ std::string fordFault(const Torus &, const SandFord &, Water water, double probe
 
 /// Finished-map counterpart to the sketch's non-water test: the crossing and
 /// both bank endpoints must actually permit walking, whatever their material.
-std::string fordWalkabilityFault(const Map &, const Torus &, const SandFord &);
+std::string fordWalkabilityFault(const GenerationMap &, const Torus &, const SandFord &);
 
 /// Whether a walkable tile (no water, no deposit, no building) lies within one tile of the ford's
 /// landing on `side` (-1 or 1), a tile past its span.
-bool fordLandingWalkable(const Map &, const Torus &, const SandFord &, int side);
+bool fordLandingWalkable(const GenerationMap &, const Torus &, const SandFord &, int side);
 
 /// A channel's core of open water, on the rasterized water: the tile under every point of
 /// `centreline` (map coordinates, in order) is pure water, and no two consecutive points' tiles

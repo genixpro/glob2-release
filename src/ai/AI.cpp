@@ -2,8 +2,11 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "AIProfile.h"
+#include "Building.h"
 #include <PerformanceTelemetry.h>
 #include "AI.h"
+#include "AIRegistry.h"
+#include "AIImplementation.h"
 #include "ai/engine/AIOrderScheduler.h"
 #include "ai/engine/AIReceiptSerialization.h"
 #include <algorithm>
@@ -11,8 +14,6 @@
 #include <iostream>
 #include "AIRuleOrders.h"
 #include <cstdlib>
-#include "AIJavaScript.h"
-#include "AIMaxima.h"
 #include "Player.h"
 #include "Utilities.h"
 #include "Game.h"
@@ -24,16 +25,9 @@
 #include <stdexcept>
 #include <Stream.h>
 #include "FileFormatVersions.h"
+#include "Team.h"
 
 
-#include "AINull.h"
-#include "AINumbi.h"
-#include "AICastor.h"
-#include "AIWarrush.h"
-#include "AINicowar.h"
-#include "shared_runtime/Runtime.h"
-#include "cortex/AICortex.h"
-#include "AICabino.h"
 
 using std::shared_ptr;
 
@@ -41,41 +35,7 @@ AI::AI(ImplementationID implementationID, Player *player)
 {
 	aiImplementation=NULL;
 	
-	switch (implementationID)
-	{
-		case NONE:
-			aiImplementation=new AINull();
-		break;
-		case NUMBI:
-			aiImplementation=new AINumbi(player);
-		break;
-		case CASTOR:
-			aiImplementation=new AICastor(player);
-		break;
-		case NICOWAR:
-			aiImplementation=new AISharedRuntime::Runtime(new NewNicowar, player);
-		break;
-		case WARRUSH:
-			aiImplementation=new AIWarrush(player);
-		break;
-		case ECONO:
-			aiImplementation=new AISharedRuntime::Runtime(new AISharedRuntime::Econo, player);
-		break;
-		case MAXIMA:
-			aiImplementation=new AIMaxima::Maxima(player);
-		break;
-		case CORTEX:
-			aiImplementation=new AICortex(player);
-		break;
-		case CABINO:
-			aiImplementation=new Cabino::AICabino(player);
-		break;
-		case JAVASCRIPT:
-			aiImplementation=new AIJavaScript(player);
-		break;
-		default:
-			throw std::runtime_error("Unknown AI implementation");
-	}
+	aiImplementation=AIRegistry::create(implementationID, player);
 
 	this->implementationID=implementationID;
 	this->player=player;
@@ -182,7 +142,7 @@ AIEngine::Command AI::decide(const AIEngine::DecisionContext& context)
         } else if(!receipt.command.empty() && receipt.command.front()!=ORDER_NULL)
             deferredControllerReceipts.push_back(receipt);
     }
-    if(deferredControllerReceipts.size()>9) throw std::logic_error("AI deferred receipt bound exceeded");
+    if(deferredControllerReceipts.size()>GameHeader::MAX_AI_ORDER_DELAY+1) throw std::logic_error("AI deferred receipt bound exceeded");
 	std::shared_ptr<Order> order;
 	// Preserve the existing native training-release policy using captured config
 	// and catalog capabilities. No live rules helper is reachable here.
@@ -203,7 +163,7 @@ AIEngine::Command AI::decide(const AIEngine::DecisionContext& context)
                 order=std::make_shared<OrderModifyBuilding>(b.identity.gid,0);
                 order->aiSelectedTarget=b.identity;
                 wrapperReleases.push_back({context.pollSequence,b.identity});
-                if(wrapperReleases.size()>9) throw std::logic_error("AI wrapper release bound exceeded");
+                if(wrapperReleases.size()>GameHeader::MAX_AI_ORDER_DELAY+1) throw std::logic_error("AI wrapper release bound exceeded");
                 break;
             }
 		}
@@ -300,57 +260,14 @@ bool AI::load(GAGCore::InputStream *stream, Sint32 versionMinor)
 	if (savedImplementation > JAVASCRIPT) return false;
 	implementationID=static_cast<ImplementationID>(savedImplementation);
 
-	switch (implementationID)
+	switch (AIRegistry::load(implementationID, stream, player, versionMinor, aiImplementation))
 	{
-		case NONE:
-			aiImplementation=new AINull();
+		case AIRegistry::Loaded::Yes:
 		break;
-		case NUMBI:
-			aiImplementation=new AINumbi(player);
-			if (!aiImplementation->load(stream, player, versionMinor))
-			{
-				stream->readLeaveSection();
-				return false;
-			}
-		break;
-		case CASTOR:
-			aiImplementation=new AICastor(player);
-			if (!aiImplementation->load(stream, player, versionMinor))
-			{
-				fprintf(stderr, "AI::load: AICastor load failed\n");
-				stream->readLeaveSection();
-				return false;
-			}
-		break;
-		case NICOWAR:
-			aiImplementation=new AISharedRuntime::Runtime(new NewNicowar, player);
-			if (!aiImplementation->load(stream, player, versionMinor)) return false;
-		break;
-		case ECONO:
-			aiImplementation=new AISharedRuntime::Runtime(new AISharedRuntime::Econo, player);
-			if (!aiImplementation->load(stream, player, versionMinor)) return false;
-		break;
-		case WARRUSH:
-			aiImplementation=new AIWarrush(player);
-			if (!aiImplementation->load(stream, player, versionMinor)) return false;
-		break;
-		case MAXIMA:
-			if(versionMinor<115)
-				throw std::runtime_error("This Maxima save uses a retired strategy format");
-			aiImplementation=new AIMaxima::Maxima(stream,player,versionMinor);
-		break;
-		case CORTEX:
-			aiImplementation=new AICortex(stream, player, versionMinor);
-		break;
-		case CABINO:
-			aiImplementation=new Cabino::AICabino(stream, player, versionMinor);
-		break;
-		case JAVASCRIPT:
-			aiImplementation=new AIJavaScript(player);
-			if(!aiImplementation->load(stream,player,versionMinor)) return false;
-		break;
-		default:
-			fprintf(stderr, "AI id %d does not exist, you probably try to load a map from a more recent version of glob2.\n", implementationID);
+		case AIRegistry::Loaded::FailedInSection:
+			stream->readLeaveSection();
+			return false;
+		case AIRegistry::Loaded::Failed:
 			return false;
 	}
 	assert(aiImplementation);
@@ -504,7 +421,7 @@ void AI::loadWrapperFeedback(GAGCore::InputStream* stream)
 {
     stream->readEnterSection("wrapperFeedback");
     wrapperGeneration=stream->readUint32("generation");
-    const auto releases=stream->readCount("releases",9);
+    const auto releases=stream->readCount("releases",GameHeader::MAX_AI_ORDER_DELAY+1);
     for(unsigned i=0;i<releases;++i){
         stream->readEnterSection(i);const auto low=stream->readUint32("sequenceLow"),high=stream->readUint32("sequenceHigh");
         WrapperRelease release{Uint64(low)|(Uint64(high)<<32),{stream->readUint16("gid"),stream->readUint32("targetGeneration")}};
@@ -513,7 +430,7 @@ void AI::loadWrapperFeedback(GAGCore::InputStream* stream)
             throw std::runtime_error("Invalid saved AI wrapper release");
         wrapperReleases.push_back(release);stream->readLeaveSection();
     }
-    const auto receipts=stream->readCount("receipts",9);
+    const auto receipts=stream->readCount("receipts",GameHeader::MAX_AI_ORDER_DELAY+1);
     for(unsigned i=0;i<receipts;++i){
         stream->readEnterSection(i);auto receipt=AIEngine::loadExecutionReceipt(*stream);
         if(receipt.request.player!=unsigned(player->number) || receipt.request.generation!=wrapperGeneration ||

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Glob2Test.h"
+#include "Map.h"
 #include "BuildingType.h"
 #include "BuildingUnitInteractionPool.h"
 #include "BuildingLibrary.h"
 #include "BuildingLibraryScreen.h"
 #include "OnlineServices.h"
 #include "OnlineFakes.h"
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
 #include "OnlineStorage.h"
 #include "SimVersion.h"
 #include "GameHeader.h"
@@ -24,6 +27,7 @@
 #include <stdexcept>
 #include <map>
 #include <array>
+#include "Building.h"
 
 TEST_SUITE("BuildingCatalog")
 {
@@ -31,7 +35,7 @@ TEST_CASE("shipped JSON preserves frozen variants while production inherits unit
 {
     glob2test::HeadlessGlobals globals;
     BuildingsTypes legacy, installed;
-    legacy.initLegacy(); installed.loadManifest((glob2test::sourceRoot() / "data/buildings/manifest.json").string());
+    legacy.initLegacy(); installed.loadManifest((glob2test::contentRoot() / "data/buildings/manifest.json").string());
     REQUIRE(legacy.size() == 55);
     installed.configureUnits(*UnitCatalog::builtins());
     auto expected=nlohmann::json::parse(legacy.snapshotJson());
@@ -946,7 +950,7 @@ TEST_SUITE("BuildingCatalog")
 TEST_CASE("configured unit costs inherit only when a producer omits its override")
 {
     const auto units=UnitCatalog::fromJson(R"({"schemaVersion":1,"units":[{"key":"worker","cost":{"food":7}}]})");
-    BuildingsTypes catalog;catalog.loadManifest((glob2test::sourceRoot()/"data/buildings/manifest.json").string());
+    BuildingsTypes catalog;catalog.loadManifest((glob2test::contentRoot()/"data/buildings/manifest.json").string());
     // Unequal late-choice recipes cannot decide their cost at completion.
     CHECK_THROWS(catalog.configureUnits(*units));
     auto snapshot=nlohmann::json::parse(catalog.snapshotJson());
@@ -966,7 +970,7 @@ TEST_CASE("configured unit costs inherit only when a producer omits its override
 TEST_CASE("late choice resolves mixed inherited and explicit equal costs before validating equality")
 {
     const auto units=UnitCatalog::fromJson(R"({"schemaVersion":1,"units":[{"key":"worker","cost":{"food":7}},{"key":"explorer","cost":{"food":7}},{"key":"warrior","cost":{"food":7}}]})");
-    BuildingsTypes source; source.loadManifest((glob2test::sourceRoot()/"data/buildings/manifest.json").string());
+    BuildingsTypes source; source.loadManifest((glob2test::contentRoot()/"data/buildings/manifest.json").string());
     auto snapshot=nlohmann::json::parse(source.snapshotJson());
     for(auto& variant:snapshot["variants"]) {
         auto& production=variant["semantics"]["production"];

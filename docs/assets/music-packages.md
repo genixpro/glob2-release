@@ -96,7 +96,7 @@ Focused regression commands (FFmpeg and native Opus development headers required
 
 ```sh
 PYTHONPATH=tools/music python3 -m unittest tools.music.tests.test_community tools.music.tests.test_runtime
-scons release=1 engine-tests
+python3 tools/dev_build.py release=1 engine-tests
 python3 test/run_tests.py --help
 ```
 
@@ -108,7 +108,7 @@ same generated audio with the real WASM decoder. To exercise the maximum duratio
 use `make_community_fixture.py <output> --seconds 900` and the runtime probe.
 
 The browser-game import check uses a real catalogue download, passed as
-`GLOB2_MUSIC_TEST_ARCHIVE`, with `browser/tests/music-import.spec.js`. It drives
+`GLOB2_MUSIC_TEST_ARCHIVE`, with `platforms/web/tests/music-import.spec.js`. It drives
 Audio settings, the file picker, installation and selection, then reloads the
 browser to verify the persisted bytes. Its quota-failure case verifies recovery
 export and a successful retry. Without that archive, the integration cases skip

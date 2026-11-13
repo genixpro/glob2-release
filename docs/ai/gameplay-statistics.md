@@ -105,7 +105,10 @@ reader retains them. Routine checksums cover queue identities and published
 simulation-driving statistics/smoothing; full checks
 join and hash complete pending results, published diagnostics and live counters.
 Consequently routine checks detect differing pending simulation statistics when
-they publish; diagnostic measurements are covered by full verification.
+they publish; diagnostic measurements are covered by full verification. The
+measurement values the [win probability model](architecture/win-probability-model.md)
+reads (`WinProbability::teamInputs`) can end a game, so routine checksums cover
+them too.
 AI telemetry collection remains on the owner. Samples are admitted once per
 logical tick, including an initially paused observation. Further paused frames
 and repeated reads of that boundary do not duplicate them.
@@ -249,6 +252,15 @@ which a colony lost its last unit, lost a unit in combat, or had a building
 destroyed; these are derived from the 512-tick samples, so they are accurate to
 about 20 seconds. The chart painter is `TeamStatChart`.
 
+The Score group also includes **Win probability**, an alliance-wide estimate on
+a fixed 0–100% axis. It is recorded automatically every 512 ticks, with explicit
+coverage ticks and a final partial interval; older saves have a gap before new
+samples start. It uses hidden opponent state, so ordinary players see it only in
+post-game results; their live touch sheet excludes it. Spectators retain the live
+chance panel. See the [model guide](architecture/win-probability-model.md) for its
+inputs and limitations, and [tournament scoring](../tools/tournaments.md#whole-game-probability-scores)
+for the integrated probability metric.
+
 In a match, the text-statistics panel pages through the colony summary and then
 one page per catalog group (click the page line to advance), giving each
 metric's current value: counters as their rate per minute over the last two
@@ -278,14 +290,14 @@ profiles as described in `test/README.md`. The statistics harness also accepts
 at 640×480 and 1024×768 with the supported maximum of 16 teams, large totals and partial legacy history.
 `src/team/stats/MetricSeriesTest.cpp` (in `glob2-unit-tests`) covers the catalog and its
 arithmetic: rates, bands, percentages, coverage gaps and axes.
-`python3 test/check_telemetry_simulation.py build/src/glob2` compares the complete
-1,024-tick four-AI and 2,048-tick 12-team checksum sidecars against compressed
-version-121 fixtures, plus a 2,048-tick Numbi/Castor scenario. It also reloads a
-format-108 mid-run checkpoint and compares
-256 team/entity checksum records against the version-121 reference. Aggregate
-checksums after save/load include `MapHeader::versionMinor`, so a format-108 save
-cannot have the same aggregate checksum as a format-107 save. CI runs the
-same check on Linux and Windows (with `.exe` on Windows).
+`python3 test/check_telemetry_simulation.py build/src/glob2` runs the
+1,024-tick four-AI and 2,048-tick 12-team games and a 2,048-tick Numbi/Castor
+scenario with complete checksum sidecars. It also continues a format-108 mid-run
+checkpoint to tick 1,280, saving at 1,152: the reload must reproduce every
+remaining tick of the uninterrupted run, aggregate checksum and team/entity records
+alike (the aggregate's map-header word does not cover the save format version).
+`tools/sim_fingerprint.py` (part `saves`) compares these runs between builds; no
+trace is committed. CI runs the check on Linux and Windows (with `.exe` on Windows).
 Actual results and platform/performance coverage are recorded with the change's
 validation artifacts; CI compilation alone is not deterministic execution proof.
 
@@ -294,7 +306,7 @@ Related: [AI documentation](README.md).
 The opt-in `TeamStatsPipeline` benchmark uses a fixed seed, 256 stationary units,
 shared snapshot capture and no orders for 1,024 ticks. Run the release test binary
 with an isolated `GLOB2_USER_DATA_DIR`, dummy SDL drivers,
-`GLOB2_STATS_BENCHMARK=1`, `GLOB2_PERF_DISABLE=1`,
+`GLOB2_STATS_BENCHMARK=1`,
 `--test-suite=TeamStatsPipeline --test-case='pipeline versus*'`. It prints
 `STATS_BENCH` rows for synchronous, immediate-snapshot and delayed-snapshot modes.
 These isolate scheduling/capture costs; they do not establish whole-game speedup.

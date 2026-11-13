@@ -1,4 +1,7 @@
 #include "PowerOfTwo.h"
+#include "AITerrainPredicates.h"
+#include "Map.h"
+#include "field/TerrainTravel.h"
 #include "Material.h"
 #include "AIStateSerialization.h"
 #include "field/UniformTraversal.h"
@@ -172,7 +175,7 @@ bool AnyResource::equals(const Entity& other) const
 void AnyResource::save(GAGCore::OutputStream* stream) const{stream->writeUint8(type(),"type");}
 
 bool Water::matches(const AIEngine::AIWorldView& world,unsigned observerTeam,int x,int y) const
-{ return terrainProvidesFertility(AIEngine::ObservationQueries::terrain(world,x,y)); }
+{ return terrainIsIrrigatingWater(AIEngine::ObservationQueries::terrain(world,x,y)); }
 bool Water::equals(const Entity& other) const
 { return other.type()==EWater; }
 void Water::save(GAGCore::OutputStream* stream) const{stream->writeUint8(type(),"type");}
@@ -719,6 +722,11 @@ void ChangeAlliances::modify(Context& c)
     const auto* t=&c.observation().teams[team];
 	struct Bit { static void apply(Uint32& mask,Uint32 bit,OptionalBool value){if(value==KeepValue)return;if(value==SetValue)mask|=bit;else mask&=~bit;} };
 	Bit::apply(c.allies,t->mask,allied);Bit::apply(c.enemies,t->mask,enemy);Bit::apply(c.market_view,t->mask,market);Bit::apply(c.inn_view,t->mask,inn);Bit::apply(c.other_view,t->mask,other);
+	// Keep only bits for teams the map has: the observed enemy mask starts as ~allies
+	// (Team::setCorrectMasks), and the order validator rejects bits beyond the map's teams.
+	const std::size_t teamCount=c.observation().teams.size();
+	const Uint32 existing=teamCount>=32 ? ~Uint32(0) : (Uint32(1)<<teamCount)-1;
+	c.allies&=existing;c.enemies&=existing;c.market_view&=existing;c.inn_view&=existing;c.other_view&=existing;
 	c.push_order(shared_ptr<Order>(new SetAllianceOrder(c.teamNumber(),c.allies,c.enemies,c.market_view,c.inn_view,c.other_view)));
 }
 void ChangeAlliances::save_payload(GAGCore::OutputStream* s)const{s->writeSint32(team,"team");s->writeSint32(allied,"allied");s->writeSint32(enemy,"enemy");s->writeSint32(market,"market");s->writeSint32(inn,"inn");s->writeSint32(other,"other");}
@@ -755,6 +763,11 @@ void BuildingRegister::issue_order(int id,int x,int y,int type)
 	BuildingRecord& r=pendingBuildings[id]; r.x=x;r.y=y;r.type=type;r.age=0;r.issued=true;
 }
 void BuildingRegister::remove_building(int id) { pendingBuildings.erase(id); }
+void BuildingRegister::placement_rejected(int x, int y, int type)
+{
+	for(auto i=pendingBuildings.begin();i!=pendingBuildings.end();++i)
+		if(i->second.issued && i->second.x==x && i->second.y==y && i->second.type==type) { pendingBuildings.erase(i); return; }
+}
 void BuildingRegister::set_upgrading(int id, bool awaitingExecution)
 {
     auto found=foundBuildings.find(id);
@@ -1444,6 +1457,24 @@ void Context::record_profile(long long totalMicros,long long aiMicros,
 	profileBuildingSearchCalls=0;
 }
 
+void Context::reject_queued_orders(const std::function<bool(const Order&)>& reject)
+{
+    for(auto i=orders.begin();i!=orders.end();) {
+        if(!reject(**i)){++i;continue;}
+        if(const auto* construction=dynamic_cast<const OrderConstruction*>(i->get()))
+            buildings.order_execution_completed(construction->gid,false,
+                (*i)->aiSelectedTarget?std::optional<Uint32>((*i)->aiSelectedTarget->generation):std::nullopt);
+        else if(const auto* create=dynamic_cast<const OrderCreate*>(i->get()))
+            buildings.placement_rejected(create->posX,create->posY,create->typeNum);
+        i=orders.erase(i);
+    }
+}
+void Context::push_urgent_order(std::shared_ptr<Order> order)
+{
+    push_order(std::move(order));
+    orders.splice(orders.begin(),orders,std::prev(orders.end()));
+}
+
 shared_ptr<Order> Context::getOrder(RuntimeAI& ai)
 {
 	const bool profiling=telemetry_enabled();
@@ -1455,6 +1486,8 @@ shared_ptr<Order> Context::getOrder(RuntimeAI& ai)
         if(const auto* construction=dynamic_cast<const OrderConstruction*>(orders.front().get()))
             buildings.order_execution_completed(construction->gid,false,
                 orders.front()->aiSelectedTarget ? std::optional<Uint32>(orders.front()->aiSelectedTarget->generation) : std::nullopt);
+        else if(const auto* create=dynamic_cast<const OrderCreate*>(orders.front().get()))
+            buildings.placement_rejected(create->posX,create->posY,create->typeNum);
         orders.pop_front();
     }
 	if(!orders.empty())

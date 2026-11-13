@@ -27,7 +27,11 @@ limits when their homes, resources or routes need more room.
   drag or open choice menu. The displayed snapshot is the map that launches.
   Randomize, under the preview, rolls the same settings again with a new seed.
 - Landscape, at the top of the map column, opens a sheet showing every landscape as
-  a real map at the current size and colony count. Regenerate all rolls the sheet
+  a real map at the current size and colony count, sorted alphabetically by its
+  localized name. Landscapes that cannot be made at that size and colony count
+  (checked up front, before any preview rolls) leave the grid for a collapsed group
+  at its end; opened, each shows why and a button that switches the sheet to the
+  nearest colony count or square size it supports. Regenerate all rolls the sheet
   again with fresh seeds; Randomize parameters rolls it with every landscape's own
   controls drawn at random, redrawing any set the world refuses; Reset to defaults
   puts every landscape back on its registered controls. Use plays exactly the map
@@ -51,7 +55,7 @@ limits when their homes, resources or routes need more room.
   weights.
 - Each colony has a numbered color swatch, controller, AI/difficulty and team.
   You, AI, shared You + AI, and Closed are explicit choices. Shared control uses
-  two of the twelve controller records; the UI explains unavailable combinations.
+  two of the sixteen controller records; the UI explains unavailable combinations.
 - The Teams choice above the colonies offers every shape the open colonies can
   take: FFA, each two-team split from the most even down to one against all, and
   each split into three or more equal teams (8 colonies: 4 vs 4, 3 vs 5, 2 vs 6,
@@ -63,12 +67,18 @@ limits when their homes, resources or routes need more room.
   "Custom teams". Online rooms use the same choice and names, plus Humans vs AI and
   without one against all. Reducing map capacity retains hidden assignments for a
   later larger map.
+- AI for all computer colonies changes the strategy of every active AI or shared
+  You + AI colony together. It shows Mixed when their strategies differ. Human,
+  Closed and retained assignments beyond the current map capacity keep their
+  strategies. Individual AI choices remain available below. A colony switched to
+  AI later restores its own retained strategy. For an eight-Nicowar FFA, switch
+  your colony to AI, then choose Nicowar in this shared choice.
 - AI profiles explain strategy, strengths and suggested counterplay. Cortex is
   Medium difficulty. All eight native AI implementations are retained.
 - All-AI matches launch live watching, with whole-map visibility, optional colony
   viewpoints, pause/speed/inspection, and no gameplay orders from the viewer.
 - Game Rules starts from a ruleset (Standard, Quick clash, Blitz, Sandbox and the
-  others in `data/rulesets.json`) and lets the player tweak any rule from there.
+  others in `content/data/rulesets.json`) and lets the player tweak any rule from there.
   - The tab names the ruleset and how many rules differ from it ("Blitz + 2
     changes"). Each changed rule says, in words, what the ruleset had ("Changed from
     Blitz: 8") and has a Reset; a second Reset restores the whole ruleset. Undoing an
@@ -184,7 +194,7 @@ stale saved commitment, alongside authoritative engine checks.
 
 ## Adding or tweaking a ruleset
 
-Rulesets live in `data/rulesets.json`, in display order. Each entry lists only the
+Rulesets live in `content/data/rulesets.json`, in display order. Each entry lists only the
 rules it changes from Standard; every other rule keeps its Standard value. Blitz,
 abridged:
 
@@ -199,10 +209,10 @@ abridged:
 
 - `id` is stable: preferences store it, so renaming one resets players who chose it
   to Standard. `standard` must exist, change nothing, and is always listed first.
-- `name` and `description` are text keys. Add each to `data/texts.keys.txt`, with
-  English in `data/texts.en.txt`, a blank line in every other catalog and the key in
-  `data/texts.pending.txt` (see the [UI framework](../../development/ui-framework.md)).
-  `data/check_translations.py` fails on a key the file uses but the catalogs lack.
+- `name` and `description` are text keys. Add each to `content/data/texts.keys.txt`, with
+  English in `content/data/texts.en.txt`, a blank line in every other catalog and the key in
+  `content/data/texts.pending.txt` (see the [UI framework](../../development/ui-framework.md)).
+  `content/data/check_translations.py` fails on a key the file uses but the catalogs lack.
 - Rule ids and values come from the registry in `src/game/rules/CustomGameRules.cpp`. Toggles
   take only `true`/`false` (`combat`, `hunger`, `revealTerrain`, `alliancesChange`,
   `instantConstruction`, `woundedRetreat`, `unitsCanDie`, `unitTraining`); `workers`
@@ -240,10 +250,10 @@ fallbacks outside the documented shared-vocabulary allowlist.
 Run from the repository root on a machine with the native dependencies:
 
 ```sh
-scons -j8 release=1 engine-tests build/src/glob2
+python3 tools/dev_build.py -j8 release=1 engine-tests glob2
 python3 test/run_tests.py --filter 'CustomGameSetup/*'
 python3 test/run_tests.py --filter 'GameSpeed/*'
-python3 data/check_translations.py --strict
+python3 content/data/check_translations.py --strict
 python3 test/test_translations.py
 python3 test/test_font_coverage.py
 ```

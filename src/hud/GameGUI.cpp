@@ -1,8 +1,10 @@
 #include "tutorial/TutorialGuidance.h"
+#include "Map.h"
 #include <ui/TextLayout.h>
 #include "hive/HiveClient.h"
 #include "hive/HiveDialog.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "InGameStatistics.h"
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include <stdio.h>
@@ -18,11 +20,16 @@
 
 #include "Game.h"
 #include "GameGUI.h"
+#include "GameGUIToolManager.h"
+#include "TorusView.h"
+#include "render/ViewState.h"
+#include "render/scene/SceneExtract.h"
 #include "online/SkinDownloads.h"
 #include "render/ColonySkinPreview.h"
 #include "GameGUITouch.h"
 #include "HudUnitConversionIcon.h"
 #include "GameGUIDialog.h"
+#include "InGameScrollableHistory.h"
 #include "GameGUIInternal.h"
 #include "LoadSaveDialog.h"
 #include "GameUtilities.h"
@@ -40,15 +47,20 @@ using std::shared_ptr;
 using std::static_pointer_cast;
 
 GameGUI::GameGUI(bool persistPreferences)
-	: keyboardManager(GameGUIShortcuts), game(this), defaultAssign(game), toolManager(game, brush, defaultAssign, ghostManager),
+	: torusViewOwner(std::make_unique<TorusView>()), torusView(*torusViewOwner),
+	  keyboardManager(GameGUIShortcuts), gameOwner(std::make_unique<Game>(this)), game(*gameOwner), defaultAssign(game),
+	  toolManagerOwner(std::make_unique<GameGUIToolManager>(game, brush, defaultAssign, ghostManager)), toolManager(*toolManagerOwner),
 	  minimap(globalContainer->runNoX,
 	         RIGHT_MENU_WIDTH, // width of the menu
 	         (globalContainer->runNoX ? 0 : globalContainer->gfx->getW()), // width of the screen
-	         20, // x offset
+	         RIGHT_MENU_OFFSET, // center the 128px minimap in the desktop sidebar
 	         10, // y offset
 	         128, // width
 	         128, //height
-	         Minimap::ShowFOW) // minimap mode
+	         Minimap::ShowFOW), // minimap mode
+	  viewOwner(std::make_unique<ViewState>()), view(*viewOwner),
+	  frameSceneOwner(std::make_unique<PresentationFrame>()), frameScene(*frameSceneOwner),
+	  sceneExtractorOwner(std::make_unique<SceneExtractor>()), sceneExtractor(*sceneExtractorOwner)
 {
 	// Headless clients may consume simulation events before the full GUI init.
 	selectionMode = NO_SELECTION;
@@ -80,6 +92,26 @@ void GameGUI::requestPause(bool pause)
 	enqueueOrder(std::make_shared<PauseGameOrder>(pause));
 }
 
+void GameGUI::setPublishedScene(const PresentationFrame* scene)
+{
+	publishedScene = scene;
+	view.scene = &drawnScene();
+	if (view.scene->buildingTypes) choiceCatalog = view.scene->buildingTypes;
+	toolManager.setDrawnScene(view.scene->world.catalogs ? view.scene : nullptr);
+	reconcilePublishedBuildingGuiState();
+}
+
+void GameGUI::stampPresentationRequest(SceneRequest& request) const
+{
+	request.tickTime = lastTickTime;
+	request.tickInterval = tickInterval;
+}
+
+int GameGUI::mapAnimationTime() const
+{
+	return view.render.animationTime;
+}
+
 GameGUI::~GameGUI()
 {
 	for (ParticleSet::iterator it = particles.begin(); it != particles.end(); ++it)
@@ -93,17 +125,33 @@ Sint32 GameGUI::displayedPosY(const Building& b) const { return ::displayedPosY(
 Sint32 GameGUI::displayedMaxUnitWorking(const Building& b) const { return ::displayedMaxUnitWorking(buildingGuiState, b); }
 Sint32 GameGUI::displayedUnitStayRange(const Building& b) const { return ::displayedUnitStayRange(buildingGuiState, b); }
 Sint32 GameGUI::displayedPriority(const Building& b) const { return ::displayedPriority(buildingGuiState, b); }
+Sint32 GameGUI::displayedPosX(const SnapshotBuilding& b) const { return ::displayedPosX(buildingGuiState, b); }
+Sint32 GameGUI::displayedPosY(const SnapshotBuilding& b) const { return ::displayedPosY(buildingGuiState, b); }
+Sint32 GameGUI::displayedPosX(const SceneBuildingPanel& b) const { return ::displayedPosX(buildingGuiState, b); }
+Sint32 GameGUI::displayedPosY(const SceneBuildingPanel& b) const { return ::displayedPosY(buildingGuiState, b); }
+Sint32 GameGUI::displayedMaxUnitWorking(const SceneBuildingPanel& b) const { return ::displayedMaxUnitWorking(buildingGuiState, b); }
+Sint32 GameGUI::displayedUnitStayRange(const SceneBuildingPanel& b) const { return ::displayedUnitStayRange(buildingGuiState, b); }
+Sint32 GameGUI::displayedPriority(const SceneBuildingPanel& b) const { return ::displayedPriority(buildingGuiState, b); }
+bool GameGUI::displayedClearingResource(const SceneBuildingPanel& b, int i) const { return ::displayedClearingResource(buildingGuiState, b, i); }
+Sint32 GameGUI::displayedMinLevelToFlag(const SceneBuildingPanel& b) const { return ::displayedMinLevelToFlag(buildingGuiState, b); }
+std::array<Sint32, NB_UNIT_TYPE> GameGUI::displayedRatio(const SceneBuildingPanel& b) const { return ::displayedRatio(buildingGuiState, b); }
 bool GameGUI::displayedClearingResource(const Building& b, int i) const { return ::displayedClearingResource(buildingGuiState, b, i); }
 Sint32 GameGUI::displayedMinLevelToFlag(const Building& b) const { return ::displayedMinLevelToFlag(buildingGuiState, b); }
 std::array<Sint32, NB_UNIT_TYPE> GameGUI::displayedRatio(const Building& b) const { return ::displayedRatio(buildingGuiState, b); }
 
 void GameGUI::init()
 {
+	hudHost.reset();
+	buildingGuiState.clear();
+	pendingBuildingReconciliations = {};
+	buildingInfoScrollTarget.reset();
+    statisticsPanel.reset();
     pendingSettings = false;
     tutorialGuidance.reset();
     tutorialHighlights.clear();
     tutorialDestination=0;
 	torusView.reset();
+	introCover.reset();
 	torusPointerDown = false;
 	camera=MapCamera();zoomControlPushed=false;
 	if (!globalContainer->runNoX) Sprite::requestHighResolution(globalContainer->settings.highResolutionArtwork);
@@ -132,7 +180,7 @@ void GameGUI::init()
 	// Reset the per-client view scratch (selection, mouse and map render state)
 	// the render path reads. Formerly cleared by Game::clearGame when these fields lived on
 	// Game; now front-end-owned, so reset it here. See CS-661.
-	view = Game::ViewState{};
+	view = ViewState{};
 	miniMapPushed=false;
 	putMark=false;
 	showUnitWorkingToBuilding=true;
@@ -279,6 +327,8 @@ void GameGUI::setMultiLine(const std::string &input, std::vector<std::string> *o
         { return font->getStringWidth(text.c_str()); }
         int lineHeight(GAGGUI::ui::FontRole) const override
         { return font->getStringHeight("M"); }
+        std::vector<std::size_t> clusterEnds(GAGGUI::ui::FontRole, const std::string &text) const override
+        { return font->getStringClusterEnds(text); }
     } measurer(globalContainer->standardFont);
     // Reserve continuation indentation while wrapping. The shared UTF-8
     // wrapper also handles unspaced CJK text, long words and explicit newlines.
@@ -406,3 +456,89 @@ void GameGUI::updateCommander(bool caughtUp)
  }
  if(hiveCards)hiveCards->invalidate();
 }
+
+bool GameGUI::hiveCardsVisible() const
+{
+	return hiveCards && !gameMenuScreen && !scrollableText && !inGameMenu &&
+		(!connectionOverlay || !connectionOverlay->blocksGameplay()) &&
+		(hiveCards->local() || globalContainer->settings.hiveMindEnabled);
+}
+
+std::vector<GAGGUI::ui::Host *> GameGUI::inspectionHosts()
+{
+	if (auto *dialog = activeDialog(); dialog && dialog != typingInputScreen.get())
+		return {&dialog->host()};
+	std::vector<GAGGUI::ui::Host *> hosts;
+	if (typingInputScreen)
+	{
+		prepareHudOwnership();
+		hosts.push_back(&typingInputScreen->host());
+	}
+	else
+	{
+		updateTutorial();
+		hosts.push_back(&hudInspectionHost());
+		if (statisticsVisible() && (!connectionOverlay || !connectionOverlay->blocksGameplay()))
+			hosts.push_back(&statisticsHost());
+		if (tutorialGuidance && (!touch || !touch->obscuresTutorial()) &&
+            (!connectionOverlay || !connectionOverlay->blocksGameplay()))
+			hosts.push_back(&tutorialGuidance->host());
+	}
+	if (hiveCardsVisible())
+		hosts.push_back(&hiveCards->host());
+	return hosts;
+}
+
+// The opening cover's title, taken once from the session as the game starts;
+// drawing then reads only this snapshot.
+void GameGUI::beginIntroCover(Uint64 now)
+{
+	IntroCover::Title title;
+	title.map = game.mapHeader.getMapName();
+	for (int i = 0; i < game.gameHeader.getNumberOfPlayers(); ++i)
+	{
+		const BasePlayer &base = game.gameHeader.getBasePlayer(i);
+		IntroCover::Player player;
+		player.name = base.name;
+		// Custom games name AIs "Maxima / 1 - Red"; the dot shows the colony.
+		if (base.type >= BasePlayer::P_AI)
+			if (const auto cut = player.name.find(" / "); cut != std::string::npos)
+				player.name.resize(cut);
+		if (base.teamNumber >= 0 && base.teamNumber < Team::MAX_COUNT && game.teams[base.teamNumber])
+		{
+			const GAGCore::Color colour = game.teams[base.teamNumber]->color;
+			player.r = colour.r;
+			player.g = colour.g;
+			player.b = colour.b;
+		}
+		title.players.push_back(std::move(player));
+	}
+	introCover.begin(now, std::move(title));
+	if (globalContainer->gfx && globalContainer->gfx->rendererCapabilities().cloudLayers && !globalContainer->reducedMotion)
+		introCover.prepare(*globalContainer->gfx, globalContainer->gfx->getW(), globalContainer->gfx->getH());
+}
+
+void GameGUI::startReplay(ReplayWriter &writer, const std::string &path)
+{
+	writer.init(path, replayTelemetryGame(), [this](GAGCore::OutputStream *stream) { save(stream, "replayHeader"); });
+}
+
+namespace
+{
+// ReplayReader skips a recording's game header through this reader.
+const bool replayHeaderSkipperRegistered = [] {
+	ReplayReader::headerSkipper() = [](GAGCore::InputStream *stream) { GameGUI header; return header.load(stream); };
+	return true;
+}();
+}
+
+Team *GameGUI::getLocalTeam(void) { return game.teams[localTeamNo]; }
+
+void GameGUI::prepareLocalPresentation(PresentationFrame& scene)
+{
+	const auto request=sceneRequest();
+	sceneExtractor.prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)),request,scene);
+}
+
+Building* GameGUI::selectionBuilding() const { return game.resolveBuilding(std::get<BuildingRef>(selection)); }
+Unit* GameGUI::selectionUnit() const { return game.resolveUnit(std::get<UnitRef>(selection)); }

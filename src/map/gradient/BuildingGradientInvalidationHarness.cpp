@@ -7,7 +7,16 @@
 // ring is incomplete. The last two pin the cases a proximity walk over the changed
 // footprint structurally could not reach - another team's buildings, and a virtual
 // flag, which is never written into the building tile grid.
-#include "EngineFixtures.h"
+#include <algorithm>
+#include "HeadlessGlobals.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "TerrainBuiltins.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
+#include "Property.h"
+#include "BuildingSeedTemplates.h"
+#include "SeedCells.h"
+#include <random>
 #include "GradientFixture.h"
 #include "LegacyPopulationOutput.h"
 
@@ -55,13 +64,17 @@ static void require(bool ok, const char* message)
 	GLOB2_REQUIRE(ok, message);
 }
 
-// An invalidated field is rebuilt on its next use once GRADIENT_DIRTY_REBUILD_TICKS
-// have passed since it was built. The harness lets that interval elapse before
-// judging, so a fix that flags the field and one that drops it both count. Taking
-// the engine's own constant rather than a copy: when it was raised from 25 to 100
-// a local copy here silently stopped covering the interval and the regression
-// started passing stale fields.
-static const Uint32 DIRTY_GRACE_TICKS = GRADIENT_DIRTY_REBUILD_TICKS;
+// An invalidated field is rebuilt on its next use once it is due: footprint
+// fields at BUILDING_FIELD_REFRESH_TICKS of age, flag routes once
+// GRADIENT_DIRTY_REBUILD_TICKS have passed since a change. The harness lets the
+// longer interval elapse before judging, so a fix that flags the field and one
+// that drops it both count. Taking the engine's own constants rather than
+// copies: when the dirty interval was raised from 25 to 100 a local copy here
+// silently stopped covering it and the regression started passing stale fields.
+static const Uint32 DIRTY_GRACE_TICKS = std::max(GRADIENT_DIRTY_REBUILD_TICKS, BUILDING_FIELD_REFRESH_TICKS);
+// A field warmed at tick 0 is due by age from this tick on; pipeline tests set
+// the clock here to request refreshes of every footprint field they use.
+static const Uint32 FIELD_DUE_TICKS = BUILDING_FIELD_REFRESH_TICKS;
 
 struct World
 {
@@ -77,8 +90,11 @@ struct World
 
 	World(int exponent = 6)
 	{
+        // Independent fixture worlds must not pick different wall-clock seeds.
+        game.gameHeader.setRandomSeed(5489);
 		game.map.setSize(exponent, exponent, GRASS);
 		game.map.setGame(&game);
+        game.map.worldRandom.initialize(game.gameHeader.getRandomSeed());
 		game.addTeam(0);
 		game.addTeam(1);
 		team = game.teams[0];
@@ -154,10 +170,11 @@ struct World
 	// requestBuildingField directly and never call this synchronous helper.
 	void warm(Building* b, int swim = 0)
 	{
+        swim=accessClass(movementAccessFromLegacy(swim));
 		const int slot = b->routeSlot(swim, BuildingRoute::Automatic);
-		if (!b->globalGradient[slot]) b->globalGradient[slot] = game.map.acquireBuildingGradientBuffer();
-		game.map.updateGlobalGradient(b, swim);
-		game.map.finishBuildingGradient(b, swim);
+		if (!b->globalGradient[slot]) b->globalGradient[slot] = game.map.routing().acquireBuildingGradientBuffer();
+		game.map.routing().updateGlobalGradient(b, movementAccessFromLegacy(swim));
+		game.map.routing().finishBuildingGradient(b, movementAccessFromLegacy(swim));
 	}
 
 	bool available(Building* b, int x, int y)
@@ -166,14 +183,17 @@ struct World
 		if (!scheduled)
 		{
 			const auto captured=b->lastGlobalGradientUpdateStepCounter[0];
-			const bool refresh=(b->dirtyGradient[0] || b->gradientGeneration[0]!=game.map.topologyGeneration)
-				&& captured+DIRTY_GRACE_TICKS<=game.stepCounter;
+			// Footprint fields come due by age; flag routes when changed.
+			const bool refresh=b->resolveRoute(BuildingRoute::Automatic)==BuildingRoute::Footprint
+				? captured+BUILDING_FIELD_REFRESH_TICKS<=game.stepCounter
+				: (b->dirtyGradient[0] || b->gradientGeneration[0]!=game.map.topologyGeneration)
+					&& captured+GRADIENT_DIRTY_REBUILD_TICKS<=game.stepCounter;
 			glob2test::awaitGradient(game,[&] {
-				game.map.requestBuildingField(b,0);
+				game.map.routing().requestBuildingField(b,MovementAccess::Land);
 				return refresh && b->lastGlobalGradientUpdateStepCounter[0]==captured ? nullptr : b->globalGradient[0];
 			});
 		}
-		return game.map.buildingAvailable(b, 0, x, y, &dist);
+		return game.map.routing().buildingAvailable(b, MovementAccess::Land, x, y, &dist);
 	}
 
 	void tick(Uint32 n) { game.stepCounter += n; }
@@ -187,7 +207,7 @@ static void idleFieldStorageIsReusedWithoutStaleRoutes()
 	require(second->globalGradient[0] == nullptr, "second building starts without a field");
 	const size_t cells = static_cast<size_t>(world.game.map.getW()) * world.game.map.getH();
 	world.warm(first);
-	const Uint16* firstField = world.game.map.buildingGradient(first, 0);
+	const Uint16* firstField = world.game.map.routing().buildingGradient(first, MovementAccess::Land);
 	require(firstField != nullptr, "first building field exists");
 	BuildingGradientSearch* firstSearch = first->globalGradientSearch[0].get();
 	require(firstSearch != nullptr, "first building search exists");
@@ -197,14 +217,14 @@ static void idleFieldStorageIsReusedWithoutStaleRoutes()
 	first->freeIdleGradients();
 	require(first->globalGradient[0] == nullptr, "idle building drops its field");
 	world.warm(second);
-	const Uint16* secondField = world.game.map.buildingGradient(second, 0);
+	const Uint16* secondField = world.game.map.routing().buildingGradient(second, MovementAccess::Land);
 	require(secondField == firstField, "another building reuses the idle field storage");
 	require(second->globalGradientSearch[0].get() == firstSearch,
 		"another building reuses the idle search queues");
 	require(std::vector<Uint16>(secondField, secondField + cells) != expected,
 		"reused storage contains the second building's field");
 	world.warm(first);
-	const Uint16* rebuilt = world.game.map.buildingGradient(first, 0);
+	const Uint16* rebuilt = world.game.map.routing().buildingGradient(first, MovementAccess::Land);
 	require(std::vector<Uint16>(rebuilt, rebuilt + cells) == expected,
 		"reactivated building rebuilds the same route values");
 	const std::vector<Uint16> secondExpected(secondField, secondField + cells);
@@ -212,7 +232,7 @@ static void idleFieldStorageIsReusedWithoutStaleRoutes()
 	second->resetPathfindGradients();
 	require(second->globalGradient[0] == nullptr, "invalidation drops the old field");
 	world.warm(second);
-	const Uint16* invalidated = world.game.map.buildingGradient(second, 0);
+	const Uint16* invalidated = world.game.map.routing().buildingGradient(second, MovementAccess::Land);
 	require(invalidated == secondField && second->globalGradientSearch[0].get() == secondSearch,
 		"invalidation reuses field storage and search queues");
 	require(std::vector<Uint16>(invalidated, invalidated + cells) == secondExpected,
@@ -294,7 +314,8 @@ static void aRingCutsOffAVirtualFlagsField()
 	require(!world.available(flag, 10, 10), "a flag walled in by new construction is no longer offered to a unit outside");
 
 	world.remove(ring);
-	require(world.available(flag, 10, 10), "clearing the ring makes the flag available at once");
+	world.tick(DIRTY_GRACE_TICKS);
+	require(world.available(flag, 10, 10), "clearing the ring makes the flag available at its next refresh");
 	std::puts("PASS a ring around a virtual flag cuts off its field, though no flag is in the building tile grid");
 }
 
@@ -323,8 +344,10 @@ static void publicReadsResolveTheirInputs()
 	World world;
 	Map &map = world.game.map;
 	Building *centre = world.place(20, 20);
-	for (int swim = 0; swim < SWIM_CLASS_COUNT; ++swim)
+	for (int cost = 0; cost < SWIM_CLASS_COUNT; ++cost)
 	{
+        const int swim=accessClass(movementAccessFromLegacy(cost));
+        world.team->routingRatio.known=true;world.team->routingRatio.selected=cost>0 && cost<LEGACY_SWIM_CLASS_COUNT ? cost : Map::SWIM_CLASS_EVEN;
         // Water-only callers need water outside the inn's occupied grass island.
         // Retain the original all-grass setup for walking/swimming classes0-6.
         if(swim==SWIM_CLASS_COUNT-1)
@@ -332,22 +355,22 @@ static void publicReadsResolveTheirInputs()
                 for(int x=0;x<map.getW();++x)
                     if(map.getBuilding(x,y)==NOGBID) map.paintCell(x,y,WATER);
 		world.warm(centre,swim);
-		const Uint16 *full = map.buildingGradient(centre, swim);
+		const Uint16 *full = map.routing().buildingGradient(centre, movementAccessFromLegacy(swim));
 		require(full != nullptr, "public field is reachable");
 		std::vector<Uint16> expected(full, full + map.getW() * map.getH());
 		int expectedDist, expectedDx, expectedDy;
-		require(map.buildingAvailable(centre, swim, 18, 20, &expectedDist), "complete distance exists");
-		require(map.pathfindBuilding(random, centre, swim, 18, 20, &expectedDx, &expectedDy), "complete direction exists");
-		map.updateGlobalGradient(centre, swim);
+		require(map.routing().buildingAvailable(centre, movementAccessFromLegacy(swim), 18, 20, &expectedDist), "complete distance exists");
+		require(map.routing().pathfindBuilding(random, centre, movementAccessFromLegacy(swim), 18, 20, &expectedDx, &expectedDy), "complete direction exists");
+		map.routing().updateGlobalGradient(centre, movementAccessFromLegacy(swim));
 		int dist, dx, dy;
-		require(map.buildingAvailable(centre, swim, 18, 20, &dist) && dist == expectedDist,
+		require(map.routing().buildingAvailable(centre, movementAccessFromLegacy(swim), 18, 20, &dist) && dist == expectedDist,
 			"point API resolves its own distance");
 		require(!centre->globalGradientSearch[swim]->complete(), "point read does not finish the field");
-		map.updateGlobalGradient(centre, swim);
-		require(map.pathfindBuilding(random, centre, swim, 18, 20, &dx, &dy) && dx == expectedDx && dy == expectedDy,
+		map.routing().updateGlobalGradient(centre, movementAccessFromLegacy(swim));
+		require(map.routing().pathfindBuilding(random, centre, movementAccessFromLegacy(swim), 18, 20, &dx, &dy) && dx == expectedDx && dy == expectedDy,
 			"movement API resolves its own input layer");
 		require(!centre->globalGradientSearch[swim]->complete(), "movement does not finish the field");
-		full = map.buildingGradient(centre, swim);
+		full = map.routing().buildingGradient(centre, movementAccessFromLegacy(swim));
 		require(centre->globalGradientSearch[swim]->complete(), "public array API completes the field");
 		require(std::vector<Uint16>(full, full + expected.size()) == expected, "public array is fully resolved");
 	}
@@ -356,9 +379,9 @@ static void publicReadsResolveTheirInputs()
 
 static void preparePeriodic(Map& map)
 {
-    map.stagePeriodicGradientPreparation();
+    map.routing().stagePeriodicGradientPreparation();
     map.game->snapshotStore().invalidateBoundary();
-    map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+    map.routing().preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
 }
 
 static void delayedFields()
@@ -371,35 +394,35 @@ static void delayedFields()
 		map.setResourceByIndex(30, 30, 0, 1);
 		map.addGuardArea(40, 40, 0);
 		map.addClearArea(30, 30, 0);
-		const int swim=1;
-		auto field=[&]() { return kind==0 ? map.getMaterialGradientSlot(0, 0, swim)
-			: kind==1 ? map.getGuardAreasGradient(0, swim) : map.getClearAreasGradient(0, swim); };
-		auto refresh=[&]() { if(kind==0) map.updateMaterialGradient(0, 0, swim);
-			else if(kind==1) map.updateGuardAreasGradient(0, swim); else map.updateClearAreasGradient(0, swim); };
+		const int swim=int(MovementAccess::Amphibious);
+		auto field=[&]() { return kind==0 ? map.routing().getMaterialGradientSlot(0, 0, movementAccessFromLegacy(swim))
+			: kind==1 ? map.routing().getGuardAreasGradient(0, movementAccessFromLegacy(swim)) : map.routing().getClearAreasGradient(0, movementAccessFromLegacy(swim)); };
+		auto refresh=[&]() { if(kind==0) map.routing().updateMaterialGradient(0, 0, movementAccessFromLegacy(swim));
+			else if(kind==1) map.routing().updateGuardAreasGradient(0, movementAccessFromLegacy(swim)); else map.routing().updateClearAreasGradient(0, movementAccessFromLegacy(swim)); };
 		const auto cells=map.getW()*map.getH();
 		const auto reference=[&]() {
 			std::vector<Uint16> values(cells);
-			if(kind==0) map.seedMaterialGradient(0, 0, swim, values.data());
-			else if(kind==1) map.seedGuardAreasGradient(0, swim, values.data());
-			else map.seedClearAreasGradient(0, swim, values.data());
-			map.propagateGradient(values.data(), swim);
+			if(kind==0) map.routing().seedMaterialGradient(0, 0, swim, values.data());
+			else if(kind==1) map.routing().seedGuardAreasGradient(0, swim, values.data());
+			else map.routing().seedClearAreasGradient(0, swim, values.data());
+			map.routing().propagateGradient(values.data(), swim);
 			return values;
 		};
 		const auto original=reference();
 		map.configureCompute(workers+1);
-		map.configureGradientPipeline(workers, 3);
-		const auto publish=[&]() { ++world.game.stepCounter; map.advanceGradientPipeline(); };
-		const auto capture=[&]() { map.stagePeriodicGradientPreparation(); glob2test::prepareGradientBoundary(world.game); };
+		map.routing().configureGradientPipeline(workers, 3);
+		const auto publish=[&]() { ++world.game.stepCounter; map.routing().advanceGradientPipeline(); };
+		const auto capture=[&]() { map.routing().stagePeriodicGradientPreparation(); glob2test::prepareGradientBoundary(world.game); };
 		require(!field(), "cold read enrolls without publishing a placeholder");
 		publish(); capture(); // Admission at advance 1, publication at advance 4.
-		require(map.gradientPipelineStatus().jobs==1, "pipeline scheduled a real field");
+		require(map.routing().gradientPipelineStatus().jobs==1, "pipeline scheduled a real field");
 		map.addForbidden(41, 40, 0);
 		refresh();
 		publish(); require(!field(), "first captured field remains pending at advance 2");
 		publish(); require(!field(), "first captured field remains pending at advance 3");
 		publish();
 		require(field()!=nullptr, "cold field publishes at its original deadline despite a soft edit");
-		require(map.gradientPipelineStatus().discarded==0, "soft changes do not supersede private work");
+		require(map.routing().gradientPipelineStatus().discarded==0, "soft changes do not supersede private work");
 		require(std::vector<Uint16>(field(),field()+cells)==original, "first publication uses its original capture");
 		const auto frozen=reference();
 		require(frozen!=original, "the changed world requires a different field");
@@ -415,7 +438,7 @@ static void delayedFields()
 		require(std::vector<Uint16>(field(),field()+cells)==frozen, "terrain changes do not alter a pending snapshot");
         while(world.game.stepCounter<1+2*AdaptiveGradientState::MinimumInterval) publish();
 		refresh(); capture(); // Destruction must safely drain private work.
-        require(map.gradientPipelineStatus().pending==1, "teardown retains an admitted private refresh");
+        require(map.routing().gradientPipelineStatus().pending==1, "teardown retains an admitted private refresh");
 
 	}
 	std::puts("PASS cold and soft-stale resource/guard/clear deadlines, captured terrain, teardown");
@@ -435,6 +458,185 @@ void requireSameCells(const std::vector<Uint16>& actual, const Uint16* expected,
 			INFO(what << " cell " << i << " actual " << actual[i] << " expected " << expected[i]);
 			REQUIRE(actual[i] == expected[i]);
 		}
+}
+
+// Building seed templates: after any sequence of map edits, the incrementally
+// maintained planes equal a fresh rebuild, and template-backed seeds equal the
+// full scan for every building, route and movement class.
+void requireSameTemplates(const MapState::BuildingSeedPlanes& actual, const MapState::BuildingSeedPlanes& expected, const std::string& what)
+{
+	INFO(what);
+	REQUIRE(actual.cells == expected.cells);
+	for (size_t k = 0; k < actual.planes.size(); ++k)
+		requireSameCells(actual.planes[k], expected.planes[k].data(), what + " plane " + std::to_string(k));
+	// A team's bitset is allocated on its first set bit and kept afterwards,
+	// so an all-zero bitset and an absent one are the same contents.
+	const auto sameBits = [&](const MapState::BuildingSeedPlanes::Bits& a, const MapState::BuildingSeedPlanes::Bits& b) {
+		const auto zero = [](const auto& bits) { return std::all_of(bits.begin(), bits.end(), [](std::uint64_t w) { return w == 0; }); };
+		if (a.empty() || b.empty()) return zero(a) && zero(b);
+		return a == b;
+	};
+	for (size_t t = 0; t < actual.forbidden.size(); ++t)
+	{
+		INFO("team " << t);
+		REQUIRE(sameBits(actual.forbidden[t], expected.forbidden[t]));
+		REQUIRE(sameBits(actual.buildings[t], expected.buildings[t]));
+	}
+}
+
+void buildingSeedTemplatesMatchScan(std::uint32_t seed)
+{
+	glob2test::HeadlessGame world({.wDec=6, .hDec=6, .teams=3, .discovered=true, .clearImmobile=true, .loadDefaultRace=true, .header=true});
+	auto& game = world.game;
+	auto& m = game.map;
+	std::mt19937 rng(seed);
+	const auto pick = [&](int n) { return int(rng() % unsigned(n)); };
+	auto catalog = nlohmann::json::parse(game.buildingsTypes.snapshotJson());
+	catalog["variants"][game.buildingsTypes.getFinishedTypeNum("hospital")]["semantics"]["occupiesGround"] = false;
+	catalog["variants"][game.buildingsTypes.getFinishedTypeNum("school")]["properties"]["width"] = 3;
+	game.buildingsTypes.loadSnapshotJson(catalog.dump());
+	game.configureBuildingCatalog();
+
+	const std::vector<TerrainType> palette = {GRASS, GRASS, GRASS, SAND, WATER, WATER};
+	const std::vector<Uint16> resources = {WOOD, WHEAT, STONE, ALGA, PAPYRUS};
+	const auto paint = [&](int x, int y) { m.setVertexTerrain(x, y, palette[pick(int(palette.size()))]); };
+	const auto resource = [&](int x, int y) {
+		m.replaceResource(x, y, pick(3) ? Resource{} : Resource{resources[pick(int(resources.size()))], 0, 1, 0});
+	};
+	for (int y = 0; y < 64; ++y)
+		for (int x = 0; x < 64; ++x)
+		{
+			paint(x, y);
+			if (!pick(6)) resource(x, y);
+			if (!pick(25)) m.addForbidden(x, y, pick(3));
+			if (!pick(40)) m.markImmobileUnit(x, y, pick(3));
+		}
+
+	// Footprints near the edge wrap around the torus.
+	std::vector<Building*> buildings;
+	const char* types[] = {"inn", "hospital", "school", "swimmingpool", "warflag", "clearingflag", "explorationflag"};
+	for (int i = 0; i < 9; ++i)
+	{
+		const int x = i < 2 ? 62 : pick(64), y = i < 2 ? 63 - i : pick(64);
+		Building* b = world.addBuilding(types[pick(7)], x, y, 0, pick(3));
+		b->unitStayRange = pick(7);
+		b->clearingMaterialMask = 0;
+		b->setClearsMaterial(WOOD, true); b->setClearsMaterial(ALGA, pick(2));
+		buildings.push_back(b);
+	}
+	game.teams[0]->allies |= game.teams[2]->me;
+
+	auto& live = m.routing().gradientRuntime->buildingSeeds;
+	const auto view = [&] { return m.stateView(); };
+	live.ensure(view());
+	const size_t cells = m.size;
+	std::vector<Uint16> scanned(cells), templated(cells);
+	using namespace gradient_preparation;
+	// Every boundary carries templates here, and each capture is byte-compared
+	// with the live game (including the templates) as GLOB2_SNAPSHOT_VERIFY does.
+	live.setCaptureEveryBoundary(true);
+	SimulationSnapshot::Store store;
+	store.setVerification(true);
+	auto boundary = store.captureBoundary(game);
+	const auto checkSeeds = [&](const std::string& what) {
+		auto plain = view();
+		auto withTemplates = plain;
+		withTemplates.buildingSeeds = &live.ensure(plain);
+		// The worker path: the same seeds from a captured building view.
+		const auto leased = boundary.buildingGradientView();
+		const auto captured = leased.view();
+		REQUIRE(captured.buildingSeeds);
+		std::vector<Uint16> fromSnapshot(cells);
+		const auto run = [cells](auto fn) { fn(0, cells); };
+		for (Building* b : buildings)
+			for (BuildingRoute route : {BuildingRoute::Footprint, BuildingRoute::Clearing, BuildingRoute::Combat})
+				for (int swim = 0; swim < MOVEMENT_CLASS_COUNT; ++swim)
+				{
+					const auto seedInput = captureBuildingSeed(*b, swim, route);
+					const auto expected = buildingCells(plain, seedInput, scanned.data(), run);
+					const auto actual = buildingCells(withTemplates, seedInput, templated.data(), run);
+					const auto snapshotResult = buildingCells(captured, seedInput, fromSnapshot.data(), run);
+					const std::string where = what + " " + b->type->type + " route " + std::to_string(int(route)) + " swim " + std::to_string(swim);
+					INFO(where);
+					REQUIRE(actual.locked == expected.locked);
+					REQUIRE(actual.resourceState == expected.resourceState);
+					requireSameCells(templated, scanned.data(), where);
+					REQUIRE(snapshotResult.locked == expected.locked);
+					REQUIRE(snapshotResult.resourceState == expected.resourceState);
+					requireSameCells(fromSnapshot, scanned.data(), where + " snapshot");
+				}
+	};
+	checkSeeds("initial");
+
+	for (int step = 0; step < 60; ++step)
+	{
+		const int x = pick(64), y = pick(64);
+		const auto rebuildsBefore = live.rebuilds();
+		bool bulk = false;
+		switch (pick(9))
+		{
+		case 0: paint(x, y); break;
+		case 1: resource(x, y); break;
+		case 2: m.addForbidden(x, y, pick(3)); break;
+		case 3: m.removeForbidden(x, y, pick(3)); break;
+		case 4: m.markImmobileUnit(x, y, pick(3)); break;
+		case 5: m.clearImmobileUnit(x, y); break;
+		case 6: {
+			// Clear and restamp a footprint, as kill and construction recovery do.
+			Building* b = buildings[pick(int(buildings.size()))];
+			if (!b->type->semantics.occupiesGround) break;
+			m.setBuilding(b->posX, b->posY, b->type->width, b->type->height, NOGBID);
+			if (pick(2)) m.setBuilding(b->posX, b->posY, b->type->width, b->type->height, b->gid);
+			break;
+		}
+		case 7: {
+			auto tile = m.getTile(x, y);
+			tile.forbidden ^= Uint32(1) << pick(3);
+			if (pick(2)) tile.resource = pick(2) ? Resource{} : Resource{resources[pick(int(resources.size()))], 0, 1, 0};
+			m.replaceTile(x, y, tile);
+			break;
+		}
+		default:
+			// A rare bulk edit invalidates; the next use rebuilds.
+			if (!pick(8)) { m.fillTerrain(pick(2) ? GRASS : SAND); bulk = true; }
+			else paint(x, y);
+			break;
+		}
+		// Each boundary refreshes only changed chunks of a pooled copy; an
+		// older boundary still leased keeps exactly what it captured.
+		game.stepCounter++;
+		const auto older = boundary;
+		const auto olderPlanes = older.buildingSeeds->planes;
+		boundary = store.captureBoundary(game);
+		BuildingSeedTemplates fresh;
+		const auto& expected = fresh.ensure(view());
+		requireSameTemplates(live.ensure(view()), expected, "step " + std::to_string(step));
+		// Per-cell edits update in place; only bulk edits rebuild.
+		REQUIRE(live.rebuilds() == rebuildsBefore + (bulk ? 1 : 0));
+		REQUIRE(boundary.buildingSeeds);
+		requireSameTemplates(boundary.buildingSeeds->planes, expected, "captured step " + std::to_string(step));
+		requireSameTemplates(older.buildingSeeds->planes, olderPlanes, "older capture step " + std::to_string(step));
+		if (step % 15 == 14) checkSeeds("step " + std::to_string(step));
+	}
+}
+
+// Production capture: boundaries carry templates only while building field
+// requests are pending, and the requested field is still built.
+void buildingSeedCaptureFollowsDemand()
+{
+	glob2test::HeadlessGame world({.wDec=7, .hDec=7, .clearImmobile=true, .header=true, .seed=731});
+	auto& game = world.game;
+	const auto& metrics = game.snapshotStore().metrics;
+	world.step(4);
+	CHECK(metrics.buildingSeedBytesCopied == 0);
+	auto* inn = world.addBuilding("inn", 4, 4);
+	REQUIRE(game.map.routing().requestBuildingField(inn, MovementAccess::Land, BuildingRoute::Footprint) == FieldReadiness::Pending);
+	for (int tick = 0; tick < 16 && !inn->globalGradient[0]; ++tick) world.step(1);
+	REQUIRE(inn->globalGradient[0]);
+	CHECK(metrics.buildingSeedBytesCopied > 0);
+	const auto copied = metrics.buildingSeedBytesCopied;
+	world.step(4);
+	CHECK(metrics.buildingSeedBytesCopied == copied);
 }
 
 void scheduledKernelsMatchSynchronous(KernelTerrain config)
@@ -518,16 +720,18 @@ void scheduledKernelsMatchSynchronous(KernelTerrain config)
 	int locked = 0, clearing = 0, partials = 0;
 	for (Building* b : buildings)
 		for (BuildingRoute route : {BuildingRoute::Footprint, BuildingRoute::Clearing, BuildingRoute::Combat})
-			for (int swim = 0; swim < SWIM_CLASS_COUNT; ++swim)
+			for (int cost = 0; cost < SWIM_CLASS_COUNT; ++cost)
 			{
+                const int swim=accessClass(movementAccessFromLegacy(cost));
+                b->owner->routingRatio.known=true;b->owner->routingRatio.selected=cost>0 && cost<LEGACY_SWIM_CLASS_COUNT ? cost : Map::SWIM_CLASS_EVEN;
 				const std::string what = std::string(b->type->type) + " route " + std::to_string(int(route)) + " swim " + std::to_string(swim);
 				const int slot = b->routeSlot(swim, route), access = b->routeAccess(swim, route);
-				if (!b->globalGradient[slot]) b->globalGradient[slot] = m.acquireBuildingGradientBuffer();
-				m.updateGlobalGradient(b, swim, route);
-				m.finishBuildingGradient(b, swim, route);
+				if (!b->globalGradient[slot]) b->globalGradient[slot] = m.routing().acquireBuildingGradientBuffer();
+				m.routing().updateGlobalGradient(b, movementAccessFromLegacy(swim), route);
+				m.routing().finishBuildingGradient(b, movementAccessFromLegacy(swim), route);
 				const Uint16* expected = b->globalGradient[slot];
-				const auto seed = captureBuildingSeed(*b, swim, route);
-				const auto inputs = BuildingGradientSearch::Inputs::ofSnapshot(snapshot, swim);
+				const auto seed = captureBuildingSeed(*b, cost, route);
+				const auto inputs = BuildingGradientSearch::Inputs::ofSnapshot(snapshot, cost);
 				BuildingGradientSearch search;
 				const auto result = buildBuilding(seed, snapshot, inputs, actual.data(), search, gradient_kernel::COST_LIMIT);
 				INFO(what);
@@ -539,7 +743,7 @@ void scheduledKernelsMatchSynchronous(KernelTerrain config)
 				// Partial: settle a few layers, check them, then resume by cell and finish.
 				seedBuilding(seed, snapshot, partial.data());
 				BuildingGradientSearch resumed;
-				resumed.begin(inputs, partial.data(), swim, m.getW(), m.getH());
+				resumed.begin(inputs, partial.data(), cost, m.getW(), m.getH());
 				for (int depth : {0, 7, 40, 160})
 				{
 					resumed.resolveToCost(depth);
@@ -579,24 +783,24 @@ struct Scheduler
 		world.scheduled = true;
 		game.gameHeader.setBuildingGradientDelay(delay);
 		map.configureCompute(workers + 1);
-		map.configureGradientPipeline(workers, 8);
+		map.routing().configureGradientPipeline(workers, 8);
 	}
 	template <class Teams> void tick(Teams&& teams)
 	{
-		map.advanceGradientPipeline();
+		map.routing().advanceGradientPipeline();
 		teams();
 		++game.stepCounter;
-		map.stagePeriodicGradientPreparation();
-		map.game->snapshotStore().invalidateBoundary(); map.preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
+		map.routing().stagePeriodicGradientPreparation();
+		map.game->snapshotStore().invalidateBoundary(); map.routing().preparePendingGradient(map.game->snapshotStore().captureBoundary(*map.game));
 	}
 	void tick() { tick([] {}); }
-	Map::BuildingGradientPipelineStatus status() const { return map.buildingGradientPipelineStatus(); }
+	MapRouting::BuildingGradientPipelineStatus status() const { return map.routing().buildingGradientPipelineStatus(); }
 	size_t cells() const { return size_t(map.getW()) * map.getH(); }
 	std::vector<Uint16> field(const Uint16* values) const { return values ? std::vector<Uint16>(values, values + cells()) : std::vector<Uint16>(); }
 	// A full field equal to what one synchronous build would leave.
 	std::vector<Uint16> finished(Building* b, int swim, BuildingRoute route = BuildingRoute::Footprint)
 	{
-		map.finishBuildingGradient(b, swim, route);
+		map.routing().finishBuildingGradient(b, movementAccessFromLegacy(swim), route);
 		return field(b->globalGradient[b->routeSlot(swim, route)]);
 	}
 	Uint16 at(Building* b, int x, int y, int slot = 0) const { return b->globalGradient[slot][map.coordToIndex(x, y)]; }
@@ -687,7 +891,7 @@ void scheduledFixedDeadlines()
 			s.game.stepCounter = DIRTY_GRACE_TICKS + 1;
 			s.map.addForbidden(10, 10, 0);
 			s.tick([&] {
-				s.map.buildingAvailable(b, 0, 2, 2, &dist);
+				s.map.routing().buildingAvailable(b, MovementAccess::Land, 2, 2, &dist);
 				require(s.status().queued == 1, "a stale field requests a refresh");
 			});
 			const Uint32 captured = s.game.stepCounter;
@@ -695,16 +899,16 @@ void scheduledFixedDeadlines()
 			for (unsigned i = 1; i < delay; ++i)
 				s.tick([&] {
 					require(s.at(b, 10, 10) != GRADIENT_FORBIDDEN && s.status().published == 0, "old field until the deadline");
-					s.map.buildingAvailable(b, 0, 2, 2, &dist);
+					s.map.routing().buildingAvailable(b, MovementAccess::Land, 2, 2, &dist);
 				});
-			s.map.advanceGradientPipeline();
+			s.map.routing().advanceGradientPipeline();
 			const auto status = s.status();
 			require(status.published == 1 && status.jobs == 1 && status.discarded == 0, "one publication despite repeated requests");
 			require(s.at(b, 10, 10) == GRADIENT_FORBIDDEN, "replacement visible on the deadline");
 			require(b->lastGlobalGradientUpdateStepCounter[0] == captured, "the field's age is its capture tick");
 			require(status.synchronous == synchronous, "no owner rebuild");
 			const auto published = s.finished(b, 0);
-			s.map.updateGlobalGradient(b, 0);
+			s.map.routing().updateGlobalGradient(b, MovementAccess::Land);
 			require(published == s.finished(b, 0), "published field equals a synchronous build of the captured world");
 		}
 	std::puts("PASS scheduled building fields publish at fixed deadlines across workers 0/1/2/4/8 and delays 1/4/8");
@@ -724,7 +928,7 @@ void scheduledPerTeamQuotas()
         scheduler.tick([&] {
             // Team 0's excess requests precede every request from team 1.
             for (auto* list : {&first,&second})
-                for (auto* b : *list) REQUIRE(scheduler.map.requestBuildingRefresh(b,0));
+                for (auto* b : *list) REQUIRE(scheduler.map.routing().requestBuildingRefresh(b,0));
         });
         const auto firstCapture=scheduler.game.stepCounter;
         CHECK(scheduler.status().pending==6);
@@ -756,7 +960,7 @@ void scheduledColdTeamQuotas()
         for (int i=0; i<6; ++i) buildings.push_back(world.place(4+i*8,8));
         for (int i=0; i<2; ++i) buildings.push_back(world.place(12+i*16,40,1));
         scheduler.tick([&] {
-            for (auto* b : buildings) REQUIRE(scheduler.map.requestBuildingRefresh(b,0));
+            for (auto* b : buildings) REQUIRE(scheduler.map.routing().requestBuildingRefresh(b,0));
         });
         CHECK(scheduler.status().pending==6);
         CHECK(scheduler.status().queued==2);
@@ -788,15 +992,15 @@ void scheduledMixedTeamDeadlines()
         auto* other=world.place(32,32,1);
         scheduler.game.stepCounter=600;
         scheduler.tick([&] {
-            for (unsigned i=0; i<4; ++i) REQUIRE(scheduler.map.requestBuildingRefresh(warm[i],0));
+            for (unsigned i=0; i<4; ++i) REQUIRE(scheduler.map.routing().requestBuildingRefresh(warm[i],0));
         });
         for (unsigned i=0; i<6; ++i) scheduler.tick();
         scheduler.tick([&] {
             // Cold team-0 work collides with its four warm deadlines. The later
             // warm request could fit, but must not pass it; team 1 can proceed.
-            REQUIRE(scheduler.map.requestBuildingRefresh(cold,0));
-            REQUIRE(scheduler.map.requestBuildingRefresh(warm[4],0));
-            REQUIRE(scheduler.map.requestBuildingRefresh(other,0));
+            REQUIRE(scheduler.map.routing().requestBuildingRefresh(cold,0));
+            REQUIRE(scheduler.map.routing().requestBuildingRefresh(warm[4],0));
+            REQUIRE(scheduler.map.routing().requestBuildingRefresh(other,0));
         });
         CHECK(scheduler.status().jobs==5);
         CHECK(scheduler.status().queued==2);
@@ -840,7 +1044,7 @@ void scheduledWidePendingSave(bool text)
     for (unsigned tick=0;tick<8;++tick)
         scheduler.tick([&] {
             for (unsigned team=0;team<9;++team) for (unsigned i=0;i<4;++i)
-                REQUIRE(scheduler.map.requestBuildingRefresh(buildings[team*32+tick*4+i],0));
+                REQUIRE(scheduler.map.routing().requestBuildingRefresh(buildings[team*32+tick*4+i],0));
         });
     REQUIRE(scheduler.status().pending==288);
     REQUIRE(scheduler.status().queued==0);
@@ -876,7 +1080,7 @@ void scheduledLegacyPendingSave(int version)
     auto* b=source.game.teams[0]->myBuildings[0];
     REQUIRE(b);
     scheduler.game.stepCounter=600;
-    scheduler.tick([&] { REQUIRE(scheduler.map.requestBuildingRefresh(b,0)); });
+    scheduler.tick([&] { REQUIRE(scheduler.map.routing().requestBuildingRefresh(b,0)); });
     REQUIRE(scheduler.status().pending==1);
     const auto bytes=saveLegacyRuntime(scheduler.map,version);
     resume.game.stepCounter=scheduler.game.stepCounter;
@@ -909,7 +1113,7 @@ void scheduledCaptureAtBoundary()
 	});
 	s.map.addForbidden(12, 10, 0); // After the boundary: not part of it.
 	for (int i = 1; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
+	s.map.routing().advanceGradientPipeline();
 	require(s.status().published == 1, "published");
 	require(s.at(b, 10, 10) == GRADIENT_FORBIDDEN && s.at(b, 11, 10) == GRADIENT_FORBIDDEN, "the capture follows the whole tick");
 	require(s.at(b, 12, 10) != GRADIENT_FORBIDDEN, "the capture precedes later edits");
@@ -932,24 +1136,24 @@ void scheduledPartialResume()
 		require(b != nullptr, "pool site placed");
 		int dist = 0;
 		world.warm(b);
-		require(s.map.buildingAvailable(b, 0, 98, 98, &dist), "reference warm field");
-		const int depth = s.map.predictBuildingDepth(b, 0);
+		require(s.map.routing().buildingAvailable(b, MovementAccess::Land, 98, 98, &dist), "reference warm field");
+		const int depth = s.map.routing().predictBuildingDepth(b, 0);
 		s.game.stepCounter = DIRTY_GRACE_TICKS + 1;
 		s.map.addForbidden(10, 10, 0);
-		s.tick([&] { s.map.buildingAvailable(b, 0, 98, 98, &dist); });
+		s.tick([&] { s.map.routing().buildingAvailable(b, MovementAccess::Land, 98, 98, &dist); });
 		for (int i = 1; i < 4; ++i) s.tick();
-		s.map.advanceGradientPipeline();
+		s.map.routing().advanceGradientPipeline();
 		require(s.status().published == 1, "published");
 		auto* search = b->globalGradientSearch[0].get();
 		// The production predictor may settle a small map entirely.
 		const bool partial = !search || !search->complete();
 		require(search && (!partial || search->settledCost() > depth), "the published field carries its frontier");
 		const auto workerCost = search->settledCost();
-		require(s.map.buildingAvailable(b, 0, 230, 230, &dist), "far query resolves on the owner");
+		require(s.map.routing().buildingAvailable(b, MovementAccess::Land, 230, 230, &dist), "far query resolves on the owner");
 		require(!partial || search->settledCost() > workerCost, "the owner continues the transferred search");
 		const auto resumed = s.finished(b, 0);
 		const auto resumedCost = b->globalGradientSearch[0]->settledCost();
-		s.map.updateGlobalGradient(b, 0);
+		s.map.routing().updateGlobalGradient(b, MovementAccess::Land);
 		const auto full = s.finished(b, 0);
 		require(resumed == full, "resumed values equal a full build");
 		require(resumedCost == b->globalGradientSearch[0]->settledCost(), "the finished frontier matches a full build");
@@ -970,12 +1174,12 @@ void scheduledSupersession()
 	Building* c = world.place(8, 40);
 	Building* d = world.place(40, 8);
 	for (Building* x : {a, b, c, d}) { world.warm(x); require(world.available(x, 2, 2), "reference warm field"); }
-	s.game.stepCounter = 600; // Past the idle eviction age as well.
+	s.game.stepCounter = FIELD_DUE_TICKS; // Due by age, and past the idle eviction age.
 	s.map.addForbidden(10, 10, 0);
 	s.tick([&] { for (Building* x : {a, b, c, d}) world.available(x, 2, 2); });
 	require(s.status().pending == 4 && s.status().jobs == 4, "four jobs admitted in one tick");
 	s.tick([&] {
-		s.map.updateGlobalGradient(a, 0);    // synchronous rebuild
+		s.map.routing().updateGlobalGradient(a, MovementAccess::Land);    // synchronous rebuild
 		c->resetPathfindGradients();         // lifecycle reset
 		d->globalGradientUsedStep[0] = 0;
 		d->freeIdleGradients();              // idle eviction
@@ -984,7 +1188,7 @@ void scheduledSupersession()
 	require(!c->globalGradient[0] && !d->globalGradient[0], "dropped fields");
 	const auto expectedA = s.finished(a, 0);
 	for (int i = 2; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
+	s.map.routing().advanceGradientPipeline();
 	const auto status = s.status();
 	require(status.published == 1 && status.discarded == 3, "only the unsuperseded job publishes at the shared deadline");
 	require(s.finished(a, 0) == expectedA, "a stale result cannot overwrite a synchronous rebuild");
@@ -1011,7 +1215,7 @@ void scheduledSaveBoundaries()
 					auto& list = buildings[x == &s ? 0 : 1];
 					list = {w.place(24, 24), w.place(40, 40)};
 					for (Building* b : list) { w.warm(b); require(w.available(b, 2, 2), "reference warm field"); }
-					x->game.stepCounter = 600;
+					x->game.stepCounter = FIELD_DUE_TICKS;
 					x->map.addForbidden(10, 10, 0);
 					x->tick([&] { for (Building* b : list) w.available(b, 2, 2); });
 					list[1]->globalGradientUsedStep[0] = 0;
@@ -1028,13 +1232,13 @@ void scheduledSaveBoundaries()
 					require(r.at(buildings[1][0], 10, 10) != GRADIENT_FORBIDDEN, "no early publication after loading");
 					s.tick(); r.tick();
 				}
-				s.map.advanceGradientPipeline(); r.map.advanceGradientPipeline();
+				s.map.routing().advanceGradientPipeline(); r.map.routing().advanceGradientPipeline();
 				for (int i : {0, 1})
 				{
 					Scheduler& x = i ? r : s;
 					Building* b = buildings[i][0];
 					require(x.status().published == 1, "restored result publishes at its original deadline");
-					require(x.at(b, 10, 10) == GRADIENT_FORBIDDEN && b->lastGlobalGradientUpdateStepCounter[0] == 601, "same capture");
+					require(x.at(b, 10, 10) == GRADIENT_FORBIDDEN && b->lastGlobalGradientUpdateStepCounter[0] == FIELD_DUE_TICKS + 1, "same capture");
 					require(!buildings[i][1]->globalGradient[0], "an evicted destination stays absent");
 				}
 				require(s.finished(buildings[0][0], 0) == r.finished(buildings[1][0], 0), "same published field");
@@ -1075,7 +1279,7 @@ void scheduledReusedDestination()
 		require(world.available(old, 2, 2), "reference warm field");
 		const auto gid = old->gid;
 		const auto identity = old->scriptIdentity;
-		s.game.stepCounter = 200;
+		s.game.stepCounter = FIELD_DUE_TICKS;
 		s.map.addForbidden(10, 10, 0);
 		s.tick([&] { world.available(old, 2, 2); });
 		require(s.status().pending == 1, "pending");
@@ -1087,7 +1291,7 @@ void scheduledReusedDestination()
 		require(world.available(replacement, 2, 2), "replacement reference warm field");
 		const auto field = s.finished(replacement, 0);
 		for (int i = 1; i < 4; ++i) s.tick();
-		s.map.advanceGradientPipeline();
+		s.map.routing().advanceGradientPipeline();
 		require(s.status().discarded == 1 && s.finished(replacement, 0) == field, "the old result is discarded untouched");
 	}
 	std::puts("PASS a deleted building's pending result cannot replace a reused destination");
@@ -1099,9 +1303,10 @@ void scheduledAccessMetadata()
 	World world;
 	Scheduler s(world, 2, 4);
 	Building* b = world.place(24, 24);
-	world.warm(b); // Isolate the two access variants.
+	world.warm(b);
+    world.team->routingRatio.known=true;world.team->routingRatio.selected=1;
 	int dist = 0;
-	for (int swim : {1, 3}) { world.warm(b, swim); require(s.map.buildingAvailable(b, swim, 2, 2, &dist), "reference warm field"); }
+	for (int swim : {1, 3}) { world.warm(b, swim); require(s.map.routing().buildingAvailable(b, movementAccessFromLegacy(swim), 2, 2, &dist), "reference warm field"); }
 	const int access = b->routeAccess(1, BuildingRoute::Footprint);
 	require(access == b->routeAccess(3, BuildingRoute::Footprint), "classes 1 and 3 share one access variant");
 	std::vector<std::pair<int, int>> fence;
@@ -1111,31 +1316,34 @@ void scheduledAccessMetadata()
 	auto paint = [&](bool on) { for (auto [x, y] : fence) on ? s.map.addForbidden(x, y, 0) : s.map.removeForbidden(x, y, 0); };
 	s.game.stepCounter = DIRTY_GRACE_TICKS + 1;
 	paint(true);
-	s.tick([&] { s.map.buildingAvailable(b, 1, 2, 2, &dist); }); // captures the fence: locked
+	s.tick([&] { s.map.routing().buildingAvailable(b, movementAccessFromLegacy(1), 2, 2, &dist); }); // captures the fence: locked
 	s.tick([&] {
 		paint(false);
-		s.map.updateGlobalGradient(b, 3); // stamped with the capture's tick, but newer
+        world.team->routingRatio.selected=6;
+		s.map.routing().updateGlobalGradient(b, MovementAccess::Amphibious); // stamped with the capture's tick, but newer
 		require(!b->isLocked(access), "synchronous build sees the open fence");
 	});
 	for (int i = 2; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
-	require(s.status().published == 1 && !b->isLocked(access), "an older capture cannot overwrite newer access metadata");
+	s.map.routing().advanceGradientPipeline();
+	require(s.status().published == 0 && s.status().discarded == 1 && !b->isLocked(access), "an older capture cannot overwrite newer access metadata");
 	s.game.stepCounter += DIRTY_GRACE_TICKS;
 	paint(true);
-	s.tick([&] { s.map.buildingAvailable(b, 1, 2, 2, &dist); });
+	s.tick([&] { s.map.routing().buildingAvailable(b, movementAccessFromLegacy(1), 2, 2, &dist); });
 	for (int i = 1; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
-	require(s.status().published == 2 && b->isLocked(access), "the newest capture writes access metadata");
+	s.map.routing().advanceGradientPipeline();
+	require(s.status().published == 1 && b->isLocked(access), "the newest capture writes access metadata");
 	const auto bytes = saveRuntime(s.map);
 	loadRuntime(s.map, bytes);
 	require(b->isLocked(access), "saves keep the published metadata");
+    CHECK(s.map.routing().publishedCostClass(b->globalGradient[int(MovementAccess::Amphibious)])==6);
 	std::puts("PASS access metadata follows the newest capture across swim classes and saves");
 }
 
 // 8. With the pipeline on, a team-wide reset or a forbidden-area paint keeps
-// the building's walking field serving and refreshes it on schedule, at once
-// and with no owner build. A building's own change still drops it. Creation
-// itself enables delayed publication even without an explicit Scheduler.
+// the building's walking field serving; the field refreshes when it comes due
+// by age (BUILDING_FIELD_REFRESH_TICKS), on schedule and with no owner build.
+// A building's own change still drops it. Creation itself enables delayed
+// publication even without an explicit Scheduler.
 void scheduledResetsKeepStaleFields()
 {
 	for (auto cause : {Building::GradientDrop::Area, Building::GradientDrop::Team})
@@ -1148,32 +1356,36 @@ void scheduledResetsKeepStaleFields()
 		require(world.available(b, 2, 2), "reference warm walking field");
 		s.tick(); // Configures the pipeline.
 		s.game.stepCounter += 300;
-		s.map.updateGlobalGradient(b, 0);
+		s.map.routing().updateGlobalGradient(b, MovementAccess::Land);
 		const Uint16* walking = b->globalGradient[0];
 		const auto values = s.finished(b, 0);
 		s.game.stepCounter += 10; // Inside the dirty throttle: a kept field is due anyway.
 		s.map.addForbidden(10, 10, 0);
 		b->resetPathfindGradients(cause);
 		require(b->globalGradient[0] == walking && s.finished(b, 0) == values, "the stale field keeps serving");
+		// The edit alone requests nothing: the field is not yet due by age.
+		s.tick([&] { require(world.available(b, 2, 2) && s.status().queued == 0, "an edit alone requests no refresh"); });
+		require(b->globalGradient[0] == walking, "the field keeps serving until it is due");
+		s.game.stepCounter = b->lastGlobalGradientUpdateStepCounter[0] + BUILDING_FIELD_REFRESH_TICKS;
 		const auto before = s.status();
 		Uint32 captured = 0;
 		s.tick([&] {
-			require(world.available(b, 2, 2) && s.status().queued == 1, "served while a refresh is requested");
+			require(world.available(b, 2, 2) && s.status().queued == 1, "served while the due refresh is requested");
 			captured = s.game.stepCounter + 1;
 		});
 		require(s.status().pending == 1 && s.status().synchronous == before.synchronous, "one scheduled refresh, no owner build");
 		for (int i = 1; i < 4; ++i) s.tick([&] { world.available(b, 2, 2); });
-		s.map.advanceGradientPipeline();
+		s.map.routing().advanceGradientPipeline();
 		const auto after = s.status();
 		require(after.published == before.published + 1 && after.synchronous == before.synchronous, "published on schedule");
 		require(s.at(b, 10, 10) == GRADIENT_FORBIDDEN && b->lastGlobalGradientUpdateStepCounter[0] == captured,
 			"refreshed from the capture");
 		const auto published = s.finished(b, 0);
-		s.map.updateGlobalGradient(b, 0);
+		s.map.routing().updateGlobalGradient(b, MovementAccess::Land);
 		require(published == s.finished(b, 0), "the published field equals a synchronous build");
 		b->resetPathfindGradients(Building::GradientDrop::Own);
 		require(!b->globalGradient[0], "an own reset drops the field");
-		require(s.map.requestBuildingField(b, 0) == FieldReadiness::Pending, "hard reset enrolls a cold delayed field");
+		require(s.map.routing().requestBuildingField(b, MovementAccess::Land) == FieldReadiness::Pending, "hard reset enrolls a cold delayed field");
 		require(s.status().synchronous == after.synchronous + 1, "only the explicit reference build ran synchronously");
 	}
 	{
@@ -1181,12 +1393,12 @@ void scheduledResetsKeepStaleFields()
 		Building* b = world.place(24, 24);
 		world.warm(b);
 		require(world.available(b, 2, 2), "reference warm field");
-		require(world.game.map.buildingGradientPipelineActive(), "first route demand enables delayed simulation publication");
+		require(world.game.map.routing().buildingGradientPipelineActive(), "first route demand enables delayed simulation publication");
 		const auto* walking=b->globalGradient[0];
 		b->resetPathfindGradients(Building::GradientDrop::Area);
 		require(b->globalGradient[0]==walking && b->dirtyGradient[0], "a simulation area edit retains dirty published guidance");
 	}
-	std::puts("PASS area and team-wide resets keep stale walking fields serving and refresh them on schedule");
+	std::puts("PASS area and team-wide resets keep walking fields serving until they are due, then refresh on schedule");
 }
 
 // 9. Slow and failing workers never move the publication tick.
@@ -1209,7 +1421,7 @@ void scheduledSlowAndFailingWorkers()
 			s.map.addForbidden(10, 10, 0);
 			s.tick([&] { world.available(b, 2, 2); });
 			for (int i = 1; i < 4; ++i) s.tick([&] { require(s.status().published == 0, "never early"); });
-			s.map.advanceGradientPipeline();
+			s.map.routing().advanceGradientPipeline();
 			require(s.status().published == 1, "never late");
 			const auto field = s.finished(b, 0);
 			if (reference.empty()) reference = field;
@@ -1229,7 +1441,7 @@ void scheduledSlowAndFailingWorkers()
 			s.tick([&] { world.available(b, 2, 2); });
 			for (int i = 1; i < 4; ++i) s.tick();
 			bool thrown = false;
-			try { atSave ? (void)saveRuntime(s.map) : s.map.advanceGradientPipeline(); }
+			try { atSave ? (void)saveRuntime(s.map) : s.map.routing().advanceGradientPipeline(); }
 			catch (const std::runtime_error&) { thrown = true; }
 			require(thrown, atSave ? "a failure surfaces at save" : "a failure surfaces at publication");
 			require(s.at(b, 10, 10) != GRADIENT_FORBIDDEN, "a failed result never publishes");
@@ -1274,7 +1486,7 @@ void scheduledForbiddenEditCarriesPendingGeneration()
 	require(s.status().pending == 1, "the rival's refresh is pending");
 	paint(world);
 	for (int i = 1; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
+	s.map.routing().advanceGradientPipeline();
 	require(s.status().published == 1, "published");
 	require(rival->gradientGeneration[0] == s.map.topologyGeneration,
 		"scheduled: the published field is current like the synchronous one");
@@ -1298,40 +1510,45 @@ void scheduledSameTickSwimClassesKeepRequestOrder()
 	{
 		World world; // synchronous reference
 		Building* b = world.place(24, 24);
-		for (int swim : {1, 3}) { world.warm(b, swim); require(world.game.map.buildingAvailable(b, swim, 2, 2, &dist), "reference warm field"); }
+		for (int swim : {1, 3}) { world.warm(b, swim); require(world.game.map.routing().buildingAvailable(b, movementAccessFromLegacy(swim), 2, 2, &dist), "reference warm field"); }
 		const int access = b->routeAccess(1, BuildingRoute::Footprint);
 		auto paint = [&](bool on) { fence(world, on); };
 		world.game.stepCounter = DIRTY_GRACE_TICKS + 1;
 		paint(true);
 		world.warm(b,1);
-		world.game.map.buildingAvailable(b, 1, 2, 2, &dist);
+		world.game.map.routing().buildingAvailable(b, movementAccessFromLegacy(1), 2, 2, &dist);
 		require(b->isLocked(access), "synchronous: the fenced build locks");
 		paint(false);
 		world.warm(b,3);
-		world.game.map.buildingAvailable(b, 3, 2, 2, &dist);
+		world.game.map.routing().buildingAvailable(b, MovementAccess::Amphibious, 2, 2, &dist);
 		require(!b->isLocked(access), "synchronous: the later build of the same tick wins");
 	}
 	World world;
 	Scheduler s(world, 2, 4);
 	Building* b = world.place(24, 24);
 	world.warm(b); // This case isolates classes 1 and 3.
-	for (int swim : {1, 3}) { world.warm(b, swim); require(s.map.buildingAvailable(b, swim, 2, 2, &dist), "reference warm field"); }
+	for (int swim : {1, 3}) { world.warm(b, swim); require(s.map.routing().buildingAvailable(b, movementAccessFromLegacy(swim), 2, 2, &dist), "reference warm field"); }
 	const int access = b->routeAccess(1, BuildingRoute::Footprint);
 	require(access == b->routeAccess(3, BuildingRoute::Footprint), "classes 1 and 3 share one access variant");
 	auto paint = [&](bool on) { fence(world, on); };
 	s.game.stepCounter = DIRTY_GRACE_TICKS + 1;
 	paint(true);
-	s.tick([&] { s.map.buildingAvailable(b, 1, 2, 2, &dist); }); // captures the fence
+	s.tick([&] { s.map.routing().buildingAvailable(b, movementAccessFromLegacy(1), 2, 2, &dist); }); // captures the fence
 	paint(false);
-	s.map.buildingAvailable(b, 3, 2, 2, &dist); // same tick, open fence
-	s.map.stagePeriodicGradientPreparation();
-	s.map.game->snapshotStore().invalidateBoundary(); s.map.preparePendingGradient(s.map.game->snapshotStore().captureBoundary(*s.map.game));
-	require(s.status().pending == 2, "both swim classes are pending with one capture tick");
-	require(b->lastGlobalGradientUpdateStepCounter[b->routeSlot(1, BuildingRoute::Footprint)] < s.game.stepCounter, "nothing published yet");
+	s.map.routing().buildingAvailable(b, MovementAccess::Amphibious, 2, 2, &dist); // same tick, open fence
+	s.map.routing().stagePeriodicGradientPreparation();
+	s.map.game->snapshotStore().invalidateBoundary(); s.map.routing().preparePendingGradient(s.map.game->snapshotStore().captureBoundary(*s.map.game));
+	require(s.status().pending == 1, "amphibious requests share one pending generation");
+	require(b->lastGlobalGradientUpdateStepCounter[b->routeSlot(int(MovementAccess::Amphibious), BuildingRoute::Footprint)] < s.game.stepCounter, "nothing published yet");
 	for (int i = 1; i < 4; ++i) s.tick();
-	s.map.advanceGradientPipeline();
-	require(s.status().published == 2, "both published at one deadline");
-	require(!b->isLocked(access), "scheduled: the later capture of the same tick wins, like the synchronous build");
+	s.map.routing().advanceGradientPipeline();
+	require(s.status().published == 1, "the shared generation publishes once");
+    require(b->isLocked(access), "a repeated read cannot mutate the frozen capture");
+    REQUIRE(s.map.routing().requestBuildingRefresh(b,int(MovementAccess::Amphibious)));
+    s.map.routing().stagePeriodicGradientPreparation();glob2test::prepareGradientBoundary(s.game);
+    for(int i=0;i<4;++i)s.tick();
+    s.map.routing().advanceGradientPipeline();
+    require(s.status().published==2 && !b->isLocked(access), "a subsequent refresh captures the open fence");
 	std::puts("PASS same-tick swim classes write access metadata in request order");
 }
 
@@ -1339,6 +1556,76 @@ void scheduledSameTickSwimClassesKeepRequestOrder()
 
 TEST_SUITE("BuildingGradientInvalidation")
 {
+    TEST_CASE("pre194 material gradients load with destination metadata disabled [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        for (int version : {191,192,193}) {
+        CAPTURE(version);
+        World original(5),restored(5);
+        original.game.map.routing().configureGradientPipeline(0,2);
+        restored.game.map.routing().configureGradientPipeline(0,2);
+        restored.game.map.routing().setMaterialDestinationsEnabled(true);
+        const auto bytes=saveLegacyRuntime(original.game.map,version);
+        auto* backend=new GAGCore::MemoryStreamBackend;
+        backend->write(bytes.data(),bytes.size()); backend->seekFromStart(0);
+        GAGCore::BinaryInputStream input(backend);
+        restored.game.map.loadRuntimeState(&input,version);
+        CHECK_FALSE(restored.game.map.routing().materialDestinationsEnabled());
+        CHECK(input.readUint32("followingSection")==RuntimeSentinel);
+        }
+    }
+
+    TEST_CASE("material destination planes retain published and pending generations across binary and text saves [save-format]")
+    {
+        glob2test::HeadlessGlobals globals;
+        for (bool text : {false,true}) for (unsigned workers : {0u,2u}) {
+            CAPTURE(text); CAPTURE(workers);
+            World original(5), restored(5);
+            auto& map=original.game.map;
+            for (World* world : {&original,&restored}) {
+                world->game.map.setResourceByIndex(12,12,WHEAT,1);
+                world->game.map.routing().configureGradientPipeline(workers,2);
+                world->game.map.routing().setMaterialDestinationsEnabled(true);
+            }
+            REQUIRE(map.worldRandom.streams==restored.game.map.worldRandom.streams);
+            REQUIRE(map.materialAmountAtSlot(map.coordToIndex(12,12),WHEAT)==
+                restored.game.map.materialAmountAtSlot(map.coordToIndex(12,12),WHEAT));
+            const auto* field=glob2test::awaitGradient(original.game,[&]{return map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);});
+            auto published=map.routing().materialGradientDestinations(field);
+            REQUIRE(published);
+            CHECK(published->x[map.coordToIndex(4,4)]==12);
+            CHECK(published->y[map.coordToIndex(4,4)]==12);
+            REQUIRE(map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Amphibious)==nullptr);
+            preparePeriodic(map);
+            REQUIRE(map.routing().gradientPipelineStatus().pending>0);
+            restored.game.stepCounter=original.game.stepCounter;
+            const auto bytes=saveRuntime(map,text);
+            loadRuntime(restored.game.map,bytes,text);
+            auto compare=[&] {
+                CAPTURE(original.game.stepCounter);
+                const auto* a=map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);
+                const auto* b=restored.game.map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);
+                REQUIRE(a); REQUIRE(b);
+                auto da=map.routing().materialGradientDestinations(a),db=restored.game.map.routing().materialGradientDestinations(b);
+                REQUIRE(da); REQUIRE(db);
+                CHECK(std::equal(a,a+published->cells,b));
+                CHECK(std::equal(da->x.get(),da->x.get()+da->cells,db->x.get()));
+                CHECK(std::equal(da->y.get(),da->y.get()+da->cells,db->y.get()));
+                CHECK(map.checkSum(true,true)==restored.game.map.checkSum(true,true));
+            };
+            REQUIRE(restored.game.map.routing().materialDestinationsEnabled());
+            compare();
+            for (unsigned tick=0;tick<4;++tick) {
+                ++original.game.stepCounter; ++restored.game.stepCounter;
+                map.routing().advanceGradientPipeline(); restored.game.map.routing().advanceGradientPipeline();
+                compare();
+            }
+            const auto* alternate=restored.game.map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Amphibious);
+            REQUIRE(alternate);
+            REQUIRE(restored.game.map.routing().materialGradientDestinations(alternate));
+        }
+    }
+
     TEST_CASE("owner observation at tick zero publishes cold fields and access metadata at tick one")
     {
         glob2test::HeadlessGlobals globals;
@@ -1364,28 +1651,28 @@ TEST_SUITE("BuildingGradientInvalidation")
             REQUIRE_FALSE(site->isLocked(access));
             REQUIRE(flag->anyResourceToClear[variant]==0);
             GradientExecutionAudit audit;
-            REQUIRE(map.requestBuildingField(site,0,BuildingRoute::Footprint)==FieldReadiness::Pending);
-            REQUIRE(map.requestBuildingField(flag,0,BuildingRoute::Clearing)==FieldReadiness::Pending);
+            REQUIRE(map.routing().requestBuildingField(site,MovementAccess::Land,BuildingRoute::Footprint)==FieldReadiness::Pending);
+            REQUIRE(map.routing().requestBuildingField(flag,MovementAccess::Land,BuildingRoute::Clearing)==FieldReadiness::Pending);
             game.observeCompletedWorld();
-            REQUIRE(map.buildingGradientPipelineStatus().pending==2);
-            map.finishGradientPipeline(); // Force early private completion without publication.
+            REQUIRE(map.routing().buildingGradientPipelineStatus().pending==2);
+            map.routing().finishGradientPipeline(); // Force early private completion without publication.
             for (unsigned tick=0;tick<initialDelay;++tick) {
                 CAPTURE(tick);
                 if (tick) { ++game.stepCounter; game.observeCompletedWorld(); }
-                CHECK(map.lookupBuildingField(site,0,BuildingRoute::Footprint)==nullptr);
-                CHECK(map.lookupBuildingField(flag,0,BuildingRoute::Clearing)==nullptr);
+                CHECK(map.routing().lookupBuildingField(site,MovementAccess::Land,BuildingRoute::Footprint)==nullptr);
+                CHECK(map.routing().lookupBuildingField(flag,MovementAccess::Land,BuildingRoute::Clearing)==nullptr);
                 CHECK_FALSE(site->isLocked(access));
                 CHECK(flag->anyResourceToClear[variant]==0);
             }
             ++game.stepCounter; game.observeCompletedWorld();
             REQUIRE(game.stepCounter==initialDelay);
-            REQUIRE(map.lookupBuildingField(site,0,BuildingRoute::Footprint)!=nullptr);
-            REQUIRE(map.lookupBuildingField(flag,0,BuildingRoute::Clearing)!=nullptr);
+            REQUIRE(map.routing().lookupBuildingField(site,MovementAccess::Land,BuildingRoute::Footprint)!=nullptr);
+            REQUIRE(map.routing().lookupBuildingField(flag,MovementAccess::Land,BuildingRoute::Clearing)!=nullptr);
             CHECK(site->lastGlobalGradientUpdateStepCounter[site->routeSlot(0,BuildingRoute::Footprint)]==0);
             CHECK(flag->lastGlobalGradientUpdateStepCounter[flag->routeSlot(0,BuildingRoute::Clearing)]==0);
             CHECK(site->isLocked(access));
             CHECK(flag->anyResourceToClear[variant]==1);
-            map.finishGradientPipeline();
+            map.routing().finishGradientPipeline();
             if (workers && GAGCore::ThreadSupport::available) CHECK(audit.totals().owner==0);
             else CHECK(audit.totals().owner>0);
         }
@@ -1441,11 +1728,11 @@ TEST_SUITE("BuildingGradientInvalidation")
             // Master173 could queue only warm building refreshes. Published
             // building drafts170/174 additionally permit an initial cold field.
             if (!hasInitialBuildingGradient(version)) source.warm(original);
-            REQUIRE(source.game.map.requestBuildingRefresh(original,slot));
-            REQUIRE(source.game.map.buildingGradientPipelineStatus().queued==1);
+            REQUIRE(source.game.map.routing().requestBuildingRefresh(original,slot));
+            REQUIRE(source.game.map.routing().buildingGradientPipelineStatus().queued==1);
             if (admitted) {
                 scheduled.tick();
-                REQUIRE(source.game.map.buildingGradientPipelineStatus().pending==1);
+                REQUIRE(source.game.map.routing().buildingGradientPipelineStatus().pending==1);
             }
             restored.game.stepCounter=source.game.stepCounter;
             const auto bytes=saveLegacyRuntime(source.game.map,version);
@@ -1454,10 +1741,10 @@ TEST_SUITE("BuildingGradientInvalidation")
             GAGCore::BinaryInputStream input(backend);
             restored.game.map.loadRuntimeState(&input,version);
             CHECK(input.readUint32("followingSection")==RuntimeSentinel);
-            CHECK(restored.game.map.buildingGradientPipelineStatus().queued==
-                source.game.map.buildingGradientPipelineStatus().queued);
-            CHECK(restored.game.map.buildingGradientPipelineStatus().pending==
-                source.game.map.buildingGradientPipelineStatus().pending);
+            CHECK(restored.game.map.routing().buildingGradientPipelineStatus().queued==
+                source.game.map.routing().buildingGradientPipelineStatus().queued);
+            CHECK(restored.game.map.routing().buildingGradientPipelineStatus().pending==
+                source.game.map.routing().buildingGradientPipelineStatus().pending);
             CHECK(loaded->refreshRequested.test(slot));
             CHECK(bool(loaded->globalGradient[slot])==bool(original->globalGradient[slot]));
             CHECK(saveRuntime(restored.game.map)==saveRuntime(source.game.map));
@@ -1480,8 +1767,8 @@ TEST_SUITE("BuildingGradientInvalidation")
         GAGCore::BinaryInputStream input(saved);
         restored.game.map.loadRuntimeState(&input,174);
         CHECK(input.readUint32("followingSection")==RuntimeSentinel);
-        CHECK(restored.game.map.buildingGradientPipelineStatus().queued==0);
-        CHECK(restored.game.map.buildingGradientPipelineStatus().pending==0);
+        CHECK(restored.game.map.routing().buildingGradientPipelineStatus().queued==0);
+        CHECK(restored.game.map.routing().buildingGradientPipelineStatus().pending==0);
     }
 
     TEST_CASE("observation phase is covered by both current checksum tiers")
@@ -1491,12 +1778,12 @@ TEST_SUITE("BuildingGradientInvalidation")
             CAPTURE(heavy);
             World world;
             auto& map = world.game.map;
-            const auto current = map.checkSum(heavy,false,false);
-            const auto legacy = map.checkSum(heavy,false,true);
+            const auto current = map.checkSum(heavy,false,ChecksumScheme::Current);
+            const auto legacy = map.checkSum(heavy,false,ChecksumScheme::Legacy152);
             // This empty world's publication changes only the owner phase.
             map.publishWorldResultsDue();
-            CHECK(map.checkSum(heavy,false,false) != current);
-            CHECK(map.checkSum(heavy,false,true) == legacy);
+            CHECK(map.checkSum(heavy,false,ChecksumScheme::Current) != current);
+            CHECK(map.checkSum(heavy,false,ChecksumScheme::Legacy152) == legacy);
         }
     }
 
@@ -1539,27 +1826,27 @@ TEST_SUITE("BuildingGradientInvalidation")
                 world->game.stepCounter = 37;
                 world->game.map.setResourceByIndex(20, 20, WHEAT, 1);
                 glob2test::LegacyPopulationOutput::primeMaterialGradient(world->game.map,0,WHEAT,0);
-                world->game.map.configureGradientPipeline(0, 2);
+                world->game.map.routing().configureGradientPipeline(0, 2);
             }
             auto& map = original.game.map;
             // Request explicitly: warm natural fields now require demand rather
             // than participating in the legacy periodic round automatically.
-            map.updateMaterialGradient(0,WHEAT,0);
+            map.routing().updateMaterialGradient(0,WHEAT,MovementAccess::Land);
             map.publishWorldResultsDue();
             auto observation = original.game.snapshotStore().captureBoundary(original.game);
             map.submitWorldWork(observation);
-            const auto pending = map.gradientPipelineStatus().pending;
+            const auto pending = map.routing().gradientPipelineStatus().pending;
             REQUIRE(pending == 1);
             map.publishWorldResultsDue();
             map.submitWorldWork(observation);
-            CHECK(map.gradientPipelineStatus().pending == pending);
-            CHECK(map.gradientPipelineStatus().jobs == 1);
+            CHECK(map.routing().gradientPipelineStatus().pending == pending);
+            CHECK(map.routing().gradientPipelineStatus().jobs == 1);
             const auto bytes = saveRuntime(map);
             loadRuntime(restored.game.map, bytes);
             restored.game.map.publishWorldResultsDue();
             restored.game.map.submitWorldWork(restored.game.snapshotStore().captureBoundary(restored.game));
-            CHECK(restored.game.map.gradientPipelineStatus().pending == pending);
-            CHECK(restored.game.map.gradientPipelineStatus().published == 0);
+            CHECK(restored.game.map.routing().gradientPipelineStatus().pending == pending);
+            CHECK(restored.game.map.routing().gradientPipelineStatus().published == 0);
             CHECK(restored.game.map.resourceGrowthMetrics().submitted == 0);
             // Formats 164–166 have no publication/submission markers. Retain
             // their original outputs and verify that the next section aligns.
@@ -1575,29 +1862,29 @@ TEST_SUITE("BuildingGradientInvalidation")
             legacy.game.map.publishWorldResultsDue();
             legacy.game.map.submitWorldWork(legacy.game.snapshotStore().captureBoundary(legacy.game));
             CHECK(legacy.game.map.resourceGrowthMetrics().submitted == 0);
-            CHECK(legacy.game.map.gradientPipelineStatus().published == 0);
+            CHECK(legacy.game.map.routing().gradientPipelineStatus().published == 0);
             ++original.game.stepCounter;
             ++restored.game.stepCounter;
             ++legacy.game.stepCounter;
             map.publishWorldResultsDue();
             restored.game.map.publishWorldResultsDue();
             legacy.game.map.publishWorldResultsDue();
-            CHECK(map.gradientPipelineStatus().published == 0);
-            CHECK(restored.game.map.gradientPipelineStatus().published == 0);
-            CHECK(legacy.game.map.gradientPipelineStatus().published == (legacyVersion<FILE_FORMAT_VERSION_SINGLE_OBSERVATION ? 1 : 0));
+            CHECK(map.routing().gradientPipelineStatus().published == 0);
+            CHECK(restored.game.map.routing().gradientPipelineStatus().published == 0);
+            CHECK(legacy.game.map.routing().gradientPipelineStatus().published == (legacyVersion<FILE_FORMAT_VERSION_SINGLE_OBSERVATION ? 1 : 0));
             ++original.game.stepCounter;
             ++restored.game.stepCounter;
             ++legacy.game.stepCounter;
             map.publishWorldResultsDue();
             restored.game.map.publishWorldResultsDue();
             legacy.game.map.publishWorldResultsDue();
-            CHECK(map.gradientPipelineStatus().published == 1);
-            CHECK(restored.game.map.gradientPipelineStatus().published == 1);
-            CHECK(legacy.game.map.gradientPipelineStatus().published == 1);
-            const auto* a = map.getMaterialGradientSlot(0,WHEAT,0);
-            const auto* b = restored.game.map.getMaterialGradientSlot(0,WHEAT,0);
+            CHECK(map.routing().gradientPipelineStatus().published == 1);
+            CHECK(restored.game.map.routing().gradientPipelineStatus().published == 1);
+            CHECK(legacy.game.map.routing().gradientPipelineStatus().published == 1);
+            const auto* a = map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);
+            const auto* b = restored.game.map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);
             CHECK(std::equal(a, a + map.getW() * map.getH(), b));
-            const auto* historical = legacy.game.map.getMaterialGradientSlot(0,WHEAT,0);
+            const auto* historical = legacy.game.map.routing().getMaterialGradientSlot(0,WHEAT,MovementAccess::Land);
             REQUIRE(historical != nullptr);
             CHECK(std::equal(a, a + map.getW() * map.getH(), historical));
         }
@@ -1642,6 +1929,18 @@ TEST_SUITE("BuildingGradientInvalidation")
 	{
 		glob2test::HeadlessGlobals globals;
 		idleFieldStorageIsReusedWithoutStaleRoutes();
+	}
+	TEST_CASE("snapshot boundaries copy building seed templates only while building fields are requested")
+	{
+		glob2test::HeadlessGlobals globals;
+		buildingSeedCaptureFollowsDemand();
+	}
+	TEST_CASE("building seed templates follow map edits and seed exactly as the full scan [property]")
+	{
+		glob2test::forEachSeed(4, [](std::uint32_t seed) {
+			glob2test::HeadlessGlobals globals;
+			buildingSeedTemplatesMatchScan(seed);
+		});
 	}
 	TEST_CASE("snapshot building seeds and captured-input searches match the synchronous kernels for every route and swim class")
 	{
@@ -1698,18 +1997,18 @@ TEST_SUITE("BuildingGradientInvalidation")
                 REQUIRE(source.available(b,2,2));
             }
             const auto before=s.status();
-            for (unsigned i=0; i<64; ++i) REQUIRE(s.map.requestBuildingRefresh(buildings[i],0));
+            for (unsigned i=0; i<64; ++i) REQUIRE(s.map.routing().requestBuildingRefresh(buildings[i],0));
             CHECK(s.status().queued==64);
             CHECK(s.status().synchronous==before.synchronous);
             // Coalescing an existing destination must not trigger overflow.
-            REQUIRE(s.map.requestBuildingRefresh(buildings[1],0));
+            REQUIRE(s.map.routing().requestBuildingRefresh(buildings[1],0));
             CHECK(s.status().queued==64);
             CHECK(s.status().synchronous==before.synchronous);
-            REQUIRE(s.map.requestBuildingRefresh(buildings[64],0));
+            REQUIRE(s.map.routing().requestBuildingRefresh(buildings[64],0));
             CHECK(s.status().queued==65);
             CHECK(s.status().synchronous==before.synchronous);
-            CHECK(s.status().synchronousByReason[std::size_t(Map::BuildingSyncReason::Overflow)]
-                ==before.synchronousByReason[std::size_t(Map::BuildingSyncReason::Overflow)]);
+            CHECK(s.status().synchronousByReason[std::size_t(MapRouting::BuildingSyncReason::Overflow)]
+                ==before.synchronousByReason[std::size_t(MapRouting::BuildingSyncReason::Overflow)]);
             for (auto* building:buildings) CHECK(building->refreshRequested.test(0));
 
             const auto bytes=saveRuntime(s.map,text);
@@ -1719,8 +2018,8 @@ TEST_SUITE("BuildingGradientInvalidation")
             for (auto* building:loaded) CHECK(building->refreshRequested.test(0));
             // Coalescing the oldest destination preserves every queued refresh,
             // including after loading, rather than evicting a published field.
-            REQUIRE(s.map.requestBuildingRefresh(buildings.front(),0));
-            REQUIRE(r.map.requestBuildingRefresh(loaded.front(),0));
+            REQUIRE(s.map.routing().requestBuildingRefresh(buildings.front(),0));
+            REQUIRE(r.map.routing().requestBuildingRefresh(loaded.front(),0));
             CHECK(buildings[1]->refreshRequested.test(0));
             CHECK(loaded[1]->refreshRequested.test(0));
             CHECK(s.status().queued==65);
@@ -1753,7 +2052,7 @@ TEST_SUITE("BuildingGradientInvalidation")
 		glob2test::HeadlessGlobals globals;
 		scheduledReusedDestination();
 	}
-	TEST_CASE("access metadata follows the newest capture across swim classes and saves")
+	TEST_CASE("shared access metadata ignores superseded captures across ratio changes and saves")
 	{
 		glob2test::HeadlessGlobals globals;
 		scheduledAccessMetadata();
@@ -1773,7 +2072,7 @@ TEST_SUITE("BuildingGradientInvalidation")
 		glob2test::HeadlessGlobals globals;
 		scheduledForbiddenEditCarriesPendingGeneration();
 	}
-	TEST_CASE("same-tick swim classes write access metadata in request order")
+	TEST_CASE("same-tick amphibious requests share one immutable capture")
 	{
 		glob2test::HeadlessGlobals globals;
 		scheduledSameTickSwimClassesKeepRequestOrder();

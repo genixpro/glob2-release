@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <Environment.h>
+#include "Building.h"
+#include "ComputeTelemetry.h"
+#include "gradient/MapRouting.h"
 #include "Headless.h"
 #include "OwnerTickProfile.h"
 #include "ResourceGrowth.h"
@@ -16,6 +19,7 @@
 #include "Engine.h"
 #include "sim/snapshot/SnapshotChecksum.h"
 #include "GameDiagnostics.h"
+#include "WarriorTacticsTrace.h"
 #include "GlobalContainer.h"
 #include "BuildingArtwork.h"
 #include "Sha256.h"
@@ -26,11 +30,12 @@
 #include "field/OpenCLGradient.h"
 #include "field/GradientAccelerators.h"
 #include "AIMaximaStrategy.h"
-#include "ai/cortex/CortexTuning.h"
+#include "AIRegistry.h"
 #include "Game.h"
 #include "GameRuleOverrides.h"
 #include "Player.h"
 #include "TeamStat.h"
+#include "WinProbability.h"
 #include "Unit.h"
 #include "Version.h"
 #include "GenerationRequest.h"
@@ -38,6 +43,7 @@
 #include "ReplayWriter.h"
 #include "SimVersion.h"
 #include <nlohmann/json.hpp>
+#include "map/claims/ClaimPolicy.h"
 #include <BinaryStream.h>
 #include <StreamBackend.h>
 #include "GameGUI.h"
@@ -62,6 +68,8 @@
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include "MapScript.h"
+#include "Team.h"
 
 namespace fs = std::filesystem;
 namespace Headless
@@ -184,6 +192,9 @@ struct TickProfile
     {
         const auto started = std::chrono::steady_clock::now();
         Sample sample; sample.tick = tick; sample.duration = duration;
+        // Explicit per-tick profiling pulls completed worker summaries here;
+        // normal play only merges them at periodic capture boundaries.
+        executor.absorbPerformance(PerformanceTelemetry::collector());
         const auto& perf = PerformanceTelemetry::collector();
         for (unsigned i = 0; i < previousPhases.size(); ++i) {
             const auto cumulative = perf.total[i].time.total + perf.window[i].time.total;
@@ -244,6 +255,7 @@ struct TickProfile
                 const auto id = PerformanceTelemetry::Id(i);
                 if (id == PerformanceTelemetry::Id::SimulationLateness || id == PerformanceTelemetry::Id::SceneAge ||
                     id == PerformanceTelemetry::Id::FrameInterval || id == PerformanceTelemetry::Id::Jitter) continue;
+                if (std::string_view(PerformanceTelemetry::unit(i)) != "ns") continue;
                 if (sample.phases[i]) row["phases"][names[i]] = {{"observed_ns", sample.phases[i]}, {"stride", strides[i]}};
             }
             for (unsigned p = 0; p < Producers; ++p)
@@ -314,7 +326,7 @@ void Headless::writeManifest(const std::string &directory)
 	manifest(fs::path(directory));
 }
 
-void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::vector<Sint32> &eliminatedTicks)
+void Headless::playersAndTeamsJson(std::ostream &result, const Game &game, const std::vector<Sint32> &eliminatedTicks)
 {
 	bool comma=false;
 	result << "\"players\":[";
@@ -330,7 +342,7 @@ void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::
 	std::set<int> winningAlliances; std::vector<int> winningTeams;
 	for(int t=0;t<game.mapHeader.getNumberOfTeams();++t)
 	{
-		Team *team=game.teams[t];
+		const Team *team=game.teams[t];
 		int units=0,workers=0,explorers=0,warriors=0,buildings=0,sites=0;
 		long long warriorHP=0,warriorAttack=0;
 		for (const Unit *u : team->liveUnits.entries())
@@ -363,7 +375,33 @@ void Headless::playersAndTeamsJson(std::ostream &result, Game &game, const std::
 			for(int k=0;k<EndOfGameStat::TYPE_NB_STATS;++k){if(k)result<<',';result<<stat.value[k];}
 			result<<']';
 		}
-		result << "]}";
+        const auto &probability = team->stats.getWinProbabilityHistory();
+        if (probability.empty() || probability.back().tick != game.stepCounter)
+            throw std::logic_error("Result serialization requires finalized win probability history");
+        const auto &first = probability.front();
+        const auto &last = probability.back();
+        const auto duration = last.tick - first.tick;
+        const auto area = team->stats.winProbabilityAreaTwice();
+        result << "],\"win_probability\":{\"model\":" << quote(team->stats.getWinProbabilityModel())
+            << ",\"final_model\":" << quote(WinProbability::modelId()) << ",\"permille\":" << last.permille
+            << ",\"start_tick\":" << first.tick << ",\"end_tick\":" << last.tick
+            << ",\"area_twice_permille_ticks\":" << area
+            << ",\"mean\":";
+        if (duration)
+        {
+            // Match verification hashes this JSON across platforms. Format the
+            // convenience mean with integer rounding, not a platform's float
+            // formatter. The exact area above remains the analysis input.
+            // area <= 2000*UINT32_MAX: multiplying by 1e6 still fits Uint64.
+            const Uint64 scaled = (area * 1000000 + Uint64(duration) * 1000) / (Uint64(duration) * 2000);
+            const auto fraction = std::to_string(scaled % 1000000);
+            result << scaled / 1000000 << '.' << std::string(6 - fraction.size(), '0') << fraction;
+        }
+        else result << "null";
+        result << "},\"win_probability_history\":[";
+        for (size_t i = 0; i < probability.size(); ++i)
+            result << (i ? "," : "") << '[' << probability[i].tick << ',' << probability[i].permille << ']';
+        result << "]}";
 	}
 	result << "],\"winning_teams\":[";
 	comma=false;for(int t:winningTeams){if(comma)result<<',';comma=true;result<<t;}
@@ -491,16 +529,19 @@ struct HeadlessRunner
 			throw std::invalid_argument("--replay must be true or false");
 		const std::string replay=(output/"game.replay").string();
 		setHeadlessEnvironment("GLOB2_REPLAY_PATH", replay.c_str());
+		bool traceWarriors=false;
 		for(const auto &telemetry : many(options,"--telemetry"))
 		{
 			if(telemetry=="checksums") setHeadlessEnvironment("GLOB2_CHECKSUM_SIDECAR", "1");
 			else if(telemetry=="team-timeline") setHeadlessEnvironment("GLOB2_TEAM_TIMELINE", "1");
 			else if(telemetry=="maxima") setHeadlessEnvironment("GLOB2_MAXIMA_TELEMETRY", "1");
+            else if(telemetry=="warrior-tactics") traceWarriors=true;
 			else throw std::invalid_argument("unknown telemetry: " + telemetry);
 		}
 		globals.load();
 		Engine engine;
 		engine.headlessOutput=output.string();
+        if(traceWarriors) engine.warriorTactics=std::make_unique<GameDiagnostics::WarriorTacticsTrace>(output.string());
 		bool initial=false, final=false;
 		for(const auto &save : many(options,"--save"))
 		{
@@ -521,7 +562,7 @@ struct HeadlessRunner
 		if(!fs::is_regular_file(requested)) throw std::invalid_argument("input file does not exist");
 		if(!saved.empty())
 		{
-			for(const auto &key : {"--player","--ai-param","--ai-script","--map-script","--alliance","--win-condition","--game-seed","--experiment","--rule","--ai-order-delay"})
+			for(const auto &key : {"--player","--ai-param","--ai-script","--map-script","--alliance","--win-condition","--game-seed","--experiment","--rule","--ai-order-delay","--resource-claims"})
 				if(options.count(key)) throw std::invalid_argument(std::string(key)+" cannot override a saved game");
 			if(engine.initCustom(saved)!=Engine::EE_NO_ERROR) throw std::invalid_argument("cannot load saved game");
 			if(globals.automaticEndingSteps <= int(engine.gui.game.stepCounter)) throw std::invalid_argument("tick limit must exceed the saved tick");
@@ -536,11 +577,11 @@ struct HeadlessRunner
 				applyGameRule(header, rule);
 				forkSettings.push_back("rule:"+rule);
 			}
-			const auto buildings=engine.gui.game.map.buildingGradientPipelineStatus();
+			const auto buildings=engine.gui.game.map.routing().buildingGradientPipelineStatus();
 			if(!forkSettings.empty() && (buildings.pending || buildings.queued))
 				throw std::invalid_argument("cannot fork a saved game with pending building gradients");
 			// Apply the forked delay now, so a save before the first tick records it.
-			engine.gui.game.map.ensureBuildingGradientPipeline();
+			engine.gui.game.map.routing().ensureBuildingGradientPipeline();
 		}
 		else
 		{
@@ -585,17 +626,18 @@ struct HeadlessRunner
 				if(!knownExperimentKey(key, header.catalogExperimentKeys())) throw std::invalid_argument("unknown experiment: " + key);
 				header.getExperiments().set(key, true, header.catalogExperimentKeys());
 			}
-			// Added to the list in force rather than replacing it, so a real
-			// elimination or prestige win still ends the game first and only an
-			// otherwise-undecided match is stopped early.
-			if(options.count("--win-probability"))
+			// Tournament runs default to 95% early victory. Real elimination or
+            // prestige wins take precedence. Saved games retain their own rules;
+            // an explicit zero (or a later --rule override) disables this.
 			{
-				const int permille=integer(one(options,"--win-probability","0"), 501, 1000);
+				const int permille=integer(one(options,"--win-probability","950"), 0, 1000);
+                if (permille != 0 && permille < 501)
+                    throw std::invalid_argument("win probability must be 0 or 501..1000");
 				WinningCondition::setWinProbabilityWinCondition(header.getWinningConditions(),
-					std::optional<Uint32>(static_cast<Uint32>(permille)));
+					permille ? std::optional<Uint32>(static_cast<Uint32>(permille)) : std::nullopt);
 			}
 			for (const auto& rule:many(options,"--rule")) applyGameRule(header, rule);
-			if (options.count("--ai-order-delay")) header.setAIOrderDelay(integer(one(options,"--ai-order-delay"), 0, 8));
+			if (options.count("--ai-order-delay")) header.setAIOrderDelay(integer(one(options,"--ai-order-delay"), 0, GameHeader::MAX_AI_ORDER_DELAY));
 			std::map<int,std::string> overrides;
 			std::set<std::pair<int,std::string>> seen;
 			for(const auto &assignment : many(options,"--ai-param"))
@@ -610,12 +652,8 @@ struct HeadlessRunner
 			{
 				const int ai=BasePlayer::implementationIdFromPlayerType(header.getBasePlayer(p).type);
 				std::string error;
-				if(ai==AI::CORTEX)
-				{
-					Cortex::CortexTuning values;
-					if(!Cortex::applyTuning(values,overrides[p],error)) throw std::invalid_argument(error);
-					header.setAIConfig(p,Cortex::tuningValues(values));
-				}
+				if(std::string config;AIRegistry::applyTuning(ai,overrides[p],config))
+					header.setAIConfig(p,config);
 				else if(ai==AI::MAXIMA)
 				{
 					AIMaxima::StrategyConfigOptions config;
@@ -640,6 +678,14 @@ struct HeadlessRunner
 			for(size_t p=0;p<players.size();++p)if(BasePlayer::implementationIdFromPlayerType(header.getBasePlayer(p).type)==AI::JAVASCRIPT && !scriptedPlayers.count(p))throw std::invalid_argument("JavaScript player requires --ai-script");
 			engine.gui.localPlayer=0;engine.gui.localTeamNo=0;
 			if(engine.initGame(map,header,true,false,false,mapFile)!=Engine::EE_NO_ERROR) throw std::invalid_argument("cannot initialize map");
+            // initGame enabled resource claims. A claims-off baseline replaces
+            // that before the first tick and never records a replay.
+            if(one(options,"--resource-claims","default")=="off") {
+                if(recordReplay)throw std::invalid_argument("--resource-claims off cannot record a replay");
+                // Fresh map initialization has not admitted simulation field
+                // requests; the setter enforces that drained boundary.
+                engine.gui.game.map.disableResourceClaims();
+            }
 		}
 		if(options.count("--map-script"))
 		{
@@ -672,24 +718,31 @@ struct HeadlessRunner
             engine.gui.game.map.computeExecutor().configureTelemetry(computeMode);
         engine.gui.game.map.setResourceGrowthDelay(integer(
             one(options, "--resource-growth-delay", std::to_string(engine.gui.game.map.resourceGrowthDelay())), 1, 16));
-		const auto pipeline = engine.gui.game.map.gradientPipelineStatus();
-		if (!pipeline.enabled) engine.gui.game.map.configureGradientPipeline(1, gradientDelay);
+        if (options.count("--claim-route-delay")) {
+            // An engine setting, not a match rule: a replay would not reproduce it.
+            const unsigned claimDelay = integer(one(options, "--claim-route-delay"), 1, ResourceClaims::Policy::MaxRoutePublicationDelay);
+            if (recordReplay && claimDelay != ResourceClaims::Policy::RoutePublicationDelay)
+                throw std::invalid_argument("--claim-route-delay other than the default cannot record a replay");
+            engine.gui.game.map.setClaimRouteDelay(claimDelay);
+        }
+		const auto pipeline = engine.gui.game.map.routing().gradientPipelineStatus();
+		if (!pipeline.enabled) engine.gui.game.map.routing().configureGradientPipeline(1, gradientDelay);
 		else {
 			if (options.count("--gradient-delay") && gradientDelay != pipeline.delay) {
 				if (pipeline.pending) throw std::invalid_argument("cannot change the delay with pending gradients");
-				engine.gui.game.map.configureGradientPipeline(1, gradientDelay);
+				engine.gui.game.map.routing().configureGradientPipeline(1, gradientDelay);
 			}
-			engine.gui.game.map.setGradientWorkerCount(1);
+			engine.gui.game.map.routing().setGradientWorkerCount(1);
 		}
         if (options.count("--gradient-work-stats")) {
             const auto path=fs::absolute(one(options,"--gradient-work-stats"));
             fs::create_directories(path.parent_path());
-            engine.gui.game.map.configureGradientWorkStats(path.string());
+            engine.gui.game.map.routing().configureGradientWorkStats(path.string());
         }
         if (options.count("--resource-gradient-exploration")) {
             if (one(options,"--resource-gradient-probe","false")!="true" || recordReplay)
                 throw std::invalid_argument("Gradient collection overrides require the probe and reject replay recording");
-            engine.gui.game.map.configureResourceGradientExploration(
+            engine.gui.game.map.routing().configureResourceGradientExploration(
                 one(options,"--resource-gradient-exploration"),
                 integer(one(options,"--resource-gradient-exploration-seed","0"),0,UINT32_MAX),
                 (output/"gradient-decisions.csv").string());
@@ -697,7 +750,7 @@ struct HeadlessRunner
 		globals.headlessReplay=recordReplay;
 		if(recordReplay) {
 			globals.replayWriter=std::make_unique<ReplayWriter>();
-			globals.replayWriter->init(replay, engine.gui);
+			engine.gui.startReplay(*globals.replayWriter, replay);
 		}
 		if(initial) engine.saveInitialGameStateOrExit((output/"initial.game").string(),"initial",engine.gui.game.mapHeader.getMapName());
 		for (int i = 0; i < engine.gui.game.gameHeader.getNumberOfPlayers(); ++i)
@@ -756,26 +809,31 @@ struct HeadlessRunner
 				if(!measureStart && engine.gui.game.stepCounter>=start) measureStart=processCpuNs();
 			}
 			engine.finishSession();
-			engine.gui.game.map.finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth();
+			engine.gui.game.map.routing().finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth();
 			if(!measureStart || engine.gui.game.stepCounter<=start) throw std::runtime_error("game ended before benchmark measurement");
 			engine.gui.game.drainHiring();
 			runCpu=processCpuNs()-measureStart;
 			measuredTicks=engine.gui.game.stepCounter-start;
 			if (tickProfile) tickProfile->write(output);
 		}
-		else { engine.run(); engine.gui.game.map.finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth(); engine.gui.game.drainHiring(); }
+		else { engine.run(); engine.gui.game.map.routing().finishGradientPipeline(); engine.gui.game.map.finishResourceGrowth(); engine.gui.game.drainHiring(); }
         if (!engine.latestChecksum) throw std::runtime_error("Missing terminal snapshot checksum");
         const auto initialChecksum=initialSamples.front().sample.value;
         if (engine.diagnostics) engine.diagnostics->finish();
+        if (engine.warriorTactics) engine.warriorTactics->finish();
         const auto runEnd = std::chrono::steady_clock::now();
 		const auto saveCpuStart=benchmark?processCpuNs():0;
 		if(final) engine.saveInitialGameStateOrExit((output/"final.game").string(),"final",engine.gui.game.mapHeader.getMapName());
 		const auto saveCpu=benchmark?processCpuNs()-saveCpuStart:0;
+        engine.gui.game.map.computeExecutor().absorbPerformance(PerformanceTelemetry::collector());
 		PerformanceTelemetry::collector().capture(engine.gui.game.stepCounter, true, true);
 		PerformanceTelemetry::collector().reset();
 		Game &game=engine.gui.game;
-		const auto pipelineResult = game.map.gradientPipelineStatus();
-		const auto buildingResult = game.map.buildingGradientPipelineStatus();
+		// Finalize reporting only after continuation saves. A report endpoint
+		// must not add an off-cadence sample to a subsequently resumed game.
+		game.winProbabilitySyncStep(true);
+		const auto pipelineResult = game.map.routing().gradientPipelineStatus();
+		const auto buildingResult = game.map.routing().buildingGradientPipelineStatus();
 		const auto gradient=gradient_kernel::configuration();
         const auto accelerator=gradient_kernel::acceleratorStatus(gradient.backend);
         std::sort(tickDurations.begin(),tickDurations.end());
@@ -807,7 +865,7 @@ struct HeadlessRunner
 		result << "{\"schema_version\":1,\"job_type\":\"game\",\"status\":\"completed\",\"ticks\":" << game.stepCounter
 			<< ",\"initialChecksum\":" << initialChecksum
 			<< ",\"finalChecksum\":" << engine.latestChecksum->value
-            << ",\"checksum_algorithm\":\"snapshot-v3\""
+            << ",\"checksum_algorithm\":\"snapshot-v4\""
 			<< ",\"benchmark_setup_cpu_ns\":" << setupCpu
 			<< ",\"benchmark_run_cpu_ns\":" << runCpu
 			<< ",\"benchmark_save_cpu_ns\":" << saveCpu
@@ -852,7 +910,7 @@ struct HeadlessRunner
 			<< ",\"building_gradient_pending\":" << buildingResult.pending
 			<< ",\"building_gradient_synchronous_by_reason\":{";
 		for (std::size_t reason = 0; reason < buildingResult.synchronousByReason.size(); ++reason)
-			result << (reason ? "," : "") << quote(Map::buildingSyncReasonName(Map::BuildingSyncReason(reason)))
+			result << (reason ? "," : "") << quote(MapRouting::buildingSyncReasonName(MapRouting::BuildingSyncReason(reason)))
 				<< ':' << buildingResult.synchronousByReason[reason];
 		result << '}';
 
@@ -913,7 +971,7 @@ struct HeadlessRunner
         result << ']';
 		result << ",\"gradient_execution\":{";
 		bool gradientComma=false;
-		for (const auto& [name,value] : game.map.gradientExecutionMetrics()) {
+		for (const auto& [name,value] : game.map.routing().gradientExecutionMetrics()) {
 			if (gradientComma) result << ',';
 			gradientComma=true; result << quote(name) << ':' << value;
 		}
@@ -941,6 +999,9 @@ struct HeadlessRunner
 			for(const auto& setting:forkSettings) { if(comma)result<<','; comma=true; result<<quote(setting); }
 			result << ']';
 		}
+        result << ",\"resource_claims\":" << quote(engine.gui.game.map.activeClaimsEnabled()?"default":"off");
+        if(engine.gui.game.map.activeClaimsEnabled())
+            result << ",\"resource_claims_policy_name\":" << quote(std::string(ResourceClaims::Policy::Name));
         if (options.count("--resource-gradient-exploration")) {
             result << ",\"resource_gradient_collection\":{\"intervals\":" << quote(one(options,"--resource-gradient-exploration"))
                 << ",\"seed\":" << integer(one(options,"--resource-gradient-exploration-seed","0"),0,UINT32_MAX)
@@ -1071,7 +1132,7 @@ int runHeadlessCommand(const Cli::Request &request)
 			GlobalContainer globals("glob2-tournament-catalog");
 			globalContainer=&globals;for(const auto &directory:request.all("--data-dir"))globals.fileManager->addDir(directory);globals.runNoX=true;
 			std::cout << "{\"schema_version\":1,\"save_version\":" << VERSION_MINOR << ",\"protocol_version\":" << NET_PROTOCOL_VERSION
-				<< ",\"building_catalog_hash\":" << quote(globals.buildingsTypes.fingerprint()) << ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"ai_telemetry_version\":1,\"performance_telemetry_version\":1,\"commands\":[\"game\",\"generate_map\",\"verify_match\",\"sim_version\",\"compose_buildings\",\"validate_set\"],\"sim_version\":" << Online::currentSimVersion().toJson().dump() << ",\"verify_match_version\":1,\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\"],\"ais\":[";
+				<< ",\"building_catalog_hash\":" << quote(globals.buildingsTypes.fingerprint()) << ",\"map_report_version\":2,\"generation_telemetry_version\":1,\"gameplay_telemetry_version\":2,\"resource_claims_default\":\"" << ResourceClaims::Policy::Name << "\",\"resource_claims_switch_version\":1,\"ai_telemetry_version\":1,\"performance_telemetry_version\":2,\"commands\":[\"game\",\"generate_map\",\"verify_match\",\"sim_version\",\"compose_buildings\",\"validate_set\"],\"sim_version\":" << Online::currentSimVersion().toJson().dump() << ",\"verify_match_version\":1,\"telemetry\":[\"checksums\",\"team-timeline\",\"maxima\",\"warrior-tactics\"],\"ais\":[";
 
 			bool comma=false;
 			for(int ai:AINames::selectionOrder())
@@ -1079,10 +1140,16 @@ int runHeadlessCommand(const Cli::Request &request)
 				if(ai==AI::NONE)continue;if(comma)std::cout<<',';comma=true;
 				std::string name=AINames::getCLIName(ai);std::transform(name.begin(),name.end(),name.begin(),[](unsigned char c){return std::tolower(c);});
 				std::cout << "{\"id\":" << ai << ",\"name\":" << quote(name) << ",\"parameters\":";
-				if(ai==AI::CORTEX)std::cout<<Cortex::tuningSchemaJson();
+				if(const std::string schema=AIRegistry::tuningSchemaJson(ai);!schema.empty())std::cout<<schema;
 				else if(ai==AI::MAXIMA)std::cout<<AIMaxima::StrategyResolver::schemaJson();
 				else std::cout<<"[]";
 				std::cout<<'}';
+			}
+			std::cout << "],\"experiments\":[";
+			comma=false;
+			for(const auto& definition:registeredExperimentDefinitions()) {
+				if(comma)std::cout<<',';
+				comma=true;std::cout<<quote(definition.key);
 			}
 			std::cout << "],\"generators\":" << std::flush;
 			char a[]="study",b[]="--catalog";char *args[]={a,b};runMapStudy(2,args);

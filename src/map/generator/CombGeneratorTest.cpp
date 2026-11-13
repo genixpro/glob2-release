@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Contracts and a controlled firing probe on unmodified generated Comb terrain.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "GameFixtures.h"
 #include <array>
 #include "GlobalContainer.h"
 #include "Game.h"
@@ -29,6 +31,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <string>
+#include "Team.h"
 
 namespace
 {

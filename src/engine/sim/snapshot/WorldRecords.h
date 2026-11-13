@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "RoutingRatioPolicy.h"
 
 #include "BuildingCatalog.h"
 #include "BuildingState.h"
@@ -8,6 +9,8 @@
 #include "TerrainRegistry.h"
 #include "TeamStat.h"
 #include "UnitState.h"
+#include "ResourceClaims.h"
+#include "map/claims/ClaimPolicy.h"
 #include "sim/EntityRef.h"
 #include <array>
 #include <memory>
@@ -39,6 +42,10 @@ struct BuildingView : BuildingStateRecord
 
 struct UnitView : UnitState
 {
+    bool activeClaimsEnabled=false;
+    std::optional<ResourceClaims::Claim> activeMaterialClaim;
+    Uint64 materialClaimTask=0;
+    ResourceClaims::MaterialClaimPolicyState materialClaimPolicyState;
     int realAttackStrength = 0;
 	UnitRef identity;
 	int team = 0;
@@ -48,6 +55,7 @@ struct UnitView : UnitState
 struct ColorRecord { Uint8 r = 0, g = 0, b = 0, a = 255; };
 struct TeamView
 {
+    RoutingRatioState routingRatio;
 	int number = 0, prestige = 0, startX = 0, startY = 0;
 	bool alive = false, won = false, lost = false;
 	ColorRecord color;
@@ -61,6 +69,7 @@ struct TeamView
 	TeamStat statistics;
 	std::array<Sint32, MaterialSlotCount> materials{};
 	int workerBalance = 0, starving = 0;
+	int winProbabilityPermille = 0; // the latest recorded 512-tick sample
 	std::array<int, NB_UNIT_LEVELS> workersLevel{};
 	std::vector<BuildingRef> virtualBuildings, swarms;
 };

@@ -3,7 +3,7 @@
 // queue ids, no ratings in unrated queues, positive rules, no seeds, no raw pairing
 // strings and plurals that agree ("1 player"). UX review round 2: H-2, H-3, H-6, P-5,
 // R-8, X-4, X-7, L-1.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
 #include "FrontendTheme.h"
 #include "GlobalContainer.h"
 #include "PlatformRoom.h"
@@ -84,6 +84,17 @@ std::string joined(const std::vector<std::string> &texts)
 
 TEST_SUITE("OnlineWording")
 {
+	TEST_CASE("Bengali account avatar retains its complete first shaping cluster [display]")
+	{
+		Display display;
+		GAGGUI::ScreenStack stack(*globalContainer->gfx);
+		const auto texts = paintedTexts(OnlineUIFixtures::hubFixture(stack, [](OnlineHubScreen::Model &model) {
+			model.displayName = "ক্ষিতিজ";
+			model.accountKind = "registered";
+		}));
+		CHECK(std::find(texts.begin(), texts.end(), "ক্ষি") != texts.end());
+		CHECK(std::find(texts.begin(), texts.end(), "ক্ষিতিজ") != texts.end());
+	}
 	TEST_CASE("queue names, durations and estimates read the same everywhere")
 	{
 		Strings strings;

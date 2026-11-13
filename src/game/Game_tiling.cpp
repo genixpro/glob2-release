@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Repeating a map at game setup: see MapTiling.h.
 #include "PowerOfTwo.h"
+#include "Map.h"
 #include "Game.h"
 #include "Building.h"
 #include "BuildingType.h"
@@ -12,6 +13,8 @@
 #include "UnitType.h"
 
 #include <vector>
+#include "SGSL.h"
+#include "MapScript.h"
 
 namespace
 {

@@ -4,6 +4,7 @@
 #include "Unit.h"
 #include "Team.h"
 #include "Map.h"
+#include "gradient/MapRouting.h"
 
 #include "Building.h"
 
@@ -58,8 +59,8 @@ void Unit::flyToTarget()
     directionFromDxDy();
     if(directGradientDecision) {
         const auto key=*directGradientDecision;directGradientDecision.reset();
-        const auto* cells=*owner->map->gradientFieldDestination(key);
-        owner->map->directGradientMovement(key,posX,posY,entityRandom,cells,dx||dy,true,false);
+        const auto* cells=*owner->map->routing().gradientFieldDestination(key);
+        owner->map->routing().directGradientMovement(key,posX,posY,entityRandom,cells,dx||dy,true,false);
     }
 
 }
@@ -140,11 +141,6 @@ void Unit::dxDyFromDirection(void)
 	findDisplacement([&](int* pathDx, int* pathDy) { dxDyFromDirection(direction,pathDx,pathDy); return true; });
 }
 
-int Unit::swimClass() const
-{
-	return Map::swimClass(performance[WALK], performance[SWIM]);
-}
-
 int Unit::directionFromDxDy(int dx, int dy)
 {
 	const int tab[3][3]={	{0, 1, 2},
@@ -164,7 +160,5 @@ void Unit::simplifyDirection(int ldx, int ldy, int *cdx, int *cdy)
 
 }
 
-int Unit::movementClass() const
-{
-    return performance[FLY]>0 ? AIR_MOVEMENT_CLASS : swimClass();
-}
+MovementAccess Unit::movementAccess() const
+{ return movementAccessForSpeeds(performance[WALK],performance[SWIM],performance[FLY]); }

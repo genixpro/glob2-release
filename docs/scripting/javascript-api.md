@@ -32,7 +32,7 @@ entity objects, pathfinding queries or direct mutation methods.
   below; unused arguments are not a versioning or extension mechanism.
 
 AI decisions use an immutable observation for `ctx.tick`. A match-wide engine delay
-of 0–8 ticks (default 8) schedules returned orders at `ctx.tick + delay`; profile 2
+of 0–16 ticks (default 14) schedules returned orders at `ctx.tick + delay`; profile 2
 actions retain their IDs while awaiting execution receipts. An accepted order may
 still have an effect that completes later. Account for outstanding intents before
 issuing duplicate commands. Map-script callbacks keep their existing cadence.
@@ -322,9 +322,13 @@ script asks for.
 bottom-left, bottom-right. Terrain is stored per map vertex, and vertex (x,y) is the
 top-left corner of tile (x,y). Index the immutable definitions returned by
 `ctx.game.terrainTypes()` with these IDs. When all four agree, the tile has that
-terrain's rules exactly; mixed corners are walkable when any corner is, never
-swimmable or buildable, block projectiles and count as a shoreline when any corner
-does, and are otherwise as permissive as the weakest corner. There is
+terrain's rules exactly. For mixed profiles, two or more blocked corners prevent
+ground movement. Otherwise walking or swimming wins by corner count, with
+walking winning a tie between the two. All numeric modifiers use the arithmetic mean
+of all four corners: ground/air speed and health, growth, fertility, inhibition and
+shoreline support. Q8 averages round toward zero, and signed health rates can
+offset each other. Mixed profiles are never buildable; they block projectiles and count as a shoreline when any corner does,
+and require all corners for flight and growth permissions. There is
 no single per-tile terrain field. `corners` follows the same visibility and
 remembered-observation rules as `resource`. The registry is static public metadata
 and does not reveal map contents.
@@ -355,8 +359,7 @@ if (tile.explored && tile.corners.every(c => c === tile.corners[0])) {
 }
 ```
 
-Each entry has `id`, stable `name`, `experiment` (a required experiment key or
-`null`), `editorSelectable`, and these gameplay properties:
+Each entry has `id`, stable `name`, `editorSelectable`, and these gameplay properties:
 
 | Fields | Meaning |
 | --- | --- |
@@ -365,12 +368,11 @@ Each entry has `id`, stable `name`, `experiment` (a required experiment key or
 | `buildable`, `projectileBlocks`, `shoreline` | Building placement capability, projectile obstruction, and shoreline classification |
 | `groundSpeedQ8`, `airSpeedQ8`, `growthQ8` | Multipliers: `256` is normal, `128` half, `512` double |
 | `groundHealthQ8`, `airHealthQ8` | Signed HP per exposed tick, divided by `256`; negative damages |
-| `fertilityQ8`, `inhibitionQ8`, `shoreSupportQ8` | Nearby contribution, inhibition, and aquatic shoreline support in Q8 units |
+| `fertilityQ8`, `inhibitionQ8` | Nearby contribution and inhibition in Q8 units |
 | `allowedResources` | Runtime resource IDs permitted by compiled habitat rules and explicit terrain whitelists; refreshed when either catalog changes |
 | `farmMaterial` | Preferred renewable farming material key, or `null` for none |
 
-The array is ID-indexed and includes experimental materials even when the current
-match has not enabled their authoring options.
+The array is ID-indexed. Every terrain is available without experiment flags.
 All nested registry values are read-only in both scripting profiles, including
 commander and map scripts. Existing IDs remain water `0`, sand `1`, grass `2`,
 ice `3` and Trail `4` (legacy registry name `road`); scripts should query capabilities

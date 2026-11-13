@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // The one header every test includes: doctest with the project configuration, plus
-// helpers that need neither the engine nor a GlobalContainer. Engine tests include
-// EngineFixtures.h instead, which includes this.
+// helpers that need neither the engine nor a GlobalContainer. The engine fixtures
+// (HeadlessGlobals.h, HeadlessGame.h, GameFixtures.h, DrawFixtures.h) include this.
 #pragma once
 
 #define DOCTEST_CONFIG_SUPER_FAST_ASSERTS
@@ -38,9 +38,14 @@ namespace glob2test
 
 namespace glob2test
 {
-	// Repository root: PACKAGE_SOURCE_DIR from the generated BuildConfig.h, or
+	// Repository root: PACKAGE_SOURCE_DIR from the generated BuildPaths.h, or
 	// GLOB2_TEST_SOURCE_ROOT when the binary runs on another machine.
 	std::filesystem::path sourceRoot();
+
+	// The runtime tree holding data/, maps/, campaigns/, scripts/ and games/:
+	// sourceRoot()/content in a checkout, or sourceRoot() itself when a runner
+	// staged those directories there directly.
+	std::filesystem::path contentRoot();
 
 	// test/fixtures/<relative>.
 	std::filesystem::path fixture(const std::string& relative);
@@ -97,7 +102,18 @@ namespace glob2test
 
 	// Compares `actual` with test/fixtures/<relative>, line endings normalised, and
 	// reports the first differing line. Rewrites the fixture when updatingFixtures().
+	// With GLOB2_TEST_SIM_TRACE_DIR set it first writes `actual` to that directory
+	// under the same relative path, so tools/sim_fingerprint.py can compare two
+	// builds' traces whatever the committed fixture says.
 	void expectGolden(const std::string& relative, const std::string& actual);
+
+	// Records `actual` for tools/sim_fingerprint.py without a committed fixture: with
+	// GLOB2_TEST_SIM_TRACE_DIR set it writes the trace to that directory under
+	// `relative`, otherwise it does nothing. sim-diff compares the trace between the
+	// merge base and a pull request, so a scenario keeps change detection without a
+	// stored output to refresh. Tag the case [sim-trace] so the fingerprint runs it,
+	// and give it a direct check of its own: the trace asserts nothing.
+	void recordSimTrace(const std::string& relative, const std::string& actual);
 
 	// Decompresses test/fixtures/<relative>.gz (or any repository-relative .gz) into
 	// the profile and returns the raw file, for loaders that want an uncompressed path.

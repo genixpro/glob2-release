@@ -5,6 +5,10 @@
 #pragma once
 namespace Online { class SkinDownloads; }
 #include <MapCamera.h>
+#include <CooperativeTask.h>
+#include <GAGColor.h>
+#include <ui/PositionedControl.h>
+#include <ui/Icon.h>
 
 #include <InputState.h>
 #include <functional>
@@ -15,11 +19,14 @@ namespace Online { class SkinDownloads; }
 #include <queue>
 #include <random>
 #include <unordered_map>
-#include <valarray>
 #include <variant>
 
-#include "Game.h"
-#include "TorusView.h"
+#include "GameEvent.h"
+#include "TeamCapacity.h"
+#include "UnitConsts.h"
+#include "sim/EntityRef.h"
+#include <deque>
+#include "IntroCover.h"
 #include "Brush.h"
 #include "Campaign.h"
 #include "MapHeader.h"
@@ -27,13 +34,11 @@ namespace Online { class SkinDownloads; }
 #include "MarkManager.h"
 #include "GameGUIMessageManager.h"
 #include "GameEventFeed.h"
-#include "GameGUIDialog.h"
+class InGameStatisticsPanel;
 namespace Tutorial { class Guidance; }
 #include "GameSpeedControl.h"
 #include "render/Minimap.h"
 #include "OverlayAreas.h"
-#include "render/scene/SceneExtract.h"
-#include "GameGUIToolManager.h"
 #include "GameGUIDefaultAssignManager.h"
 #include "GameGUIGhostBuildingManager.h"
 #include "BuildingGuiState.h"
@@ -53,10 +58,29 @@ using namespace GAGCore;
 namespace GAGGUI
 {
 	class OverlayScreen;
+	namespace ui { class Host; }
 }
+namespace Glob2UI { class InGameDialog; }
+// Held by pointer so that files using GameGUI do not compile the scene and renderer.
+class GameGUIToolManager;
+class SceneExtractor;
+class TorusView;
+struct PresentationFrame;
+struct SceneBuildingPanel;
+struct SceneRequest;
+struct ViewState;
+struct MapRenderState;
+class GameHeader;
+namespace SimulationSnapshot { struct BuildingView; }
+using SnapshotBuilding = SimulationSnapshot::BuildingView;
 using namespace GAGGUI;
 
 class TeamStats;
+class Game;
+struct DeferredGameSHA1;
+class Team;
+class Building;
+class Unit;
 class InGameTextInput;
 class Order;
 class MapMarkOrder;
@@ -70,17 +94,26 @@ class MapMarkOrder;
 /*!
 	Handle all user input during game, draw & handle menu.
 */
-namespace Hive { class Client; class Dialog; }
+namespace Hive
+{
+class Client;
+class Dialog;
+class LocalCommander;
+} // namespace Hive
+class ReplayWriter;
 class GameGUITouch;
 class HudUnitConversionIcon;
 class ConnectionOverlay;
+struct EventFeedLayout;
 class GameGUI : public ClientCommandSink
 {
+	friend struct TranslationPreviewAccess;
 	friend struct CustomGameSetupHarness;
 	friend struct TurnClient;
 	friend struct ScriptPresentationFixture;
     friend class TorusRenderIntegrationTest;
-    TorusView torusView;
+    std::unique_ptr<TorusView> torusViewOwner;
+    TorusView &torusView;
     bool torusPointerDown = false;
     bool torusMapPointer(int x, int y, int &mx, int &my) const;
     bool handleTorusPointer(const SDL_Event &event);
@@ -144,7 +177,7 @@ public:
 	void waitForAutosave();
     bool savePending();
 	//! return the local team of the player who is running glob2
-	Team *getLocalTeam(void) { return game.teams[localTeamNo]; }
+	Team *getLocalTeam(void);
 
 	//! Apply every queued simulation notice (ClientEvents) to the GUI. The
 	//! engine calls this after each tick; executeOrder, step and drawAll call
@@ -184,6 +217,10 @@ public:
 	
 	/// Show the dialog that says that the replay ended
 	void showEndOfReplayScreen(bool client = false);
+
+	/// Cover the screen with clouds for the first five seconds of a game. The
+	/// simulation and the map renderer keep running underneath. See IntroCover.
+	void beginIntroCover(Uint64 now);
 	
 	///This is an enum for the current highlight object. The highlighted object is shown with a large arrow.
 	///This is primarily for tutorials
@@ -256,9 +293,35 @@ public:
 	///Game::clientRequests), so they outlive it.
 	ClientEvents clientEvents;
 	ClientRequests clientRequests;
-	Game game;
+	/// Held through a pointer so that GameGUI.h (and Engine.h) need not include
+	/// Game.h; `game` is the same object, bound once at construction.
+	std::unique_ptr<Game> gameOwner;
+	Game& game;
 	/// Live network games always use normal speed; replays remain adjustable.
 	bool canChangeGameSpeed() const;
+	std::vector<GAGGUI::ui::Host *> inspectionHosts();
+	// Hive cards remain available above the chat/commander composer.
+	bool hiveCardsVisible() const;
+	// Domain UI model shared by desktop HUD paint, human hit testing and inspection.
+	std::vector<GAGGUI::ui::PositionedControl> describeHudControls();
+	SDL_Rect connectionOverlayArea() const;
+	GAGGUI::ui::Host &hudInspectionHost();
+	void prepareHudOwnership();
+	bool activateHudControlAt(GAGGUI::ui::Point point, const std::string &prefix = {});
+	GAGGUI::ui::Rect hudControlBounds(const std::string &key, GAGGUI::ui::Rect fallback);
+	class HudControlPaint
+	{
+		GameGUI &gui;
+		const std::vector<GAGGUI::ui::PositionedControl> *previous;
+		std::vector<GAGGUI::ui::PositionedControl> snapshot;
+	  public:
+		explicit HudControlPaint(GameGUI &owner);
+		~HudControlPaint();
+		HudControlPaint(const HudControlPaint &) = delete;
+		HudControlPaint &operator=(const HudControlPaint &) = delete;
+	};
+
+
 	void setColonySkins(std::unique_ptr<Online::SkinDownloads> downloads);
     void swapColonyAppearance(MapRenderState &state);
 	/// Chevrons the HUD speed control lights for the current speed.
@@ -276,21 +339,21 @@ public:
 	/// The scene this frame draws: the simulation's published scene when the
 	/// simulation runs on its own thread, else the explicitly prepared local frame.
 	Game *replayTelemetryGame();
-	const PresentationFrame& drawnScene() const { return publishedScene ? *publishedScene : frameScene; }
+	//! Starts recording to writer at path (an empty path records to memory), with this GUI's game header.
+	void startReplay(ReplayWriter &writer, const std::string &path);
+	const PresentationFrame& drawnScene() const
+	{
+		if (publishedScene) return *publishedScene;
+		return frameScene;
+	}
 	/// Draw scenes published by the simulation thread (null: use the explicitly prepared local frame).
-	void setPublishedScene(const PresentationFrame* scene)
-    {
-        publishedScene = scene;
-        view.scene = &drawnScene();
-        if (view.scene->buildingTypes) choiceCatalog = view.scene->buildingTypes;
-        toolManager.setDrawnScene(view.scene->world.catalogs ? view.scene : nullptr);
-    }
+	void setPublishedScene(const PresentationFrame* scene);
 	/// What the next scene should show; read by extraction, which runs where the
 	/// game may be read. The main thread publishes it through the runner mailbox.
 	SceneRequest sceneRequest(bool includeTiming = true);
-    void stampPresentationRequest(SceneRequest& request) const { request.tickTime=lastTickTime;request.tickInterval=tickInterval; }
+    void stampPresentationRequest(SceneRequest& request) const;
 	/// Standalone owner-side observation through the shared read boundary.
-	void prepareLocalPresentation(PresentationFrame& scene) { const auto request=sceneRequest(); sceneExtractor.prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)),request,scene); }
+	void prepareLocalPresentation(PresentationFrame& scene);
     // Explicit observation for standalone clients and owner-side tools.
     void prepareLocalPresentation()
     {
@@ -323,7 +386,7 @@ public:
 		tickClock = (((tickClock >> 32) + 1) << 32) | Uint32(time);
 	}
 	/// Water and cloud animation phase of this GUI's map view (presentation only).
-	int mapAnimationTime() const { return view.render.animationTime; }
+	int mapAnimationTime() const;
 	friend class Game;
 	// Read by the simulation thread as well as the GUI (see SimulationRunner).
 	std::atomic<bool> gamePaused{false};
@@ -339,6 +402,7 @@ public:
 	bool drawHealthFoodBar, drawPathLines, drawAccessibilityAids;
 	int localPlayer = 0, localTeamNo = 0;
 	std::shared_ptr<Hive::Client> hive;
+	std::shared_ptr<Hive::LocalCommander> localHive;
 	void updateCommander(bool caughtUp);
 	void openCommander();
 	std::unique_ptr<Hive::Dialog> hiveCards;
@@ -346,6 +410,10 @@ public:
 	bool enqueueCommanderOrders(const std::vector<std::shared_ptr<Order>> &orders, const std::function<bool()> &commit);
 	int viewportX, viewportY;
 	MapCamera camera;
+	IntroCover introCover;
+	/// Swallow gameplay input while the opening cover is closed; a press skips
+	/// to the parting. Returns whether the event was consumed.
+	bool introCoverConsumes(const SDL_Event &event);
 	bool zoomControlPushed=false;
 	void updateCamera();
 	bool zoomMap(double steps,int x,int y);
@@ -397,12 +465,27 @@ public:
 	/// Whether the menus offer Pause to this player now.
 	bool pauseAvailable() const;
 private:
+	std::unique_ptr<GAGGUI::ui::Host> hudHost;
+	const std::vector<GAGGUI::ui::PositionedControl> *hudPaintControls = nullptr;
+	struct TopBarLayout
+	{
+		// Workers, explorers, warriors, prestige, win chance, conversions
+		// gained and lost, then the speed control and tick rate.
+		std::array<std::string, 8> values;
+		std::array<double, 8> x;
+		double scale;
+	};
+	TopBarLayout topBarLayout() const;
+	//! The local side's live win probability as two digits, "00" to "99"
+	//! (certain wins read 99), or "--" before the scene has one.
+	std::string localWinChanceText() const;
 	friend class GameGUISelectionHarness;
 	friend class SavegameSafetyHarness;
 	friend class TorusRenderIntegrationTest;
 	friend class TorusRenderBenchmark;
 	friend class SoftwareRenderBenchmark;
 	bool persistPreferences;
+    friend class InGameStatisticsPanel;
     friend class GameGUITouch;
     friend class GameGUITouchHarness;
 	friend class MobileGalleryGameplay;
@@ -434,7 +517,8 @@ private:
 	void handleKeySwitchToAreaBrush(int figure);
 	void handleKeySelectConstruct(const char *buildingName);
 	void handleKeySelectPlaceFlag(const char *flagName);
-	void handleKeySelectPlaceArea(GameGUIToolManager::ZoneType zone);
+	//! `zone` is a GameGUIToolManager::ZoneType.
+	void handleKeySelectPlaceArea(int zone);
 	void handleMouseMotion(int mx, int my, int button);
 	void handleMouseButtonDown(SDL_MouseButtonEvent mouseEvent);
 	void handleMouseButtonUp(SDL_MouseButtonEvent mouseEvent);
@@ -486,6 +570,9 @@ private:
 	void drawPanelButtons(int y);
 	//! Draw a single button of the panel
 	void drawPanelButton(int y, int pos, int numButtons, int sprite);
+	// Held for the HUD's life: the icon cache releases icons nobody keeps, so a
+	// temporary reference would reload its images every frame.
+	std::shared_ptr<const GAGGUI::ui::IconAsset> panelMapIcon;
 	//! Draw a choice of buildings or flags. Thin coordinator over the four helpers below.
 	//! `panelTopY` is the single Y origin for both the sprite grid and the mouse hit grid;
 	//! all four helpers anchor to it so layout and hit-test cannot drift apart.
@@ -500,13 +587,14 @@ private:
 	//! `panelTopY` is the Y of the first row of cells — must match the value passed to
 	//! drawChoiceSprites / drawChoiceHighlight so click/hover/draw share one origin.
 	std::optional<size_t> pickChoiceUnderMouse(int panelTopY, size_t count, unsigned numberPerLine) const;
+	GAGGUI::ui::Rect choiceControlBounds(int panelTopY, size_t index, unsigned numberPerLine) const;
 	//! Paint the resource/info text block at the bottom of the right panel for the given type.
 	void drawChoiceInfoPanel(const std::string& type);
 	int choiceVisibleRows(int panelTopY,unsigned columns) const;
 	bool scrollBuildingChoices(double delta);
 	int buildingChoiceRow=0, flagChoiceRow=0;
 	int buildingInfoScroll=0, buildingInfoScrollMaximum=0;
-	Uint16 buildingInfoScrollGid=0xffff;
+	std::optional<BuildingRef> buildingInfoScrollTarget;
 	//! Draw a choice of flags
 	void drawFlagView(void);
 	//! Draw the infos from a unit
@@ -660,7 +748,8 @@ private:
 	
 	// Brushes
 	BrushTool brush;
-	GameGUIToolManager toolManager;
+	std::unique_ptr<GameGUIToolManager> toolManagerOwner;
+	GameGUIToolManager &toolManager;
 
 	//! Unset and clean everything related to the selection so a new one can be set
 	void cleanOldSelection(void);
@@ -672,8 +761,8 @@ private:
 	//! throws std::bad_variant_access rather than silently reinterpreting bytes.
 	//! Precondition: selectionMode is the matching mode (caller-guaranteed).
 	//! The entity accessors return null once the entity is gone.
-	Building* selectionBuilding() const { return game.resolveBuilding(std::get<BuildingRef>(selection)); }
-	Unit* selectionUnit() const { return game.resolveUnit(std::get<UnitRef>(selection)); }
+	Building* selectionBuilding() const;
+	Unit* selectionUnit() const;
 	int selectionResource() const { return std::get<int>(selection); }
 	//! Selected building/unit, or null in any other mode or once it is gone.
 	Building* selectedBuildingOrNull() const;
@@ -687,7 +776,7 @@ private:
 	void handleClientEvent(ClientEventVariant&& event);
 	//! GameEvents per team, aged like Team::updateEvents did, until step()
 	//! shows the local team's.
-	std::array<std::deque<GameEvent>, Team::MAX_COUNT> pendingTeamEvents;
+	std::array<std::deque<GameEvent>, TEAM_MAX_COUNT> pendingTeamEvents;
 
 	// What's visible or hidden on GUI
 	std::vector<std::string> buildingsChoiceName;
@@ -741,14 +830,14 @@ private:
 	bool showUnitWorkingToBuilding;
 
 	const TeamStats *teamStats;
-	int measurementPage = 0;
-	//! Pages of the statistics text view: the colony summary, the metric groups
-	//! and, when spectating, the win chances.
-	int statisticsPages() const;
-	void drawStatisticsPage(int y);
-	//! Each side's chance of winning, under the statistics. Drawn for live
-	//! spectators, independently of the game's winning conditions.
-	void drawWinProbabilities(int x, int y);
+    std::unique_ptr<InGameStatisticsPanel> statisticsPanel;
+    InGameStatisticsPanel &statistics();
+    bool statisticsVisible() const;
+    bool handleStatisticsEvent(const SDL_Event &event);
+    GAGGUI::ui::Rect statisticsBounds() const;
+    GAGGUI::ui::Host &statisticsHost();
+    void drawStatisticsPanel();
+    void drawMapOverlayControls();
 	Team *localTeam;
 
 	Uint32 chatMask;
@@ -781,7 +870,8 @@ private:
 		IGM_HIVE,
 		IGM_CONFIRM_LEAVE,
 		IGM_TELEMETRY,
-        IGM_TUTORIAL_RESTART
+        IGM_TUTORIAL_RESTART,
+        IGM_STATISTICS
 	} inGameMenu;
 	// The dialog receiving input, if any: the menu, the chat composer or the history.
 	Glob2UI::InGameDialog *activeDialog() const;
@@ -856,6 +946,9 @@ private:
 	void stepEventFeed(int viewedTeam);
 	/// Draw the eventFeed rows from (x, y) down; returns the y below the last row.
 	int drawEventFeed(int x, int y);
+	std::optional<int> eventFeedStartY();
+	EventFeedLayout eventFeedLayout(int x, int y) const;
+	std::vector<GAGGUI::ui::PositionedControl> describeEventControls();
 	/// Jump the camera to a feed row when (mx, my) hits one; true if it did.
 	bool handleEventFeedClick(int mx, int my);
 	/// Scroll so map tile (x, y) is at the centre of the view.
@@ -893,12 +986,15 @@ private:
 	///Per-building GUI-side pending order state (optimistic shadow).
 	///See BuildingGuiState.h. Public so render code can read pending positions.
 	BuildingGuiStateMap buildingGuiState;
+	std::queue<std::pair<Uint64, std::shared_ptr<Order>>> pendingBuildingReconciliations;
 
 	///Per-client viewer state (selection + mouse). NOT simulation state — see
-	///Game::ViewState. Owned here (not on Game) and passed into game.drawMap.
-	Game::ViewState view;
+	///ViewState. Owned here (not on Game) and passed into MapDrawer::drawMap.
+	std::unique_ptr<ViewState> viewOwner;
+	ViewState &view;
 	///The scene drawn this frame, extracted from `game` at the start of drawAll.
-	PresentationFrame frameScene;
+	std::unique_ptr<PresentationFrame> frameSceneOwner;
+	PresentationFrame &frameScene;
 	Uint64 lastTickTime = 0;
 	Uint32 tickInterval = 0;
 	///PresentationFrame published by the simulation thread, or null when an owner-side tool prepares a local frame
@@ -906,7 +1002,8 @@ private:
 	const PresentationFrame* publishedScene = nullptr;
 	const SceneBuildingPanel* inputBuildingPanel();
 	///Extracts frameScene; keeps the state that spans frames (the overlay map).
-	SceneExtractor sceneExtractor;
+	std::unique_ptr<SceneExtractor> sceneExtractorOwner;
+	SceneExtractor &sceneExtractor;
 
 	///Accessor: pending value if set, else authoritative from `b`.
 	Sint32 displayedPosX(const Building& b) const;
@@ -925,22 +1022,23 @@ private:
 	template<class B> bool displayedExplorersRequireBombing(const B& b) const { return ::displayedExplorersRequireBombing(buildingGuiState,b); }
 	std::array<Sint32, NB_UNIT_TYPE> displayedRatio(const Building& b) const;
 	// The same for the selected building's panel model.
-	Sint32 displayedPosX(const SnapshotBuilding& b) const { return ::displayedPosX(buildingGuiState, b); }
-	Sint32 displayedPosY(const SnapshotBuilding& b) const { return ::displayedPosY(buildingGuiState, b); }
-	Sint32 displayedPosX(const SceneBuildingPanel& b) const { return ::displayedPosX(buildingGuiState, b); }
-	Sint32 displayedPosY(const SceneBuildingPanel& b) const { return ::displayedPosY(buildingGuiState, b); }
-	Sint32 displayedMaxUnitWorking(const SceneBuildingPanel& b) const { return ::displayedMaxUnitWorking(buildingGuiState, b); }
-	Sint32 displayedUnitStayRange(const SceneBuildingPanel& b) const { return ::displayedUnitStayRange(buildingGuiState, b); }
-	Sint32 displayedPriority(const SceneBuildingPanel& b) const { return ::displayedPriority(buildingGuiState, b); }
-	bool displayedClearingResource(const SceneBuildingPanel& b, int i) const { return ::displayedClearingResource(buildingGuiState, b, i); }
-	Sint32 displayedMinLevelToFlag(const SceneBuildingPanel& b) const { return ::displayedMinLevelToFlag(buildingGuiState, b); }
-	std::array<Sint32, NB_UNIT_TYPE> displayedRatio(const SceneBuildingPanel& b) const { return ::displayedRatio(buildingGuiState, b); }
+	Sint32 displayedPosX(const SnapshotBuilding& b) const;
+	Sint32 displayedPosY(const SnapshotBuilding& b) const;
+	Sint32 displayedPosX(const SceneBuildingPanel& b) const;
+	Sint32 displayedPosY(const SceneBuildingPanel& b) const;
+	Sint32 displayedMaxUnitWorking(const SceneBuildingPanel& b) const;
+	Sint32 displayedUnitStayRange(const SceneBuildingPanel& b) const;
+	Sint32 displayedPriority(const SceneBuildingPanel& b) const;
+	bool displayedClearingResource(const SceneBuildingPanel& b, int i) const;
+	Sint32 displayedMinLevelToFlag(const SceneBuildingPanel& b) const;
+	std::array<Sint32, NB_UNIT_TYPE> displayedRatio(const SceneBuildingPanel& b) const;
 
 	///Get-or-create the pending state for a building (used by GUI mutators).
 	BuildingGuiState& pendingFor(Uint16 gid) { return buildingGuiState[gid]; }
 
 	///Called from executeOrder: clear pending fields the order has now made authoritative.
 	void reconcileBuildingGuiState(const std::shared_ptr<Order>& order);
+	void reconcilePublishedBuildingGuiState();
 	
 	//! A particle is cute and only for eye candy
 	struct Particle

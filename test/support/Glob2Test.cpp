@@ -6,6 +6,7 @@
 #include <cstdio>
 
 #include <glob2/BuildConfig.h>
+#include <glob2/BuildPaths.h>
 #include <Toolkit.h>
 #include <zlib.h>
 
@@ -83,10 +84,17 @@ namespace glob2test
 	std::filesystem::path sourceRoot()
 	{
 		// The build host's checkout, unless the binary runs somewhere else (an Android
-		// device, say) and the runner staged data/, maps/, games/ and test/fixtures/.
+		// device, say) and the runner staged the runtime tree and test/fixtures/.
 		if (const char* env = std::getenv("GLOB2_TEST_SOURCE_ROOT"); env && *env)
 			return std::filesystem::path(env);
 		return std::filesystem::path(PACKAGE_SOURCE_DIR);
+	}
+
+	std::filesystem::path contentRoot()
+	{
+		const auto content = sourceRoot() / "content";
+		std::error_code error;
+		return std::filesystem::is_directory(content / "data", error) ? content : sourceRoot();
 	}
 
 	std::filesystem::path fixture(const std::string& relative)
@@ -176,10 +184,21 @@ namespace glob2test
 		return value && std::string(value) == "1";
 	}
 
+	void recordSimTrace(const std::string& relative, const std::string& actual)
+	{
+		if (const char* traces = std::getenv("GLOB2_TEST_SIM_TRACE_DIR"); traces && *traces)
+		{
+			const std::filesystem::path trace = std::filesystem::path(traces) / relative;
+			std::filesystem::create_directories(trace.parent_path());
+			writeFile(trace, normalised(actual));
+		}
+	}
+
 	void expectGolden(const std::string& relative, const std::string& actual)
 	{
 		const std::filesystem::path path = fixture(relative);
 		const std::string text = normalised(actual);
+		recordSimTrace(relative, actual);
 		if (updatingFixtures())
 		{
 			std::filesystem::create_directories(path.parent_path());
@@ -215,7 +234,11 @@ namespace glob2test
 	{
 		std::filesystem::path source = relativeGz;
 		if (source.is_relative() && !std::filesystem::exists(source))
-			source = std::filesystem::exists(fixture(relativeGz)) ? fixture(relativeGz) : sourceRoot() / relativeGz;
+			// Runtime-tree paths (games/...) resolve under contentRoot(); repository
+			// paths (test/fixtures/...) under sourceRoot().
+			source = std::filesystem::exists(fixture(relativeGz)) ? fixture(relativeGz)
+				: std::filesystem::exists(contentRoot() / relativeGz) ? contentRoot() / relativeGz
+				: sourceRoot() / relativeGz;
 		REQUIRE_MESSAGE(std::filesystem::exists(source), "missing compressed fixture " << source.string());
 		std::filesystem::path target = profileDir() / "inflated" / source.filename();
 		if (target.extension() == ".gz") target.replace_extension();

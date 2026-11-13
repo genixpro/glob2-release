@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "TerrainBuiltins.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "DrawFixtures.h"
 #include "editor/BrushSwatches.h"
 #include "MapAssetBundle.h"
 #include "BuildingArtwork.h"

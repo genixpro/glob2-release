@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
 #include "EntityRandomIO.h"
 #include "Version.h"
 #include "sim/snapshot/WorldSnapshot.h"
@@ -11,6 +13,8 @@
 #include <TextStream.h>
 #include <memory>
 #include <fstream>
+#include "sim/EntityRefOf.h"
+#include "SGSL.h"
 
 namespace
 {
@@ -146,7 +150,7 @@ TEST_SUITE("EntityRandomLifecycle")
         const auto otherBefore = otherTeam->entityRandom;
         const auto buildingBefore = building->entityRandom;
         const auto flyerBefore = flyer->entityRandom;
-        world.game.map.pathfindRandom(worker);
+        world.game.map.routing().pathfindRandom(worker);
         CHECK(worker->entityRandom != workerBefore);
         CHECK(flyer->entityRandom == flyerBefore);
         // Force the random-fly action, without running ecology or another unit.
@@ -186,8 +190,8 @@ TEST_SUITE("EntityRandomLifecycle")
         expected.nextU32();
         std::vector<Uint16> gradient(world.game.map.getW() * world.game.map.getH(), 100);
         int dx = 0, dy = 0;
-        REQUIRE(world.game.map.directionByGradient(worker->entityRandom,
-            worker->owner->me, worker->swimClass(), worker->posX, worker->posY,
+        REQUIRE(world.game.map.routing().directionByGradient(worker->entityRandom,
+            worker->owner->me, worker->movementAccess(), worker->posX, worker->posY,
             gradient.data(), &dx, &dy, false));
         CHECK(worker->entityRandom == expected);
         CHECK(target->entityRandom == targetRandom);
@@ -286,13 +290,13 @@ TEST_SUITE("EntityRandomLifecycle")
         unit->entityRandom.nextU32(); building->entityRandom.nextU32();
         const auto captured = SimulationSnapshot::capture(world.game, SimulationSnapshot::captureCatalog(world.game));
         AIEngine::AIWorldView frozen(captured);
-        REQUIRE(frozen.unit(Game::refOf(unit)));
-        REQUIRE(frozen.building(Game::refOf(building)));
+        REQUIRE(frozen.unit(refOf(unit)));
+        REQUIRE(frozen.building(refOf(building)));
         const auto unitBefore = unit->entityRandom;
         const auto buildingBefore = building->entityRandom;
         unit->entityRandom.nextU32(); building->entityRandom.nextU32();
-        CHECK(frozen.unit(Game::refOf(unit))->entityRandom == unitBefore);
-        CHECK(frozen.building(Game::refOf(building))->entityRandom == buildingBefore);
+        CHECK(frozen.unit(refOf(unit))->entityRandom == unitBefore);
+        CHECK(frozen.building(refOf(building))->entityRandom == buildingBefore);
     }
 
     TEST_CASE("binary and text saves preserve exact private state and subsequent draws")
@@ -399,7 +403,10 @@ TEST_SUITE("EntityRandomLifecycle")
             }
             bytes.insert(position,flags);
         };
-        REQUIRE_FALSE(world.game.map.marketsV2Enabled());
+        // Format 187 retired MapHeader's experiment requirements. Format 150
+        // still needs the empty section even though this fixture enables none.
+        addLegacyFlags({"Game","MapHeader"},"experiments\n{\ncount = 0;\n}\n");
+        REQUIRE_FALSE(world.game.map.routing().marketsV2Enabled());
         for (int team=0; team<world.game.teamsCount(); ++team)
             for (int swim=0; swim<LEGACY_SWIM_CLASS_COUNT; ++swim) {
                 const std::vector<std::string> base={"Game","mapRuntime","teams",
@@ -461,17 +468,15 @@ TEST_SUITE("EntityRandomLifecycle")
         const auto current=save(migrated.game,true);
         glob2test::HeadlessGame continued({.header=true});
         REQUIRE(load(continued.game,current,true));
-        // The header checksum includes the loaded format number, which the
-        // new save upgrades. Every simulation component after that header must
-        // still agree, including pending work and private random streams.
+        // The new save upgrades the format number; every simulation component,
+        // including pending work and private random streams, must still agree.
         CHECK(migrated.game.mapHeader.getVersionMinor()==150);
         CHECK(continued.game.mapHeader.getVersionMinor()==VERSION_MINOR);
         std::vector<Uint32> before,after;
         migrated.game.checkSum(&before,nullptr,nullptr,true);
         continued.game.checkSum(&after,nullptr,nullptr,true);
-        REQUIRE(before.size()==after.size());
         REQUIRE(before.size()>1);
-        CHECK(std::equal(before.begin()+1,before.end(),after.begin()+1));
+        CHECK(before==after);
 }
 
     TEST_CASE("truncated binary RNG state and even increments are rejected")

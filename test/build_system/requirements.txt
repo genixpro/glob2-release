@@ -1,0 +1,2 @@
+# Development-only build graph and asset contracts; nothing ships at runtime.
+-r ../../tools/asset-requirements.txt

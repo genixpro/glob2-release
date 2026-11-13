@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "ChecksumScheme.h"
 #include "IntrusiveEntityList.h"
 #include "TeamCapacity.h"
 #include <SDL3/SDL_iostream.h>
@@ -14,6 +15,7 @@
 #include <queue>
 
 #include "Race.h"
+#include "RoutingRatioPolicy.h"
 #include "TeamStat.h"
 #include "GameEvent.h"
 
@@ -22,6 +24,7 @@
 
 #include "BaseTeam.h"
 #include "WinningConditions.h"
+#include "sim/SimContext.h"
 
 class Building;
 class BuildingsTypes;
@@ -66,7 +69,8 @@ public:
 		START_POS_FROM_SWARM = 3,
 	};
 
-	Team(Game *game);
+	//! ctx comes from game->simContext().
+	Team(Game *game, const SimContext &ctx);
 
 	virtual ~Team(void);
 
@@ -91,6 +95,8 @@ public:
 
 	//! Step every unit, building and bullet of the team.
 	void syncStep(void);
+    RoutingRatioState routingRatio;
+    void updateRoutingRatio();
 
 	void pushGameEvent(GameEvent event);
 	//! Pop the oldest event, if any.
@@ -103,9 +109,8 @@ public:
 	void setCorrectMasks(void);
 	void setCorrectColor(const GAGCore::Color& color);
 	void setCorrectColor(float value);
-	/// Bit for `team` in team-mask bitfields (allies, sharedVision*, Tile::forbidden, ...).
-	/// Masks have MAX_COUNT_ON_DISK bits; `1<<31` on a signed int would be UB.
-	inline static Uint32 teamNumberToMask(int team) { return Uint32(1)<<team; }
+	/// Bit for `team` in team-mask bitfields (see ::teamNumberToMask in TeamCapacity.h).
+	inline static Uint32 teamNumberToMask(int team) { return ::teamNumberToMask(team); }
 
 	void update();
 	//! Whether any other team shares its market vision with us.
@@ -137,7 +142,7 @@ public:
 	void dirtyGlobalGradient();
 	void dirtyWarFlagGradient();
 
-	Uint32 checkSum(std::vector<Uint32> *checkSumsVector=NULL, std::vector<Uint32> *checkSumsVectorForBuildings=NULL, std::vector<Uint32> *checkSumsVectorForUnits=NULL, bool legacy152=false);
+	Uint32 checkSum(std::vector<Uint32> *checkSumsVector=NULL, std::vector<Uint32> *checkSumsVectorForBuildings=NULL, std::vector<Uint32> *checkSumsVectorForUnits=NULL, ChecksumScheme scheme=ChecksumScheme::Current);
 
 	//! Name of the first human/AI player on this team, or "" if none controls it.
 	//! Locale-agnostic; UI wanting the localized "[Uncontrolled]" placeholder
@@ -152,6 +157,8 @@ private:
 
 public:
 	Game *game;
+	//! The game state entity code reads per tick; see sim/SimContext.h.
+	SimContext ctx;
 	Map *map;
 
 	Unit **myUnits;

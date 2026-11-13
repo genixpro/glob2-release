@@ -2,7 +2,9 @@
 // The simulation/client channels in src/engine/sim: GameEvents delivered through
 // ClientEvents, script presentation through ClientCommandSink, and the SGSL
 // Space acknowledgement through ClientRequests.
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "sim/snapshot/SnapshotStore.h"
+#include "HeadlessGame.h"
 #include "EngineTiming.h"
 #include "GameGUI.h"
 #include "Order.h"
@@ -17,6 +19,8 @@
 #include <thread>
 #include <ThreadSupport.h>
 #include <vector>
+#include "SGSL.h"
+#include "MapScript.h"
 
 namespace
 {

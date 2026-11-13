@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
 #include "BinaryStream.h"
 #include "StreamBackend.h"
 #include "WinningConditions.h"
 #include <FileManager.h>
 #include <Toolkit.h>
 #include <fstream>
+#include "GameScripting.h"
 
 struct ScriptPresentationFixture
 {

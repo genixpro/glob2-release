@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <Environment.h>
+#include "Map.h"
 #include "MapCommand.h"
 #include "MapAssetBundle.h"
 #include "BrushSwatches.h"
@@ -41,6 +42,9 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include "Team.h"
+#include "GameObjectives.h"
+#include "GameHints.h"
 
 namespace
 {
@@ -513,7 +517,7 @@ int runMapCommand(const Cli::Request &cli)
 			}
 			else if (arg == "--data-dir")
 				directories.push_back(value);
-			else if (arg != "--generator-package")
+			else if (arg != "--generator-package" && arg != "--compute-threads") // applied by dispatch
 				throw std::invalid_argument("Unknown option for " + mode + ": " + arg);
 		}
 		if (!writesMap && !exporting && !render)

@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Building.h"
+#include "Map.h"
+#include "HeadlessGame.h"
+#include "GraphicContext.h"
 #include "GameDiagnostics.h"
 #include "DatasetWriter.h"
 #include "Order.h"
@@ -16,6 +20,7 @@
 #include <limits>
 #include <BinaryStream.h>
 #include <StreamBackend.h>
+#include <GraphicContext.h>
 
 TEST_SUITE("GameDiagnostics")
 {

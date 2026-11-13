@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
 #include "AreaEffects.h"
 #include "BuildingType.h"
 #include <nlohmann/json.hpp>
@@ -8,6 +9,8 @@
 #include <array>
 #include <algorithm>
 #include <string_view>
+#include "Unit.h"
+#include "Building.h"
 #ifndef WIN32
 #include <sys/resource.h>
 #endif

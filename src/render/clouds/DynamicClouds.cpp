@@ -5,6 +5,7 @@
 #include "CloudField.h"
 #include "GlobalContainer.h"
 #include "GraphicContext.h"
+#include <PresentationWork.h>
 
 void DynamicClouds::compute(const int viewPortX, const int viewPortY, const int viewPortWidth,
                             const int viewPortHeight, const int time, const int worldWidth,
@@ -26,23 +27,30 @@ void DynamicClouds::compute(const int viewPortX, const int viewPortY, const int 
     hGrid = (viewPortHeight - renderOffsetY + renderCellSize - 1) / renderCellSize + 1;
     if (alphaMap.size() != static_cast<size_t>(wGrid * hGrid))
     {
-        alphaMap.resize(wGrid * hGrid);
-        cloudMap.resize(wGrid * hGrid);
+        alphaMap.assign(wGrid * hGrid, 0);
+        cloudMap.assign(wGrid * hGrid, 0);
     }
     CloudField field(worldWidth * 32, worldHeight * 32, time, cloudSize, cloudStability, maxCloudSpeed,
                      windStability, maxAlpha);
-    for (int y = 0; y < hGrid; ++y)
-        for (int x = 0; x < wGrid; ++x)
-        {
-            int wx = startX + x * renderCellSize, wy = startY + y * renderCellSize;
-            alphaMap[y * wGrid + x] = field.opacity(wx, wy);
-            if (includeCloudLayer)
-                cloudMap[y * wGrid + x] = field.opacity(wx, wy, std::max(.01f, cloudHeight));
-        }
+    // Rows are independent samples of one immutable field: spread them over
+    // the presentation workers instead of the graphics thread alone.
+    const float magnification = std::max(.01f, cloudHeight);
+    constexpr int RowsPerJob = 4;
+    GAGCore::executePresentationJobs(std::size_t((hGrid + RowsPerJob - 1) / RowsPerJob), [&](std::size_t job)
+    {
+        for (int y = int(job) * RowsPerJob; y < std::min(hGrid, int(job + 1) * RowsPerJob); ++y)
+            for (int x = 0; x < wGrid; ++x)
+            {
+                int wx = startX + x * renderCellSize, wy = startY + y * renderCellSize;
+                alphaMap[y * wGrid + x] = field.opacity(wx, wy);
+                if (includeCloudLayer)
+                    cloudMap[y * wGrid + x] = field.opacity(wx, wy, magnification);
+            }
+    });
 }
 
 void DynamicClouds::computeWorld(const int worldWidth, const int worldHeight, const int time,
-                                 std::valarray<unsigned char> &out, int &gridW, int &gridH, int maxGridSize) const
+                                 std::vector<unsigned char> &out, int &gridW, int &gridH, int maxGridSize) const
 {
     // Sample the same world field at the detail needed by the overview.
     int cell = granularity;
@@ -51,7 +59,7 @@ void DynamicClouds::computeWorld(const int worldWidth, const int worldHeight, co
     gridW = std::max(1, worldWidth * 32 / cell);
     gridH = std::max(1, worldHeight * 32 / cell);
     if (out.size() != static_cast<size_t>(gridW * gridH))
-        out.resize(gridW * gridH);
+        out.assign(gridW * gridH, 0);
     CloudField field(worldWidth * 32, worldHeight * 32, time, cloudSize, cloudStability, maxCloudSpeed,
                      windStability, maxAlpha);
     for (int y = 0; y < gridH; ++y)

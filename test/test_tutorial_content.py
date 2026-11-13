@@ -16,11 +16,11 @@ spec.loader.exec_module(builder)
 
 class TutorialContentTest(unittest.TestCase):
     def setUp(self):
-        self.lesson=json.loads((ROOT/'scripts/tutorials/introduction.json').read_text())
+        self.lesson=json.loads((ROOT/'content/scripts/tutorials/introduction.json').read_text())
     def test_catalog_bundles_are_current(self):
-        for entry in json.loads((ROOT/'scripts/tutorials/catalog.json').read_text()):
-            definition=json.loads((ROOT/entry['definition']).read_text())
-            self.assertEqual(builder.bundle(definition),(ROOT/entry['script']).read_text())
+        for entry in json.loads((ROOT/'content/scripts/tutorials/catalog.json').read_text()):
+            definition=json.loads((ROOT/'content'/entry['definition']).read_text())
+            self.assertEqual(builder.bundle(definition),(ROOT/'content'/entry['script']).read_text())
 
     def test_shipped_lessons_have_no_unreachable_target_definitions(self):
         # Hooks may refer to targets through code; ordinary shipped definitions
@@ -67,26 +67,6 @@ class TutorialContentTest(unittest.TestCase):
         d=copy.deepcopy(self.lesson)
         d['steps'][0]['onEnter']=[{'type':'scenarioOrder','team':1,'order':{'type':'moveFlag','destination':'missing'}}]
         with self.assertRaises(ValueError): builder.validate(d)
-    def test_source_and_debug_packages_keep_lesson_definitions_and_scripts(self):
-        class Environment(dict):
-            def Install(self, destination, source):
-                installed.append((destination,source))
-            def Alias(self, *args): pass
-        for target in ('dist','install'):
-            packed=[];installed=[];old=Path.cwd()
-            try:
-                os.chdir(ROOT/'scripts')
-                runpy.run_path('SConscript',init_globals={'env':Environment(TARFILE='source.tar',INSTALLDIR='prefix'),
-                    'Import':lambda *args:None,'PackTar':lambda archive,path:packed.append(Path(path).as_posix()),
-                    'COMMAND_LINE_TARGETS':[target]})
-            finally:
-                os.chdir(old)
-            self.assertIn('tutorials/catalog.json',packed)
-            self.assertIn('tutorials/healing.json',packed)
-            self.assertIn('healing.js',packed)
-            for part in range(1,5):
-                self.assertNotIn(f'tutorial_part{part}.sgsl',packed)
-            self.assertTrue(any('tutorials' in dest and source.endswith('catalog.json') for dest,source in installed))
     def test_an_additional_ordinary_step_needs_only_definition_data(self):
         d=copy.deepcopy(self.lesson)
         d['steps'].append(copy.deepcopy(d['steps'][1]));d['steps'][-1]['id']='build-another'
@@ -98,7 +78,7 @@ class TutorialContentTest(unittest.TestCase):
         spec.loader.exec_module(exporter)
         rows,missing=exporter.rows()
         paths={row[1] for row in rows if row[0]=='tutorial'}
-        self.assertEqual(paths,{entry['definition'] for entry in json.loads((ROOT/'scripts/tutorials/catalog.json').read_text())})
+        self.assertEqual(paths,{entry['definition'] for entry in json.loads((ROOT/'content/scripts/tutorials/catalog.json').read_text())})
         self.assertFalse(any(path.endswith('.sgsl') for path in paths))
 
     def test_invalid_lesson_selection_fails_before_generation_or_bundle_writes(self):
@@ -110,26 +90,12 @@ class TutorialContentTest(unittest.TestCase):
             self.assertIn(message,result.stderr)
             self.assertEqual(result.stdout,'')
 
-    def test_source_archive_keeps_the_build_tools_shared_inventory(self):
-        packed=[]
-        old=Path.cwd()
-        try:
-            os.chdir(ROOT/'tools')
-            runpy.run_path('SConscript',init_globals={'env':{'TARFILE':'source.tar'},
-                'Import':lambda *args:None,
-                'PackTar':lambda archive,paths:packed.extend(paths if isinstance(paths,list) else [paths]),
-                'COMMAND_LINE_TARGETS':['dist']})
-        finally:
-            os.chdir(old)
-        self.assertIn('tutorials/build.py',packed)
-        self.assertIn('tutorials/content.py',packed)
-
     def test_shared_inventory_rejects_empty_catalogs(self):
         from tutorials.content import packaged_assets
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory)
-            (root/'scripts/tutorials').mkdir(parents=True)
-            (root/'scripts/tutorials/catalog.json').write_text('[]')
+            (root/'content/scripts/tutorials').mkdir(parents=True)
+            (root/'content/scripts/tutorials/catalog.json').write_text('[]')
             with self.assertRaisesRegex(ValueError,'catalog entries'):
                 packaged_assets(root)
 

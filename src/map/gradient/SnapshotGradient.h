@@ -1,14 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include "BuildingRoute.h"
 #include "sim/snapshot/WorldSnapshot.h"
 #include "field/GradientWorkspace.h"
+#include "field/GradientDestinations.h"
 #include <vector>
 #include <span>
 #include <exception>
 #include <stdexcept>
-#include "Team.h"
+#include "TeamCapacity.h"
 #include "BuildingGradientSearch.h"
-#include "Building.h"
+class Building;
 #include "SeedCells.h"
 
 class ComputeExecutor;
@@ -39,6 +41,9 @@ struct Request
     int consumer = -1;
     bool excludesShared = false;
     unsigned modes = 1;
+    // Opt-in foundation; production material requests remain cost-only until
+    // metadata backend equivalence, persistence and performance are validated.
+    bool destinations = false;
 };
 // One executor thread owns each cache. Stamps identify immutable inputs, not ticks:
 // jobs may arrive out of order and a pooled snapshot buffer may have been reused.
@@ -55,7 +60,7 @@ struct MaterialSeedCache
     std::vector<Uint32> resourceTraits;
     std::vector<Uint32> forbiddenMasks;
     std::array<Bits, MaterialCount> goals, airGoals;
-    std::array<Bits, Team::MAX_COUNT> forbidden;
+    std::array<Bits, TEAM_MAX_COUNT> forbidden;
     Bits buildings, airBuildings;
     std::array<std::vector<Uint64>, 4> stamps;
     bool disabled = false;
@@ -73,12 +78,15 @@ void boxSum(Uint16* grid, int width, int height, CrowdingScratch& scratch);
 std::uint64_t seed(const Request& request, const SimulationSnapshot::Handle& snapshot, Uint16* output, CrowdingScratch& scratch);
 void propagate(const Request& request, const SimulationSnapshot::Handle& snapshot, Uint16* output, GradientWorkspace& scratch);
 void propagateCPU(const Request& request,const SimulationSnapshot::Handle& snapshot,Uint16* output,GradientWorkspace& scratch);
+void propagateCPU(const Request&, const SimulationSnapshot::Handle&, Uint16*, GradientWorkspace&,
+    gradient_kernel::DestinationPlanes);
 
 // Worker-side ownership transfer for the asynchronous device service. Only
 // terrain survives seed preparation; the DTO owns all inputs and original seeds.
 std::shared_ptr<gradient_kernel::OwnedGradientField> ownPropagation(
     const Request&, const SimulationSnapshot::Handle&, std::unique_ptr<Uint16[]>&,
-    std::shared_ptr<gradient_kernel::BackendSession>, gradient_kernel::PlanDecision, std::uint64_t due);
+    std::shared_ptr<gradient_kernel::BackendSession>, gradient_kernel::PlanDecision, std::uint64_t due,
+    std::shared_ptr<gradient_kernel::OwnedDestinations> destinations = {});
 struct MinimalCostViewMetrics {
     Uint64 attempted=0,constructed=0,reused=0,declined=0,copiedBytes=0;
     Uint64 budgetDeclines=0,allocationDeclines=0,representationDeclines=0;

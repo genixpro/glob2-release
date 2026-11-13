@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
 #include <map>
 #include <nlohmann/json_fwd.hpp>
+#include "TerrainSmoothBorders.h"
 
 namespace TerrainVisual
 {
@@ -15,17 +17,50 @@ struct Variant
 	int frame;
 	unsigned weight;
 };
+// Contour geometry of a boundary profile. Patch blends the nine prepared
+// patches with authored contour curves; contextual follows marching-square
+// curves through two-material cells; smooth follows a spline field through the
+// vertex neighbourhood (see TerrainSmoothBorders.h).
+enum class BoundaryShape { Patch, Contextual, Smooth };
 struct Profile
 {
 	std::string key;
+	BoundaryShape shape = BoundaryShape::Patch;
+	// Version 4: rank among the edges of one border class; the higher one
+	// shapes a contact between two materials of that class.
+	int precedence = 0;
+	// Version 4: profile this edge draws against a shoreline class, or -1.
+	int coast = -1;
+	int wiggle = 0;        // Smooth: Q8 pixels of meander along a straight contour.
+	int wigglePeriod = 64; // Smooth: logical pixels between the broadest meanders.
+	int squareness = 0;    // Smooth: Q8 from round (0) to square (256) corners.
+	int detail = 0;        // Smooth: Q8 pixels of fine (16 px) edge roughness.
+	int jagged = 0;        // Smooth: Q8 pixels (0-2048) of angular grit (8 and 4 px, creased).
 	int roughness = 192;  // Q8 multiplier; 256 represents 1.
 	int feather = 256;    // Q8 native-pixel edge softness.
 	int amplitude = 512;  // Q8 pixel limit on local contour displacement.
 	int speckle = 0;      // Q8 pixel reach of detached pebbles beside an edge.
+	// Version 4: the shape the dominant side of a contact gives it (see
+	// Catalog::shapes). Teeth are Q8 pixels of displacement along the edge,
+	// sharp on one side and rounded on the other: points push sharp crests of
+	// the shaping material into its neighbour, as resistant rock does; lobes
+	// push rounded tongues with sharp re-entrant cusps, as an advancing flow
+	// does. Facets interpolate the teeth linearly, so flanks run straight.
+	int teeth = 0;
+	bool lobes = false, facets = false;
+	// Version 4: loose or broken grains this material sheds across its own
+	// edges into a neighbour, within speckle reach: none, rounded grains
+	// (sand, soil) or angular chips (rock, ice).
+	enum class Clasts : unsigned char { None, Round, Angular } clasts = Clasts::None;
+	// Version 4 physical properties, Q8 from 0 to 256 (grain in Q8 pixels),
+	// from which the contact parameters above derive when a profile does not
+	// name them (see docs/assets/terrain-rendering.md#physical-properties).
+	// physical is false when a profile names none of them.
+	bool physical = false;
+	int resistance = 0, cohesion = 0, grain = 0, spread = 0;
 	int bridge = 0;       // Q8 pixel half-width of the neck joining diagonal lobes.
 	int shearScale = 128; // Version 3 reads shear curves as pixel displacement (256).
 	bool legacyEdges = false;
-	bool contextual = false; // Neighbour-guided natural border geometry (version 3).
 	std::vector<std::vector<int>> contours; // Q12 normalized patch displacements.
 };
 // Contact treatment where this material meets another. A higher material casts
@@ -37,23 +72,164 @@ struct Seam
 	int fringe = 0, fringeWidth = 0; // Q8 tint strength and Q8 pixel width.
 	std::array<unsigned char, 3> fringeColor{255, 255, 255};
 };
+// Animated shoreline where a liquid ("surf") material meets any material
+// without surf: lighter shallows on the liquid side, a darker wet band on the
+// land side, and a foam line that washes up the land and back. Widths and reach
+// are Q8 logical pixels from the coverage margin, which is exact only within
+// eight pixels of the edge, so every band must end inside that distance.
+struct Surf
+{
+	int period = 0;                  // Animation ticks per wash; zero disables surf.
+	int ticks = 1;                   // Animation ticks per surf update (and page re-blend).
+	int reach = 0;                   // Q8 pixels the wash climbs onto the land.
+	int shallow = 0, shallowWidth = 0; // Q8 tint strength and Q8 pixel width.
+	int wet = 0, wetWidth = 0;         // Q8 darkening strength and Q8 pixel width.
+	int foam = 0, foamWidth = 0;       // Q8 strength and Q8 pixel half-width.
+	std::array<unsigned char, 3> shallowColor{}, foamColor{255, 255, 255};
+};
+// Applies surf to one composed sample. value holds the composed channels and
+// is updated in place. surfSide is true when the sample's dominant material is
+// the surf one. wx and wy are the sample's non-negative Q8 world pixel
+// coordinates. land is the Q8 shore wash of the land material across the
+// shoreline (Material::shoreWash): it scales the wash's reach and swing; the
+// bands keep their full strength. The integer arithmetic is mirrored exactly by
+// libs/gag/shaders/terrain-compose-fragment.glsl and, in floating point, by the
+// direct terrain shader (libs/gag/include/DirectTerrainShader.h).
+void applySurf(const Surf &, bool surfSide, int margin, int wx, int wy, unsigned time,
+			   unsigned value[3], int land = 256);
+// Share of each wash (of 1024) spent rushing up the beach; the rest drains back
+// more slowly. Mirrored as washIn in libs/gag/shaders/terrain-compose-fragment.glsl.
+constexpr int SurfWashInQ10 = 224;
+// Shore calm: animated surf liquids fade from their full waves to a quiet
+// shimmer toward land, so the surf is the only motion at the beach. The fade
+// ends ShoreCalmReachQ8 (Q8 cells) from the shoreline, which lies halfway
+// between a land and a liquid vertex; ShoreCalmContrastQ8 is the share of the
+// wave contrast kept at the shoreline itself.
+constexpr int ShoreCalmReachQ8 = 512; // Two tiles.
+constexpr int ShoreCalmContrastQ8 = 64;
+// Q8 calm of a liquid vertex whose nearest non-surf vertex is at squared
+// vertex distance d2 (zero means none within reach).
+unsigned shoreCalmAt(int d2);
+// An offset beyond this integer radius already has zero calm, even on
+// an axis. The half-cell term matches the shoreline offset in shoreCalmAt.
+constexpr int ShoreCalmSearch = (ShoreCalmReachQ8 + 128) / 256;
+// Calm at a sample: corner calm bilinearly interpolated at Q8 cell position
+// fx, fy (0..256). The result is continuous across cells.
+unsigned shoreCalm(const std::array<std::uint8_t, 4> &corners, unsigned fx, unsigned fy);
+// Pulls rgb toward mean by calm (Q8), keeping `strength` of the reduction;
+// mirrored exactly by libs/gag/shaders/terrain-compose-fragment.glsl.
+void applyShoreCalm(unsigned calm, unsigned strength, const std::array<unsigned char, 3> &mean,
+					unsigned rgb[3]);
 // Raised objects drawn over a material's cells with the resources, in screen
 // row order, so they overlap neighbouring cells (boulders, hedges, rock).
 // `full` frames are for cells surrounded by the same material, `edge` frames
 // (smaller, pulled toward the cell centre) for cells with an open neighbour.
+// Connected foliage instead selects its surface using the painted corner mask.
 struct Decor
 {
 	std::string sprite;
 	std::vector<int> full, edge;
+	// Optional mask-major frames: TL=1, TR=2, BL=4, BR=8. Equal numbers
+	// of variants for each of the 16 masks; mask zero is never drawn.
+	std::vector<int> connected;
+	// Corner tiles ("connected_corners"): each mask holds 16 variants indexed by
+	// the colour bits of the cell's four vertices (see cornerColours), so a
+	// texture continues across every cell edge without repeating periodically.
+	bool connectedCorners = false;
+	// Optional extra filled-mask frames ("connected_interior"), colour-major with
+	// the same count per colour: alternative interiors picked by a cell hash.
+	std::vector<int> connectedInterior;
+	// Draw the corner-mask frames against open ground too ("connected_open"):
+	// cells with undecorated corners show this material's edge, as for a cliff
+	// whose rim and walls stand on the grass, instead of no raised decor.
+	bool connectedOpen = false;
+	// Optional frames against another connected mass ("connected_foreign", needs
+	// connected_corners and connected_open): where corners belong to another mass,
+	// the rim pulls back a quarter of the cell, so two masses stand apart across a
+	// valley half a cell wide. ForeignCodes masks, code-major, 16 colours each.
+	std::vector<int> connectedForeign;
+	// Terraced masses ("connected_tiers", needs connected_open): deep inside a
+	// large patch the same corner frames are drawn again, lifted, as up to
+	// MaxDecorTiers terraces stepping up toward the middle (Compositor::decorTierFrame).
+	bool connectedTiers = false;
+	// Clearance from masses ("clear_of_masses", object decor only): the decor is
+	// not drawn on a cell when a vertex of a connected open-ground mass (cliffs,
+	// glacier...) lies within this many vertices of the cell's corners, so spires
+	// and pillars do not stand against a mass's rim and terraces. 0 checks the
+	// cell's own corners; -1 (absent) draws as usual.
+	int clearOfMasses = -1;
+};
+// Largest accepted clear_of_masses: one vertex past the corners, the terrain a
+// cell's discovery check already covers, so fog hides no mass the decor reveals.
+inline constexpr int MaxDecorClearOfMasses = 1;
+// Terraces of a tiered mass: at most this many above the base, each drawn
+// DecorTierRise native pixels above the one below.
+inline constexpr int MaxDecorTiers = 3;
+inline constexpr int DecorTierRise = 20;
+// Corner codes with own (1) and foreign (2) corners in base 3 (TL, TR, BL, BR),
+// in increasing code order: the layout of Decor::connectedForeign.
+inline constexpr unsigned ForeignCodes = 50;
+// Index of a cell's own/foreign corner masks in ForeignCodes order, or -1 when
+// the cell has no own or no foreign corner.
+int foreignCodeIndex(unsigned ownMask, unsigned foreignMask);
+// Decor frames may be up to MaximumDecorFrame native pixels on each side. A
+// frame up to 64 px tall is centred on its 32 px cell; a taller frame keeps a
+// 64 px frame's bottom edge, 16 px below the cell, and grows upward, so tall
+// obstacles stand on their own cell rather than spilling into the row south.
+// Every frame is centred horizontally. Offsets are subtracted from the cell's
+// top-left corner.
+constexpr int MaximumDecorFrame = 128;
+constexpr int decorOffsetX(int width) { return (width - 32) >> 1; }
+constexpr int decorOffsetY(int height) { return std::max((height - 32) >> 1, height - 48); }
+// Native pixels a decor frame extends beyond its cell on each side.
+struct DecorReach
+{
+	int up = 0, down = 0, side = 0;
+	void include(int width, int height)
+	{
+		up = std::max(up, decorOffsetY(height));
+		down = std::max(down, height - 32 - decorOffsetY(height));
+		side = std::max(side, decorOffsetX(width));
+	}
+};
+// Version 4 border class: what kind of surface a material is (cover, cut,
+// built, flow, solid, pool). Classes are listed strongest first; the stronger
+// side of a contact shapes it. A shoreline class takes the shape of its basin,
+// so the land against it draws its coast profile.
+struct BorderClass
+{
+	std::string key;
+	bool shoreline = false;
+	// Laid stone paths do not end on whole stones against this class: water,
+	// lava, holes and chasms cut the stones along their own smooth edge, as a
+	// quay or a drop would, instead of filling the gaps of dropped stones.
+	bool cutsStones = false;
+};
+// A flat animated overlay drawn over the ground under any decor ("overlay"),
+// such as the glints that mark fertile ground. Each cycle lists one frame per
+// step, -1 for a step that draws nothing; a cell keeps one cycle, starts it at
+// its own hashed step and advances one step every `ticks` scene ticks. Only
+// densityQ8/256 of the cells draw at all, chosen by a presentation hash.
+struct Overlay
+{
+	std::string sprite;
+	std::vector<std::vector<int>> cycles;
+	int ticks = 1;
+	int densityQ8 = 256;
 };
 struct Material
 {
 	std::string key, sprite;
+	unsigned borderClass = 0; // Version 4.
 	std::vector<Variant> variants;
 	unsigned totalWeight = 0;
 	std::uint32_t salt = 0;
+	std::uint32_t blockSalt = 0;
 	unsigned profile = 0;
 	int animationFrames = 1, animationTicks = 1, animationStride = 0;
+	// Crossfade weights per phase ("animation_blend_steps"); zero blends on
+	// every tick. Fewer steps recompose animated pages less often.
+	int animationBlendSteps = 0;
 	// Variants share one periodic edge band and join without the runtime's
 	// border blend toward variant 0 ("edges": "periodic").
 	bool periodicEdges = false;
@@ -62,9 +238,24 @@ struct Material
 	// periodic field larger than a cell continues across every cell edge.
 	// Zero picks variants by hash.
 	int variantGrid = 0;
+	// Interchangeable blocks share boundary geometry; choose one per map block.
+	int variantBlocks = 1;
+	// Laid stone paths ("stones"): the data path of the stone map that numbers
+	// the stones of the variant block, so their borders keep or drop whole
+	// stones (see TerrainStones.h). Empty for every other material.
+	std::string stones;
 	Decor decor;
+	Overlay overlay;
 	std::array<unsigned char, 3> preview{}, minimap{};
 	Seam seam;
+	Surf surf;
+	// Q8 strength of a liquid's surf where it washes against this material
+	// ("shore_wash_q8", default 256): paved paths take a calmer wash.
+	int shoreWash = 256;
+	// Set by the compositor for animated surf liquids: their mean native colour,
+	// toward which shore calm pulls the waves.
+	bool shoreCalm = false;
+	std::array<unsigned char, 3> calmMean{};
 };
 struct PairTreatment
 {
@@ -78,21 +269,62 @@ class Catalog
 	int version = 2;
 	// Q8 pixel amplitudes at 64px, 32px and 8px scales. Omitted in older packs.
 	std::array<int, 3> boundaryWarp{};
+	std::vector<BorderClass> borderClasses; // Version 4, strongest first.
 	std::vector<Profile> profiles;
 	std::vector<Material> materials;
 	std::vector<PairTreatment> treatments;
 	std::map<std::string, MaterialId> bindings;
 	static Catalog parse(const nlohmann::json &document);
 	MaterialId find(const std::string &key) const;
+	// Boundary profile drawing the contact of two different materials; see
+	// TerrainBorderRules.cpp.
 	unsigned profileFor(MaterialId a, MaterialId b) const;
 	bool contextualFor(MaterialId a, MaterialId b) const;
+	// Version 4: a's border class is stronger, or the same class with a higher
+	// edge precedence. Diagonal smooth contacts join the dominant material.
+	bool dominates(MaterialId a, MaterialId b) const;
+	// Version 4: a gives the contact of a and b its shape: the dominant
+	// material, or the lower key between equals. Pure in the pair, so every
+	// tile agrees, and exactly one of shapes(a, b) and shapes(b, a) holds.
+	bool shapes(MaterialId a, MaterialId b) const;
+	// Whether a seam shadow, fringe or surf band is drawn where a meets b.
+	bool bandsBetween(MaterialId a, MaterialId b) const
+	{
+		const auto &x = materials[a], &y = materials[b];
+		if ((x.surf.period > 0) != (y.surf.period > 0))
+			return true;
+		if (x.seam.fringe || y.seam.fringe)
+			return true;
+		const auto &higher = x.seam.height > y.seam.height ? x.seam : y.seam;
+		return x.seam.height != y.seam.height && higher.cast && higher.castWidth;
+	}
+	// Whether laid stones are cut, not kept or dropped, where they meet this
+	// material (BorderClass::cutsStones; always false before version 4).
+	bool cutsStones(MaterialId id) const
+	{
+		return version >= 4 && materials[id].borderClass < borderClasses.size() &&
+			   borderClasses[materials[id].borderClass].cutsStones;
+	}
 	// seed is the map's terrain look seed (Recipe::seed); zero for diagnostics.
 	unsigned variantIndex(MaterialId material, int x, int y, std::uint32_t seed = 0) const;
 	int frame(MaterialId material, int x, int y, int time, std::uint32_t seed = 0) const;
 	// Decor frame for a cell of this material, or -1 when it has no decor.
-	int decorFrame(MaterialId material, int x, int y, bool edge, std::uint32_t seed = 0) const;
+	// cornerColours selects the variant of corner-tiled connected decor.
+	int decorFrame(MaterialId material, int x, int y, bool edge, std::uint32_t seed = 0,
+		unsigned cornerMask = 15, unsigned cornerColours = 0) const;
+	// The connected_foreign frame of a cell whose other corners hold another
+	// mass, or -1 when the material has none.
+	int decorForeignFrame(MaterialId material, unsigned ownMask, unsigned foreignMask, unsigned cornerColours) const;
+	// Overlay frame for a cell of this material at a presentation time (the
+	// clock `frame` uses for animated materials), or -1 when the material has
+	// no overlay, the cell is not chosen or its step is empty.
+	int overlayFrame(MaterialId material, int x, int y, std::uint32_t time, std::uint32_t seed = 0, bool *animated = nullptr) const;
 };
 std::uint32_t hash(std::uint32_t x, std::uint32_t y, std::uint32_t salt = 0);
+std::uint32_t mapSeedSalt(std::uint32_t seed);
+// One seeded bit per map vertex, packed for a cell in corner-mask order. It is
+// shared by all materials, so adjacent connected foliage joins the same shapes.
+unsigned cornerColours(int x, int y, unsigned maskW, unsigned maskH, std::uint32_t seed);
 struct Recipe
 {
 	// Materials of the cell's corner vertices: top-left, top-right, bottom-left,
@@ -106,6 +338,63 @@ struct Recipe
 	// Row-major vertices (-1,-1)..(2,2); optional for standalone diagnostics.
 	std::array<MaterialId, 16> neighborhood{};
 	bool hasNeighborhood = false;
+	// Q8 shore calm of each corner (see shoreCalm), zero away from land.
+	std::array<std::uint8_t, 4> calm{};
+	bool calmed() const { return calm != std::array<std::uint8_t, 4>{}; }
+	// Whole-stone path edges (see TerrainStones.h). Each layer is one laid
+	// stone path whose stones reach this cell: ground is the land a dropped
+	// stone reveals, and kept holds, for this cell and its eight neighbours in
+	// row-major order from (-1,-1), one bit per stone centred in that cell,
+	// numbered as in the stone map: set when kept. Where two paths meet, both
+	// are layers, dominant first, so every cell a stone reaches decides it alike.
+	struct StoneLayer
+	{
+		MaterialId material = 0, ground = 0;
+		std::array<std::uint64_t, 9> kept{};
+		bool operator==(const StoneLayer &) const = default;
+	};
+	static constexpr unsigned MaxStoneLayers = 3;
+	bool stones = false; // stoneLayerCount > 0.
+	std::uint8_t stoneLayerCount = 0;
+	std::array<StoneLayer, MaxStoneLayers> stoneLayers{};
+	// Bit k set when corners[k] cuts stones (Catalog::cutsStones): samples
+	// covered by such a corner keep the smooth border.
+	std::uint8_t stoneCutCorners = 0;
+	// Neighbourhood materials that are no corner here but draw a seam or surf
+	// band against one. They never cover a sample of this cell; they give its
+	// seams and surf the distance to their contour beyond the tile edge, so the
+	// bands continue across it, even into a cell whose corners all agree.
+	static constexpr unsigned MaxHalo = 3;
+	std::uint8_t haloCount = 0;
+	std::array<MaterialId, MaxHalo> halo{};
+	// One material fills the whole cell: its corners agree and no stone
+	// border reaches it.
+	bool uniform() const
+	{
+		return !stones && !haloCount && corners[1] == corners[0] && corners[2] == corners[0] && corners[3] == corners[0];
+	}
+	// The distinct materials the cell may draw, in palette order: its corners,
+	// then each stone layer's material and ground. Returns the count.
+	unsigned palette(std::array<MaterialId, 4> &out) const
+	{
+		unsigned count = 0;
+		const auto add = [&](MaterialId id)
+		{
+			for (unsigned i = 0; i < count; ++i)
+				if (out[i] == id) return;
+			// describe() sets stones only when all of them fit.
+			if (count < out.size()) out[count++] = id;
+		};
+		for (const auto id : corners) add(id);
+		for (unsigned i = 0; i < stoneLayerCount; ++i)
+		{
+			add(stoneLayers[i].material);
+			add(stoneLayers[i].ground);
+		}
+		for (unsigned i = 0; i < haloCount; ++i)
+			add(halo[i]);
+		return count;
+	}
 	bool operator==(const Recipe &) const = default;
 };
 struct Coverage
@@ -126,11 +415,15 @@ struct Coverage
 class PreparedCoverage
 {
   public:
-	PreparedCoverage(const Catalog &, const Recipe &);
+	enum class Detail { Surface, Weights };
+	PreparedCoverage(const Catalog &, const Recipe &, Detail = Detail::Surface);
 	// Q8 local pixel coordinates; resolution independent and toroidally periodic.
 	Coverage at(int px, int py) const;
 
   private:
+	SmoothBorders smooth;
+	Coverage roughCoverage(int px, int py) const;
+	bool edgeMetadata;
 	struct Point { float x = 0, y = 0; };
 	struct Border
 	{
@@ -143,7 +436,14 @@ class PreparedCoverage
 	bool hasBorder = false;
 	std::array<MaterialId, 2> borderMaterials{};
 	float borderBlendScale = 65536;
+	// Nearest contour segment (1-based, 0 when beyond the seam reach) at two-pixel
+	// lattice points from -4 to 36 logical pixels. Samples search only the
+	// segments their lattice corners name, not the whole curve.
+	static constexpr int NearestLattice = 21;
+	std::array<std::uint8_t, NearestLattice * NearestLattice> nearestSegment{};
 	void prepareBorders(const Catalog &, const Recipe &);
+	void prepareNearestSegments();
+	unsigned borderMargin(Point sample) const;
 	Coverage patchCoverage(int px, int py, const std::array<int, 2> *displacement = nullptr) const;
 	struct WarpLayer
 	{

@@ -14,10 +14,15 @@
 //
 // The experiment is baked into the game's header (GameOptions::experiments).
 // The first case runs the same scenarios without it, expects the old outcome,
-// and compares the default game's per-100-tick checksums against a checked-in
-// golden, so any change to the default path through this code shows up.
+// checks that a save continues identically, and records the default game's
+// per-100-tick checksums for sim-diff, so any change to the default path through
+// this code shows up there.
 
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "gradient/MapRouting.h"
+#include "HeadlessGame.h"
+#include "Continuation.h"
+#include "Property.h"
 #include "GradientFixture.h"
 #include "Brush.h"
 #include "ExperimentalFeatures.h"
@@ -25,8 +30,6 @@
 #include "Order.h"
 #include "UnitConsts.h"
 #include "map/gradient/SnapshotGradient.h"
-#include <BinaryStream.h>
-#include <StreamBackend.h>
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -36,8 +39,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
-
-using namespace GAGCore;
+#include "Unit.h"
+#include "Building.h"
 
 namespace
 {
@@ -49,6 +52,9 @@ namespace
 		bool slowCadence = false;       // allocate what a large game has: about every 170 ticks
 		Uint32 seed = 1;
 		bool experiment = true;
+		// With experiment false: set the flag and clear it again, rather than never
+		// mentioning it, so the header carries an explicit "off".
+		bool explicitlyOff = false;
 	};
 
 	// A painted square and how it is counted.
@@ -59,17 +65,6 @@ namespace
 		int half;        // painted box is (2*half+1) square
 		int countRadius; // warriors within this many tiles count as "at" the zone
 	};
-
-	// Simulation checksum of everything that matters, for continuation checks.
-	std::vector<Uint32> simulationState(Game& game, bool legacy152=false)
-	{
-		std::vector<Uint32> result, buildings, units;
-		game.checkSum(&result, &buildings, &units, true, legacy152);
-		result.erase(result.begin()); // the save path upgrades the map format header
-		result.insert(result.end(), buildings.begin(), buildings.end());
-		result.insert(result.end(), units.begin(), units.end());
-		return result;
-	}
 
 	// Steps a game, keeping every warrior fed so the scenarios stay about
 	// guarding rather than eating. Optional movement counts are simulation data;
@@ -104,6 +99,11 @@ namespace
 		game.seed = options.seed;
 		if (options.experiment)
 			game.experiments.set(ExperimentId::GuardAreaBalancing);
+		else if (options.explicitlyOff)
+		{
+			game.experiments.set(ExperimentId::GuardAreaBalancing, true);
+			game.experiments.set(ExperimentId::GuardAreaBalancing, false);
+		}
 		return game;
 	}
 
@@ -118,7 +118,7 @@ namespace
 		{
 			if (options.resourceGradients)
 				for (int r = 0; r < MaterialCount; ++r)
-					glob2test::awaitGradient(game,[&] { return game.map.getMaterialGradientSlot(0,r,0); });
+					glob2test::awaitGradient(game,[&] { return game.map.routing().getMaterialGradientSlot(0,r,MovementAccess::Land); });
 			if (options.slowCadence)
 			{
 				// Two more teams with every resource field allocated: the round-robin
@@ -128,7 +128,7 @@ namespace
 				for (int t = 0; t < 3; ++t)
 					for (int r = 0; r < MaterialCount; ++r)
 						for (int c = 0; c < SWIM_CLASS_COUNT; ++c)
-							glob2test::awaitGradient(game,[&] { return game.map.getMaterialGradientSlot(t,r,c); });
+							glob2test::awaitGradient(game,[&] { return game.map.routing().getMaterialGradientSlot(t,r,movementAccessFromLegacy(c)); });
 			}
 		}
 
@@ -480,7 +480,7 @@ namespace
 	// field and its refresh flag are saved with the live RNG, and the crowding
 	// counts are recomputed from unit positions at the next rebuild, so no
 	// derived state is lost. The experiment travels in the header, so the loaded
-	// game balances too.
+	// game balances too, and a game without it stays on the default path.
 	void savedGameContinuesIdentically(const Options& options)
 	{
 		World world(options);
@@ -489,37 +489,16 @@ namespace
 		world.spawnWarriors(SPAWN_X, SPAWN_Y, options.warriors);
 		world.run(1500);
 
-		auto* backend = new MemoryStreamBackend();
-		BinaryOutputStream output(backend);
-		world.headless.gui.save(&output, "guard continuation");
-		const std::string bytes(backend->getBuffer(), backend->getPosition());
-
-		std::vector<std::vector<Uint32>> continuation;
-		for (int i = 0; i < 1000; ++i)
-		{
-			world.run(1);
-			continuation.push_back(simulationState(world.game));
-		}
-
-		GameGUI restored(false);
-		auto* source = new MemoryStreamBackend(bytes.data(), bytes.size());
-		source->seekFromStart(0);
-		BinaryInputStream input(source);
-		REQUIRE(restored.load(&input));
-		REQUIRE(restored.game.gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing));
-		// Mirrors GameGUI::loadFromHeaders, which applies the player header after Game::load.
-		restored.game.setGameHeader(world.game.gameHeader, true);
-		Team* restoredTeam = restored.game.teams[0];
-		for (int i = 0; i < 1000; ++i)
-		{
-			stepGame(restored.game, restoredTeam, 1);
-			const auto actual = simulationState(restored.game);
-			if (actual != continuation[i])
-			{
-				std::fprintf(stderr, "continuation mismatch at step %d after loading (sizes %zu/%zu)\n", i, actual.size(), continuation[i].size());
-				REQUIRE_MESSAGE(false, "the loaded game continues identically");
-			}
-		}
+		// Saved and loaded through GameGUI, as a player's save is.
+		const auto result = glob2test::expectContinuation(world.game, {.ticks = 1000,
+			.step = [](Game& game) { stepGame(game, game.teams[0], 1); return std::vector<std::string>{}; },
+			.gui = &world.headless.gui, .name = "guard continuation",
+			.afterLoad = [&options](Game& original, Game& loaded) {
+				REQUIRE(loaded.gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing) == options.experiment);
+				// Mirrors GameGUI::loadFromHeaders, which applies the player header after Game::load.
+				loaded.setGameHeader(original.gameHeader, true);
+			}});
+		REQUIRE_MESSAGE(result.matched, "the loaded game continues identically");
 		std::printf("[saveload] near %d  far %d after 2500 ticks, 1000 of them after a load\n",
 			world.countNear(NEAR_AREA), world.countNear(FAR_AREA));
 	}
@@ -540,7 +519,7 @@ namespace
 			if (tick)
 				world.run(100);
 			Uint32 hash = 2166136261u; // FNV-1a over every checksum word
-			for (Uint32 word : simulationState(world.game, true))
+			for (Uint32 word : glob2test::simulationComponents(world.game, true))
 			{
 				hash ^= word;
 				hash *= 16777619u;
@@ -548,6 +527,29 @@ namespace
 			text << tick << ' ' << std::hex << std::setw(8) << std::setfill('0') << hash << std::dec << '\n';
 		}
 		return text.str();
+	}
+
+	// The off-path scenario's full simulation state after every tick, without the
+	// experiment: the flag never mentioned, or explicitly set false.
+	std::vector<std::vector<Uint32>> offPathStates(bool explicitlyOff, Uint32 seed, int ticks)
+	{
+		setSyncRandSeed(seed);
+		Options options;
+		options.experiment = false;
+		options.explicitlyOff = explicitlyOff;
+		options.seed = seed;
+		World world(options);
+		CHECK_FALSE(world.game.gameHeader.hasExperiment(ExperimentId::GuardAreaBalancing));
+		world.paint(NEAR_AREA);
+		world.paint(FAR_AREA);
+		world.spawnWarriors(SPAWN_X, SPAWN_Y, options.warriors);
+		std::vector<std::vector<Uint32>> states;
+		for (int tick = 0; tick < ticks; ++tick)
+		{
+			world.run(1);
+			states.push_back(glob2test::simulationComponents(world.game));
+		}
+		return states;
 	}
 
 	// The separable box sum must equal a brute-force count, including across the
@@ -560,7 +562,7 @@ namespace
 		world.spawnWarriors(62, 40, 4);
 		world.spawnWarriors(30, 30, options.warriors);
 		std::vector<Uint16> crowd(map.getW() * map.getH());
-		REQUIRE(map.computeWarriorCrowding(0, crowd.data()));
+		REQUIRE(map.routing().computeWarriorCrowding(0, crowd.data()));
 		int mismatches = 0;
 		for (int y = 0; y < map.getH(); ++y)
 			for (int x = 0; x < map.getW(); ++x)
@@ -580,7 +582,7 @@ namespace
 		// A team without warriors reports so and leaves the buffer alone.
 		World empty(options);
 		std::vector<Uint16> untouched(map.getW() * map.getH(), 7);
-		CHECK(!empty.game.map.computeWarriorCrowding(0, untouched.data()));
+		CHECK(!empty.game.map.routing().computeWarriorCrowding(0, untouched.data()));
 		CHECK(untouched[0] == 7);
 	}
 
@@ -642,7 +644,7 @@ namespace
 			world.paint(b);
 			world.spawnWarriors(w / 4, w / 4, options.warriors);
 			std::vector<Uint16> crowd(w * w);
-			timeIt("crowding pass", w, options.warriors, [&] { world.game.map.computeWarriorCrowding(0, crowd.data()); });
+			timeIt("crowding pass", w, options.warriors, [&] { world.game.map.routing().computeWarriorCrowding(0, crowd.data()); });
 			timeGuardReference(world,"reference guard kernel",options.warriors);
 		}
 	}
@@ -650,14 +652,35 @@ namespace
 
 TEST_SUITE("GuardAreaBalance")
 {
-	TEST_CASE("without the experiment every warrior takes the nearest area; nobody leaves it; the checksum trace is stable [golden]")
+	TEST_CASE("without the experiment every warrior takes the nearest area, nobody leaves it, and a save continues identically [sim-trace]")
 	{
 		glob2test::HeadlessGlobals globals;
 		Options options;
 		options.experiment = false;
 		spawnSplitsBetweenAreas(options);
 		clumpDrainsIntoNewArea(options);
-		glob2test::expectGolden("guard-area/off-path-checksums.txt", offPathTrace());
+		savedGameContinuesIdentically(options);
+		glob2test::recordSimTrace("guard-area/off-path-checksums.txt", offPathTrace());
+	}
+	TEST_CASE("the flag absent and the flag false play the same game, and warriors take the nearest area")
+	{
+		glob2test::HeadlessGlobals globals;
+		glob2test::forEachSeed(2, [](std::uint32_t seed) {
+			const auto absent = offPathStates(false, seed, 800);
+			const auto off = offPathStates(true, seed, 800);
+			REQUIRE(absent.size() == off.size());
+			int firstDifference = -1;
+			for (std::size_t tick = 0; tick < absent.size() && firstDifference < 0; ++tick)
+				if (absent[tick] != off[tick]) firstDifference = int(tick) + 1;
+			CHECK(firstDifference == -1);
+		}, 1);
+		// The semantic checks the first case runs: with the experiment off every
+		// warrior takes the nearest area and an existing clump stays put.
+		Options options;
+		options.experiment = false;
+		options.explicitlyOff = true;
+		spawnSplitsBetweenAreas(options);
+		clumpDrainsIntoNewArea(options);
 	}
 	TEST_CASE("crowding box sum matches brute force across the torus seam")
 	{

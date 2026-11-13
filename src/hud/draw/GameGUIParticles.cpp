@@ -7,11 +7,15 @@
 #include <stdlib.h>
 
 
-#include "Game.h"
 #include "GameGUI.h"
 #include "GameGUIViewport.h"
 #include "GlobalContainer.h"
 #include "ParticleCrossfade.h"
+#include "Building.h"
+#include <GraphicContext.h>
+#include "render/scene/SceneEntities.h"
+#include "render/scene/Scene.h"
+#include "TorusView.h"
 
 namespace
 {

@@ -1,4 +1,5 @@
 #include "MapZoomControls.h"
+#include "Map.h"
 #include "DynamicClouds.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2022-2023 Nathan Mills
@@ -8,9 +9,10 @@
 #include "../../render/MapCopies.h"
 #include <FormatableString.h>
 #include "Game.h"
+#include "render/MapDrawer.h"
 #include "GlobalContainer.h"
 #include "MapEdit.h"
-#include "render/scene/SceneExtract.h"
+#include "EditorSceneCache.h"
 #include "render/scene/BuildingCatalogView.h"
 #include "EditorDock.h"
 #include "ScriptEditorScreen.h"
@@ -21,6 +23,7 @@
 #include "Utilities.h"
 #include <SDL3/SDL.h>
 #include <algorithm>
+#include "sim/EntityRefOf.h"
 
 void MapEdit::draw(Uint64 frameTick)
 {
@@ -48,11 +51,27 @@ void MapEdit::preparePresentation()
     SceneRequest request;
     request.localTeam=team;request.includePanels=false;request.includeScriptAreas=true;
     request.view.overlay=isFertilityOn ? OverlayArea::Fertility : OverlayArea::None;
-    request.selectedBuilding=Game::refOf(view.selectedBuilding);
-    request.selectedUnit=Game::refOf(view.selectedUnit);
+    request.selectedBuilding=refOf(view.selectedBuilding);
+    request.selectedUnit=refOf(view.selectedUnit);
     request.view.displayW=int(camera.visibleW());request.view.displayH=int(camera.visibleH());
-    SceneExtractor().prepare(game.captureReadBoundary(SceneExtractor::captureOptions(request)),request,view.render.ownScene);
+    // An unchanged world costs no capture: the store returns its latest boundary,
+    // with the same serial. Preparing a scene does cost, so keep the current one.
+    const auto world=game.captureReadBoundary(SceneExtractor::captureOptions(request));
+    if (!sceneCache) sceneCache=std::make_unique<EditorSceneCache>();
+    if (!sceneCache->holds(world,request))
+    {
+        sceneCache->boundarySerial=0; // A preparation that throws leaves no scene to keep.
+        sceneCache->extractor.prepare(world,request,view.render.ownScene);
+        sceneCache->boundarySerial=world.boundarySerial;
+        sceneCache->request=request;
+        ++sceneCache->preparations;
+    }
     view.scene=&view.render.ownScene;
+}
+
+Uint64 MapEdit::scenePreparations() const
+{
+    return sceneCache ? sceneCache->preparations : 0;
 }
 
 void MapEdit::drawMap(int sx, int sy, int sw, int sh)
@@ -70,7 +89,7 @@ void MapEdit::drawMap(int sx, int sy, int sw, int sh)
 	}
 
     preparePresentation();
-	game.drawMap(0, 0, int(std::ceil(camera.visibleW()+camera.fractionX())), int(std::ceil(camera.visibleH()+camera.fractionY())), 0, 0, viewportX, viewportY, team, view, drawOptions, nullptr, nullptr, false,
+	MapDrawer::drawMap(0, 0, int(std::ceil(camera.visibleW()+camera.fractionX())), int(std::ceil(camera.visibleH()+camera.fractionY())), 0, 0, viewportX, viewportY, team, view, drawOptions, nullptr, nullptr, false,
         DynamicClouds::gridLimitForZoom(view.scene->map.getW(), view.scene->map.getH(),
             globalContainer->settings.cloudPatchSize, camera.zoom));
 

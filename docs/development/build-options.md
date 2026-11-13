@@ -4,8 +4,8 @@ Fast builds accelerate editing; ordinary debug builds provide full symbols and r
 
 Native distribution packages that extract separate debug symbols can use
 `release=1 retain_symbols=1`. This preserves release optimization and the free
-launch profile while keeping compiler debug information and disabling stripping
-by SCons. The RPM recipe uses this mode so Fedora can produce its debug packages.
+launch profile while keeping compiler debug information and disabling stripping.
+The RPM recipe uses this mode so Fedora can produce its debug packages.
 Its output directory is separate from ordinary stripped release builds. Other
 release packages keep their existing stripping behavior; macOS already retains
 symbols for its matching dSYM.
@@ -15,20 +15,52 @@ translation unit (`BOOST_ASIO_HAS_PTHREADS=1`). Keep this build-wide: header-ord
 detection can otherwise mix POSIX and Win32 Asio thread layouts, corrupting
 network teardown. The pthread runtime is already required by the Windows build.
 
+## Compiler checks
+
+`python3 tools/compiler/check_stencil_vectorizer.py [--cxx COMPILER]` compiles a
+torus 3x3 smoothing stencil shaped like the map generators' kernels at `-O0`,
+`-O2` and `-O2` without the vectorizers, under AddressSanitizer, and requires one
+checksum from every build and run. It runs on macOS CI and the Linux Clang job,
+because an analysis on Apple clang 21 saw `-O2` turn this loop shape into an ASan
+heap overflow with run-to-run-varying sums. If it ever fails, check whether the
+real stencils in `src/map/generator/shared/` are affected; if they are, add
+`-fno-vectorize -fno-slp-vectorize` for Clang to the strict numeric sources'
+flags (`STRICT_CXXFLAGS` in `buildsys/javascript.py`, applied by `CMakeLists.txt`)
+and refresh that platform's generator rows.
+
 ## Fast development builds
 
-`python3 tools/dev_build.py` enables caching and `dev_fast=1` in a separate output
-directory, forwarding SCons targets and options. It defaults to at most eight
-jobs and `linker=auto`. The wrapper preserves the selected client profile and normal release compiler flags.
-Install ccache before using the development command. Native dependencies still
-come from the existing package-manager or `GLOB2_SDL3_PREFIX` configuration;
-mobile dependencies and SDKs still require their existing setup steps.
+`python3 tools/dev_build.py` builds every tier and platform with
+[CMake + Ninja](#cmake--ninja-build): native Linux and macOS, Windows in the MSYS2
+MINGW64 shell (where it adds `mingw=1`), `target=web`, `target=android` and
+`target=ios` (on macOS). Its arguments are `key=value` build options (`perf=1`,
+`opt=3`, `release=1`, `role=relay`, `compile_profile=core`, `lean_images=1`,
+...), targets, `.` (glob2 and the four test binaries), `-jN` (default `-j8`), `-k`
+(keep going), `-n` (print the commands only) and `--build=DIR`. Native builds
+without `perf=1`, `release=1`, `profile=1` or `role=relay` add the dev tier's
+`dev_fast=1 linker=auto`; browser development builds also add
+`web_variant=threaded`; mobile builds add nothing.
+
+The options resolve, through `buildsys/build_layout.py`, to a build identity and
+its directory (`build/linux/client/debug/dev-dev_fast-true-linker-auto`,
+`build/linux/client/perf`, `build/linux/client/release`,
+`build/emscripten/client/release`, ...), which CMake configures with
+`GLOB2_BUILD_ARGS`; a directory whose options changed is reconfigured. `CC=`,
+`CXX=`, `CXXFLAGS=` and `LINKFLAGS=` set the compilers and base flags,
+`portaudio=1` enables the PortAudio voice backend, and a file target names its
+CMake target (`build/linux/client/release/src/glob2` and
+`build/mingw/client/release/src/glob2.exe` are `glob2`; a browser file is
+`web-package`). Delete a build directory to clean it. Install ccache before using
+the development command. Native dependencies still come from the existing
+package-manager or `GLOB2_SDL3_PREFIX` configuration; mobile dependencies and SDKs
+still require their existing setup steps.
 
 ```sh
-python3 tools/dev_build.py
+python3 tools/dev_build.py                    # glob2, the dev tier
 python3 tools/dev_build.py engine-tests -j8
+python3 tools/dev_build.py perf=1 opt=3 engine-tests
+python3 tools/dev_build.py release=1 glob2
 python3 tools/dev_build.py dev_fast=0 linker=default
-python3 tools/dev_build.py pch=1 unity=1
 python3 tools/dev_build.py target=web web_variant=serial
 python3 tools/dev_build.py target=web web_variant=serial web_legacy_gl=0
 python3 tools/dev_build.py target=android arch=arm64-v8a
@@ -37,24 +69,126 @@ python3 tools/dev_build.py --cache-stats
 ```
 
 Fast builds use `-O0 -g1`: backtraces and basic symbols remain, but full variable
-inspection requires ordinary debug compilation. Fast/PCH/unity options reject
-release or profiling builds. Use release builds for shipping and performance
-measurements. Preserve numeric guards and compare simulation checksums when
-validating build configurations; do not bump the simulation revision to mask a
-build-induced mismatch.
+inspection requires ordinary debug compilation (`dev_fast=0`). Preserve numeric guards and compare simulation
+checksums when validating build configurations; do not bump the simulation
+revision to mask a build-induced mismatch.
 
-`pch=1` precompiles stable standard headers separately for each compiler/flag
-configuration. Its C++ objects bypass ccache rather than weakening cache
-correctness; C and Objective-C++ objects bypass PCH. `unity=1` combines only the
-checked-in allowlist in deterministic groups of at most four files, preserves
-ordinary source commands for IDEs, and reuses production objects in harnesses.
-Both experiments default off; their speed benefit must be measured.
+## Core compile profile
+
+`compile_profile=core` is an opt-in native development build that leaves out code
+most edits never touch, so a change to a core header recompiles fewer files:
+
+```sh
+python3 tools/dev_build.py compile_profile=core engine-tests unit-tests
+python3 test/run_tests.py --build-dir build/linux/client/debug/dev-dev_fast-true-linker-auto-compile_profile-core
+```
+
+It leaves out the optional groups `buildsys/sources.py` defines as filters over
+`CLIENT_SOURCES`:
+
+- `generators`: the map generators in `src/map/generator/generators/`, except
+  the default lobby landscape (`lava-shield`), `uniform`, `hills`, and `forts`
+  and `even-ground`, whose blueprints the JavaScript toolkit binds. Generator
+  core, shared, compatibility and JavaScript code stay.
+- `ai:castor`, `ai:cortex`, `ai:cabino`. Nicowar, Econo and Warrush (the golden
+  match and the shared runtime), Maxima, JavaScript and AINull stay, and so does
+  Numbi, the custom-game default AI that most game-starting tests use.
+- `editor`: the map editor in `src/map/editor/`, apart from its keyboard
+  shortcut table, which the settings screen edits, and the brush swatches that
+  `glob2 map` renders. `Game_editor.cpp` stays: it holds `Game`'s own placement
+  and script queries. The menu's editor button then only prints why it does
+  nothing.
+
+The registries keep every id and catalog position, and drop only the entries
+that are not built. Creating or loading an AI that was left out fails with
+"… is not compiled into this build (compile_profile=core); rebuild with
+compile_profile=full". Saves, replays and scripts keep the same ids. Lobby
+pickers offer only the AIs and generators that were built, and the custom-game
+lobby replaces a saved AI that was left out with Nicowar, as does loading a saved
+network game, whose remote players normally become Castor.
+Rated play, `match verify` and `online turn-client` refuse to run outside the
+full profile. `glob2 info version` reports `compile_profile`, and the build
+directory's `profile.json` records it.
+
+Core builds go in their own directory (`…-compile_profile-core`), so full and
+core objects never mix. Only `src/app/CompileProfile.cpp` and the AI and
+generator registries include the generated `glob2/CompileProfile.h`. No compile
+line gains a define, so the other objects match the full build's. The first
+core build still recompiles about half of them: a source that includes a header
+generated in the build directory (such as `glob2/BuildConfig.h`) carries that
+directory's path in its preprocessed text, so it misses the compiler-cache entry
+the full build made. Later core builds are incremental as usual. Editing
+`src/game/Game.h` recompiles about 20% fewer client sources in the core profile
+(219 instead of 274), and `src/unit/Unit.h` about 22% fewer. Test registry
+entries name the groups they need with `require={'generators'}`, `'editor'` or
+`'ai:castor'`, and core test binaries leave those entries out. A single case
+that needs one takes `* glob2test::needs({"ai:castor"})` (`test/support/ProfileNeeds.h`)
+and is not listed in a core build; loops over several AIs skip the ones
+`AIRegistry::available` rejects.
+
+The full profile is the default. CI, releases and every perf build use it, and
+final PR verification must use it too: a passing core build covers only the
+code it compiled.
+
+## Build tiers
+
+| Tier | Command | Evidence it may back |
+| --- | --- | --- |
+| dev | `python3 tools/dev_build.py` (`-O0 -g1`; CMake + Ninja on Linux) | correctness, checksum and golden traces, save/replay continuity |
+| perf-screen | `python3 tools/dev_build.py perf=1` (`-O2 -g1`) | the direction and rough size of a performance change |
+| perf-confirm | `python3 tools/dev_build.py perf=1 opt=3` (`-O3 -g1`) | the number quoted in a performance PR; required when screening shows under 5% or mixed signs |
+| release | `python3 tools/dev_build.py release=1` and the platform packaging | shipping, package size and store QA only; never PR performance evidence |
+
+`perf=1` is a native client build in `build/<toolchain>/client/perf` (`perf/o3`
+with `opt=3`). It keeps the full client profile, lossless development assets and
+`-g1` symbols, and does not strip or use `-fwhole-program`, so a profiler can
+attribute samples and every performance claim is reproducible from one command.
+`tools/dev_build.py perf=1` builds it with the managed compiler cache, through
+the CMake `perf` and `perf-o3` presets' identities.
+Rendering measurements that need shipped asset paths add
+`sprite_packing=video optimized_assets=1`. Simulation numeric sources keep their
+strict flags in every tier, so the dev and perf builds of one platform produce the
+same simulation checksums; a mismatch is a bug, not a reason to bump the
+simulation revision.
+
+### Comparing against master
+
+`python3 tools/dev_baseline.py build` builds the dev and perf tiers of
+origin/master in a detached worktree under the development store; with the shared
+compiler cache, a baseline one merge newer than the last is mostly cache hits.
+`tools/perf_ab.py` then measures a candidate build against it in alternating
+pairs and prints the table for the pull request:
+
+```sh
+python3 tools/dev_build.py perf=1 engine-tests
+python3 tools/perf_ab.py --baseline master --candidate build/linux/client/perf --name terrain-hazard \
+  -- '{build}/test/glob2-engine-tests' -ts=TerrainHazardBenchmark '-tc=*idle decisions*'
+```
+
+`--baseline master` resolves the baseline of the branch's merge base
+(`dev_baseline.py path --merge-base HEAD`); any build directory works too. The
+metric is wall time unless `--metric REGEX` picks a number the benchmark prints.
+Screening uses three pairs; quoted numbers use `perf=1 opt=3` and seven pairs.
+For those, build the master baseline with `dev_baseline.py build --variants
+perf-o3`, which `--baseline master` then selects for an `opt=3` candidate, as
+does `tools/inline_guard.py`. The change it reports is the median of the
+per-pair changes, with their interquartile range, so load from other work on a
+shared machine lands on both halves of a pair rather than deciding the result.
+On a shared machine, also pin with `--pin [CPUS]` (taskset, by default the last
+CPU), and prefer a CPU-time metric the benchmark prints (for example `/usr/bin/time
+-f cpu=%U` with `--metric 'cpu=([0-9.]+)'`) over wall time. `dev_baseline.py gc --keep 3` removes
+older baselines that no comparison is using, and `dev_baseline.py seed WORKTREE`
+copies a baseline's dev build into a fresh worktree so its first build recompiles
+only what differs. Each baseline builds with its own revision's
+`tools/dev_build.py`, so a candidate and its baseline share compile and link
+lines. A CMake build directory records absolute paths and cannot be relocated, so
+`seed` leaves CMake builds alone; the shared compiler cache already serves a
+baseline's objects to a fresh worktree's first build.
 
 `linker=auto` uses installed LLD for native Linux ELF builds and otherwise keeps
 the platform linker. `linker=lld` fails on unsupported targets or missing tools.
 Android retains its NDK linker, and Apple/browser builds retain their existing
-linkers. `dependency_jobs=N` overrides dependency parallelism, which otherwise
-follows SCons `-j`.
+linkers. The build provisions pinned dependencies with one job per CPU.
 
 Recording and browser SDL/Opus installations are shared by recipe, pinned inputs,
 compiler, SDK, architecture and ABI configuration. Publication is staged and
@@ -63,34 +197,190 @@ builds use temporary paths without spaces, then their verified installations are
 copied to the cache volume before atomic publication. This permits the macOS
 `Application Support` cache location without passing it to upstream Makefiles.
 Pinned SDL and recording archive downloads retry network failures and transient
-HTTP responses up to three attempts, with one- and two-second delays. Every
-archive must match its locked SHA-256 before installation; checksum failures
-and permanent HTTP errors fail immediately.
+HTTP responses in up to three rounds, with one- and two-second delays between
+rounds. Each round tries the primary URL and any locked mirrors in order; a
+transient primary failure falls through to a mirror without an extra delay.
+Every source must match the same locked SHA-256 before installation; checksum
+failures and permanent HTTP errors fail immediately.
 Explicit
 prefix overrides and `GLOB2_DEV_MODE=isolated` remain supported. Clean, dry-run,
 help and compilation-database-only requests do not provision dependencies.
-A cold native dry-run can still require an existing SCons configure directory.
-Debug prefix mapping in fast builds uses `.`; run the debugger from the checkout
-or set its source substitution directory when debugging elsewhere. Runtime paths
-and `__FILE__` semantics are preserved.
 
-`CCACHE_DEBUG=1 CCACHE_DEBUGDIR=/absolute/path` enables miss diagnostics through
-the wrapper. Do not add sloppiness settings. Inspect cache statistics and eviction
+### Sharing the compiler cache between checkouts
+
+Every checkout of the same commit produces the same compiler-cache keys, so a new
+worktree compiles mostly from direct cache hits. Nothing checkout-specific reaches
+a compile command line or a widely included header: the absolute source, runtime
+asset and renderer shader directories live in the generated
+`glob2/BuildPaths.h`, which only the four files that use them include, and the
+version banner reports the source revision from `glob2/BuildStamp.h` instead of
+`__DATE__`/`__TIME__`. Add a new checkout-specific value to
+`buildsys/checkout_paths.py`, never to `BuildConfig.h` or a `-D` flag.
+
+Builds other than shipping invocations (`bundle`, `package`, `install`,
+`retain_symbols`) set `CCACHE_BASEDIR` to the checkout and map debug paths to
+`.`; run the debugger from the checkout or set its source substitution directory
+when debugging elsewhere (`settings set target.source-map . <checkout>` in LLDB,
+`set substitute-path . <checkout>` in GDB). Runtime paths and `__FILE__` semantics
+are preserved. Shipping invocations keep absolute debug paths.
+
+The managed cache has one configuration file, `ccache.conf` in its directory,
+written by every build: a 20 GiB `max_size`, `compiler_check = content` and
+compression. Builds and `tools/dev_build.py --cache-stats` read the same limit;
+`CCACHE_MAXSIZE` or other `CCACHE_*` variables still override it for one run, and
+an explicit `CCACHE_DIR` uses that directory's own configuration.
+
+### Parallel lanes
+
+Test runs and asset exports on one machine share a pool of `ncpu + 1` CPU tokens
+(`buildsys/jobserver.py`): each running test process and each asset-encoding
+worker holds one token, so several checkouts working at once share the CPUs
+instead of multiplying the process count. Ninja does not draw from the pool;
+`-jN` caps a lane's compile jobs, and `tools/dev_build.py` defaults to `-j8`.
+Tokens are `flock`ed files under the development store's `state/jobserver/`, released by the kernel
+when a process exits, so a killed build leaks nothing. Children of a token holder
+acquire nothing. `GLOB2_JOBSERVER=0` disables the pool and `GLOB2_JOBSERVER_TOKENS`
+resizes it; Windows builds run without it. `python3 tools/dev_environment.py
+lanes` lists the builds running now.
+
+### Up-to-date checks
+
+Ninja tracks headers through compiler depfiles, so a no-change build takes about
+1.5 s. `CCACHE_DEBUG=1 CCACHE_DEBUGDIR=/absolute/path` enables miss diagnostics
+through the wrapper. Do not add sloppiness settings. Inspect cache statistics and eviction
 before increasing budgets or attributing poor reuse to source size.
 
-Run `python3 tools/benchmark_build.py --help` for isolated comparisons. The default
-is three repetitions of dependency setup, uncached compilation, warm-cache
-rebuilding, no-change builds, source edits and header edits. Reports include exact
-commands, compile databases, dependency manifests, cache deltas and object sizes.
-Compile/link work totals sum command durations; they are not parallel wall times.
-GNU time reports per-process peak RSS on Linux; unsupported hosts report missing
-memory coverage explicitly. Review evidence stays under `artifacts/dev-build`.
-No speedup is assumed before measuring matching source and toolchain inputs.
+### CMake + Ninja build
+
+CMake + Ninja builds every tier: dev, `compile_profile=core`, perf,
+perf-confirm, release (with `lean_images=1`, `retain_symbols=1` and `opengl=0`)
+and the `role=relay` match relay, plus installation. Under MSYS2's MinGW-w64 GCC
+it builds the Windows client (`build/mingw/...`) with `WIN32` and
+`BOOST_ASIO_HAS_PTHREADS`, Winsock, `opengl32`/`glu32`, a POSIX regex library
+(`regex`, else `systre`), the Windows certificate store, the `mingw32` recording
+libraries and `-mwindows` for the client and harnesses but not the console test
+programs. On macOS it builds `build/darwin/...` with Homebrew's (else MacPorts')
+libraries, Apple's frameworks and Objective-C++ sources; release builds keep `-g`
+and skip `-fwhole-program` and `-s`. Its `bundle` target makes `Glob2.app`
+(assets, libraries, MoltenVK and a dSYM, through `buildsys/bundle.py`) and
+`package` also `Glob2-<version>.dmg`; `tools/dev_build.py` sets
+`GLOB2_MAC_BUNDLE` for them, which links the pinned PNG/JPEG SDL_image.
+`target=web` (`cmake/web-toolchain.cmake`, `cmake/web.cmake`) and
+`target=android`/`target=ios` (`cmake/mobile-toolchain.cmake`, `cmake/mobile.cmake`)
+use the same `CMakeLists.txt`. `GLOB2_BUILD_ARGS` takes the build options;
+`buildsys/build_layout.py` resolves them into the build identity, which fixes the
+tier, its flags, its feature switches, its asset profile and its default
+directory. The strict-numeric simulation sources compile with
+`-fno-fast-math -ffp-contract=off` (`STRICT_CXXFLAGS` in `buildsys/javascript.py`)
+in every tier. The build needs CMake 3.25 or later, Ninja and `pkg-config`; `pip
+install cmake ninja` into a development virtual environment provides the first two.
+
+```sh
+python3 tools/dev_build.py .                            # glob2 and the four test binaries
+python3 tools/dev_build.py perf=1 engine-tests unit-tests
+python3 tools/dev_build.py role=relay release=1 relay   # glob2-relay and glob2-relay-tests
+python3 test/run_tests.py --binary all -j12             # finds the newest build
+cmake --preset perf && cmake --build --preset perf --target engine-tests
+```
+
+The presets in `CMakePresets.json` (`dev`, `core`, `perf`, `perf-o3`, `release`,
+`relay`) configure the tiers into their default directories, as
+`tools/dev_build.py` does. After configuring, Ninja re-runs CMake itself when
+`CMakeLists.txt`, `cmake/` or the generators it imports change. Targets are
+`glob2`, `engine-tests`, `unit-tests`, `map-tests`, `sim-tests`, `tests`,
+`glob2-tools`, `relay`, `relay-tests`, `usl_runner` and the harness aliases
+(`transport-test`, `mobile-gallery`, ...), plus `install`, macOS `bundle` and
+`package`, and for the browser `web-package`, `web-tests`, `web-serial` and
+`web-threaded`, for mobile `android-tests` and `ios-tests`. Source archives come
+from `tools/release/release.py`. Test
+tools that look for the newest build directory (`tools/build_paths.py`, so
+`test/run_tests.py` without `--build-dir`) take whichever dev or release build
+was built last; `--build-dir` or `GLOB2_BUILD_DIR` picks one explicitly.
+
+Tier flags: `GLOB2_CXXFLAGS` and `GLOB2_LINKFLAGS` (`CXXFLAGS=` and
+`LINKFLAGS=` of `tools/dev_build.py`, default `-g`; distributions pass their
+optflags) come first; `dev_fast` replaces every `-g`/`-O` with `-O0 -g1`; `perf=1` compiles
+C++ with `-O2 -g1` (`-O3` with `opt=3`) and links at the same level; `release=1`
+adds `-O3`, links with `-O3 -fwhole-program` and strips with `-s` (test binaries
+keep their symbols) unless `retain_symbols=1`. QuickJS and openlibm compile at
+`-O2` in the optimized tiers and `-O0` otherwise. When ccache is installed it is
+the compiler launcher, with the managed cache directory and settings, and
+`-fdebug-prefix-map=<checkout>=.` makes objects relocatable. `linker=auto` links
+with `lld` when `ld.lld` is installed. Ninja does not draw from the
+[token pool](#parallel-lanes); the wrapper passes `-j8` unless given `-jN`.
+
+Keep the generated source lists in step: after changing `buildsys/sources.py`,
+`buildsys/javascript.py`, `test/tests.py` or `buildsys/harness_programs.py`, run
+`python3 buildsys/export_cmake_sources.py` and commit `cmake/sources.cmake` and
+`cmake/tests.cmake` (`--check` reports a stale file;
+`test/build_system/test_cmake_sources.py` fails while one is stale).
+
+What it builds:
+
+- `libusl.a`, `libgag.a`, `libGlob2JavaScript.a` (QuickJS and openlibm with the
+  strict numeric flags of `buildsys/javascript.py`, applied per source), every
+  client object, as the object library `glob2_client`, and `glob2`. The numeric
+  symbol guard runs once the guarded client objects are compiled, before any
+  program links them. `compile_profile=core` leaves out the optional source
+  groups (`GLOB2_CORE_EXCLUDED_SOURCES`), the tests and harnesses that need
+  them, and writes `glob2/CompileProfile.h` accordingly.
+- `glob2-engine-tests`, `glob2-unit-tests`, `glob2-map-tests` and
+  `glob2-sim-tests` from the `test/tests.py` registry: the test include
+  directories and `SDL_MAIN_HANDLED`, one object library per group of entries
+  with the same `cxxflags`, `defines` and `require`, the client objects, the
+  `glob2_map` and
+  `glob2_sim` module archives linked as one `--start-group` group, and a
+  `<binary>.provenance.json` sidecar written by `buildsys/test_provenance.py` on
+  every build of the alias.
+- The `test/tests.py` `PROGRAMS` and the harnesses listed in
+  `buildsys/harness_programs.py`.
+- With `role=relay`, only `glob2-relay` and `glob2-relay-tests`: SDL headers but
+  no SDL, media or recording library, linked with `pthread ssl crypto`.
+- The pinned h264 recording libraries (`GLOB2_RECORDING_PREFIX`, the
+  `recording/` beside `GLOB2_SDL3_PREFIX`, or a shared-store build made on first
+  use), and with `lean_images=1` the private PNG/JPEG/WebP SDL_image
+  (`buildsys/native_image_dependency.py`), both through
+  `buildsys/shared_dependencies.py`.
+- The runtime assets: the `buildsys/runtime_assets.py` export for the tier's
+  asset profile (lossy WebP and video sprite packing in release builds), shared
+  through the development store, into `<build>/runtime-assets`, which
+  `BuildPaths.h` names. A depfile lists every asset input and the directories
+  holding them, so the export runs again only when one changes.
+  `identity.json` is the resolved identity plus `"generator": "cmake"`, which
+  `test/run_tests.py`, `tools/perf_ab.py` and `tools/dev_baseline.py` read.
+
+`BuildConfig.h`, `BuildPaths.h`, `BuildStamp.h`, `CompileProfile.h`,
+`SkinMaterials.h`, the renderer shaders, the Hive contract, the online error
+catalog and `SkinRenderRecipe.h` come from the shared generators, through
+`buildsys/cmake_generate.py`. `-DGLOB2_EXPORT_RUNTIME_ASSETS=OFF` skips the
+asset export and points `BuildPaths.h` at `GLOB2_RUNTIME_ASSET_DIR`.
+
+#### Installation
+
+`python3 tools/dev_build.py release=1 install` builds a shipping binary and runs
+`cmake --install <build>` (honouring `DESTDIR`), which installs `glob2` into `GLOB2_BINDIR`, and under `GLOB2_INSTALLDIR` the verified
+runtime-asset tree merged into `glob2/` (`runtime_assets.install_export`), the
+renderer shaders, the desktop entry, AppStream metainfo, hicolor icons, shell
+completions and `man/man6/glob2.6`, the SDL3 runtime from `GLOB2_SDL3_PREFIX`
+into `<bindir>/../lib/glob2` with its notices, the recording notices, and with
+`lean_images=1` the private SDL_image with its soname links and notice.
+`GLOB2_DATADIR` is the data directory compiled into the game. All three default
+under `CMAKE_INSTALL_PREFIX`. Configure installed builds with
+`-DGLOB2_SHIPPING=ON`, which leaves out the build prefix's rpath and the debug-path mapping; installing a
+`GLOB2_SDL3_PREFIX` build without it fails.
+
+```sh
+cmake -S . -B build/linux/client/release/lean-images -G Ninja \
+  -DGLOB2_BUILD_ARGS='release=1 lean_images=1' -DGLOB2_SHIPPING=ON \
+  -DGLOB2_BINDIR=/usr/bin -DGLOB2_INSTALLDIR=/usr/share -DGLOB2_DATADIR=/usr/share
+cmake --build build/linux/client/release/lean-images --target glob2
+DESTDIR="$stage" cmake --install build/linux/client/release/lean-images
+```
 
 ### Shared renderer shader assets
 
 The build generates shader layouts and GLSL variants from
-`libgag/shaders/renderer-manifest.json` and the authoritative material sources.
+`libs/gag/shaders/renderer-manifest.json` and the authoritative material sources.
 `GLOB2_GLSLANG` can point to pinned glslang 15.1.0 for offline Vulkan SPIR-V generation;
 without the platform’s offline binaries the experimental SDL GPU family is unavailable.
 `GLOB2_NAGA` selects pinned Naga 27.0.0 for browser WGSL. Optional
@@ -135,12 +425,12 @@ An explicit `--build` directory refuses an incompatible existing identity.
 
 ```sh
 python3 tools/dev_build.py client_profile=free
-scons release=1 client_profile=free
-scons release=1 client_profile=free distribution=app_store bundle
-scons target=ios release=1 client_profile=free
+python3 tools/dev_build.py release=1 client_profile=free
+python3 tools/dev_build.py release=1 client_profile=free distribution=app_store bundle   # macOS
+python3 tools/dev_build.py target=ios release=1 client_profile=free
 ```
 
-Use standard release packaging for shipping. Fast/PCH/unity development builds
+Use standard release packaging for shipping. Fast development builds
 are unsuitable for release qualification. Keep the actual producer
 `identity.json` with final-package evidence; do not reconstruct it from an
 intended command after signing.
@@ -171,7 +461,7 @@ Verification requires the complete receipt set, including the generator and
 pinned Vulkan headers; missing receipts or a changed target fail the build.
 Shader translation tools remain development dependencies.
 
-Apple packaging fetches hash-pinned MoltenVK **1.4.2** using `scons/moltenvk.json`.
+Apple packaging fetches hash-pinned MoltenVK **1.4.2** using `buildsys/moltenvk.json`.
 macOS bundles select the executable's architecture and include its framework and
 Apache-2.0 notice; iOS device/simulator projects embed and sign the matching slice.
 Downloads and extraction publish to the dependency cache only after validating
@@ -183,3 +473,37 @@ framework metadata. These are upstream input sizes, not measured compressed
 package growth. Adding MoltenVK is a runtime dependency change requiring explicit
 maintainer approval and Apple packaging/device qualification. Runtime selection
 remains independent of rendering and never ships a shader compiler.
+
+## Recording codec builds
+
+Native Linux clients can select `recording_codec=h264` (the default),
+`recording_codec=vp9`, or `recording_codec=av1`:
+
+```sh
+python3 tools/dev_build.py release=1 recording_codec=vp9
+python3 tools/dev_build.py release=1 recording_codec=av1
+python3 tools/dev_build.py recording_codec=vp9 unit-tests
+```
+
+The WebM profiles replace H.264/AAC with VP9/Opus or AV1/Opus throughout the
+recorder. They neither fetch nor link x264 or NVIDIA codec headers, and do not
+compile H.264 or AAC encoders. They use pinned static libvpx 1.17.0 (VP9) or
+libaom 3.15.1 (AV1), together with the native client's existing Opus dependency
+through `pkg-config`. There is one native Opus implementation; the recorder does
+not bundle a second copy. libvpx uses a BSD license; libaom includes BSD and AOM
+patent license terms. The dependency recipe
+installs license and patent notices with the selected sources and configuration.
+AV1 builds also require CMake. Only the selected video library is built.
+
+Each profile has a separate output directory and dependency-cache identity.
+The native Opus version, compiler flags and link flags are recorded in the
+recording receipt and included in its cache inputs.
+Explicit `GLOB2_RECORDING_PREFIX` overrides must use a separate prefix for each
+codec. A prebuilt SDL recording prefix is reused only for the default H.264
+profile. WebM profiles currently support native Linux clients; other targets
+reject them before provisioning dependencies. Both use software encoding, so
+qualify gameplay frame times and dropped-frame counters on the target hardware;
+realtime settings alone do not establish realtime performance.
+
+See [gameplay recording](../features/gameplay-recording.md) for output paths,
+quality controls and recovery.

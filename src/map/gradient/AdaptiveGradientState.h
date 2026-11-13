@@ -20,7 +20,14 @@ struct AdaptiveGradientState
 {
     using Counts=AdaptiveGradientFeatures::Counts;
     using Inputs=AdaptiveGradientFeatures::Base;
-    static constexpr unsigned MinimumInterval=32, MaximumAge=1024, QueryHistoryTicks=128;
+    // MaximumAge is the safety cap: a field that is still demanded is
+    // refreshed once its serving capture is this old, even when the model
+    // predicts little benefit. A long-served field drifts from the stock it
+    // describes as tiles are harvested and regrow, and workers following it
+    // walk to stock that is gone. A 256-tick cap bounds that drift for a small
+    // compute cost; idle fields never age into work. It must equal the
+    // generated DemandedAgeCapTicks.
+    static constexpr unsigned MinimumInterval=32, MaximumAge=256, QueryHistoryTicks=128;
     // The generated deployment model owns its benefit cutoff. Define this in
     // the implementation so coefficient updates do not widen header rebuilds.
     static const std::int64_t Threshold;
@@ -79,6 +86,14 @@ struct AdaptiveGradientState
         // not refresh later merely because an old query aged. Accepted demand
         // survives until admission, including explicit capacity deferral.
         bool minimumIntervalElapsed(std::uint32_t tick) const {return std::uint32_t(tick-submitted)>=MinimumInterval;}
+        // The evaluation prefix that needs neither targets nor a prediction.
+        // True means evaluate() would return no request.
+        bool idle() {
+            if(!demand&&!reactive&&!deferred)return true;
+            if(queued)return true;
+            if(inflight){demand=false;return true;}
+            return false;
+        }
         Evaluation evaluate(std::uint32_t tick,const Targets&,bool hasServing,const Prediction&,unsigned fixedInterval=0);
         void defer(Reason reason) {deferred=demand=true;acceptedReason=reason;}
         void admitted(std::uint32_t tick) {submitted=tick;demand=reactive=queued=deferred=false;acceptedReason=Reason::None;inflight=true;}

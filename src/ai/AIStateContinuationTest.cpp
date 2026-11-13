@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "Map.h"
+#include "ProfileNeeds.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
 #include "AI.h"
 #include "Order.h"
 #include "Player.h"
@@ -10,6 +15,7 @@
 #include <BinaryStream.h>
 #include <StreamBackend.h>
 #include <set>
+#include "Building.h"
 
 namespace
 {
@@ -93,7 +99,6 @@ std::vector<Uint32> state(Game& game)
 {
     std::vector<Uint32> result,buildings,units;
     game.checkSum(&result,&buildings,&units,true);
-    result.erase(result.begin()); // Loaded header records the save format.
     result.insert(result.end(),buildings.begin(),buildings.end());
     result.insert(result.end(),units.begin(),units.end());
     return result;
@@ -160,12 +165,12 @@ void continuation(AI::ImplementationID id, bool depleted, int checkpoint, bool m
 
 TEST_SUITE("AIStateContinuation")
 {
-    TEST_CASE("Cortex economy and food shortage survive save-load")
+    TEST_CASE("Cortex economy and food shortage survive save-load" * glob2test::needs({"ai:cortex"}))
     {
         glob2test::HeadlessGlobals globals;
         for (bool depleted : {false,true}) continuation(AI::CORTEX,depleted,256);
     }
-    TEST_CASE("Cabino specialist modules survive save-load")
+    TEST_CASE("Cabino specialist modules survive save-load" * glob2test::needs({"ai:cabino"}))
     {
         glob2test::HeadlessGlobals globals;
         for (int checkpoint : {0,1,49,50,51,127,256,512,1024,2048})

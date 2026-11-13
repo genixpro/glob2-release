@@ -14,7 +14,7 @@ from pathlib import Path
 from dataclasses import dataclass
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "scons"))
+sys.path.insert(0, str(ROOT / "buildsys"))
 from sources import INCLUDE_DIRECTORIES
 from clang import cindex as c
 
@@ -196,8 +196,8 @@ def parameters(v):
     if error:
         return None, error
     implicit = {
-        "Game": "(*e.game)",
-        "Map": "e.game->map",
+        "GenerationWorld": "(*e.world)",
+        "GenerationMap": "e.world->map",
         "GenerationContext": "(*e.generation)",
         "GenerationRequest": "e.request",
         "GenerationTelemetry": "e.generation->telemetry",
@@ -392,7 +392,7 @@ def main():
             t = plan.cpp_type
             raw = t.replace("const ", "").strip(" &")
             if plan.implicit:
-                if raw in ("Game", "Map"):
+                if raw in ("GenerationWorld", "GenerationMap"):
                     lines.append(
                         "if(!e.game || e.inspecting"
                         + (" || e.readonly" if not t.startswith("const ") else "")
@@ -1064,7 +1064,7 @@ def main():
             "export type GeneratorCallback = (context: GeneratorContext) => void | string;",
         ]
     )
-    emit(ROOT / "data/generators/toolkit.d.ts", "\n".join(types) + "\n")
+    emit(ROOT / "content/data/generators/toolkit.d.ts", "\n".join(types) + "\n")
     print(
         f"{len(records)} records, {len(functions)} functions, {sum(len(x) for x in groups.values())} adapters"
     )

@@ -2,12 +2,13 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #include "PowerOfTwo.h"
+#include "Map.h"
+#include "field/TerrainTravel.h"
 #include <PerformanceTelemetry.h>
 #include "shared_runtime/Runtime.h"
 #include "Building.h"
 #include <queue>
 #include <algorithm>
-#include "Game.h"
 #include "Order.h"
 #include "Utilities.h"
 #include "Brush.h"

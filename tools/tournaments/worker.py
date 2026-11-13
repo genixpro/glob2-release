@@ -24,6 +24,7 @@ from .transfer import get_chunk, offset, put_chunk
 from .resources import plan_allocations, plan_from_record, validate_frozen_attempt, validate_game_participants
 from .storage import CompressedLog, DEFAULT_ATTEMPT_BYTES, DEFAULT_LOG_BYTES
 
+STORAGE_CHECK_SECONDS = 5.0
 HOST_DEFAULTS = {'slots': max(1, (os.cpu_count() or 1) - 1), 'collect_slots': 2, 'result_backlog_limit': 128,
                  'disk_reserve_bytes': 5 * 1024**3, 'spool_budget_bytes': 10 * 1024**3,
                  'attempt_budget_bytes': DEFAULT_ATTEMPT_BYTES, 'log_budget_bytes': DEFAULT_LOG_BYTES,
@@ -72,15 +73,22 @@ def installed_bundle(path):
     return manifest
 
 
-def outcome_only(result):
+def outcome_only(result, config=None):
     """Retain the authoritative outcome and every supported adjudication field."""
     team_fields = ('team', 'alliance', 'outcome', 'alive', 'eliminated_tick',
-                   'prestige', 'units', 'buildings', 'warrior_attack', 'warrior_hp', 'warriors')
+                   'prestige', 'units', 'buildings', 'warrior_attack', 'warrior_hp', 'warriors',
+                   'win_probability')
+    from .probability import log_integral_summary, score_horizon
+    horizon = score_horizon(result, config)
     player_fields = ('player', 'team', 'ai')
-    return {key: result[key] for key in ('schema_version', 'status', 'ticks', 'termination', 'winning_teams')
+    return {key: result[key] for key in ('schema_version', 'status', 'ticks', 'termination', 'winning_teams', 'win_probability_permille')
             if key in result} | {
-        'teams': [{key: team[key] for key in team_fields if key in team} for team in result.get('teams', [])],
+        'teams': [{key: team[key] for key in team_fields if key in team}
+                  | {'win_probability_log_integral': log_integral_summary(team, result.get('ticks'), horizon)}
+                  for team in result.get('teams', [])],
         'players': [{key: player[key] for key in player_fields if key in player} for player in result.get('players', [])],
+        **({'win_probability_permille': result['resolved']['rules']['winProbabilityPermille']}
+           if 'winProbabilityPermille' in result.get('resolved', {}).get('rules', {}) else {}),
         **{key: result[key] for key in ('compute_threads', 'compute_resolved_threads',
                                        'compute_requested_threads', 'gpu_requested', 'resource_plan') if key in result},
     }
@@ -327,8 +335,20 @@ class Worker:
                     if stage == 'pack':
                         self.db.execute("UPDATE queue SET state='executed',updated=? WHERE id=?", (now, row['id']))
                     else:
-                        atomic_json(directory / 'execution.json', {'category': 'interrupted', 'diagnostic': 'attempt supervisor interrupted',
-                                                                   'started': row['started'], 'finished': now, 'exit_code': None, 'result': None})
+                        # Keep the failed attempt's immutable CPU assignment:
+                        # coordinator admission validates it even for retries.
+                        # Reacquire the supervisor lock so a concurrent startup
+                        # or completion cannot race the synthesized record.
+                        with contextlib.suppress(BlockingIOError):
+                            with lock(directory / 'execute.lock'):
+                                if (directory / 'execution.json').exists():
+                                    continue
+                                attempt = json.loads(row['job'])
+                                execution = {'category': 'interrupted', 'diagnostic': 'attempt supervisor interrupted',
+                                             'started': row['started'], 'finished': now, 'exit_code': None, 'result': None}
+                                if 'execution_allocation' in attempt:
+                                    execution['execution_allocation'] = attempt['execution_allocation']
+                                atomic_json(directory / 'execution.json', execution)
         running = self.db.execute("SELECT count(*) FROM queue WHERE state='running'").fetchone()[0]
         collecting = self.db.execute("SELECT count(*) FROM queue WHERE state='packing'").fetchone()[0]
         for row in self.db.execute("SELECT * FROM queue WHERE state='executed' ORDER BY updated").fetchall():
@@ -355,11 +375,13 @@ class Worker:
 
 
 def execute(root, identity):
-    worker = Worker(root)
-    directory = worker.root / 'attempts' / identifier(identity)
+    directory = Path(root).resolve() / 'attempts' / identifier(identity)
     with lock(directory / 'execute.lock') as guard:
         if (directory / 'execution.json').exists():
             return
+        # Bundle CLI probes in Worker construction may exceed the daemon's
+        # startup grace. Hold ownership throughout initialization as well.
+        worker = Worker(root)
         attempt = read_json(directory / 'attempt.json')
         job = attempt['job']
         started = time.time()
@@ -427,20 +449,31 @@ def execute(root, identity):
                                    job['outputs'].get('log_mode', 'full'))
             stderr = CompressedLog(process.stderr, directory / 'stderr.log.gz', log_limit)
             deadline = time.monotonic() + job['limits'].get('timeout_seconds', 3600)
+            # Storage checks walk directory trees, and the worker-wide walk grows with
+            # every concurrent attempt, so run them every few seconds rather than on
+            # each 0.2 s exit poll. RLIMIT_FSIZE still bounds every child-written file.
+            next_storage_check = 0.0
             while process.poll() is None:
-                if time.monotonic() >= deadline:
+                now = time.monotonic()
+                if now >= deadline:
                     record['category'] = 'timeout'
                     process.kill()
                     break
-                if stdout.error or stderr.error or usage(directory) > attempt_limit:
+                if stdout.error or stderr.error:
                     record['category'] = 'storage_limit'
                     process.kill()
                     break
-                if (shutil.disk_usage(directory).free < worker.config['disk_reserve_bytes']
-                        or usage(worker.root / 'attempts') + usage(worker.root / 'spool') > worker.config['spool_budget_bytes']):
-                    record['category'] = 'disk_pressure'
-                    process.kill()
-                    break
+                if now >= next_storage_check:
+                    next_storage_check = now + STORAGE_CHECK_SECONDS
+                    if usage(directory) > attempt_limit:
+                        record['category'] = 'storage_limit'
+                        process.kill()
+                        break
+                    if (shutil.disk_usage(directory).free < worker.config['disk_reserve_bytes']
+                            or usage(worker.root / 'attempts') + usage(worker.root / 'spool') > worker.config['spool_budget_bytes']):
+                        record['category'] = 'disk_pressure'
+                        process.kill()
+                        break
                 time.sleep(0.2)
             record['exit_code'] = process.wait()
             record['streamed_logs'] = {'stdout.log.gz': stdout.finish(), 'stderr.log.gz': stderr.finish()}
@@ -467,7 +500,7 @@ def execute(root, identity):
                     elif code == 0 and status != 'completed':
                         record['category'] = 'invalid_result'
                     elif code == 0 and job['outputs'].get('result') == 'outcome':
-                        record['result'] = outcome_only(record['result'])
+                        record['result'] = outcome_only(record['result'], job['config'])
                 except (OSError, ValueError) as error:
                     record['diagnostic'] = str(error)
                     if code == 0:

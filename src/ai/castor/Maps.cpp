@@ -4,16 +4,17 @@
 #include "PowerOfTwo.h"
 #include "Material.h"
 #include "AIResourcePolicy.h"
+#include <algorithm>
 #include <PerformanceTelemetry.h>
 #include "AICastor.h"
 #include "ai/observation/WorldQueries.h"
-#include "Game.h"
 #include "GlobalContainer.h"
 #include "MapInternal.h"
 #include "Order.h"
 #include "Player.h"
 #include "Unit.h"
 #include "Utilities.h"
+#include "Map.h"
 
 #define AI_FILE_MIN_VERSION 1
 #define AI_FILE_VERSION 2
@@ -432,28 +433,34 @@ void AICastor::computeHydratationMap()
 	for (int y=0; y<h; y++)
 		for (int x=0; x<w; x++)
 		{
-			if (terrainProvidesFertility(queries->terrainPropertiesAt(x,y)))
-				for (int r=1; r<range; r++)
+			const auto& terrain=queries->terrainPropertiesAt(x,y);
+			if (!terrainProvidesFertility(terrain))
+				continue;
+			// Weigh each source by the engine's strength: water (256/256) keeps its
+			// historical full weight; Fertile ground (48/256) only waters weakly.
+			const int strengthQ8=std::min<int>(terrain.fertilityQ8,256);
+			for (int r=1; r<range; r++)
 				{
+					const Uint16 add=Uint16((range-r)*strengthQ8/256);
 					for (int dx=-r; dx<=r; dx++)
 					{
 						Uint16 *gp=&gradient[((x+dx)&wMask)+(((y -r)&hMask)<<wDec)];
-						*gp+=(range-r);
+						*gp+=add;
 					}
 					for (int dx=-r; dx<=r; dx++)
 					{
 						Uint16 *gp=&gradient[((x+dx)&wMask)+(((y +r)&hMask)<<wDec)];
-						*gp+=(range-r);
+						*gp+=add;
 					}
 					for (int dy=(1-r); dy<r; dy++)
 					{
 						Uint16 *gp=&gradient[((x -r)&wMask)+(((y+dy)&hMask)<<wDec)];
-						*gp+=(range-r);
+						*gp+=add;
 					}
 					for (int dy=(1-r); dy<r; dy++)
 					{
 						Uint16 *gp=&gradient[((x +r)&wMask)+(((y+dy)&hMask)<<wDec)];
-						*gp+=(range-r);
+						*gp+=add;
 					}
 				}
 		}
@@ -531,14 +538,14 @@ Uint8 castorWheatGradient(Uint16 g)
 
 Uint8 AICastor::wheatGradientAt(size_t index)
 {
-	return castorWheatGradient(queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),canSwim ? Map::SWIM_CLASS_EVEN : 0).data()[index]);
+	return castorWheatGradient(queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),movementAccessFromLegacy(canSwim ? Map::SWIM_CLASS_EVEN : 0)).data()[index]);
 }
 
 void AICastor::copyWheatGradient(Uint8* destination)
 {
 	const size_t size=observation->width*observation->height;
 	if (!size) return;
-	const auto* gradient=queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),canSwim ? Map::SWIM_CLASS_EVEN : 0).data();
+	const auto* gradient=queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),movementAccessFromLegacy(canSwim ? Map::SWIM_CLASS_EVEN : 0)).data();
 	for (size_t i=0; i<size; ++i)
 		destination[i]=castorWheatGradient(gradient[i]);
 }
@@ -554,7 +561,7 @@ void AICastor::computeWheatGrowthMap()
 	size_t size=w*h;
 	memcpy(wheatGrowthMap, obstacleBuildingMap, size);
 	
-	const auto* gradient=size ? queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),canSwim ? Map::SWIM_CLASS_EVEN : 0).data() : nullptr;
+	const auto* gradient=size ? queries->resourceGradient(teamNumber,materialIndex(MaterialId::Food),movementAccessFromLegacy(canSwim ? Map::SWIM_CLASS_EVEN : 0)).data() : nullptr;
 	for (size_t i=0; i<size; i++)
 		if (castorWheatGradient(gradient[i])==AI_CASTOR_WHEAT_GRADIENT_PEAK)
 			wheatGrowthMap[i]=AI_CASTOR_WHEAT_GROWTH_BASE+(hydratationMap[i]>>AI_CASTOR_WHEAT_GROWTH_HYDRATATION_SHIFT);

@@ -15,7 +15,7 @@ their lazy initialization/invalidation paths. Skipping one field does not cause
 another family to fill an executor slot. With no initialization, reactive request
 or accepted demanded refresh, no periodic work is submitted.
 
-A logical field key contains a stable family, team, movement class and optional
+A logical field key contains a stable family, team, movement access and optional
 material identity. Its publication carries the immutable capture tick, effective
 seed count and change epochs, movement-counter baseline and history-known flag.
 Requests made while a replacement is pending do not move its deadline. Published
@@ -23,10 +23,10 @@ cells remain available until replacement publication, normally eight ticks after
 capture. Replacements of an existing shared field have a 32-tick minimum
 between admissions, including reactive, history and safety refreshes. First-use
 initialization of a missing field remains available immediately. A demanded
-field is eligible for a safety refresh when its serving capture reaches 1,024
+field is eligible for a safety refresh when its serving capture reaches 256
 ticks, even if its predicted benefit is below threshold. Admission remains
 subject to executor capacity and normal publication delay, so serving age can
-exceed 1,024 while a replacement is pending. Idle fields do not refresh solely
+exceed 256 while a replacement is pending. Idle fields do not refresh solely
 because they aged. Demand is registered before cached-unreachable returns, so a
 new source or opened route can recover. Team aliveness is not a substitute for actual demand.
 The minimum applies separately to each family/team/movement/material identity.
@@ -98,7 +98,7 @@ as a positive signed 64-bit integer. Every pool must agree, and preparation
 records that attested value as actual collection policy. Fresh bundles must also
 attest matching `build_options.refresh_age_cap_ticks` and
 `build_options.refresh_minimum_interval_ticks` in every pool. The current cap
-is `1024` and the current minimum is `32`; the correctness floor is eight ticks. Missing or contradictory attestations fail rather
+is `256` and the current minimum is `32`; the correctness floor is eight ticks. Missing or contradictory attestations fail rather
 than assuming a default. Frozen historical exports remain
 readable and their bytes are not amended.
 Hash-only qualification receipts accept only the canonical declaration or the
@@ -106,7 +106,7 @@ explicitly reconstructed historical 128000 declaration.
 
 An untrained header is an explicit placeholder, not a mapped resource-only model.
 Ordinary execution retains cold/reactive/history initialization and the demanded
-1,024-tick safety refresh without pretending that placeholder predictions
+256-tick safety refresh without pretending that placeholder predictions
 establish adaptive quality. Collection bootstrapping requires explicit positive fixed intervals.
 Interval 0 is available only with a trained generic model. Engine promotion still
 requires total-compute and per-family quality evidence.
@@ -260,15 +260,24 @@ An unmeasured family receives neither synthetic zero labels nor a validation
 claim. Reports also score the same unified rows with
 the previous weighting, so a weighting change is not mistaken for a feature gain.
 
-The checked-in fit uses a derived view of the historical AI campaign that
-excludes Guard movement rows owned by Cabino, Castor, Cortex, Econo, Nicowar and
-Numbi. Its verified initial maps had no painted zones and its games accepted no
-external orders; those six implementations never paint Guard zones. Raw cohorts
-and persistent map splits are retained, with exclusions recorded separately.
-Maxima/Warrush zero-goal rows remain: zero eligible gradient goals cannot prove
-there were no painted tiles. This filter applies to that recorded campaign,
-not to AI identity at runtime or to future games with human-painted zones.
-Model provenance records both input identities and the exclusion manifest hash.
+The checked-in fit (November 2026) comes from 9,856 games collected on the
+SIM 154 engine with the `unified-gradient-h128-v4` collector: 1.22M eligible
+episodes on 7,385 development and 2,464 held-out maps, with formats, generators
+and AIs sampled evenly. Its held-out decision regret is 2.80, against 3.29 for
+the previous coefficients on the same held-out rows. A learning curve on those
+rows was flat from 461 to 7,385 training maps (2.82 to 2.80): the gain came from
+current-engine data rather than volume, so a later refit after engine changes
+needs only a few hundred maps. Over half of the games reached the 1,800-second
+cap and contributed their complete horizons as censored cohorts. No row filter
+is applied, since Guard and Clear fields are now requested only for teams with
+painted zones (see the top of this guide). Markets remain unmeasured and use the
+combined fallback. Model provenance records the training-input receipt, split
+registry and slot accounting.
+
+The previous fit used a derived view of the historical AI campaign that excluded
+Guard movement rows owned by Cabino, Castor, Cortex, Econo, Nicowar and Numbi,
+which never paint Guard zones; that engine still requested their empty Guard
+fields. Its raw cohorts and map splits remain on the historical evidence branch.
 
 Review pooled and per-family results, format/generator/size, age/demand,
 target-change, route-change and weighted-cost-change slices. A good pooled score
@@ -280,7 +289,7 @@ load. Keep diagnostic quality repeats separate from production timings.
 
 Review age/demand joint support explicitly. Historical uncapped cohorts retain
 their original policy metadata; their H128 labels remain compatible with a
-changed deployment cap. The 1,024-tick demanded safety refresh is an explicit
+changed deployment cap. The 256-tick demanded safety refresh is an explicit
 policy, not a learned prediction or a guarantee of publication by that age.
 
 Scheduling/state changes require save/load, thread/platform checksum and
@@ -437,3 +446,38 @@ Adapter implementation is an explicit environment-specific boundary: a config
 with missing adapters is not a self-contained build recipe. The driver and its
 focused mocked orchestration tests can be verified without starting games;
 adopting a live campaign or replacing its frozen tools is deliberately excluded.
+
+## Shared amphibious routing
+
+Live gradient lookups use movement access, rather than a walking/swimming speed
+ratio. Land-only and amphibious ground units each share a field; water-only and
+air access remain separate. Actual movement speeds and physical passability are
+unchanged. Living amphibious ground units determine their team's most common
+quantized ratio initially and every 512 simulation ticks. A tie retains the
+previous choice when possible, otherwise choosing the lower class; an empty
+team uses equal walking/swimming cost.
+
+The ratio is captured when a field preparation starts. Published fields retain
+their own preparation costs for direction selection and lazy expansion. A policy
+change does not discard published guidance or eagerly rebuild all fields: units
+continue using the existing field until its ordinary refresh publishes a
+replacement. Allied visitors share the building owner's field and cost policy.
+Synchronous hazard-escape caches use the same access identities and team ratio;
+a ratio change rebuilds their derived field on the next query to keep cache resets
+and save/load directionally equivalent. Periodic, consumer-specific, building,
+snapshot-backed material and hiring queries use the same access identities. Single-team point searches use that team's policy;
+multi-team searches use equal cost because they have no single owner. Maxima's
+independent strategic travel fields retain their neutral access-based semantics.
+
+Save format 205 preserves each published and pending field's captured costs.
+Older saves coalesce ratio-keyed fields into one amphibious field, preserving
+available published guidance while restarting obsolete preparation queues. The
+save-format floor remains unchanged. Historical research campaigns require their
+frozen binaries and tool packages; production exposes no ratio-policy selector.
+
+The existing unified quality probe uses private fresh fields and copied selector
+RNG state. Its private fields retain captured preparation costs independently of
+live caches; counterfactual results do not describe completed journeys. Existing
+`--gradient-work-stats PATH` diagnostics retain request, refresh and publication
+statistics. Elapsed scopes remain attribution aids, not additive process CPU
+measurements.

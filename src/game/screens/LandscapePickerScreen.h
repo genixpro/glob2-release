@@ -1,3 +1,4 @@
+#include "ui/DiagnosticText.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 #include "GenerationRequest.h"
@@ -7,6 +8,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 /// A full-window modal showing every landscape as a freshly generated map, for picking one by
@@ -30,13 +32,6 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	{
 		CANCEL = -2
 	};
-	/// How the sheet orders its tiles. Random is the registry's own catalog order (shuffled once
-	/// so browsing favours no landscape); Alphabetical sorts by each entry's shown name.
-	enum class SortOrder
-	{
-		Random,
-		Alphabetical
-	};
 	struct Entry
 	{
 		std::string name;
@@ -48,8 +43,7 @@ class LandscapePickerScreen : public Glob2UI::Screen
 		// This entry's generator's catalog tags (GeneratorDefinition::tags), for the filter row.
 		std::vector<std::string> tags;
 	};
-	LandscapePickerScreen(const std::string &title, std::vector<Entry> entries, int selected,
-						  SortOrder sortOrder = SortOrder::Random);
+	LandscapePickerScreen(const std::string &title, std::vector<Entry> entries, int selected);
 	~LandscapePickerScreen() override;
 	Glob2UI::Element build(const Glob2UI::Presentation &presentation) override;
 	void onTimer(Uint32 tick) override;
@@ -62,10 +56,6 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	std::optional<std::uint32_t> chosenSeed() const;
 	/// The request the selection's preview was rolled with (see randomizeParameters).
 	GenerationRequest chosenRequest() const;
-	/// The sort order currently shown, random or alphabetical, as last changed by the person
-	/// (starts at the constructor's `sortOrder`) - a caller persists this the way it persists any
-	/// other lobby preference.
-	SortOrder currentSortOrder() const { return sortOrder; }
 	/// Draws every landscape's own controls at random (GenerationRequest::randomizeControls) and
 	/// rolls them all again. A random set the world then refuses is drawn again, up to
 	/// kRandomDraws times per landscape, so the sheet fills with maps that exist.
@@ -81,8 +71,7 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	/// at - uniform across entries[] by construction (the caller's GenerationHistory already
 	/// carries these shared fields onto every method) and kept uniform by setShared(). A caller
 	/// reads these back after execute() returns, on any exit, and applies them to its own lobby
-	/// setup, the same two-way relationship currentSortOrder() has with a caller's preferences:
-	/// this sheet is a live view onto shared lobby settings, not a disconnected copy of them.
+	/// setup: this sheet is a live view onto shared lobby settings.
 	int sharedWDec() const { return entries.empty() ? 0 : entries.front().request.wDec; }
 	int sharedHDec() const { return entries.empty() ? 0 : entries.front().request.hDec; }
 	int sharedTeams() const { return entries.empty() ? 0 : entries.front().request.nbTeams; }
@@ -92,6 +81,26 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	/// still compatible with it. FEEDBACK 2026-09-17: the point is instant comparison across the
 	/// whole grid of how every landscape responds, not editing one map's parameters in isolation.
 	void setShared(const GeneratorControl &control, int value);
+	/// Sets several shared controls at once (by GeneratorControl::id), then rerolls and
+	/// rechecks the sheet a single time, as setShared does for one.
+	void setShared(const std::vector<std::pair<std::string, int>> &changes);
+	/// Entries the active filters keep but that cannot generate at the sheet's size and colony
+	/// count, sorted by name. They are drawn after the grid in a group that starts collapsed,
+	/// so the browsable grid holds only real maps while every landscape stays discoverable.
+	const std::vector<int> &unavailableEntries() const { return unavailable; }
+	bool unavailableShown() const { return showUnavailable; }
+	void setUnavailableShown(bool shown);
+	/// The nearest shared settings (colony count alone, or a square size) at which entries[index]
+	/// would generate, as (control id, value) pairs and a button label; nullopt when it already can,
+	/// or no shared setting makes it valid.
+	struct SettingsFix
+	{
+		std::vector<std::pair<std::string, int>> changes;
+		std::string label;
+	};
+	const std::optional<SettingsFix> &settingsFix(int index) const { return fixes[std::size_t(index)]; }
+	/// Applies settingsFix(index) and selects that entry.
+	void applySettingsFix(int index);
 
   protected:
 	void onEscape() override { endExecute(CANCEL); }
@@ -109,6 +118,7 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	std::vector<std::unique_ptr<MapPreview>> previews;
 	static std::vector<GenerationRequest> requestsOf(const std::vector<Entry> &);
 	Glob2UI::Element tile(int index, const Glob2UI::Presentation &presentation, bool compact);
+	std::optional<SettingsFix> nearestFix(const GenerationRequest &request) const;
 	void refresh();
 	void updatePreviewPriority();
 	/// Whether entries[index] matches every active filter except filterCategories[skip] (skip < 0
@@ -119,10 +129,8 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	/// Refills `incompatible` from a fresh validateGenerationRequest per entry, against each
 	/// entry's own (shared, per setShared) size and colony count.
 	void recomputeIncompatible();
-	/// Recomputes `visible` (entries[] indices, filtered by the active tag choices and ordered by
-	/// `sortOrder`) and `incompatible` (each entry's live validateGenerationRequest reason against
-	/// the sheet's own size/colony count, empty when it can generate). Called once at construction
-	/// and again whenever the person changes the sort order or a filter.
+	/// Recomputes `visible`: entries[] indices filtered by the active tag choices and sorted
+	/// by localized display name. Called at construction and after filter or shared-control edits.
 	void rebuild();
 	std::string title;
 	std::vector<Entry> entries;
@@ -130,12 +138,18 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	/// Per entry, random draws still allowed after a refused set (0 when the parameters are the
 	/// entry's own or the draws are spent).
 	std::vector<int> redraws;
-	/// entries[] indices currently shown, filtered and ordered; empty-filter/Random means the
-	/// identity order 0..entries.size()-1.
+	/// entries[] indices shown in the main grid: filtered, able to generate at the sheet's
+	/// settings, and sorted by localized display name.
 	std::vector<int> visible;
+	/// Filtered entries that cannot generate at the sheet's settings (see unavailableEntries).
+	std::vector<int> unavailable;
+	bool showUnavailable = false;
+	/// Parallel to entries[]: settingsFix() for each, refilled with incompatible[].
+	std::vector<std::optional<SettingsFix>> fixes;
 	/// Parallel to entries[]: the live reason this entry cannot generate at the sheet's size and
 	/// colony count, or empty when it can. Recomputed at construction and by setShared() whenever
 	/// that size or count changes; a validateGenerationRequest check, so it costs no worker time.
+	std::vector<std::string> incompatibleText;
 	std::vector<std::string> incompatible;
 	/// Every tag category present across entries[]'s own tags (each generator's own
 	/// GeneratorDefinition::tags, carried in by the caller), fixed at construction in a stable
@@ -150,6 +164,5 @@ class LandscapePickerScreen : public Glob2UI::Screen
 	Uint32 nextPreviewTick = 0;
 	std::vector<std::size_t> priorityOrder;
 	std::vector<std::size_t> viewportSlots;
-	SortOrder sortOrder;
 	LandscapePreviewer previewer;
 };

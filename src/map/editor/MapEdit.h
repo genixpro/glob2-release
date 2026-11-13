@@ -13,11 +13,12 @@
 #include "BrushCatalog.h"
 #include "BrushSwatches.h"
 #include "MapEditPresentation.h"
-#include "TerrainPresentation.h"
 #include "GAGSys.h"
 #include "LoadSaveDialog.h"
 #include <memory>
-#include "Game.h"
+#include "TeamCapacity.h"
+class Game;
+struct Tile;
 #include "KeyboardManager.h"
 #include "MapEditDialog.h"
 #include "WidgetRectangle.h"
@@ -25,10 +26,10 @@
 #include <optional>
 #include <set>
 #include "render/Minimap.h"
+#include "render/ViewState.h"
 #include "OverlayAreas.h"
 #include "ScriptEditorScreen.h"
 #include "EditorDialogs.h"
-#include "SetLibraryDialog.h"
 #include <string>
 #include <vector>
 
@@ -48,7 +49,9 @@ constexpr int mapEditZoneButtonX(int index, int count)
 class MapEdit;
 class PhoneEditor;
 class EditorDock;
+class SetLibraryDialog;
 struct InspectorModel;
+struct EditorSceneCache;
 
 ///This is a map editor widget, which is a widget that works within the map editor. Now to answer the crucial question, why not
 ///use libgag? Indeed, I had pondered on the use of libgag for quite some time, considering all of the odds and ends that would
@@ -114,7 +117,7 @@ public:
 	// columns fit the desktop sidebar and keep all sixteen teams in two rows.
 	static constexpr int SWATCH_SIZE = 16;
 	static constexpr int COLUMNS = (RIGHT_MENU_WIDTH - 2 * RIGHT_MENU_OFFSET) / SWATCH_SIZE;
-	static constexpr int ROWS = (Team::MAX_COUNT + COLUMNS - 1) / COLUMNS;
+	static constexpr int ROWS = (TEAM_MAX_COUNT + COLUMNS - 1) / COLUMNS;
 	static constexpr int WIDTH = COLUMNS * SWATCH_SIZE;
 	static constexpr int HEIGHT = ROWS * SWATCH_SIZE;
 	TeamColorSelector(MapEdit& me, const widgetRectangle& area, const std::string& group, const std::string& name, const std::string& action);
@@ -468,6 +471,7 @@ class MapEdit
     friend class PhoneEditor;
     friend class GameGUITouchHarness;
 	friend class MobileGalleryGameplay;
+    friend struct TranslationPreviewAccess;
 	std::unique_ptr<PhoneEditor> phone;
     bool editing = false;
     int editingResult = 0;
@@ -520,12 +524,15 @@ public:
 	///This function regenerates a game header for use in campaigns
 	void regenerateGameHeader();
 
-	Game game;
+	/// Held through a pointer so that MapEdit.h need not include Game.h; `game`
+	/// is the same object, bound once at construction.
+	std::unique_ptr<Game> gameOwner;
+	Game& game;
 
 	///Per-client viewer state (selection + mouse). NOT simulation state — see
-	///Game::ViewState. Owned here (not on Game) and passed into game.drawMap.
+	///ViewState. Owned here (not on Game) and passed into MapDrawer::drawMap.
 	///The editor only ever uses selectedUnit.
-	Game::ViewState view;
+	ViewState view;
 
 	// --- WS-A brush catalogue ---
 	// One brush model for every presentation; see BrushCatalog.h for entry ids
@@ -574,6 +581,7 @@ public:
 	// legacy sidebar width when neither dock nor phone presentation exists.
 	int dockWidth() const;
 	EditorDock *editorDock() const { return dock.get(); }
+	std::vector<GAGGUI::ui::Host *> inspectionHosts();
 	// Map status strip (bottom-left of the map): pointer coordinates plus the
 	// transient status from showStatus().
 	const std::string &coordinatesText() const { return coordinates; }
@@ -581,6 +589,7 @@ private:
 	friend class EditorDock;
 	friend InspectorModel buildInspectorModel(MapEdit &editor);
 	std::unique_ptr<EditorDock> dock;
+	std::unique_ptr<GAGGUI::ui::Host> mapControlsHost;
 	// Dock sections the author collapsed ("<section>/<group>"), kept across
 	// dock rebuilds and presentation switches.
 	std::set<std::string> dockCollapsed;
@@ -1014,8 +1023,12 @@ private:
 	void drawTerrainBrushPreview();
 public:
     // Explicit owner observation for editor drawing and standalone editor tools.
+    // Keeps the current scene while the world and the request are unchanged.
     void preparePresentation();
+    //! Scenes prepared so far; a frame that kept its scene does not count.
+    Uint64 scenePreparations() const;
 private:
+    std::unique_ptr<EditorSceneCache> sceneCache; // see EditorSceneCache.h
 	void drawStatus();
 	// --- end WS-B brush painting ---
 	///Handles a click or drag of the mouse when removing objects

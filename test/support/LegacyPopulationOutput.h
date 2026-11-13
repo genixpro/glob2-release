@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Game.h"
+#include "gradient/MapRouting.h"
 #include "Team.h"
 #include "Unit.h"
 #include "Building.h"
@@ -25,6 +26,7 @@ namespace glob2test
 // fixtures instead; silently dropping their state would weaken continuation tests.
 // PreservePending explicitly supports representable 164–168 warm-field jobs,
 // retaining every private array and deadline while rejecting new cold/cache state.
+// The appended probability history is omitted from pre-190 TeamStats records.
 // Other historical field differences remain the fixture author's responsibility.
 class LegacyPopulationOutput : public GAGCore::BinaryOutputStream
 {
@@ -39,12 +41,15 @@ class LegacyPopulationOutput : public GAGCore::BinaryOutputStream
     Team* team = nullptr;
     unsigned populationSection = 0;
 
-    bool suppressed() const { return suppressedAt && !injecting; }
-    bool tracking() const { return formatVersion<FILE_FORMAT_VERSION_TEAM_BUILDING_GRADIENT_QUOTA || formatVersion<FILE_FORMAT_VERSION_GRADIENT_DEMAND || legacy || !hasInitialBuildingGradient(formatVersion) || !hasDelayedGradientState(formatVersion); }
+    // Units injected in legacy population order bypass ordinary section
+    // tracking; their post-format sections are tracked by depth instead.
+    unsigned injectedDepth = 0, injectedSuppressedAt = 0;
+    bool suppressed() const { return injecting ? injectedSuppressedAt!=0 : suppressedAt!=0; }
+    bool tracking() const { return formatVersion<FILE_FORMAT_VERSION_RESOURCE_CLAIMS || formatVersion<FILE_FORMAT_VERSION_WIN_PROBABILITY_HISTORY || formatVersion<FILE_FORMAT_VERSION_MAINLINE_TERRAINS || formatVersion<FILE_FORMAT_VERSION_GRADIENT_DEMAND || legacy || !hasInitialBuildingGradient(formatVersion) || !hasDelayedGradientState(formatVersion); }
     void requireGradientRuntime() const
     {
         if (!game) throw std::logic_error("Synthetic historical runtime requires its owning Game");
-        const auto& runtime=*game->map.gradientRuntime;
+        const auto& runtime=*game->map.routing().gradientRuntime;
         if (preservePending) {
             // These formats share the current material/swim slot encoding.
             // Cold demands and new cache families have no historical equivalent.
@@ -54,7 +59,7 @@ class LegacyPopulationOutput : public GAGCore::BinaryOutputStream
                 throw std::logic_error("Historical pending runtime contains unrepresentable demand or caches");
             const auto legacyEnd=Team::MAX_COUNT*(2*MaterialSlotCount+2)*MOVEMENT_CLASS_COUNT;
             runtime.pipeline.visitLogical([&](auto* slot,unsigned,bool) {
-                if (!*slot || game->map.gradientDestination(slot)>=legacyEnd)
+                if (!*slot || game->map.routing().gradientDestination(slot)>=legacyEnd)
                     throw std::logic_error("Historical pending runtime requires a published legacy field destination");
             });
             const auto publishedBuilding=[&](int team,int id,Uint32 identity,int slot) {
@@ -124,18 +129,18 @@ public:
         if (team<0 || team>=Team::MAX_COUNT || material<0 || material>=MaterialCount
             || swim<0 || swim>=SWIM_CLASS_COUNT)
             throw std::invalid_argument("Invalid historical material field key");
-        auto& slot=map.materialGradients[team][material][swim];
+        auto& slot=map.routing().materialGradients[team][material][swim];
         bool pending=false;
-        for (const auto& request:map.gradientRuntime->fieldRequests) if (request.slot==&slot) pending=true;
-        map.gradientRuntime->pipeline.visitLogical([&](auto* destination,unsigned,bool) {
+        for (const auto& request:map.routing().gradientRuntime->fieldRequests) if (request.slot==&slot) pending=true;
+        map.routing().gradientRuntime->pipeline.visitLogical([&](auto* destination,unsigned,bool) {
             if (destination==&slot) pending=true;
         });
         if (slot || pending) throw std::logic_error("Historical material reference must precede enrollment");
         auto field=std::make_unique_for_overwrite<Uint16[]>(map.getW()*map.getH());
-        map.seedMaterialGradient(team,Uint8(material),swim,field.get());
-        map.propagateGradient(field.get(),swim);
+        map.routing().seedMaterialGradient(team,Uint8(material),swim,field.get());
+        map.routing().propagateGradient(field.get(),swim);
         slot=field.release();
-        map.publishPlane(&slot);
+        map.routing().publishPlane(&slot);
     }
     LegacyPopulationOutput(GAGCore::MemoryStreamBackend* backend, Game* game, int version,
         GradientLayout gradients=GradientLayout::Empty)
@@ -152,11 +157,31 @@ public:
         : LegacyPopulationOutput(backend,map.game,version,GradientLayout::PreservePending) {}
     void writeEnterSection(std::string_view name) override
     {
-        if (injecting || !tracking()) return;
+        if (injecting) {
+            ++injectedDepth;
+            if (!injectedSuppressedAt && formatVersion<FILE_FORMAT_VERSION_RESOURCE_CLAIMS
+                && (name=="activeMaterialClaim" || name=="materialClaimPolicyState"))
+                injectedSuppressedAt=injectedDepth;
+            return;
+        }
+        if (!tracking()) return;
 
         const bool teamChild = !sections.empty() && sections.back()=="Team";
         sections.emplace_back(name);
         if (suppressed()) return;
+        if (formatVersion<FILE_FORMAT_VERSION_RESOURCE_CLAIMS && (name=="activeMaterialClaim" || name=="materialClaimPolicyState"
+                || name=="activeMaterialClaims")) {
+            suppressedAt=sections.size(); return;
+        }
+        if (formatVersion<FILE_FORMAT_VERSION_RESOURCE_CLAIMS && (name=="materialDestinations" ||
+            (name=="destinations" && std::find(sections.begin(),sections.end(),"gradientPipeline")!=sections.end()))) {
+            suppressedAt=sections.size();
+            return;
+        }
+        if (formatVersion<FILE_FORMAT_VERSION_WIN_PROBABILITY_HISTORY && name=="winProbability") {
+            suppressedAt=sections.size();
+            return;
+        }
         if (formatVersion<FILE_FORMAT_VERSION_UNIFIED_GRADIENTS
             && (name=="adaptiveGradients" || name=="adaptiveCapture")) {
             suppressedAt=sections.size();
@@ -177,11 +202,11 @@ public:
             if (name=="resourceRoutingCache" || name=="airFields"
                 || (!preservePending && (name=="gradientPipeline" || name=="buildingGradientPipeline"))) {
                 if (name=="gradientPipeline" && formatVersion>=FILE_FORMAT_VERSION_GRADIENT_PIPELINE) {
-                    BinaryOutputStream::writeUint8(game->map.gradientRuntime->pipeline.enabled()
-                        ? game->map.gradientRuntime->pipeline.delayTicks() : 8,"delay");
+                    BinaryOutputStream::writeUint8(game->map.routing().gradientRuntime->pipeline.enabled()
+                        ? game->map.routing().gradientRuntime->pipeline.delayTicks() : 8,"delay");
                     BinaryOutputStream::writeUint8(0,"count");
                 } else if (name=="buildingGradientPipeline" && formatVersion>=FILE_FORMAT_VERSION_BUILDING_GRADIENT_PIPELINE) {
-                    BinaryOutputStream::writeUint8(game->map.gradientRuntime->buildings.delayTicks(),"delay");
+                    BinaryOutputStream::writeUint8(game->map.routing().gradientRuntime->buildings.delayTicks(),"delay");
                     if (hasInitialBuildingGradient(formatVersion)) BinaryOutputStream::writeUint32(0,"count");
                     else BinaryOutputStream::writeUint16(0,"count");
                     BinaryOutputStream::writeUint8(0,"count"); // No admitted results.
@@ -214,7 +239,8 @@ public:
     }
     void writeEnterSection(unsigned index) override
     {
-        if(injecting || !tracking()) return;
+        if(injecting) { ++injectedDepth; return; }
+        if(!tracking()) return;
         const std::string parent=sections.empty()?std::string{}:sections.back();
         const bool mapRuntime=std::find(sections.begin(),sections.end(),"mapRuntime")!=sections.end();
         const bool building=std::find(sections.begin(),sections.end(),"buildings")!=sections.end();
@@ -229,7 +255,15 @@ public:
     }
     void writeLeaveSection(std::size_t count=1) override
     {
-        if (injecting || !tracking()) return;
+        if (injecting) {
+            while (count--) {
+                if (!injectedDepth) throw std::logic_error("Unbalanced injected historical sections");
+                if (injectedSuppressedAt==injectedDepth) injectedSuppressedAt=0;
+                --injectedDepth;
+            }
+            return;
+        }
+        if (!tracking()) return;
 
         while (count--) {
             if (sections.empty()) throw std::logic_error("Unbalanced synthetic historical sections");
@@ -242,17 +276,28 @@ public:
                 // Before delayed fields, the material cache followed the pipeline.
                 // Empty entries have no changed per-entry encoding.
                 injecting=true;
-                game->map.saveMaterialRoutingCache(this);
+                game->map.routing().saveMaterialRoutingCache(this);
                 injecting=false;
             }
         }
     }
     void write(const void* data, std::size_t size, std::string_view name) override
-    { if (!suppressed() && !observationField(name) && !(name=="airLocked" && !hasUnifiedMovement(formatVersion))) BinaryOutputStream::write(data,size,name); }
+    {
+        if (suppressed() || observationField(name)
+            || (name=="airLocked" && !hasUnifiedMovement(formatVersion))) return;
+        BinaryOutputStream::write(data,size,name);
+        // Format187 retired this MapHeader word. Relabelled historical fixtures
+        // still need the empty requirement list before the resource definitions.
+        if (!injecting && name=="SHA1" && !sections.empty() && sections.back()=="MapHeader"
+            && formatVersion>=FILE_FORMAT_VERSION_TERRAIN_PROPERTIES
+            && formatVersion<FILE_FORMAT_VERSION_MAINLINE_TERRAINS)
+            BinaryOutputStream::writeUint32(0,"count");
+    }
     void writeEndianIndependent(const void* data, std::size_t size, std::string_view name) override
     { if (!suppressed() && !observationField(name) && !(name=="airLocked" && !hasUnifiedMovement(formatVersion))) BinaryOutputStream::writeEndianIndependent(data,size,name); }
     void writeUint32(Uint32 value, std::string_view name) override
     {
+        if(formatVersion<FILE_FORMAT_VERSION_ROUTING_RATIO_POLICY && name=="routingRatioTick")return;
         if (suppressed()) return;
         if (formatVersion<FILE_FORMAT_VERSION_UNIFIED_GRADIENTS
             && (name=="adaptiveKey" || name=="preparedGoalCount")) return;
@@ -323,7 +368,12 @@ public:
     }
     void writeUint8(Uint8 value,std::string_view name) override
     {
+        if (formatVersion<FILE_FORMAT_VERSION_RESOURCE_CLAIMS && name=="destinations" &&
+            std::find(sections.begin(),sections.end(),"queuedRequests")!=sections.end()) return;
+
         if(suppressed()) return;
+        if(formatVersion<FILE_FORMAT_VERSION_ROUTING_RATIO_POLICY
+            && (name=="preparationCost" || name=="routingRatioClass" || name=="routingRatioKnown"))return;
         if(formatVersion<FILE_FORMAT_VERSION_UNIFIED_GRADIENTS
             && (name=="hasAdaptiveKey" || name=="legacyAssociation")) return;
         if(formatVersion<FILE_FORMAT_VERSION_UNIFIED_GRADIENTS && name=="suspendedStale") {

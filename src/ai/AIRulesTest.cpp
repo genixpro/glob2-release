@@ -1,6 +1,10 @@
 #include "CabinoObservationFixture.h"
+#include "Map.h"
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
+#include "HeadlessGame.h"
+#include "GameGUI.h"
+#include "GameFixtures.h"
 #include "AI.h"
 #include "AIRules.h"
 #include "AIRuleOrders.h"
@@ -76,7 +80,6 @@ void checkOrder(Game& g, Order& o)
 std::vector<Uint32> state(Game& g)
 {
     std::vector<Uint32> s,b,u; g.checkSum(&s,&b,&u,true);
-    s.erase(s.begin()); // loader records the save format
     s.insert(s.end(),b.begin(),b.end()); s.insert(s.end(),u.begin(),u.end());return s;
 }
 std::string tick(Game& g)
@@ -690,7 +693,8 @@ TEST_CASE("renewable material potential survives saturation and honors yield pol
     const auto food=materialIndex(MaterialId::Food);
     const auto wheat=*map.resourceRegistry().find("wheat");
     // All-grass fixture maps have zero land fertility until a water donor exists.
-    map.paintCell(9,8,WATER);
+    // Cell 9 is the grass/water shore, so the wheat at (8,8) stands on pure grass.
+    map.paintCell(10,8,WATER);
     map.setResource(8,8,wheat,0);
     const auto ecology=map.resourceGrowthRateAt(index,resourceIndex(wheat));
     REQUIRE(ecology>0);

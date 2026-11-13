@@ -7,7 +7,37 @@
 // This is the version of map and savegame format, and all of the recorded data on the server
 #define VERSION_MAJOR 0
 #define MINIMUM_VERSION_MINOR 58
-#define VERSION_MINOR 186
+#define VERSION_MINOR 216
+// version 216 adds built-in steppe grass and moor grass; custom terrain IDs move up by two.
+// version 215 saves Maxima's last maintenance-clearing tick and its farming request flag.
+// version 214 saves remembered enemy building positions in Maxima's placement snapshot for role-sited towers.
+// version 213 persists material destination planes, active claims, pending unit routes, claim policy cadence and bounded claim recovery; snapshot-v4 checksums.
+// version 212 adds nine built-in Barriers and Outcrops looks; custom terrain IDs move up by nine.
+// version 211 adds built-in glacier; custom terrain IDs move up by one.
+// version 210 adds built-in arctic tundra; custom terrain IDs move up by one.
+// version 209 adds built-in rime ashlar, moonstone lozenge and frost pinwheel; custom terrain IDs move up by three.
+// version 208 adds built-in slate ashlar, basalt causeway and scoria blocks; custom terrain IDs move up by three.
+// version 207 adds built-in molten lava pool; custom terrain IDs move up by one.
+// version 206 adds built-in cliffs; custom terrain IDs move up by one.
+// version 205 shares amphibious fields and stores captured preparation costs.
+// version 204 adds built-in laterite; custom terrain IDs move up by one.
+// version 203 adds built-in overgrown road; custom terrain IDs move up by one.
+// version 202 adds built-in glacier ice; custom terrain IDs move up by one.
+// version 201 adds built-in volcanic ash; custom terrain IDs move up by one.
+// version 200 adds built-in tundra; custom terrain IDs move up by one.
+// version 199 adds built-in hardpan; custom terrain IDs move up by one.
+// version 198 adds built-in windy sand dune; custom terrain IDs move up by one.
+// version 197 adds built-in weathered sandstone; custom terrain IDs move up by one.
+// version 196 adds built-in wind-swept snow; custom terrain IDs move up by one.
+// version 195 adds built-in sandstone tiles, pumice field and frozen lake; custom terrain IDs move up by three.
+// version 194 lets replenishment couriers finish trips before demand-driven dismissal; save encoding is unchanged.
+// version 193 adds the saved adaptive prestige pipeline limit.
+// version 192 persists Maxima prestige investment and cancellation state.
+// version 191 adds four built-in grass and sand looks; custom terrain IDs move up by four.
+// version 190 adds automatic, explicitly timestamped win-probability history.
+// version 189 stores Maxima's current-flag proximity preference.
+// version 188 persists dedicated Maxima forward-support intent constraints.
+// version 187 graduates all terrains and removes terrain experiment observations.
 // version 186 admits four building gradients per team per tick and widens pending counts.
 // version 185 skips requests for unpainted Guard/Clear zones using derived tile counts.
 // Existing saves retain their masks and committed jobs; counts rebuild on load.
@@ -231,7 +261,9 @@
 //NetMessage, and the likes, in parallel to change of the VERSION_MINOR above. It is part of
 //the simulation version (src/online/SimVersion.cpp). The YOG lobby that also checked it
 //(YOG_MIN_CLIENT_NET_PROTOCOL_VERSION) was removed at protocol 51.
-#define NET_PROTOCOL_VERSION 72
+#define NET_PROTOCOL_VERSION 75
+// Protocol 75 requires adaptive prestige configuration continuation (format 193).
+// Protocol 73 omits retired terrain requirements from format-187 map headers.
 // Protocol 72 adds explicit presence and source ticks to order checksum envelopes.
 // Protocol 71 applies private-stock and cached-performance caps (format 160).
 // Protocol 70 transfers complete delayed measurement frames (format 158).

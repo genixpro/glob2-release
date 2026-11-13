@@ -158,7 +158,7 @@ one. AI observation history is recorded during simulation, even between decision
 and disabled/eliminated controllers stop recording it.
 
 AI callbacks read a frozen view of their logical `ctx.tick`. The match-wide order
-delay is 0–8 ticks, default 8, and applies to every AI controller. Returned orders
+delay is 0–16 ticks, default 14, and applies to every AI controller. Returned orders
 execute at the engine's scheduled deadline rather than immediately during the
 callback. Account for outstanding actions and execution receipts before issuing
 another command for the same intent. Acceptance of an action is distinct from
@@ -272,7 +272,7 @@ Profile versioning and API-maintenance obligations are in the reference.
 
 ## Verify a change
 
-Build `unit-tests engine-tests` with SCons, then run:
+Build `python3 tools/dev_build.py unit-tests engine-tests`, then run:
 
 ```sh
 python3 test/run_tests.py --filter 'JavaScript*/*'
@@ -416,7 +416,7 @@ custom content and existing saves.
 
 ### Authoring and packaging
 
-`scripts/tutorials/catalog.json` lists lesson definition files and generated
+`content/scripts/tutorials/catalog.json` lists lesson definition files and generated
 script paths. Each definition supplies a stable lesson ID and version, a packaged
 map path, translation keys, named targets, ordered steps, hints and setup effects.
 `introduction.json` is the five-step example; `food-supply.json` reuses ordinary
@@ -489,7 +489,7 @@ python3 tools/tutorials/build.py --check --maps --binary BUILD_DIRECTORY/src/glo
 python3 test/run_tests.py --build-dir BUILD_DIRECTORY --filter 'Introduction/*'
 ```
 
-The normal JavaScript generator package in `data/generators/training/` owns the
+The normal JavaScript generator package in `content/data/generators/training/` owns the
 256×256 landscape and lesson starting setups. Seed 20261026, two colonies and
 eight starting workers per colony are pinned by the builder. Each catalog entry has an explicit, unique `setup` selector which
 selects a setup independently of menu order; the landscape never reads that selector. Lesson modules share
@@ -510,7 +510,7 @@ maps use the existing nine script-area slots without changing the save format.
 
 Adding a lesson requires a definition/catalog entry, a JS starting-setup module,
 its generator selector, translation keys and regenerated assets. Terrain changes
-belong in the shared landscape module. Generated scripts under `scripts/` are
+belong in the shared landscape module. Generated scripts under `content/scripts/` are
 reviewable bundles; edit their definitions and shared runtime. Existing maps and
 saves keep their embedded source. The SGSL tutorial remains available separately.
 

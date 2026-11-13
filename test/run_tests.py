@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Run the native doctest binaries: glob2-engine-tests and glob2-unit-tests.
+"""Run the native doctest binaries: glob2-engine-tests, glob2-unit-tests and the module
+binaries carved out of them, glob2-sim-tests and glob2-map-tests.
 
 Every engine test case runs in its own process with a disposable profile, dummy SDL
 drivers unless it is tagged [display], a timeout and captured output shown only on
@@ -7,18 +8,30 @@ failure. Headless unit cases share a process; display unit cases run separately.
 and, under GitHub Actions, into the step summary with per-failure annotations.
 Fullscreen checks within display cases run only with --fullscreen.
 
+Binaries: --binary engine runs glob2-engine-tests and glob2-sim-tests (cases moved
+out of the engine binary keep its one-process-per-case policy and its coverage
+labels); --binary unit runs glob2-unit-tests and glob2-map-tests; --binary sim or
+map runs one module binary alone; all (the default) runs every built binary. Each
+module test file must list at least the cases test/tests.py MODULE_CASE_FLOORS
+records for it, so a case moved out of engine or unit cannot silently disappear.
+
 Tags are bracketed words at the end of a test-case name:
   [display]        needs a real window; xvfb on Linux, skipped on Windows and --no-display
   [display:WxH]    same, with a specific virtual screen size
-  [slow]           timeout 600 s; excluded by --quick
+  [slow]           only in --tier full
   [network]        binds loopback sockets; never runs in parallel with another [network]
   [artifacts]      writes files for review under --artifacts
   [golden]         compares against checked-in text; --update-fixtures rewrites it
   [writes-preferences]  legitimately saves settings (the preferences check is skipped)
   other tags ([maxima], [save-format], ...) only select.
 
+Tiers: --tier headless (the default) runs every case that is neither [display] nor
+[slow]; --tier display adds [display] cases; --tier full runs everything the platform
+can. --filter/--tag without --tier select from the full inventory.
+
 Examples:
-  python3 test/run_tests.py                       # everything the platform can run
+  python3 test/run_tests.py                       # the headless tier
+  python3 test/run_tests.py --tier full           # everything the platform can run
   python3 test/run_tests.py --list --tag display
   python3 test/run_tests.py --filter 'HungryDefeat/*' --verbose
   python3 test/run_tests.py --binary engine --shard 2/4 --junit artifacts/tests/junit.xml
@@ -49,11 +62,26 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools'))
 from build_paths import native_build_directory  # noqa: E402
+sys.path.insert(0, str(ROOT / 'buildsys'))
+import jobserver  # noqa: E402
 
-BINARIES = {'engine': 'glob2-engine-tests', 'unit': 'glob2-unit-tests'}
-DEFAULT_TIMEOUT = 120
-DISPLAY_TIMEOUT = 300
+BINARIES = {'engine': 'glob2-engine-tests', 'unit': 'glob2-unit-tests',
+            'sim': 'glob2-sim-tests', 'map': 'glob2-map-tests'}
+# Runner policy, compatibility filters and coverage labels follow the binary a
+# module's cases came from.
+FAMILY = {'engine': 'engine', 'sim': 'engine', 'unit': 'unit', 'map': 'unit'}
+SELECTIONS = {'engine': ('engine', 'sim'), 'unit': ('unit', 'map'), 'sim': ('sim',), 'map': ('map',),
+              'all': ('engine', 'sim', 'unit', 'map')}
+MODULE_PROGRAMS = ('sim', 'map')
+# Timeouts catch hangs, not slowness. A case recorded in the CI timing profiles
+# (test/ci-timings) gets TIMEOUT_MARGIN times its recorded duration, at least
+# MIN_TIMEOUT; an unrecorded case gets UNKNOWN_TIMEOUT. Unoptimized builds multiply
+# both (timeout_scale), and --timeout or GLOB2_TEST_TIMEOUT_SCALE override them.
+MIN_TIMEOUT = 60
+TIMEOUT_MARGIN = 10
+UNKNOWN_TIMEOUT = 600
 SLOW_TIMEOUT = 600
+TIMING_PROFILES = ROOT / 'test' / 'ci-timings'
 DEFAULT_SCREEN = '1600x1400'
 TAG_PATTERN = re.compile(r'\[([^\]]+)\]')
 PREFERENCES_MARKER = 'rememberUnit=1\n'
@@ -61,12 +89,16 @@ PREFERENCES_MARKER = 'rememberUnit=1\n'
 
 @dataclass
 class Case:
-    binary: str
+    binary: str          # the runner family: engine or unit
     suite: str
     name: str
     file: str = ''
     line: int = 0
     tags: list = field(default_factory=list)
+    program: str = ''    # the executable that holds the case (BINARIES); defaults to binary
+
+    def __post_init__(self):
+        self.program = self.program or self.binary
 
     @property
     def label(self):
@@ -98,11 +130,15 @@ class Job:
     without_benchmarks: bool = False  # a whole-binary job that skips only the [benchmark] cases
 
     @property
+    def program(self):
+        return self.cases[0].program if self.cases else self.binary
+
+    @property
     def label(self):
         if not self.whole:
             return self.cases[0].label
         suite = f' {self.cases[0].suite}' if self.subset and self.cases[0].suite else ''
-        return f'{BINARIES[self.binary]}{suite} ({len(self.cases)} cases)'
+        return f'{BINARIES[self.program]}{suite} ({len(self.cases)} cases)'
 
     @property
     def display(self):
@@ -115,15 +151,16 @@ class Job:
     def has(self, tag):
         return any(case.has(tag) for case in self.cases)
 
+    # Unoptimized builds run several times slower; see timeout_scale().
+    scale = 1
+    # Recorded case durations in seconds, by label (reference_timings()).
+    recorded = {}
+
     @property
     def timeout(self):
         if self.whole:
-            return SLOW_TIMEOUT * 2
-        if self.has('slow'):
-            return SLOW_TIMEOUT
-        if self.display:
-            return DISPLAY_TIMEOUT
-        return DEFAULT_TIMEOUT
+            return SLOW_TIMEOUT * 2 * self.scale
+        return sum(case_timeout(case.label, self.recorded) for case in self.cases) * self.scale
 
 
 @dataclass
@@ -152,18 +189,109 @@ def list_cases(binary, kind):
     return parse_listing(completed.stdout, kind)
 
 
+def source_name(filename):
+    """Doctest's source file name as a repository path.
+
+    The build passes absolute paths, which ccache's CCACHE_BASEDIR rewrites
+    relative to the build directory ("../../../../../src/..."); older builds
+    passed root-relative ones. All name the same file."""
+    path = filename.replace('\\', '/')
+    if os.path.isabs(path):
+        try:
+            return Path(os.path.normpath(path)).relative_to(ROOT).as_posix()
+        except ValueError:
+            return path
+    while path.startswith(('../', './')):
+        path = path.split('/', 1)[1]
+    return path
+
+
 def parse_listing(xml_text, kind):
     cases = []
     for element in ET.fromstring(xml_text).iter('TestCase'):
         name = element.get('name', '')
-        cases.append(Case(kind, element.get('testsuite', ''), name, element.get('filename', ''),
-                          int(element.get('line', '0') or 0), parse_tags(name)))
+        cases.append(Case(FAMILY[kind], element.get('testsuite', ''), name, source_name(element.get('filename', '')),
+                          int(element.get('line', '0') or 0), parse_tags(name), program=kind))
     return cases
 
 
+def module_registry(profile='full'):
+    """{program: registered test files} and the case floors from test/tests.py, without
+    the entries a compile profile does not build (their 'require' names a left-out
+    optional source group)."""
+    sys.path.insert(0, str(ROOT / 'test'))
+    import tests
+    import sources
+    left_out = set(sources.OPTIONAL_SOURCES) - sources.profile_features(profile)
+
+    def built(entry):
+        return isinstance(entry, str) or not set(entry[1].get('require', ())) & left_out
+    assigned = {kind: {tests.source_path(entry if isinstance(entry, str) else entry[0])
+                       for entry in entries if built(entry)}
+                for kind, entries in (('map', tests.MAP_TESTS), ('sim', tests.SIM_TESTS))}
+    kept = set().union(*assigned.values())
+    floors = {path: count for path, count in tests.MODULE_CASE_FLOORS.items()
+              if path in kept or profile == 'full'}
+    return assigned, floors
+
+
+def case_contract(cases, listed, assigned, floors):
+    """Problems with the module inventory: a registered module test file that a listed
+    module binary reports with fewer cases than its floor, a file listed by a binary it
+    is not registered to (it would run twice), or a floor no module registers."""
+    counts = Counter((case.program, Path(case.file).as_posix()) for case in cases)
+    problems = []
+    for kind in listed:
+        for path in sorted(assigned.get(kind, ())):
+            count, floor = counts[(kind, path)], floors.get(path, 0)
+            if count < floor:
+                problems.append(f'{BINARIES[kind]} lists {count} cases from {path}; '
+                                f'MODULE_CASE_FLOORS records {floor}')
+    owners = {path: kind for kind, paths in assigned.items() for path in paths}
+    for (program, path), count in sorted(counts.items()):
+        if path in owners and owners[path] != program:
+            problems.append(f'{BINARIES[program]} lists {count} cases from {path}, '
+                            f'which test/tests.py assigns to {BINARIES[owners[path]]}')
+    problems += [f'MODULE_CASE_FLOORS names {path}, which no module binary registers'
+                 for path in sorted(set(floors) - set(owners))]
+    return problems
+
+
+def compile_profile(build_dir):
+    try:
+        return json.loads((Path(build_dir) / 'profile.json').read_text()).get('compile_profile', 'full')
+    except (OSError, ValueError, AttributeError):
+        return 'full'
+
+
+def note_compile_profile(build_dir):
+    """Say when the binaries come from a reduced compile profile (buildsys/sources.py)."""
+    profile = compile_profile(build_dir)
+    if profile != 'full':
+        print(f'[run_tests] compile_profile={profile}: cases needing the code it leaves out are not built '
+              'or not listed; verify final changes with the full profile', flush=True)
+
+
+TIERS = ('headless', 'display', 'full')
+
+
+def resolve_tier(args):
+    """--tier wins; --quick means display; an explicit --filter/--tag selects from everything."""
+    if getattr(args, 'tier', None):
+        return args.tier
+    if getattr(args, 'quick', False):
+        return 'display'
+    if getattr(args, 'filter', None) or getattr(args, 'tag', None):
+        return 'full'
+    return 'headless'
+
+
 def select(cases, args):
-    """Apply --filter/--tag/--exclude-tag/--quick/--no-display; returns (kept, skipped)."""
+    """Apply --tier/--filter/--tag/--exclude-tag/--no-display; returns (kept, skipped).
+
+    Programmatic callers that set no tier get the full inventory."""
     kept, skipped = [], []
+    tier = getattr(args, 'tier', None) or ('display' if getattr(args, 'quick', False) else 'full')
     display_ok = not args.no_display and not (os.name == 'nt')
     for case in cases:
         compatibility = getattr(args, 'compatibility_filters', None)
@@ -175,7 +303,9 @@ def select(cases, args):
             continue
         if any(case.has(tag) for tag in args.exclude_tag):
             continue
-        if args.quick and case.has('slow'):
+        if tier != 'full' and case.has('slow'):
+            continue
+        if tier == 'headless' and case.display:
             continue
         if case.has('benchmark') and 'benchmark' not in args.tag:
             continue
@@ -184,6 +314,40 @@ def select(cases, args):
             continue
         kept.append(case)
     return kept, skipped
+
+
+def timeout_scale(build_dir):
+    """Timeout multiplier: GLOB2_TEST_TIMEOUT_SCALE, else 3 for unoptimized builds.
+
+    Timeouts catch hangs, not slowness: an -O0 development build (identity.json
+    mode "debug") takes several times longer than the optimized builds the
+    timeouts were sized on."""
+    if os.environ.get('GLOB2_TEST_TIMEOUT_SCALE'):
+        return max(1, int(os.environ['GLOB2_TEST_TIMEOUT_SCALE']))
+    try:
+        identity = json.loads((build_dir / 'identity.json').read_text())
+    except (OSError, ValueError):
+        return 1
+    return 3 if identity.get('mode') == 'debug' else 1
+
+
+def case_timeout(label, recorded):
+    """A hang guard for one case: generous against its recorded duration."""
+    seconds = recorded.get(label)
+    if seconds is None:
+        return UNKNOWN_TIMEOUT
+    return max(MIN_TIMEOUT, math.ceil(TIMEOUT_MARGIN * seconds))
+
+
+def reference_timings(path=None):
+    """Recorded case durations: the given profile, else the slowest of the committed ones."""
+    if path is not None:
+        return load_timings(path) or {}
+    recorded = {}
+    for profile in sorted(TIMING_PROFILES.glob('*.json')):
+        for label, seconds in (load_timings(profile) or {}).items():
+            recorded[label] = max(seconds, recorded.get(label, 0))
+    return recorded
 
 
 def load_timings(path):
@@ -228,8 +392,9 @@ def shard(items, spec, timings=None, auxiliary=()):
 def make_jobs(cases, args, all_cases=None):
     """all_cases: the full listing, so a whole-binary job knows when a filter applied."""
     jobs = []
-    for kind in ('unit', 'engine'):
-        mine = [case for case in cases if case.binary == kind]
+    for program in ('unit', 'map', 'engine', 'sim'):
+        kind = FAMILY[program]
+        mine = [case for case in cases if case.program == program]
         if not mine:
             continue
         if kind == 'unit':
@@ -240,7 +405,7 @@ def make_jobs(cases, args, all_cases=None):
             if not mine:
                 continue
         if kind == 'unit' or args.in_process:
-            everything = [case for case in (all_cases or []) if case.binary == kind]
+            everything = [case for case in (all_cases or []) if case.program == program]
             if kind == 'unit':
                 everything = [case for case in everything if not case.display]
             left_out = [case for case in everything if case not in mine]
@@ -297,7 +462,7 @@ def junit_execution_issue(job, junit_text):
     if not executed:
         return 'JUnit report contains no executed test cases'
     expected = Counter((case.file, case.name) for case in job.cases)
-    actual = Counter((case.get('classname', ''), case.get('name', '')) for case in executed)
+    actual = Counter((source_name(case.get('classname', '')), case.get('name', '')) for case in executed)
     missing, unexpected = expected - actual, actual - expected
     if missing or unexpected:
         def describe(cases):
@@ -334,7 +499,7 @@ def xvfb_prefix(job):
 
 
 def run_job(job, args, build_dir):
-    binary = binary_path(build_dir, job.binary)
+    binary = binary_path(build_dir, job.program)
     keep = args.keep_profiles
     root = Path(tempfile.mkdtemp(prefix='glob2-test-'))
     profile, work, home = root / 'profile', root / 'work', root / 'home'
@@ -350,12 +515,23 @@ def run_job(job, args, build_dir):
         env.setdefault('GLOB2_TEST_SHADER_DIRECTORY', str(shader_directory.resolve()))
     env.update(GLOB2_USER_DATA_DIR=str(profile), HOME=str(home), USERPROFILE=str(home),
                TMPDIR=str(root), TMP=str(root), TEMP=str(root), SDL_AUDIODRIVER='dummy')
+    # Every save audits resource-claim state against what load would rebuild.
+    env.setdefault('GLOB2_CLAIM_AUDIT', '1')
+    # Every template-backed building seed is checked against the full scan.
+    env.setdefault('GLOB2_BUILDING_SEED_AUDIT', '1')
     env.pop('GLOB2_MOBILE_UI', None)
     env.pop('GLOB2_USER_DIR', None)
     # Always override inherited opt-in: a standard run must not take over the desktop.
     env['GLOB2_TEST_FULLSCREEN'] = '1' if args.fullscreen else '0'
     if job.display:
         env['GLOB2_TEST_DISPLAY'] = '1'
+        # On macOS, display windows are hidden and never activate, so runs don't
+        # steal focus. --fullscreen checks need the screen; set
+        # GLOB2_TEST_HIDDEN_WINDOWS=0 to watch, or =1 to opt in elsewhere.
+        if args.fullscreen:
+            env['GLOB2_TEST_HIDDEN_WINDOWS'] = '0'
+        elif platform.system() == 'Darwin':
+            env.setdefault('GLOB2_TEST_HIDDEN_WINDOWS', '1')
         env.pop('SDL_VIDEODRIVER', None)
         if platform.system() == 'Linux':
             env.setdefault('LIBGL_ALWAYS_SOFTWARE', '1')
@@ -373,6 +549,9 @@ def run_job(job, args, build_dir):
         else:
             case = job.cases[0]
             env['GLOB2_TEST_ARTIFACTS'] = str(artifacts / sanitized(case.suite or 'no-suite') / sanitized(case.name))
+    env[jobserver.HELD] = '1'  # the test process runs under this job's token
+    if getattr(job, 'profile_file', None):
+        env['LLVM_PROFILE_FILE'] = job.profile_file  # --profile-per-job
     command = xvfb_prefix(job) + [str(binary), '-r=junit', f'-o={junit}', '--no-breaks=true'] + doctest_filter(job)
     if args.verbose and job.whole:
         command += ['-s']
@@ -562,8 +741,8 @@ def merge_junit(results, path):
                 by_file_and_name = {(case.file, case.name): case.suite for case in result.job.cases}
                 for testcase in document.iter('testcase'):
                     name = testcase.get('name', '')
-                    suite = (by_file_and_name.get((testcase.get('classname', ''), name))
-                             or testcase.get('classname') or 'tests')
+                    file = source_name(testcase.get('classname', ''))
+                    suite = by_file_and_name.get((file, name)) or file or 'tests'
                     testcase.set('classname', suite)
                     if result.note and not testcase.findall('failure') and not testcase.findall('error'):
                         failure = ET.SubElement(testcase, 'failure', message='run_tests: ' + result.note, type='run_tests')
@@ -622,8 +801,12 @@ def report(results, skipped, args):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--build-dir', type=Path, default=None, help='native build directory (default: GLOB2_BUILD_DIR or build/<platform>/client/release)')
-    parser.add_argument('--binary', choices=['engine', 'unit', 'all'], default='all')
+    parser.add_argument('--build-dir', type=Path, default=None, help='native build directory (default: GLOB2_BUILD_DIR, else the newest of the dev_build.py and release outputs)')
+    parser.add_argument('--binary', choices=list(SELECTIONS), default='all',
+                        help='engine: the engine and sim binaries; unit: the unit and map binaries; '
+                             'sim, map: one module binary; all: every built binary (default)')
+    parser.add_argument('--allow-missing-modules', action='store_true',
+                        help='with --binary engine or unit, skip an unbuilt sim or map binary instead of failing')
     parser.add_argument('--coverage-profile', choices=['full', 'compatibility'], default='full', help='secondary native compatibility inventory; primary Linux remains full')
     parser.add_argument('--write-inventory', type=Path, help='retain eligible and assigned native cases for coverage auditing')
     parser.add_argument('--list', action='store_true', help='print the selected cases and exit')
@@ -640,29 +823,59 @@ def main(argv=None):
     parser.add_argument('--in-process', action='store_true', help='run the engine binary as one process')
     parser.add_argument('--no-display', action='store_true', help='skip [display] cases')
     parser.add_argument('--fullscreen', action='store_true', help='enable fullscreen checks within [display] cases (takes over the desktop; prefer a virtual display)')
-    parser.add_argument('--quick', action='store_true', help='skip [slow] cases')
+    parser.add_argument('--tier', choices=TIERS, default=None,
+                        help='headless: no [display] or [slow] cases (the default); display: adds [display] cases; '
+                             'full: everything. An explicit --filter or --tag selects from the full inventory unless --tier is given')
+    parser.add_argument('--quick', action='store_true', help='same as --tier display (skip [slow] cases)')
     parser.add_argument('--update-fixtures', action='store_true', help='rewrite [golden] fixtures instead of checking them')
+    parser.add_argument('--affected', action='store_true',
+                        help='run only cases whose recorded coverage touches the change (test/select_affected.py)')
+    parser.add_argument('--coverage-map', type=Path, default=ROOT / 'artifacts' / 'coverage-map.json.gz',
+                        help='per-case coverage map for --affected (default: artifacts/coverage-map.json.gz)')
+    parser.add_argument('--affected-base', default='origin/master', help='compare the change against this revision')
+    parser.add_argument('--profile-per-job', type=Path, metavar='DIR',
+                        help='Clang coverage builds: record each job\'s executed functions under DIR')
+    parser.add_argument('--write-coverage-map', type=Path, metavar='FILE',
+                        help='with --profile-per-job, write the per-case coverage map (.json.gz) after the run')
+    parser.add_argument('--llvm-profdata', default=os.environ.get('LLVM_PROFDATA', 'llvm-profdata'))
+    parser.add_argument('--llvm-cov', default=os.environ.get('LLVM_COV', 'llvm-cov'))
     parser.add_argument('--junit', type=Path, default=ROOT / 'artifacts' / 'tests' / 'junit.xml')
     parser.add_argument('--artifacts', type=Path, default=ROOT / 'artifacts' / 'tests')
     parser.add_argument('--keep-profiles', action='store_true', help='leave every disposable profile on disk')
     parser.add_argument('--tail', type=int, default=200, help='lines of output shown for a failure')
     parser.add_argument('--verbose', action='store_true', help='show successful assertions for in-process runs')
     args = parser.parse_args(argv)
+    args.tier = resolve_tier(args)
 
     build_dir = (args.build_dir or native_build_directory()).resolve()
-    kinds = ['engine', 'unit'] if args.binary == 'all' else [args.binary]
-    cases = []
-    for kind in kinds:
+    from dev_store import require_free_space
+    require_free_space(args.artifacts, 'the test run')
+    cases, listed = [], []
+    for kind in SELECTIONS[args.binary]:
         binary = binary_path(build_dir, kind)
         if not binary.exists():
-            if args.binary == 'all':
+            if args.binary == 'all' or (kind in MODULE_PROGRAMS and args.allow_missing_modules):
                 print(f'[run_tests] {binary} is not built; skipping', flush=True)
                 continue
-            raise SystemExit(f'{binary} is not built; run: scons release=1 server=0 {kind}-tests')
+            moved = f' (it holds cases moved out of {BINARIES[FAMILY[kind]]})' if kind in MODULE_PROGRAMS else ''
+            raise SystemExit(f'{binary} is not built; run: python3 tools/dev_build.py {FAMILY[kind]}-tests{moved}')
         cases += list_cases(binary, kind)
+        listed.append(kind)
+    note_compile_profile(build_dir)
+    problems = case_contract(cases, listed, *module_registry(compile_profile(build_dir)))
+    if problems:
+        raise SystemExit('[run_tests] module case contract failed:\n  ' + '\n  '.join(problems))
     if args.coverage_profile == 'compatibility':
         args.compatibility_filters = json.loads((ROOT / 'test/ci-compatibility.json').read_text())
     kept, skipped = select(cases, args)
+    if args.affected:
+        import select_affected
+        coverage = select_affected.load_map(args.coverage_map) if args.coverage_map.exists() else None
+        labels = [f'{case.binary}:{case.label}' for case in kept + skipped]
+        selection = select_affected.select(labels, select_affected.changed_files(args.affected_base), coverage)
+        print(f'[run_tests] --affected: {selection.reason}', flush=True)
+        kept = [case for case in kept if selection.keeps(f'{case.binary}:{case.label}')]
+        skipped = [case for case in skipped if selection.keeps(f'{case.binary}:{case.label}')]
     if args.coverage_profile == 'compatibility' and not kept and not skipped:
         raise SystemExit('Compatibility inventory selected no cases; update test/ci-compatibility.json')
     if args.list:
@@ -684,19 +897,41 @@ def main(argv=None):
         inventory['fingerprint'] = hashlib.sha256(json.dumps(inventory, sort_keys=True).encode()).hexdigest()
         args.write_inventory.parent.mkdir(parents=True, exist_ok=True)
         args.write_inventory.write_text(json.dumps(inventory, indent=2) + '\n')
+    Job.scale = timeout_scale(build_dir)
+    Job.recorded = reference_timings(args.timing_profile)
     if args.timeout:
         Job.timeout = property(lambda self, t=args.timeout: t)
     network_lock = threading.Lock()
     display_slots = threading.Semaphore(args.display_jobs or min(4, args.jobs))
 
+    if args.profile_per_job:
+        args.profile_per_job.mkdir(parents=True, exist_ok=True)
+        import case_coverage
+        job_index = {id(job): index for index, job in enumerate(jobs)}
+
     def run(job):
+        if args.profile_per_job:
+            index = job_index[id(job)]
+            result = run_profiled(job, index)
+            case_coverage.finish_job(args.profile_per_job, index, [f'{case.binary}:{case.label}' for case in job.cases],
+                                     args.llvm_profdata)
+            return result
+        return run_unprofiled(job)
+
+    def run_profiled(job, index):
+        job.profile_file = case_coverage.job_environment(args.profile_per_job, index)
+        return run_unprofiled(job)
+
+    def run_unprofiled(job):
+        # One machine-wide CPU token per running test process (buildsys/jobserver.py).
         if job.has('network'):
-            with network_lock:
+            with network_lock, jobserver.slot():
                 return run_job(job, args, build_dir)
         if job.display:
-            with display_slots:
+            with display_slots, jobserver.slot():
                 return run_job(job, args, build_dir)
-        return run_job(job, args, build_dir)
+        with jobserver.slot():
+            return run_job(job, args, build_dir)
 
     results = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, args.jobs)) as pool:
@@ -712,6 +947,12 @@ def main(argv=None):
         args.write_timings.parent.mkdir(parents=True, exist_ok=True)
         args.write_timings.write_text(json.dumps({'schema': 1, 'family': os.environ.get('CI_RUNNER_FAMILY'),
             'seconds': {r.job.label: max(0.001, r.seconds) for r in results if r.status == 'pass'}}, indent=2) + '\n')
+    if args.write_coverage_map:
+        import case_coverage
+        binaries = sorted({binary_path(build_dir, job.program) for job in jobs})
+        count = case_coverage.write_map(args.profile_per_job, binaries, args.write_coverage_map,
+                                        args.llvm_profdata, args.llvm_cov)
+        print(f'[run_tests] coverage map: {args.write_coverage_map} ({count} cases)', flush=True)
     totals = merge_junit(results + skipped_results, args.junit)
     ok = report(results, skipped, args)
     print(f'[run_tests] JUnit report: {args.junit} ({totals["tests"]} cases)', flush=True)

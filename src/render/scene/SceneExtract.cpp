@@ -3,8 +3,6 @@
 #include "sim/presentation/SceneInputs.h"
 #include "OverlayAreas.h"
 #include "UnitTiming.h"
-#include "WinProbability.h"
-#include "ai/model/BuildingProjection.h"
 #include <unordered_map>
 #include <utility>
 namespace {
@@ -162,29 +160,27 @@ void preparePanels(const SceneInputs& input, PresentationFrame& scene, const std
         allianceOf.push_back(int(it - alliances.begin()));
         if (it == alliances.end()) alliances.push_back(alliance);
     }
-    std::vector<int> providers;
-    for (size_t i=0; i<scene.buildingTypes->size(); ++i)
-    {
-        const auto& t = scene.buildingTypes->at(i);
-        const auto& completed = t.isBuildingSite && t.nextLevel>=0 ? scene.buildingTypes->at(t.nextLevel) : t;
-        if (ModelBuildingProjection::trainsWarriorCombat(completed)) providers.push_back(int(i));
-    }
-    std::vector<WinProbability::Slot> slots(alliances.size());
+    // The chances the simulation recorded at its latest 512-tick sample: the
+    // same numbers the winning condition and the end-of-game chart read. Sides
+    // eliminated or allied since that sample are reconciled by renormalising
+    // over the alliances still standing.
+    std::vector<int> chances(alliances.size(), 0);
+    std::vector<bool> alive(alliances.size(), false);
     for (const auto& t : world.teams->values)
     {
         if (!t.alive || t.lost) continue;
-        auto& slot = slots[allianceOf[t.number]];
-        const auto& stat = t.statistics;
-        slot.alive = true; slot.units += stat.totalUnit; slot.prestige += t.prestige;
-        for (int id : providers) if (size_t(id) < stat.buildingCountByVariant.size()) slot.barracks += stat.buildingCountByVariant[id];
-        slot.explorers += stat.numberUnitPerType[EXPLORER]; slot.foodCritical += stat.needFoodCritical; slot.attack += stat.totalAttackPower;
+        alive[allianceOf[t.number]] = true;
+        chances[allianceOf[t.number]] = std::max(chances[allianceOf[t.number]], t.winProbabilityPermille);
     }
-    const auto chances = WinProbability::permille(slots);
+    int total = 0;
+    for (size_t a = 0; a < chances.size(); ++a) total += alive[a] ? chances[a] : 0;
+    for (size_t a = 0; a < chances.size(); ++a)
+        chances[a] = alive[a] && total > 0 ? chances[a] * 1000 / total : 0;
     panels.hud.winChances.clear();
     for (int t=0; t<scene.entities.teamCount; ++t)
     {
         const auto& team = scene.entities.teams[t];
-        panels.hud.winChances.push_back({team.firstPlayerName,presentationColor(team.color),chances[allianceOf[t]],slots[allianceOf[t]].alive});
+        panels.hud.winChances.push_back({team.firstPlayerName,presentationColor(team.color),chances[allianceOf[t]],alive[allianceOf[t]]});
     }
     panels.aiTelemetry.clear();
     if (world.telemetry) for (const auto& source : world.telemetry->rows)
@@ -197,11 +193,12 @@ void preparePanels(const SceneInputs& input, PresentationFrame& scene, const std
         row.name=source.name; row.available=source.available;
         if (row.available)
         {
-            for (size_t i=0; i<source.fields.size() && i<source.values.size(); ++i)
+            const auto& fields = *source.fields;
+            for (size_t i=0; i<fields.size() && i<source.values.size(); ++i)
             {
-                const auto& field = source.fields[i]; const auto& value = source.values[i];
+                const auto& field = fields[i]; const auto& value = source.values[i];
                 if (i >= AITelemetry::OrderTypes && i < AITelemetry::Specific && (!value.valid || !value.bits)) continue;
-                row.values.push_back({field.name, AITelemetry::displayValue(field,value),field.unit,field.meaning,value.updated});
+                row.values.push_back({std::string(field.name), AITelemetry::displayValue(field,value),std::string(field.unit),std::string(field.meaning),value.updated});
             }
             row.values.insert(row.values.end(), source.named.begin(), source.named.end());
         }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-#include "EngineFixtures.h"
+#include "HeadlessGlobals.h"
 #include "Engine.h"
 #include "ScriptRuntime.h"
 #include "AIJavaScript.h"
@@ -8,6 +8,8 @@
 #include <BinaryStream.h>
 #include <FileManager.h>
 #include <Toolkit.h>
+#include "Game.h"
+#include "MapScript.h"
 
 TEST_CASE("JavaScript fatal failure tears down a live engine session" *
 		  doctest::test_suite("JavaScriptSession"))

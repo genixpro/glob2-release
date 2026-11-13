@@ -22,6 +22,11 @@
 #include "NetEngine.h"
 #include "TurnSession.h"
 #include "ChecksumSidecar.h"
+#include "EntityRandom.h"
+
+namespace GAGGUI { class Screen; }
+
+namespace GAGGUI { class Screen; }
 
 
 class SimulationRunner;
@@ -38,15 +43,17 @@ using std::shared_ptr;
 
 /// Engine is the backend of the game. It is responsible for loading and setting up games and players,
 /// and its run function is meant to run the game that has been loaded.
-namespace GameDiagnostics { class Session; }
+namespace GameDiagnostics { class Session; class WarriorTacticsTrace; }
 class Engine
 {
+	friend struct TranslationPreviewAccess;
 	friend struct CustomGameSetupHarness;
 	friend struct HeadlessRunner;
 	friend class SimulationRunner;
 	friend struct MatchVerifier;
 	friend struct TurnClient;
 	std::shared_ptr<GameDiagnostics::Session> diagnostics;
+    std::unique_ptr<GameDiagnostics::WarriorTacticsTrace> warriorTactics;
 	bool headlessDiagnosticsPending() const;
 	std::string headlessOutput;
 	std::string initializationDiagnostic;
@@ -55,6 +62,7 @@ class Engine
 	friend class HighResolutionIntegrationHarness;
 	friend class SoftwareRenderBenchmark;
 public:
+	std::vector<GAGGUI::ui::Host*> inspectionHosts() { return gui.inspectionHosts(); }
 	//! Constructor
 	Engine();
 	//! Destructor. Also finalizes globalContainer->replayWriter (which
@@ -172,6 +180,9 @@ public:
     // Incremental session API. Requires an initialized game; the host owns
     // scheduling. GUI input and modal flows remain transitional legacy code.
     void beginSession(Uint64 now);
+    //! Cover the first five seconds of an interactive game with parting clouds
+    //! while the simulation and renderer keep running underneath. No-op headless.
+    void beginIntroCover();
     bool stepSession(Uint64 now);
     bool stepSession(Uint64 now, const std::vector<SDL_Event>& events);
     // Track a range in the next supplied event batch until GameGUI consumes it.

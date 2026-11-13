@@ -4,9 +4,10 @@
 #include "ai/observation/AIWorldView.h"
 #include "ai/observation/ObservationQueries.h"
 #include "ResourceInitializationCache.h"
+#include "map/gradient/SnapshotGradient.h"
 #include "ai/engine/AIDecision.h"
 #include <set>
-#include "Building.h"
+#include "BuildingState.h"
 #include "BuildingCapabilities.h"
 #include "Order.h"
 #include "field/RuntimeTerrainGradient.h"
@@ -30,6 +31,7 @@ class WorldQueries
  std::vector<AIEngine::ResourceEnrollmentRequest>* enrollments;
  std::set<int> enrollmentsReported;
  GradientWorkspace scratch;
+ gradient_preparation::CrowdingScratch seedScratch;
  struct Reservation { int type,x,y; };
  std::vector<Reservation> reservations;
 public:
@@ -156,7 +158,7 @@ public:
  std::shared_ptr<Order> constructionOrder(const Building& b,int workers,int futureWorkers) const
  {
   const auto& k=kind(b);
-  const bool repair=k.site?b.constructionResultState==::Building::REPAIR:b.hp<b.maxHp;
+  const bool repair=k.site?b.constructionResultState==::BuildingStateRecord::REPAIR:b.hp<b.maxHp;
   const int target=k.site?b.typeNum:repair?k.previous:k.next;
   const auto& placement=target>=0?kind(target):k;
   const int origin=k.site?b.constructionOriginTypeNum:b.typeNum;
@@ -164,10 +166,12 @@ public:
   return std::make_shared<OrderConstruction>(b.identity.gid,std::clamp(workers,0,placement.semantics.assignmentLimit),
    std::clamp(futureWorkers,0,completed.semantics.assignmentLimit));
  }
- std::span<const Uint16> resourceGradient(int owner,int resource,int swim)
+ std::span<const Uint16> resourceGradient(int owner,int resource,MovementAccess movementAccessValue)
  {
-  const int key=(owner*MaterialSlotCount+resource)*7+swim;
-  auto published=world.resourceGradient(owner,resource,swim);
+    int swim=accessClass(movementAccessValue);
+
+  const int key=(owner*MaterialSlotCount+resource)*MOVEMENT_CLASS_COUNT+swim;
+  auto published=world.resourceGradient(owner,resource,movementAccessValue);
   std::span<const Uint16> gradient=published;
   if(!published.empty()) resourceFields.erase(key);
   else {
@@ -177,25 +181,13 @@ public:
     initialization.observedTick=world.tick;
     auto buffer=std::make_shared<std::vector<Uint16>>();
     auto& values=*buffer;
-   const Uint32 mask=world.teams[owner].mask;
-   values.resize(world.tiles.size());
-   bool modified=false;
-   for(size_t i=0;i<values.size();++i) {
-    const auto resourceCell=world.resourceAt(i);const auto occupancy=world.occupancyAt(i);
-    const auto& terrain=world.terrainPropertiesAt(i);
-    modified |= terrain.groundSpeedQ8!=256;
-    Uint16 value=GRADIENT_FORBIDDEN;
-    if(!(world.areasAt(i).forbidden & mask) && occupancy.immobileUnit==255) {
-     if(!MapState::resourceBlocksGround(world.state(),i) && occupancy.building==0xffff)
-      value=(terrain.walkable || (swim && terrain.swimmable))?GRADIENT_UNREACHABLE:GRADIENT_FORBIDDEN;
-     // Passable sources are goals too. Visibility belongs to each source.
-     if((MapState::materialMaskAt(world.state(),i) & MaterialMask(1u<<resource)) && (!MapState::resourceVisibleToHarvest(world.state(),i) || (world.visibilityAt(i).visible & mask)))
-      value=GRADIENT_AT_GOAL;
-    }
-    values[i]=value;
-   }
-   gradient_kernel::propagateTerrainField(values.data(),swim,gradient_kernel::COST_LIMIT,{world.width,world.height},scratch,
-    [&](size_t i){return world.cellRuleAt(i);},modified,*world.cellRules,256);
+    values.resize(world.tiles.size());
+    gradient_preparation::Request request;
+    request.kind=gradient_preparation::Kind::Materials;request.team=owner;request.material=resource;
+    request.swim=world.preparationCostClass(owner,swim);
+    request.terrainBuckets=256; // Snapshot catalogs may include costly custom terrain.
+    gradient_preparation::seed(request,world.components(),values.data(),seedScratch);
+    gradient_preparation::propagateCPU(request,world.components(),values.data(),scratch);
     initialization.values=std::move(buffer);
    }
    if(enrollments && enrollmentsReported.insert(key).second)
@@ -204,13 +196,24 @@ public:
   }
   return gradient;
  }
- bool resourceAvailableUpdate(int owner,int resource,int swim,int x,int y,int* rx,int* ry,int* distance)
+ bool resourceAvailableUpdate(int owner,int resource,MovementAccess access,int x,int y,int* rx,int* ry,int* distance)
  {
-  const auto gradient=resourceGradient(owner,resource,swim);
+  const auto gradient=resourceGradient(owner,resource,access);
   const auto index=[&](int px,int py){return world.tileIndex(px,py);};
   Uint16 best=gradient[index(x,y)];
   const bool found=best>GRADIENT_UNREACHABLE;
   if(found && distance) *distance=gradientTiles(best);
+  const int swim=accessClass(access);
+  if(found && world.components().resourceFields && MapState::validPlane(owner,resource,swim)) {
+   const auto* published=world.components().resourceFields->find(MapState::planeKey(owner,resource,swim,false));
+   if(published && published->destinations) {
+    // Use the same published source as live planning, including aged goals.
+    // Private cold-start planes deliberately retain their cost-only ascent.
+    const auto cell=index(x,y);
+    *rx=published->destinations->x[cell];*ry=published->destinations->y[cell];
+    return true;
+   }
+  }
   int px=world.normalizeX(x),py=world.normalizeY(y);
   static constexpr int directions[8][2]={{0,-1},{1,0},{0,1},{-1,0},{-1,-1},{1,-1},{1,1},{-1,1}};
   while(true) {
@@ -228,8 +231,8 @@ public:
   unsigned required=0,provided=0;const Building* anchor=nullptr;
   for(unsigned unit=0;unit<NB_UNIT_TYPE;++unit) if(desired[unit]>0 && allowed(Intent(unit))) required |= 1u<<unit;
   if(!required) return {};
-  for(const auto& b:world.buildings) if(b.team==team && b.buildingState==::Building::ALIVE) {
-   const auto& k=kind(b); const int completed=k.site?(b.constructionResultState==::Building::REPAIR && b.constructionOriginTypeNum>=0?b.constructionOriginTypeNum:k.next):b.typeNum;
+  for(const auto& b:world.buildings) if(b.team==team && b.buildingState==::BuildingStateRecord::ALIVE) {
+   const auto& k=kind(b); const int completed=k.site?(b.constructionResultState==::BuildingStateRecord::REPAIR && b.constructionOriginTypeNum>=0?b.constructionOriginTypeNum:k.next):b.typeNum;
    provided |= unsigned(kind(completed).rawCapabilityMask)&7u;
    if(!anchor || (world.capabilities().intentMask(b.typeNum) & 7u)) anchor=&b;
    if((provided & required)==required) return {};

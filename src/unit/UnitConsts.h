@@ -5,7 +5,8 @@
 #pragma once
 
 #include <assert.h>
-#include <GAGSys.h>
+#include <SDL3/SDL_stdinc.h>
+#include "MovementClass.h"
 
 enum Abilities
 {
@@ -34,18 +35,7 @@ enum Abilities
 	FEED=18 /* old 13 */
 };
 
-//! Pathfinding swim classes. Class 0 is a unit that cannot swim; classes 1 and
-//! up bucket the unit's walk/swim speed ratio, from water being cheaper than
-//! land to water being three times dearer (see Map::swimClass). The map keeps
-//! one gradient per class so units share routes at their quantized water cost.
-static constexpr int LEGACY_SWIM_CLASS_COUNT = 7;
-static constexpr int WATER_ONLY_CLASS = LEGACY_SWIM_CLASS_COUNT;
-static constexpr int SWIM_CLASS_COUNT = LEGACY_SWIM_CLASS_COUNT + 1;
-// Ground ratio IDs are durable; air has one independent movement class.
-static constexpr int AIR_MOVEMENT_CLASS = SWIM_CLASS_COUNT;
-static constexpr int MOVEMENT_CLASS_COUNT = SWIM_CLASS_COUNT + 1;
-inline constexpr unsigned swimAccessVariant(int movement)
-{ return movement==AIR_MOVEMENT_CLASS?3u:movement==WATER_ONLY_CLASS?2u:unsigned(movement>0); }
+// Movement classes and MovementAccess: common/MovementClass.h.
 const int NB_MOVE=9;
 const int NB_ABILITY=17;
 

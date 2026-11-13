@@ -130,8 +130,9 @@ AI controller lanes preserve decision order;
 gradient and growth jobs need no lane.
 `AIEngine::Pipeline` submits one batch per tick with one job per controller on
 that controller's lane, and joins it at the deadline. The
-match-wide `GameHeader::aiOrderDelay` is an integer from 0 through 8, defaulting
-to 8 for new games. An order observed at logical tick `t` is delivered at `t + max(1, delay)`. Thread
+match-wide `GameHeader::aiOrderDelay` is an integer from 0 through
+`GameHeader::MAX_AI_ORDER_DELAY` (16), defaulting to 8 for new games. Engine
+bounds on in-flight AI work (executor slots, saved receipts) derive from that maximum. An order observed at logical tick `t` is delivered at `t + max(1, delay)`. Thread
 count and completion time never choose that deadline or which decision a
 controller makes; the owner publishes in stable request order. Human orders and
 scenario map scripts retain their existing scheduling.
@@ -294,7 +295,9 @@ include builtin construction-origin preferences, extra production state, cargo
 rows (including their identity keys), and relationship IDs. These counters exclude
 view metadata, slot-index preparation, retained capacity, allocator overhead and
 vector growth copies. `Store::Metrics` exposes their deltas alongside the existing
-aggregate `bytesCopied` estimate, whose meaning is unchanged. Pool memory metrics
+aggregate `bytesCopied` estimate, whose meaning is unchanged. Derived building seed
+templates are copied only at boundaries that request them and are counted apart, as
+`buildingSeedBytesCopied` (`building_seed_bytes_copied`), never in map bytes. Pool memory metrics
 continue to describe retained capacity and leases separately. Verification compares
 entity completeness, team/population ordering, identities, lookup tables and logical
 scalar fields, including presentation state. It also checks ordered working/inside

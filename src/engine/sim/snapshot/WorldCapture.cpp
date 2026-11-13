@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "SharedBuildingGradient.h"
+#include "gradient/MapRouting.h"
 #include "WorldSnapshot.h"
 #include "SnapshotStorage.h"
 #include "Building.h"
 #include "Game.h"
+#include "WinningConditions.h"
 #include "GameRuleOverrides.h"
 #include "BuildingCapabilities.h"
 #include "GlobalContainer.h"
@@ -22,8 +24,12 @@
 #include <stdexcept>
 #include <chrono>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 #include <utility>
+#include "sim/EntityRefOf.h"
+#include "GameScripting.h"
 
 namespace SimulationSnapshot
 {
@@ -81,6 +87,7 @@ Handle capture(const Game& game,
 	result->configurationRevision = game.gameHeader.observationRevision();
 	result->worldIdentity = game.map.identity();
 	result->mapGenerations = game.map.snapshotGenerations();
+    result->activeClaimRuntimeChecksum = game.map.activeClaimsEnabled() ? game.map.activeClaimSnapshotChecksum() : 0;
 	if (previous && previous->worldIdentity == result->worldIdentity)
 	{
 		auto reuse = [&](Component component, auto& destination, const auto& source, bool unchanged) {
@@ -169,14 +176,21 @@ Handle capture(const Game& game,
 		for (int t = 0; t < teams; ++t) if (const auto* team = game.teams[t]) {
 			buildings += team->liveBuildings.size(); units += team->liveUnits.size();
 		}
+		// A pooled buffer's lookups name exactly the gids of its records, so
+		// clearing those slots restores an all-empty table without refilling it.
+		const auto clearSlots = [&](auto& indices, const auto& records, std::size_t size) {
+			if (indices.size() != size) {
+				reserve(indices, size);
+				indices.assign(size, Entities::NoRecord);
+			}
+			else for (const auto& record : records) indices[record.gid] = Entities::NoRecord;
+		};
+		clearSlots(entities->buildingSlotIndices, entities->buildings, std::size_t(teams) * Building::MAX_COUNT);
+		clearSlots(entities->unitSlotIndices, entities->units, std::size_t(teams) * Unit::MAX_COUNT);
 		reserve(entities->buildings, buildings); reserve(entities->units, units);
 		// Reuse constructed records and fill them in place. Every field is
 		// overwritten below; no temporary record or per-record push_back copy.
 		entities->buildings.resize(buildings); entities->units.resize(units);
-		reserve(entities->buildingSlotIndices, teams * Building::MAX_COUNT);
-		reserve(entities->unitSlotIndices, teams * Unit::MAX_COUNT);
-		entities->buildingSlotIndices.resize(teams * Building::MAX_COUNT);
-		entities->unitSlotIndices.resize(teams * Unit::MAX_COUNT);
 		reserve(entities->buildingRanges, teams);
 		reserve(entities->unitRanges, teams);
 		entities->buildingRanges.assign(teams, {}); entities->unitRanges.assign(teams, {});
@@ -248,25 +262,38 @@ Handle capture(const Game& game,
 		if (length) std::memcpy(destination.data() + start, source.data() + start, length * sizeof(Element));
 		if (storage) storage->bytesCopied += length * sizeof(Element);
 	};
+	std::vector<Uint32> localDirtyChunks;
+	auto& dirtyChunks = storage ? storage->dirtyChunks : localDirtyChunks;
 	const auto refresh = [&](ChunkStamps& stamps, const MapState::ChangeTracker& live, bool resized, auto copyRange) {
 		const bool everything = resized || stamps.worldIdentity != identity || stamps.width != geometry.width
 			|| stamps.height != geometry.height || stamps.chunks.size() != live.chunks.size();
+		// One pass lists the dirty chunks (branch-free); the copy then visits
+		// only those, in the same ascending order.
 		std::size_t dirty = 0;
 		if (!everything)
+		{
+			if (dirtyChunks.size() < live.chunks.size()) dirtyChunks.resize(live.chunks.size());
+			const auto* captured = stamps.chunks.data();
+			const auto* current = live.chunks.data();
+			auto* list = dirtyChunks.data();
 			for (std::size_t chunk = 0; chunk < live.chunks.size(); ++chunk)
-				dirty += stamps.chunks[chunk] != live.chunks[chunk];
+			{
+				list[dirty] = Uint32(chunk);
+				dirty += captured[chunk] != current[chunk];
+			}
+		}
 		if (everything || dirty > live.chunks.size() / 2)
 		{
 			copyRange(std::size_t(0), cellCount);
 			if (storage && stamps.chunks.capacity() < live.chunks.size()) ++storage->allocations;
 			stamps.chunks.assign(live.chunks.begin(), live.chunks.end());
 		}
-		else for (std::size_t chunk = 0; chunk < live.chunks.size(); ++chunk)
-			if (stamps.chunks[chunk] != live.chunks[chunk])
-			{
-				geometry.forEachRow(chunk, copyRange);
-				stamps.chunks[chunk] = live.chunks[chunk];
-			}
+		else for (std::size_t i = 0; i < dirty; ++i)
+		{
+			const std::size_t chunk = dirtyChunks[i];
+			geometry.forEachRow(chunk, copyRange);
+			stamps.chunks[chunk] = live.chunks[chunk];
+		}
 		stamps.worldIdentity = identity; stamps.width = geometry.width; stamps.height = geometry.height;
 		stamps.filledTick = game.stepCounter;
 	};
@@ -318,12 +345,17 @@ Handle capture(const Game& game,
 	}
 	if (needs(requirements, Component::Visibility))
 	{
+		visibility->discoveryRevision = game.map.discoveryRevision();
 		const std::span<const Uint32> discovered(game.map.mapDiscovered);
 		const std::span<const Uint32> visible = game.map.fogOfWar ? std::span<const Uint32>(game.map.fogOfWar, cellCount) : std::span<const Uint32>{};
 		bool resized = prepare(visibility->discovered, discovered.size());
 		resized |= prepare(visibility->visible, cellCount);
-		refresh(visibility->stamps, game.map.changes(MapState::TrackedArray::Visibility), resized, [&](std::size_t start, std::size_t length) {
+		// Discovery and the active fog plane have separate trackers: a fog
+		// switch marks every visible chunk but leaves discovery untouched.
+		refresh(visibility->discoveredStamps, game.map.discoveryChanges(), resized, [&](std::size_t start, std::size_t length) {
 			copyCells(visibility->discovered, discovered, start, length);
+		});
+		refresh(visibility->stamps, game.map.changes(MapState::TrackedArray::Visibility), resized, [&](std::size_t start, std::size_t length) {
 			if (!visible.empty()) copyCells(visibility->visible, visible, start, length);
 			else std::fill_n(visibility->visible.begin() + start, length, 0u);
 		});
@@ -337,13 +369,12 @@ Handle capture(const Game& game,
 			if (needs(requirements, Component::Entities)) {
 				entities->buildingRanges[t]={Uint32(buildingRecordCount),0};
 				entities->unitRanges[t]={Uint32(unitRecordCount),0};
-				std::fill_n(entities->buildingSlotIndices.begin() + t * Building::MAX_COUNT, Building::MAX_COUNT, Entities::NoRecord);
-				std::fill_n(entities->unitSlotIndices.begin() + t * Unit::MAX_COUNT, Unit::MAX_COUNT, Entities::NoRecord);
 			}
 			continue;
 		}
 		if (needs(requirements, Component::Teams)) {
 		auto& target = teams->values[t]; target.number = t;
+        target.routingRatio=team->routingRatio;
         target.supplierPresence=(!team->stockSuppliers.empty()?1:0)|(!team->directStockSuppliers.empty()?2:0);
 		target.virtualBuildings.clear(); target.swarms.clear();
 		target.prestige = team->prestige; target.alive = team->isAlive;
@@ -369,17 +400,19 @@ Handle capture(const Game& game,
 		// balance from the current sample and changing policy inputs.
 		target.workerBalance = target.statistics.idleCarriers - target.statistics.totalNeeded;
 		target.starving = target.statistics.needFoodCritical;
+		{
+			const auto &chances = std::as_const(team->stats).getWinProbabilityHistory();
+			target.winProbabilityPermille = chances.empty() ? 0 : chances.back().permille;
+		}
 		std::copy_n(target.statistics.workersByConstructionLevel, NB_UNIT_LEVELS, target.workersLevel.begin());
-		for (auto* building : team->swarms) append(target.swarms, Game::refOf(building));
-		for (auto* building : team->virtualBuildings) append(target.virtualBuildings, Game::refOf(building));
+		for (auto* building : team->swarms) append(target.swarms, refOf(building));
+		for (auto* building : team->virtualBuildings) append(target.virtualBuildings, refOf(building));
 		std::copy_n(team->teamMaterials, MaterialSlotCount, target.materials.begin());
 		}
 		if (!needs(requirements, Component::Entities)) continue;
 		// Preserve authoritative append order in compact immutable team ranges.
 		entities->buildingRanges[t] = {Uint32(buildingRecordCount), Uint32(team->liveBuildings.size())};
 		entities->unitRanges[t] = {Uint32(unitRecordCount), Uint32(team->liveUnits.size())};
-		std::fill_n(entities->buildingSlotIndices.begin() + t * Building::MAX_COUNT, Building::MAX_COUNT, Entities::NoRecord);
-		std::fill_n(entities->unitSlotIndices.begin() + t * Unit::MAX_COUNT, Unit::MAX_COUNT, Entities::NoRecord);
 		for (auto* b : team->liveBuildings.entries())
 		{
 			auto& slot = entities->buildingSlotIndices[b->gid];
@@ -387,7 +420,7 @@ Handle capture(const Game& game,
 			auto& v = entities->buildings[buildingRecordCount++];
 			std::memcpy(static_cast<BuildingStateRecord*>(&v), static_cast<const BuildingStateRecord*>(b), sizeof(BuildingStateRecord));
 			if (storage) storage->entityBytesCopied += sizeof(BuildingStateRecord);
-			v.identity = Game::refOf(b); v.team = t; v.fundingOffset = Entities::NoRecord;
+			v.identity = refOf(b); v.team = t; v.fundingOffset = Entities::NoRecord;
                 const auto nonzero = [](const auto &values) {
                     return std::any_of(values.begin(), values.end(), [](auto value) { return value != 0; });
                 };
@@ -410,9 +443,9 @@ Handle capture(const Game& game,
 				if (b->availableMaterial(material)>0) v.availableSupplyMask |= MaterialMask(1u<<material);
 			}
 			v.working = {Uint32(entities->relationships.size()), Uint32(b->unitsWorking.size())};
-			for (const auto* u : b->unitsWorking) append(entities->relationships, Game::refOf(u));
+			for (const auto* u : b->unitsWorking) append(entities->relationships, refOf(u));
 			v.inside = {Uint32(entities->relationships.size()), Uint32(b->unitsInside.size())};
-			for (const auto* u : b->unitsInside) append(entities->relationships, Game::refOf(u));
+			for (const auto* u : b->unitsInside) append(entities->relationships, refOf(u));
 			if (storage) storage->entitySidecarBytesCopied += sizeof(v.constructionOriginRatios)
                     + v.extraProductionCount * sizeof(ExtraProductionState)
                     + (v.working.count + v.inside.count) * sizeof(UnitRef);
@@ -424,11 +457,14 @@ Handle capture(const Game& game,
 			auto& v = entities->units[unitRecordCount++];
 			std::memcpy(static_cast<UnitState*>(&v), static_cast<const UnitState*>(u), sizeof(UnitState));
 			if (storage) storage->entityBytesCopied += sizeof(UnitState);
-			v.identity = Game::refOf(u); v.team = t;
+            v.activeClaimsEnabled=game.map.activeClaimsEnabled();
+            v.activeMaterialClaim=u->activeMaterialClaim;v.materialClaimTask=u->materialClaimTask;
+            v.materialClaimPolicyState=u->materialClaimPolicyState;
+			v.identity = refOf(u); v.team = t;
 			v.realAttackStrength = u->getRealAttackStrength();
-                if(!v.isDead && v.activity==Unit::ACT_RANDOM && v.medical==Unit::MED_FREE)entities->availableMovementClasses[t]|=Uint16(1u<<(v.performance[FLY] ? AIR_MOVEMENT_CLASS : Map::swimClass(v.performance[WALK],v.performance[SWIM])));
-			v.attached = Game::refOf(u->attachedBuilding);
-			v.target = Game::refOf(u->targetBuilding);
+                if(!v.isDead && v.activity==Unit::ACT_RANDOM && v.medical==Unit::MED_FREE)entities->availableMovementClasses[t]|=Uint16(1u<<accessClass(movementAccessForSpeeds(v.performance[WALK],v.performance[SWIM],v.performance[FLY])));
+			v.attached = refOf(u->attachedBuilding);
+			v.target = refOf(u->targetBuilding);
 		}
 	}
 	if (needs(requirements, Component::Entities)) {
@@ -464,12 +500,14 @@ Handle capture(const Game& game,
         const auto count=game.map.getSectorW()*game.map.getSectorH();
         effects->sectors.resize(count);
         for (int i=0;i<count;++i) {
-            auto& sector=effects->sectors[i]; sector.bullets.clear(); sector.explosions.clear(); sector.deaths.clear();
+            auto& sector=effects->sectors[i]; sector.bullets.clear(); sector.explosions.clear(); sector.deaths.clear(); sector.unitEffects.clear();
             for (const auto* b:const_cast<Map&>(game.map).getSector(i)->bullets)
                 sector.bullets.push_back({b->px,b->py,b->speedX,b->speedY,b->ticksLeft,b->ticksInitial});
             if (game.animations) {
                 for (const auto* e:game.animations->getExplosions(i)) sector.explosions.push_back({e->x,e->y,e->ticksLeft});
                 for (const auto* d:game.animations->getDeathAnimations(i)) sector.deaths.push_back({d->x,d->y,d->ticksLeft,d->team->teamNumber});
+                for (const auto& s:game.animations->getUnitEffects(i))
+                    sector.unitEffects.push_back({s.x,s.y,s.age,s.team->teamNumber,s.unitGid,s.buildingGid,s.buildingType,s.dx,s.dy,s.kind,s.level,s.fromTeam?s.fromTeam->teamNumber:-1});
             }
         }
         result->effects=std::move(effects);
@@ -479,7 +517,7 @@ Handle capture(const Game& game,
         for (int t=0;t<game.teamsCount();++t) for (const auto* b:game.teams[t]->liveBuildings.entries()) {
             if (!b || (!b->verbose && !b->recordFailingUnits)) continue;
             EntityDiagnostics::Building value;
-            value.identity=Game::refOf(b); value.verbose=b->verbose; value.recordFailingUnits=b->recordFailingUnits;
+            value.identity=refOf(b); value.verbose=b->verbose; value.recordFailingUnits=b->recordFailingUnits;
             std::copy_n(b->unitsFailingRequirements,EntityDiagnostics::FailReasons,value.failingCounts.begin());
             for (unsigned r=0;r<EntityDiagnostics::FailReasons;++r) value.failingUnits[r]=b->unitsFailingByReason[r];
             if (b->verbose==1 || b->verbose==2) {
@@ -505,17 +543,56 @@ Handle capture(const Game& game,
         result->statistics = std::move(stats);
     }
     if (auto telemetry = acquire(&Storage::telemetry, Component::Telemetry)) {
-        telemetry->rows.clear();
+        // Assign over the pooled rows so their strings and vectors keep their
+        // capacity: a recycled buffer then copies characters, not allocations.
+        auto& rows = telemetry->rows;
+        std::size_t count = 0;
+        std::vector<Storage::TelemetrySchema> localSchemas;
+        auto& schemas = storage ? storage->telemetrySchemaScratch : localSchemas;
+        schemas.clear();
+        auto schemaOf = [&](const std::shared_ptr<AITelemetry::Series>& series) {
+            const auto& fields = series->fields;
+            if (storage)
+                for (const auto& known : storage->telemetrySchemas)
+                    if (known.data == fields.data() && known.size == fields.size() && known.text == series->fieldText && known.series.lock() == series)
+                    {
+                        schemas.push_back(known);
+                        return known.fields;
+                    }
+            // The shared schema owns the text its views name, so a snapshot
+            // keeps it valid after the series is reset, reloaded or destroyed.
+            struct Owned { std::vector<AITelemetry::Field> fields; std::shared_ptr<const std::deque<std::string>> text; };
+            auto owned = std::make_shared<const Owned>(Owned{fields, series->fieldText});
+            std::shared_ptr<const std::vector<AITelemetry::Field>> shared(owned, &owned->fields);
+            schemas.push_back({series, fields.data(), fields.size(), series->fieldText, shared});
+            return shared;
+        };
         for (int t = 0; t < game.teamsCount(); ++t)
             for (const auto& series : game.teams[t]->stats.aiTelemetry)
                 if (series->active)
-                    telemetry->rows.push_back({t, series->player, series->playerName, series->current.available,
-                        series->fields, series->current.values, series->named});
+                {
+                    if (count == rows.size()) rows.emplace_back();
+                    auto& row = rows[count++];
+                    row.team = t; row.player = series->player; row.name = series->playerName;
+                    row.available = series->current.available;
+                    row.fields = schemaOf(series); row.values = series->current.values; row.named = series->named;
+                }
+        rows.resize(count);
+        if (storage) { storage->telemetrySchemas.swap(schemas); schemas.clear(); }
         result->telemetry = std::move(telemetry);
     }
 	if (needs(requirements, Component::Entities))
 		for (const auto& p : game.buildProjects) append(entities->projects, {p.posX,p.posY,p.teamNumber,p.typeNum,p.unitWorking,p.unitWorkingFuture});
-	if (needs(requirements, Component::Teams)) teams->totalPrestige = game.totalPrestige;
+	if (needs(requirements, Component::Teams)) {
+        teams->totalPrestige = game.totalPrestige;
+        teams->prestigeWinCondition = const_cast<Game&>(game).isPrestigeWinCondition();
+        teams->prestigeAlliesShareVictory = false;
+        for(const auto& condition:game.gameHeader.getWinningConditions()) {
+            if(condition->getType()==WCPrestige)break;
+            if(condition->getType()==WCAllies)teams->prestigeAlliesShareVictory=true;
+        }
+        teams->prestigeToReach = game.prestigeToReach;
+    }
 	if (needs(requirements, Component::Catalogs)) result->catalogs = std::move(catalogsOwner);
 	if (needs(requirements, Component::Terrain)) result->terrain = std::move(terrainOwner);
 	if (needs(requirements, Component::Resources)) result->resources = std::move(resourcesOwner);
@@ -560,6 +637,33 @@ Handle capture(const Game& game,
 			result->areaFertility = std::move(area);
 		}
 	}
+	if (needs(result->requirements, Component::BuildingSeeds))
+	{
+		// Reused while unchanged. Otherwise copied (changed chunks of the free
+		// copy closest to the live templates) only when building field requests
+		// will be prepared from this boundary (MapRouting::buildingSeedDemand):
+		// the copy costs the owner thread, while the seeds it speeds up run on
+		// workers. Absent templates mean scans.
+		const auto& routing = game.map.routing();
+		if (previous && previous->buildingSeeds && routing.buildingSeedsCurrent(*previous->buildingSeeds))
+			result->buildingSeeds = previous->buildingSeeds;
+		else if (routing.buildingSeedDemand())
+		{
+			auto copy = storage ? storage->buildingSeeds.acquire(storage->allocations,
+				[&](const MapState::BuildingSeedSnapshot& buffer) {
+					return buffer.world == game.map.identity() ? buffer.generation : Uint64(0);
+				}) : std::make_shared<MapState::BuildingSeedSnapshot>();
+			const auto capacity = copy->planes.capacityBytes() + copy->stamps.capacity() * sizeof(Uint64);
+			Uint64 copied = 0;
+			routing.captureBuildingSeeds(*copy, copied);
+			if (storage)
+			{
+				storage->buildingSeedBytesCopied += copied;
+				if (copy->planes.capacityBytes() + copy->stamps.capacity() * sizeof(Uint64) > capacity) ++storage->allocations;
+			}
+			result->buildingSeeds = std::move(copy);
+		}
+	}
 	if (needs(requirements, Component::ResourceFields))
 	{
 		auto fields = acquire(&Storage::resourceFields, Component::ResourceFields);
@@ -568,14 +672,14 @@ Handle capture(const Game& game,
 		const ResourceFields *kept = previous && previous->worldIdentity == result->worldIdentity
 										 ? previous->resourceFields.get()
 										 : nullptr;
-		for (const auto &plane : game.map.publishedResourceFields())
+		for (const auto &plane : game.map.routing().publishedResourceFields())
 		{
 			if (storage && fields->planes.size() == fields->planes.capacity()) ++storage->allocations;
-			if (kept) if (const auto* same = kept->find(plane.key); same && same->generation == plane.generation) { fields->add(*same); continue; }
-			auto values = storage ? storage->resourcePlanes.acquire(storage->allocations) : std::make_shared<std::vector<Uint16>>();
-			if (storage && values->capacity() < planeCells) ++storage->allocations;
-			values->resize(planeCells); std::copy_n(*plane.slot, planeCells, values->begin());
-			fields->add(ResourceField{plane.key, plane.generation, std::move(values)});
+            const auto destinationGeneration=game.map.routing().materialGradientDestinationGeneration(plane.slot);
+			if (kept) if (const auto* same = kept->find(plane.key); same && same->generation == plane.generation && same->destinationGeneration==destinationGeneration) { fields->add(*same); continue; }
+            const auto destinations=game.map.routing().materialGradientDestinations(*plane.slot);
+			// Shared, not copied: a published plane is immutable until it leaves its slot.
+			fields->add(ResourceField{plane.key, plane.generation, game.map.routing().sharePublishedPlane(plane), planeCells, destinations, destinationGeneration});
 		}
 		result->resourceFields = std::move(fields);
 	}
@@ -617,6 +721,14 @@ void verifyCapture(const Game& game, const Handle& handle)
 			});
 	};
 	const auto live = game.map.cellView();
+	if (handle.buildingSeeds)
+	{
+		const auto& expected = game.map.routing().buildingSeedTemplates();
+		const auto& captured = handle.buildingSeeds->planes;
+		if (captured.cells != expected.cells || captured.planes != expected.planes
+			|| captured.forbidden != expected.forbidden || captured.buildings != expected.buildings)
+			throw std::logic_error("snapshot verification: building seed templates differ from the live map");
+	}
 	if (handle.terrain)
 	{
 		compare("cell rules", handle.terrain->cellRules, game.map.cellRuleState());
@@ -665,7 +777,7 @@ void verifyCapture(const Game& game, const Handle& handle)
                 || live.size() > entities.relationships.size() - relationshipIndex)
                 throw std::logic_error("snapshot verification: building relationship range differs from the game");
             for (const auto* unit : live)
-                if (entities.relationships[relationshipIndex++] != Game::refOf(unit))
+                if (entities.relationships[relationshipIndex++] != refOf(unit))
                     throw std::logic_error("snapshot verification: building relationship differs from the game");
         };
         for (int t = 0; t < teams; ++t) {
@@ -685,13 +797,15 @@ void verifyCapture(const Game& game, const Handle& handle)
                 if (unitIndex >= entities.units.size() || lookup != unitIndex)
                     throw std::logic_error("snapshot verification: unit count or lookup differs from the game");
                 const auto& unit = entities.units[unitIndex++];
-                if (unit.identity != Game::refOf(live) || unit.team != t)
+                if (unit.identity != refOf(live) || unit.team != t)
                     throw std::logic_error("snapshot verification: unit identity or order differs from the game");
+                if(unit.activeClaimsEnabled!=game.map.activeClaimsEnabled() || unit.activeMaterialClaim!=live->activeMaterialClaim
+                    || unit.materialClaimTask!=live->materialClaimTask || unit.materialClaimPolicyState!=live->materialClaimPolicyState)throw std::logic_error("active material claim snapshot mismatch");
                 if (static_cast<const UnitState&>(unit) != static_cast<const UnitState&>(*live))
                     throw std::logic_error("snapshot verification: unit state differs from the game");
                 if (unit.realAttackStrength != live->getRealAttackStrength())
                     throw std::logic_error("snapshot verification: unit attack strength differs from the game");
-                if (unit.attached != Game::refOf(live->attachedBuilding) || unit.target != Game::refOf(live->targetBuilding))
+                if (unit.attached != refOf(live->attachedBuilding) || unit.target != refOf(live->targetBuilding))
                     throw std::logic_error("snapshot verification: unit building references differ from the game");
             }
             // Deep diagnostic only: audit empty ID lookup entries too.
@@ -705,7 +819,7 @@ void verifyCapture(const Game& game, const Handle& handle)
                 if (buildingIndex >= entities.buildings.size() || lookup != buildingIndex)
                     throw std::logic_error("snapshot verification: building count or lookup differs from the game");
                 const auto& building = entities.buildings[buildingIndex++];
-                if (building.identity != Game::refOf(live) || building.team != t)
+                if (building.identity != refOf(live) || building.team != t)
                     throw std::logic_error("snapshot verification: building identity or order differs from the game");
                 if (static_cast<const BuildingStateRecord&>(building) != static_cast<const BuildingStateRecord&>(*live))
                     throw std::logic_error("snapshot verification: building state differs from the game");

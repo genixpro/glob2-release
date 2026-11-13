@@ -14,7 +14,8 @@ constexpr auto MapInputs = bit(Component::Catalogs) | bit(Component::Terrain)
 Requirements presentationRequirements(CaptureOptions options)
 {
     options.presentation = true;
-    return captureRequirements(options) & ~(bit(Component::ResourceFields) | bit(Component::StatisticsInputs));
+    return captureRequirements(options) & ~(bit(Component::ResourceFields) | bit(Component::StatisticsInputs)
+        | bit(Component::BuildingSeeds));
 }
 }
 Handle Handle::simulationView() const { return project(Simulation); }
@@ -38,7 +39,8 @@ Handle Handle::statisticsView() const
 }
 Handle Handle::gradientView() const
 { return project(MapInputs | bit(Component::Visibility) | bit(Component::Entities)); }
-Handle Handle::buildingGradientView() const { return project(MapInputs); }
+// Templates are optional: a capture without them seeds by scanning.
+Handle Handle::buildingGradientView() const { return project(MapInputs | (requirements & bit(Component::BuildingSeeds))); }
 Handle Handle::growthView() const
 { return project((MapInputs & ~bit(Component::Areas)) | bit(Component::Rules) | bit(Component::Growth)); }
 Handle Handle::sceneMapView() const
@@ -59,7 +61,8 @@ Handle Handle::project(Requirements requested) const
 	if ((requested & requirements) != requested) throw std::invalid_argument("snapshot component was not captured");
 	Handle result;
 	result.tick = tick; result.width = width; result.height = height; result.requirements = requested;
-	result.observationRevision = observationRevision;
+	result.observationRevision = observationRevision; result.boundarySerial = boundarySerial;
+    result.activeClaimRuntimeChecksum = activeClaimRuntimeChecksum;
 	result.configurationRevision = configurationRevision; result.worldIdentity = worldIdentity; result.mapGenerations = mapGenerations;
 	if (needs(requested, Component::Session)) result.session = session;
 	if (needs(requested, Component::Effects)) result.effects = effects;
@@ -80,6 +83,7 @@ Handle Handle::project(Requirements requested) const
 	if (needs(requested, Component::Rules)) result.rules = rules;
 	if (needs(requested, Component::Growth)) { result.growth = growth; result.areaFertility=areaFertility; }
 	if (needs(requested, Component::ResourceFields)) result.resourceFields = resourceFields;
+	if (needs(requested, Component::BuildingSeeds)) result.buildingSeeds = buildingSeeds;
 	return result;
 }
 MapState::View Handle::view() const
@@ -95,6 +99,7 @@ MapState::View Handle::view() const
 	if (catalogs) v.resourceRegistry = catalogs->resources.get();
 	v.growth = growth.get();
 	if(areaFertility) v.areaFertility=areaFertility->values;
+	if (buildingSeeds && !buildingSeeds->planes.empty()) v.buildingSeeds = &buildingSeeds->planes;
 	if (rules) { v.resourceGrowthDisabled = rules->values.resourceGrowthDisabled; v.resourceScarcityLevel = rules->configuration ? int(rules->configuration->getResourceScarcityLevel()) : 0; }
 	return v;
 }

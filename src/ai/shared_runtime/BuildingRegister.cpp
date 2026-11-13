@@ -2,12 +2,14 @@
 // Copyright (C) 2006 Bradley Arsenault
 
 #include "shared_runtime/Runtime.h"
+#include "Map.h"
 #include "Building.h"
 #include "Game.h"
 #include "BuildingType.h"
 #include "shared_runtime/BuildingDemands.h"
 #include <tuple>
 #include "FileFormatVersions.h"
+#include "Team.h"
 
 using namespace AISharedRuntime;
 using namespace AISharedRuntime::Construction;
@@ -254,6 +256,19 @@ void BuildingRegister::order_execution_completed(int gid, bool accepted, std::op
         }
 }
 
+
+
+
+void BuildingRegister::placement_rejected(int x, int y, int building_type)
+{
+    for(auto i=pending_buildings.begin();i!=pending_buildings.end();++i) {
+        const auto& [px,py,type,ticks]=i->second;
+        if(ticks!=AI_SHARED_RUNTIME_PENDING_NOT_ISSUED && px==x && py==y && type==building_type) {
+            pending_buildings.erase(i);
+            return;
+        }
+    }
+}
 
 
 

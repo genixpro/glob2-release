@@ -148,6 +148,8 @@ template<class A> void fields(A& a, WorldState& value)
         for(const auto& colony:value.feedingColonies)if(colony.x<0 || colony.x>=value.width || colony.y<0 || colony.y>=value.height)
             throw std::runtime_error("Invalid saved feeding colony");
     }
+    // enemyStructures and contestedBuildings are appended at the end of Maxima's
+    // execution state (Planner::TowerState) so older payloads stay exact prefixes.
 	value.invalidateProfileIndex();
 }
 
@@ -161,6 +163,14 @@ template<class A> void fields(A& a, DevelopmentIntent& value)
 	a("requiredResourceType",value.requiredMaterialType);
 	a("emergency",value.emergency);
 	a("replacesBuildingId",value.replacesBuildingId);
+    if(a.version()>=FILE_FORMAT_VERSION_MAXIMA_FORWARD_SUPPORT)
+    {
+        a("supportX",value.supportX);a("supportY",value.supportY);
+        a("supportDistance",value.supportDistance);
+    }
+    if(value.purpose==ForwardSupport && (value.supportX<0 || value.supportY<0
+        || value.supportDistance<12 || value.supportDistance>64))
+        throw std::runtime_error("Invalid Maxima forward-support constraints");
 }
 
 template<class A> void fields(A& a, DevelopmentLimits& value)

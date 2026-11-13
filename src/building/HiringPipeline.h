@@ -2,7 +2,6 @@
 #pragma once
 #include "HiringPlanner.h"
 #include "ComputeExecutor.h"
-#include "Version.h"
 #include <deque>
 #include <optional>
 #include <map>
@@ -25,6 +24,9 @@ class HiringPipeline
 	Game *game = nullptr;
 	std::optional<Uint32> lastObserved;
 	std::array<std::shared_ptr<const HiringPlanner::Output>, 16> published;
+	// Replaced publications, released on the next batch's worker rather than
+	// destroyed on the owner. They are never read again.
+	std::array<std::shared_ptr<const HiringPlanner::Output>, 16> retired;
 	std::deque<std::unique_ptr<Batch>> pending;
 	std::map<Uint16, BuildingRef> initializationRequests;
 	struct Claim
@@ -43,11 +45,25 @@ class HiringPipeline
 		Uint64 submitted = 0, published = 0;
 	};
 	Metrics metrics;
+	// Rules for new games; a loaded save keeps the rules it was saved with.
 	static constexpr unsigned Delay = Hiring::PublicationDelay, Refresh = Hiring::RefreshInterval,
 							  Extras = Hiring::CandidateExtras, Capacity = 128;
+	static_assert(Hiring::MaxPublicationDelay <= ComputeExecutor::HiringHorizon);
+	const Hiring::Rules &rules() const { return activeRules; }
+	// Owner-only recycling of cold routes that no worker initialized. Reuse
+	// saves their allocations; a route is reclaimed only once the owner holds
+	// its last reference, so no worker can still observe it.
+	struct RoutePool
+	{
+		std::vector<std::shared_ptr<HiringPlanner::PreparedRoute>> issued, spare;
+		std::size_t lastRoutes = 0;
+		void reclaim();
+		std::shared_ptr<HiringPlanner::PreparedRoute> take();
+	};
 	static HiringPlanner::Inputs
 	bindRoutes(Game &, const SimulationSnapshot::Handle &, unsigned teamMask = ~0u,
-			   const std::map<Uint16, BuildingRef> *initializations = nullptr);
+			   const std::map<Uint16, BuildingRef> *initializations = nullptr,
+			   RoutePool *pool = nullptr, Hiring::Rules rules = {});
 	explicit HiringPipeline(ComputeExecutor &);
 	~HiringPipeline();
 	// Legacy saved continuation support; new buildings initialize on demand.
@@ -59,6 +75,11 @@ class HiringPipeline
 	void drain(JoinReason = JoinReason::Teardown);
 	const HiringPlanner::BuildingLists *suggestions(const Building &) const;
 	void save(GAGCore::OutputStream *);
-	void load(Game &, GAGCore::InputStream *, int versionMinor = VERSION_MINOR);
+	void load(Game &, GAGCore::InputStream *); // current format
+	void load(Game &, GAGCore::InputStream *, int versionMinor);
 	Uint32 checkSum() const;
+
+  private:
+	RoutePool routePool;
+	Hiring::Rules activeRules;
 };
