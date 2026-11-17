@@ -5048,6 +5048,10 @@ Probabilitatea victoriei
 Prestigiu
 [stat prestige about]
 Prestigiul coloniei, obținut prin clădirile de nivel maxim. Un meci cu obiectiv de prestigiu se încheie când acesta este atins.
+[stat prestige needed]
+Prestigiu necesar pentru victorie
+[stat prestige needed about]
+Prestigiul pe care colonia ar mai trebui să-l obțină pentru a câștiga prin prestigiu: suficient pentru ca prestigiul cumulat al meciului să atingă obiectivul și pentru a depăși orice altă colonie supraviețuitoare. Se înregistrează doar când meciul are un obiectiv de prestigiu.
 [stat band combat]
 Luptă
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Pasul %0: %1 ms timp real
 IA pentru toate coloniile controlate de calculator
 [tundra]
 Sol de tundră
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

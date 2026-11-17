@@ -5048,6 +5048,10 @@ CPU %0%
 Κύρος
 [stat prestige about]
 Το κύρος της αποικίας, που κερδίζεται από κτίρια ανώτατου επιπέδου. Ένας αγώνας με στόχο κύρους τελειώνει όταν αυτός επιτευχθεί.
+[stat prestige needed]
+Κύρος που χρειάζεται για νίκη
+[stat prestige needed about]
+Το κύρος που θα έπρεπε ακόμη να κερδίσει η αποικία για να νικήσει με κύρος: αρκετό ώστε το συνολικό κύρος του αγώνα να φτάσει τον στόχο και να ξεπεράσει κάθε άλλη αποικία που επιβιώνει. Καταγράφεται μόνο όταν ο αγώνας έχει στόχο κύρους.
 [stat band combat]
 Μάχη
 [stat band starvation]
@@ -7102,3 +7106,33 @@ CPU (αυτόματα)
 ΤΝ για όλες τις αποικίες που ελέγχει ο υπολογιστής
 [tundra]
 Έδαφος τούνδρας
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

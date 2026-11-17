@@ -111,6 +111,14 @@ class Fixture(unittest.TestCase):
                 'host': attempt['host'], 'package_id': package_identity(), 'artifacts': [],
                 'category': category, 'result': {'schema_version': 1, 'status': 'completed'}, 'missing_artifacts': []}
 
+    def test_cli_probe_reports_the_loader_error(self):
+        from tools.tournaments.bundles import validate_cli
+        executable = self.root / 'broken-glob2'
+        executable.write_text('#!/bin/sh\necho "glob2: version GLIBC_2.43 not found" >&2\nexit 1\n')
+        executable.chmod(0o755)
+        with self.assertRaisesRegex(ValueError, 'GLIBC_2.43 not found'):
+            validate_cli(executable, self.root)
+
     def test_expiry_late_duplicate_and_restart(self):
         c = self.coordinator
         first = c.dispatch('one', self.status, now=10)[0]
@@ -690,7 +698,14 @@ class WorkerIntegration(unittest.TestCase):
             self.assertEqual(state['jobs'],{'failed':1})
             self.assertEqual(c.db.execute("SELECT count(*) FROM attempts WHERE category='timeout'").fetchone()[0],2)
         finally:
-            Transport(host,c.root/'worker.pyz').rpc('stop');c.close()
+            transport=Transport(host,c.root/'worker.pyz')
+            transport.rpc('stop')
+            # Let the daemon exit before tearDown removes its directory; it can
+            # still be writing there just after the stop request (Ubuntu 22.04).
+            for _ in range(20):
+                if not transport.rpc('status')['daemon_running']: break
+                time.sleep(.1)
+            c.close()
 
     def test_real_worker_protocol_and_lost_ack(self):
         from tools.tournaments.transport import Transport

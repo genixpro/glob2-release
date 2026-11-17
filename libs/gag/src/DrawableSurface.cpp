@@ -96,6 +96,29 @@ namespace GAGCore
         return result;
     }
 
+    std::unique_ptr<DrawableSurface> DrawableSurface::fromReducedLevel(const AssetImage& image, unsigned level,
+            int width, int height)
+    {
+        if (level >= image.mips.size()) throw std::invalid_argument("No such prepared mip level");
+        const auto &mip = image.mips[level];
+        if (width <= 0 || height <= 0 || width > mip.width || height > mip.height ||
+            mip.pixels.size() < size_t(mip.width) * mip.height * 4)
+            throw std::invalid_argument("Reduced level outside its prepared mip");
+        std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> pixels(
+            SDL_CreateSurface(width, height, SDL_PIXELFORMAT_ARGB8888), SDL_DestroySurface);
+        if (!pixels) throw std::runtime_error(SDL_GetError());
+        // Levels hold the decoded surface's byte order, or RGBA where the
+        // workers prepared RGBA upload pixels (AssetImage::prepareUpload). The
+        // content is the level's top-left corner: the chain pads to powers of two.
+        const auto format = image.uploadPixels.empty() ? SDL_PIXELFORMAT_ARGB8888 : SDL_PIXELFORMAT_RGBA32;
+        if (!SDL_ConvertPixels(width, height, format, mip.pixels.data(), mip.width * 4,
+                               SDL_PIXELFORMAT_ARGB8888, pixels->pixels, pixels->pitch))
+            throw std::runtime_error(SDL_GetError());
+        auto result = std::make_unique<DrawableSurface>(pixels.get(), AdoptPixels{}, true);
+        pixels.release();
+        return result;
+    }
+
     void DrawableSurface::adoptUploadPreparation(const AssetImage& image, bool exclusive)
     {
         if (exclusive) { preparedUploadPixels = std::move(image.uploadPixels); preparedMips = std::move(image.mips); }
@@ -159,6 +182,88 @@ namespace GAGCore
 #else
         return false;
 #endif
+    }
+
+    bool DrawableSurface::releasePortablePixels()
+    {
+        if (!sdlsurface || this == _gc || textureInfo || !_gc || !_gc->portableRenderer ||
+            _gc->renderer != _gc->portableRenderer.get() ||
+            !_gc->portableRenderer->hasTexture(this, contentRevision()))
+            return false;
+        hasOpaquePixels(); // Answered from the pixels one last time, then from the cache.
+        releasedW = sdlsurface->w;
+        releasedH = sdlsurface->h;
+        SDL_DestroySurface(sdlsurface);
+        sdlsurface = nullptr;
+        std::vector<unsigned char>().swap(preparedUploadPixels);
+        std::vector<AssetImage::Mip>().swap(preparedMips);
+        releasedOnPortable = true;
+        return true;
+    }
+
+    bool DrawableSurface::portableTextureLost() const
+    {
+        return releasedOnPortable && !(_gc && _gc->portableRenderer && _gc->renderer == _gc->portableRenderer.get() &&
+            _gc->portableRenderer->hasTexture(this, contentRevision()));
+    }
+
+    bool DrawableSurface::releaseDevicePixels()
+    {
+        // Releasing frees a few large blocks; spreading them keeps frames even.
+        constexpr unsigned ReleasesPerFrame = 16;
+        if (!sdlsurface || this == _gc || textureInfo || !_gc || !_gc->deviceRenderer ||
+            _gc->renderer != _gc->deviceRenderer.get() || _gc->offscreenPass ||
+            _gc->deviceReleasesThisFrame >= ReleasesPerFrame ||
+            !retainDeviceTexture(*_gc->deviceRenderer, this, contentRevision()))
+            return false;
+        ++_gc->deviceReleasesThisFrame;
+        hasOpaquePixels(); // Answered from the pixels one last time, then from the cache.
+        releasedW = sdlsurface->w;
+        releasedH = sdlsurface->h;
+        SDL_DestroySurface(sdlsurface);
+        sdlsurface = nullptr;
+        std::vector<unsigned char>().swap(preparedUploadPixels);
+        std::vector<AssetImage::Mip>().swap(preparedMips);
+        releasedOnDevice = true;
+        return true;
+    }
+
+    bool DrawableSurface::deviceHoldsPixels() const
+    {
+        if (!_gc || !_gc->deviceRenderer || _gc->renderer != _gc->deviceRenderer.get()) return true;
+        return _gc->deviceRenderer->hasTexture(this, contentRevision());
+    }
+
+    bool DrawableSurface::takeDeviceUpload()
+    {
+        constexpr unsigned UploadsPerFrame = 8;
+        if (!_gc || !_gc->deviceRenderer || _gc->renderer != _gc->deviceRenderer.get() || _gc->offscreenPass) return true;
+        if (_gc->deviceUploadsThisFrame >= UploadsPerFrame) return false;
+        ++_gc->deviceUploadsThisFrame;
+        return true;
+    }
+
+    bool DrawableSurface::prepareDeviceTexture()
+    {
+        // Plain nearest-sampled surfaces only: linear and mipmapped ones admit
+        // other texture descriptors when they draw.
+        if (!sdlsurface || !_gc || !_gc->deviceRenderer || _gc->renderer != _gc->deviceRenderer.get() ||
+            _gc->offscreenPass || highResolutionSampling || singleLevelSampling || spriteSource)
+            return false;
+        if (deviceHoldsPixels()) return true;
+        if (!takeDeviceUpload()) return false;
+        // The budget class and alpha a draw admits it with (GraphicContext::drawSurface).
+        auto &backend = *_gc->deviceRenderer;
+        backend.textureBudgetClass(deviceBudgetClass);
+        backend.prepareTexture(this, sdlsurface, pixelRevision);
+        backend.textureBudgetClass(TextureDescriptor::BudgetClass::General);
+        return deviceHoldsPixels();
+    }
+
+    bool DrawableSurface::deviceBacked() const
+    {
+        return releasedOnDevice && !sdlsurface && _gc && _gc->deviceRenderer &&
+            _gc->deviceRenderer->hasTexture(this, pixelRevision);
     }
 
 	DrawableSurface *DrawableSurface::clone(void)
@@ -321,6 +426,10 @@ namespace GAGCore
                     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR_MIPMAP_LINEAR);
                     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_S,GL_CLAMP_TO_EDGE);
                     glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_WRAP_T,GL_CLAMP_TO_EDGE);
+                    // A render device may have kept only premultiplied blocks,
+                    // which this context never uploads: prepare the chain again.
+                    if (!preparedMips.empty() && preparedMips.front().pixels.empty())
+                        std::vector<AssetImage::Mip>().swap(preparedMips);
                     if ((preparedUploadRevision != pixelRevision || preparedMips.empty()) &&
                         sdlsurface->w > 0 && sdlsurface->h > 0 &&
                         sdlsurface->pitch == sdlsurface->w * 4 &&
@@ -419,7 +528,10 @@ namespace GAGCore
                     // same normalized coordinates. Blocks need 4x4 levels.
                     size_t first = std::min<size_t>(uploadSkipLevels, levels->empty() ? 0 : levels->size() - 1);
                     while (compress && first > 0 && ((*levels)[first].width < 4 || (*levels)[first].height < 4)) --first;
-                    for (size_t mip = first; mip < levels->size(); ++mip) {
+                    // An HD sprite frame samples its band's level alone.
+                    const size_t end = singleLevelSampling ? first + 1 : levels->size();
+                    if (singleLevelSampling) glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+                    for (size_t mip = first; mip < end; ++mip) {
                         const auto &level = (*levels)[mip];
                         const int w = level.width, h = level.height, glLevel = int(mip - first);
                         if (compress && (w < 4 || h < 4)) { glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, glLevel - 1); break; }

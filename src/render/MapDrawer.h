@@ -32,7 +32,9 @@ namespace MapDrawer
 		BOTTOM_TO_TOP
 	};
 
-	void drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene);
+	//! With flightShadowOnly, draws only a flying unit's ground shadow, so a
+	//! pass of shadows can lie under every flyer's body.
+	void drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene, bool flightShadowOnly = false);
 	// Prepare one immutable presentation frame for several offscreen regions.
 	void finishMapCapture(ViewState &view, Uint32 options, bool paused);
 	void finishMapCapture(MapRenderState &render, Uint32 options, bool paused);
@@ -52,7 +54,8 @@ namespace MapDrawer
 	//! `opacity` fades an entity's bars and pips with it, as a unit fading into the fog of war.
 	void anchorBars(int x, int y, MapRenderState* drawnRender = nullptr, float opacity = 1.f);
 	//! `beside` puts the badge up and to the right of (x, y) instead of centred on it.
-	void drawStatusPip(int x, int y, MapOverlayQueue::StatusIcon icon, MapRenderState* drawnRender = nullptr, float opacity = 1.f, bool beside = false);
+	//! `severity` blends it from yellow (0, the condition has just begun) to red (1, at its worst).
+	void drawStatusPip(int x, int y, MapOverlayQueue::StatusIcon icon, float severity, MapRenderState* drawnRender = nullptr, float opacity = 1.f, bool beside = false);
 	///draws a point bar. This can be health, hunger, fill level, etc. Point bars can have 2 sections of actLength and secondActLength, followed by black until maxLength. r/g/b is for the first section, r2/g2/b2 for the second
 	//! With drawnRender the bar takes the opacity of the last anchorBars; without it, `opacity`.
 	void drawPointBar(int x, int y, BarOrientation orientation, int maxLength, int actLength, int secondActLength, Uint8 r, Uint8 g, Uint8 b, Uint8 r2, Uint8 g2, Uint8 b2, int barWidth=2, MapRenderState* drawnRender=nullptr, float opacity = 1.f);

@@ -5048,6 +5048,10 @@ FFmpeg در دسترس نیست، پس ضبط خاموش است. FFmpeg را ن�
 اعتبار
 [stat prestige about]
 اعتبار مستعمره که با ساختمان‌های بالاترین سطح به دست می‌آید. مسابقه‌ای با هدف اعتبار، با رسیدن به آن تمام می‌شود.
+[stat prestige needed]
+اعتبار لازم برای پیروزی
+[stat prestige needed about]
+اعتباری که مستعمره هنوز باید به دست آورد تا با اعتبار پیروز شود: به اندازه‌ای که اعتبار مجموع مسابقه به هدف برسد و از همهٔ مستعمره‌های بازماندهٔ دیگر جلو بزند. فقط وقتی ثبت می‌شود که مسابقه هدف اعتبار داشته باشد.
 [stat band combat]
 نبرد
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Discord باز شد. هر زمان بخواهید می‌توانید به با�
 هوش مصنوعی برای همهٔ مستعمره‌های تحت کنترل رایانه
 [tundra]
 زمین توندرا
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

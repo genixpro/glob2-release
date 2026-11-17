@@ -10,6 +10,7 @@
 #include <EventQueue.h>
 #include <ApplicationHost.h>
 #include <Toolkit.h>
+#include <StringTable.h>
 #include <FormatableString.h>
 
 #include "AINames.h"
@@ -17,6 +18,7 @@
 #include "ConnectionOverlay.h"
 #include "DatasetWriter.h"
 #include "Engine.h"
+#include "DeviceAdaptationSession.h"
 #include "tutorial/TutorialModel.h"
 #include "sim/snapshot/SnapshotChecksum.h"
 #include "hive/HiveClient.h"
@@ -447,6 +449,12 @@ void Engine::drawFrame(MainLoopState& st, bool everyFrame, const PresentationFra
 			if (perf.lastPresentation && perf.clock() - perf.lastPresentation > 2000000000ULL)
 				perf.windowFlags |= PerformanceTelemetry::PresentationGap;
 			perf.presented();
+			// O(1): the step-down's slow-frame ring. Fast-forward presets skip
+			// frames on purpose, so only normal-cadence drawing counts.
+			if (globalContainer->settings.getGameSpeedRenderInterval() <= 1)
+				DeviceAdaptation::framePresented();
+			if (DeviceAdaptation::session().takeNotice())
+				gui.addNotice(Toolkit::getStringTable()->getString("[artwork stepped down notice]"));
 		}
 		else
 			perf.record(PerformanceTelemetry::Id::RenderDeferred, 1);
@@ -980,18 +988,26 @@ void Engine::printTeamTimeline()
 		std::cout << "GLOB2_TIMELINE team=" << t << " ai=" << aiLabel[t]
 			<< " result=" << (team->hasWon ? "won" : team->hasLost ? "lost" : "alive")
 			<< " samples=" << hist.size() << std::endl;
+		const std::vector<PrestigeNeededSample>& needed = team->stats.getPrestigeNeededHistory();
+		size_t nextNeeded = 0;
 		for (size_t i = 0; i < hist.size(); i++)
 		{
 			const EndOfGameStat& s = hist[i];
+			const Uint32 tick = Uint32(i * (END_OF_GAME_STAT_INTERVAL_MASK + 1));
+			while (nextNeeded < needed.size() && needed[nextNeeded].tick < tick)
+				++nextNeeded;
 			std::cout << "GLOB2_TL team=" << t
-				<< " tick=" << (i * (END_OF_GAME_STAT_INTERVAL_MASK + 1))
+				<< " tick=" << tick
 				<< " units=" << s.value[EndOfGameStat::TYPE_UNITS]
 				<< " bld=" << s.value[EndOfGameStat::TYPE_BUILDINGS]
 				<< " prestige=" << s.value[EndOfGameStat::TYPE_PRESTIGE]
 				<< " hp=" << s.value[EndOfGameStat::TYPE_HP]
 				<< " atk=" << s.value[EndOfGameStat::TYPE_ATTACK]
-				<< " def=" << s.value[EndOfGameStat::TYPE_DEFENSE]
-				<< std::endl;
+				<< " def=" << s.value[EndOfGameStat::TYPE_DEFENSE];
+			// Only recorded while prestige can end the game.
+			if (nextNeeded < needed.size() && needed[nextNeeded].tick == tick)
+				std::cout << " prestigeNeeded=" << needed[nextNeeded].value;
+			std::cout << std::endl;
 		}
 
 		team->stats.printMeasurements(t, true);
@@ -1260,6 +1276,8 @@ void Engine::beginSession(Uint64 now)
 		perf.describe(metadata.str());
 	}
 	printTurnTelemetrySession();
+	if (!globalContainer->runNoX)
+		DeviceAdaptation::matchStarted();
 	// Establish loaded-session coverage before a simulation thread can publish.
 	configureSessionTelemetry(*session, perf);
 	establishObservation(!globalContainer->runNoX);

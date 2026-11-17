@@ -5016,6 +5016,10 @@ AI தொலை அளவீடு
 கௌரவம்
 [stat prestige about]
 அதிகபட்ச நிலைக் கட்டிடங்கள் மூலம் குடியிருப்பு பெற்ற கௌரவம். கௌரவ இலக்கு உள்ள ஆட்டத்தில் அந்த இலக்கை அடைந்ததும் ஆட்டம் முடியும்.
+[stat prestige needed]
+வெல்லத் தேவையான கௌரவம்
+[stat prestige needed about]
+கௌரவத்தால் வெல்ல குடியிருப்பு இன்னும் ஈட்ட வேண்டிய கௌரவம்: ஆட்டத்தின் மொத்தக் கௌரவம் இலக்கை அடையவும், எஞ்சியிருக்கும் மற்ற எல்லாக் குடியிருப்புகளையும் முந்தவும் போதுமான அளவு. ஆட்டத்தில் கௌரவ இலக்கு இருக்கும்போது மட்டுமே பதிவாகும்.
 [stat band combat]
 போர்
 [stat band starvation]
@@ -7102,3 +7106,33 @@ GL மட்டும்
 தொடர் கட்டளையைப் புதுப்பிக்க முடியவில்லை. உங்கள் கட்டளை இந்தச் சாதனத்தில் இடைநிறுத்தப்பட்டுள்ளது; தொடர்புடைய கட்டுப்பாட்டை மீண்டும் பயன்படுத்தவும்.
 [tundra]
 துந்திரா நிலம்
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

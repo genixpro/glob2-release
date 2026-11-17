@@ -123,16 +123,17 @@ void Game::winProbabilitySyncStep(bool force)
 {
 	// Read the same state as the victory condition, regardless of whether the
 	// rule or detailed telemetry is enabled. This history never drives play.
-	if ((stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) != 0 && !isGameEnded && !force)
+	const bool periodic = (stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) == 0;
+	if (!periodic && !force)
 		return;
-	bool newSample = false;
+	bool newSample = false, haveHistory = true;
 	for (int t = 0; t < teamsCount(); ++t)
 	{
 		const auto &history = teams[t]->stats.getWinProbabilityHistory();
 		newSample |= history.empty() || history.back().tick != stepCounter;
+		haveHistory &= !history.empty();
 	}
 	if (!newSample) return;
-	std::vector<int> allianceOf;
 	// The probability rule has just assigned loss flags. Preserve the actual
 	// prediction that ended the match instead of turning a 95% call into 100%.
 	Uint32 ignoreLostTeams = 0;
@@ -140,6 +141,19 @@ void Game::winProbabilitySyncStep(bool force)
 	{
 		if (teams[t]->winCondition == WCWinProbability) ignoreLostTeams |= 1u << t;
 	}
+	// The trace only ever holds what the model predicted at its cadence. A
+	// reporting point between samples, or a sample after another rule (prestige,
+	// conquest, script) has decided the game, repeats the last prediction:
+	// re-evaluating with the losers removed would manufacture a sudden 100%.
+	const bool decidedByOtherRule = isGameEnded && ignoreLostTeams == 0;
+	if (haveHistory && (!periodic || decidedByOtherRule))
+	{
+		for (int t = 0; t < teamsCount(); ++t)
+			teams[t]->stats.recordWinProbability(stepCounter,
+				teams[t]->stats.getWinProbabilityHistory().back().permille, WinProbability::modelId());
+		return;
+	}
+	std::vector<int> allianceOf;
 	const std::vector<WinProbability::Slot> slots = WinProbability::slotsOf(*this, allianceOf, ignoreLostTeams);
 	const std::vector<int> chances = WinProbability::permille(slots);
 	for (int t = 0; t < teamsCount(); ++t)
@@ -157,6 +171,7 @@ void Game::winProbabilitySyncStep(bool force)
 			<< " innWalkDistance=" << slots[i].innWalkDistance
 			<< " swarmFilling=" << slots[i].swarmFilling
 			<< " attack=" << slots[i].attack
+			<< " prestigeNeeded=" << slots[i].prestigeNeeded
 			<< std::endl;
 }
 
@@ -225,6 +240,10 @@ void Game::prestigeSyncStep()
 	{
 		totalPrestigeReached=true;
 	}
+	// Recorded on the statistics cadence, only where prestige can end the game.
+	if (WinProbability::prestigeCounts(*this) && (stepCounter & END_OF_GAME_STAT_INTERVAL_MASK) == 0)
+		for (int i=0; i<mapHeader.getNumberOfTeams(); i++)
+			teams[i]->stats.recordPrestigeNeeded(stepCounter, WinProbability::prestigeNeeded(*this, i));
 }
 
 

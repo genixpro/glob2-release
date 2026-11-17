@@ -5016,6 +5016,10 @@ Makadirio ya nafasi ya muungano wako kushinda, yaliyopimwa katika mchezo wote. W
 Heshima
 [stat prestige about]
 Heshima ya makazi, inayopatikana kwa majengo ya kiwango cha juu kabisa. Mechi yenye lengo la heshima huisha likifikiwa.
+[stat prestige needed]
+Heshima inayohitajika kushinda
+[stat prestige needed about]
+Heshima ambayo makazi bado yangehitaji kupata ili kushinda kwa heshima: ya kutosha ili heshima ya jumla ya mechi ifikie lengo, na kupita kila makazi mengine yaliyosalia. Hurekodiwa tu wakati mechi ina lengo la heshima.
 [stat band combat]
 Mapigano
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Hatua %0: %1 ms muda halisi
 Usasishaji wa amri inayoendelea umeshindwa. Amri yako imesitishwa kwa muda kwenye kifaa hiki; jaribu tena kwa kutumia kidhibiti husika.
 [tundra]
 Ardhi ya tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

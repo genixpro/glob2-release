@@ -5048,6 +5048,10 @@ Geschätzte Chance, dass Ihr Bündnis gewinnt, über das ganze Spiel hinweg erfa
 Prestigepunkte
 [stat prestige about]
 Das Prestige der Kolonie, verdient durch Gebäude der höchsten Stufe. Ein Match mit Prestigeziel endet, sobald es erreicht ist.
+[stat prestige needed]
+Zum Sieg nötiges Prestige
+[stat prestige needed about]
+Das Prestige, das die Kolonie noch verdienen müsste, um durch Prestige zu gewinnen: genug, damit das gesamte Prestige des Matches das Ziel erreicht, und um jede andere überlebende Kolonie zu übertreffen. Wird nur erfasst, wenn das Match ein Prestigeziel hat.
 [stat band combat]
 Kampf
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Tick %0: %1 ms Echtzeit
 KI für alle computergesteuerten Kolonien
 [tundra]
 Tundraboden
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

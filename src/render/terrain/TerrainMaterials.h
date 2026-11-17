@@ -97,6 +97,13 @@ struct Surf
 // direct terrain shader (libs/gag/include/DirectTerrainShader.h).
 void applySurf(const Surf &, bool surfSide, int margin, int wx, int wy, unsigned time,
 			   unsigned value[3], int land = 256);
+// applySurf in two parts for composing many samples at one time: the phase of
+// a material's wash at `time`, the margin beyond which surf changes nothing,
+// and the sample update for a margin within that reach. Identical results.
+int surfPhase(const Surf &, unsigned time);
+int surfReach(const Surf &, bool surfSide);
+void applySurfAt(const Surf &, bool surfSide, int margin, int wx, int wy, int phase,
+				 unsigned value[3], int land = 256);
 // Share of each wash (of 1024) spent rushing up the beach; the rest drains back
 // more slowly. Mirrored as washIn in libs/gag/shaders/terrain-compose-fragment.glsl.
 constexpr int SurfWashInQ10 = 224;
@@ -320,6 +327,15 @@ class Catalog
 	// no overlay, the cell is not chosen or its step is empty.
 	int overlayFrame(MaterialId material, int x, int y, std::uint32_t time, std::uint32_t seed = 0, bool *animated = nullptr) const;
 };
+// The shortest period, in animation ticks, after which every animation of the
+// catalogue repeats: the least common multiple of each flipbook's cycle
+// (frames × ticks) and each surf's period. Renderers wrap the presentation
+// time they hand shaders at this period, so float precision stays far below
+// a tick however long a session runs: below 2^17 ticks a float resolves
+// 1/128 of a tick (0.13 ms). Zero when there is no animation, or when the
+// period exceeds MaxAnimationPeriod (then the time is not wrapped).
+inline constexpr int MaxAnimationPeriod = 1 << 17;
+int animationPeriod(const Catalog &);
 std::uint32_t hash(std::uint32_t x, std::uint32_t y, std::uint32_t salt = 0);
 std::uint32_t mapSeedSalt(std::uint32_t seed);
 // One seeded bit per map vertex, packed for a cell in corner-mask order. It is

@@ -5048,6 +5048,10 @@ Chance estimée de victoire de votre alliance, échantillonnée tout au long de 
 Prestige
 [stat prestige about]
 Le prestige de la colonie, gagné grâce aux bâtiments de niveau maximal. Une partie avec un objectif de prestige se termine quand il est atteint.
+[stat prestige needed]
+Prestige requis pour gagner
+[stat prestige needed about]
+Le prestige que la colonie devrait encore gagner pour l'emporter au prestige : assez pour que le prestige cumulé de la partie atteigne l'objectif, et pour dépasser toutes les autres colonies survivantes. Enregistré seulement quand la partie a un objectif de prestige.
 [stat band combat]
 Combats
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Tic %0 : %1 ms en temps réel
 IA de toutes les colonies contrôlées par l’ordinateur
 [tundra]
 Sol de toundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

@@ -78,7 +78,20 @@ public:
 	}
 	bool hiveMindEnabled;
 	bool hiveMindSupervision;
-	bool highResolutionArtwork;
+	// Device-adaptive preferences: Auto follows DeviceProfile; Off and On are
+	// the player's explicit choice and are never overridden.
+	enum class AdaptiveChoice : std::uint8_t { Auto, Off, On };
+	AdaptiveChoice highResolutionArtworkChoice = AdaptiveChoice::Auto;
+	// The effective value every renderer reads: the explicit choice, or Auto
+	// resolved against the device profile. A session step-down lowers it on
+	// Auto for the rest of the run without saving anything.
+	bool highResolutionArtwork = true;
+	bool highResolutionArtworkSteppedDown = false;
+	void setHighResolutionArtworkChoice(AdaptiveChoice choice);
+	// Resolve Auto values against DeviceProfile::current() (load() calls it).
+	void resolveAdaptiveDefaults();
+	static const char *adaptiveChoiceName(AdaptiveChoice choice);
+	static std::optional<AdaptiveChoice> parseAdaptiveChoice(const std::string &text);
 	// Local rendering preferences; never serialized into games or orders.
 	bool showColonySkins = true;
 	bool clouds;
@@ -98,6 +111,14 @@ public:
 	bool smoothFog = true;
 	void setGraphicsDetail(bool full);
 	static constexpr Uint32 LEGACY_LOW_DETAIL = 0x1;
+	//! The eight effects setGraphicsDetail sets together follow the device
+	//! tier (on except on a Low device) until the player changes one of them.
+	//! On by default in the browser, whose build used to start with them all
+	//! off; native builds start with full detail and leave this off.
+	bool graphicsDetailAdaptive;
+	static bool isGraphicsDetailEffect(bool Settings::*field);
+	//! A player's choice of one effect; a detail effect ends the adaptive default.
+	void chooseEffect(bool Settings::*field, bool on);
 	/// Periodically saves the game in progress as "Auto save".
 	bool autosaveGames;
 	// Local compute preference. An absent value defaults off in both graphical and headless sessions.
@@ -202,6 +223,12 @@ public:
 	void resetDefaultUnitsAssigned();
 	void resetDefaultFlagRadius();
 };
+
+// Window flags for the startup graphic context. Desktop and mobile builds let
+// Auto follow the measured per-platform renderer order (PREFERDEVICE; desktop
+// also keeps USEGPU for Legacy GL); browsers keep their probed surface. The
+// request is not persisted, and an explicit renderer choice still overrides it.
+unsigned startupScreenFlags(unsigned savedFlags);
 
 // Version 2 imports the historical family/level preferences into catalog keys.
 #define SETTINGS_VERSION 2

@@ -5048,6 +5048,10 @@ Ocenjena verjetnost zmage vašega zavezništva, merjena skozi celotno tekmo. Zav
 Ugled
 [stat prestige about]
 Ugled kolonije, pridobljen z zgradbami najvišje stopnje. Tekma s ciljem ugleda se konča, ko je cilj dosežen.
+[stat prestige needed]
+Ugled, potreben za zmago
+[stat prestige needed about]
+Ugled, ki bi ga morala kolonija še pridobiti za zmago z ugledom: dovolj, da skupni ugled tekme doseže cilj, in da prehiti vsako drugo preživelo kolonijo. Beleži se le, če ima tekma cilj ugleda.
 [stat band combat]
 Boj
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Korak %0: %1 ms dejanskega časa
 Umetna inteligenca za vse računalniško vodene kolonije
 [tundra]
 Tundrska tla
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

@@ -5048,6 +5048,10 @@ Odhadovaná šance na vítězství vašeho spojenectví, měřená v průběhu c
 Prestiž
 [stat prestige about]
 Prestiž kolonie, získaná budovami nejvyšší úrovně. Zápas s cílem prestiže skončí, jakmile je cíl dosažen.
+[stat prestige needed]
+Prestiž potřebná k vítězství
+[stat prestige needed about]
+Prestiž, kterou by kolonie ještě musela získat, aby zvítězila prestiží: dost na to, aby celková prestiž zápasu dosáhla cíle, a aby předstihla všechny ostatní přeživší kolonie. Zaznamenává se, jen když má zápas cíl prestiže.
 [stat band combat]
 Boj
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Krok %0: %1 ms skutečného času
 AI pro všechny počítačem řízené kolonie
 [tundra]
 Tundrová půda
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

@@ -61,7 +61,12 @@ result to fixed-density reuse. If the view cannot fit the requested density,
 the renderer can still fall back to its normal streaming path.
 `GLOB2_BENCH_FRAME_TIMES=1` prints each measured and warmup frame; summaries
 include p99 and maximum latency as well as median and p95. Per-frame records
-include estimated resident terrain texture bytes within the cache accounting.
+include estimated resident terrain texture bytes within the cache accounting,
+and, on the portable SDL renderer, `FRAME_UPLOADS` with the texture uploads and
+bytes since the previous frame. `GLOB2_BENCH_CAPTURE_FRAMES=60,61,62` with
+`GLOB2_BENCH_CAPTURE_PREFIX` saves those frames, for example over a fixed camera
+(`GLOB2_BENCH_PAN_X`/`Y`, `GLOB2_BENCH_ZOOM`) on open water: consecutive frames
+show whether every animated cell steps together.
 They also include process CPU time captured before diagnostic output on platforms where
 `clock()` measures CPU time; Windows omits that field. The benchmark finishes
 deferred HD artwork loading before timing, so density changes compare identical
@@ -133,8 +138,8 @@ Direct terrain is the default for flat views with Original artwork
 (`highResolutionArtwork=0`) on desktop legacy OpenGL, programmable OpenGL,
 SDL GPU with the direct terrain shaders, and WebGPU with the WGSL assets.
 It uses the map's terrain variants, coverage, contact bands, surf, and
-discovery. Desktop legacy OpenGL draws every view, HD artwork included, with
-the direct pass described below. On the other backends, HD artwork, editor views,
+discovery. Desktop legacy OpenGL, SDL GPU and programmable OpenGL draw every
+view, HD artwork included, with the streamed direct pass described below. On the other backends, HD artwork, editor views,
 tiled captures, and backends without direct terrain support use composed pages.
 
 The shader blends in floating point and uses linear atlas sampling. The page
@@ -247,19 +252,260 @@ For comparisons with another revision, set `GLOB2_BENCH_PAUSE_PRESENTATION=1`
 to freeze terrain animation and `GLOB2_BENCH_WARMUP_FRAMES` to the same number of
 frames on both executables. Record cold-frame samples as well as steady-state
 medians, and confirm `STEADY_CACHE pending=0` before describing results as fully
-warmed. Compare complete builds from both revisions; the diagnostic immediate
-path is not an untouched-master baseline.
+warmed. Its `stale_artwork` counts cached map rows replayed at their previous
+resolution while newly streamed HD frames wait to be recorded into them; it
+settles once streaming does. Compare complete builds from both revisions; the
+diagnostic immediate path is not an untouched-master baseline.
 
 
 See [skin rendering](skin-rendering.md) for production sprite export and skin preview diagnostics.
+
+## Renderer parity
+
+Every renderer may draw by its own path, but once a view has been held still
+long enough for streaming and background composition to finish, the GPU-backed
+renderers (`legacy-gl`, `portable-sdl`, `sdl-gpu`, `programmable-gl`) must
+show the same picture. `tools/rendering/renderer_parity.py` checks that over a
+matrix of scenes. It draws each scene with each renderer in a fresh process and
+profile (renderers the host cannot create are skipped and listed), holds the
+camera for `--settle-frames` (600 by default, about ten seconds: long enough
+for legacy GL's HD band reload after a zoom) and captures the last frame.
+
+```sh
+python3 tools/dev_build.py perf=1 glob2 torus-render-benchmark
+python3 tools/rendering/renderer_parity.py --prepare --quick --label mine   # everyday: ten scenes
+python3 tools/rendering/renderer_parity.py --label mine                    # renderer PRs: the whole matrix
+python3 tools/rendering/renderer_parity.py --list-scenes
+```
+
+`--quick` runs the everyday subset (ten scenes, about two and a half minutes
+with `--jobs 8` on a 32-thread Linux desktop with one discrete GPU); renderer
+PRs run the whole matrix (65 scenes, about sixteen minutes there). A renderer
+process takes 15 to 25 seconds per scene, most of it the settle frames;
+`--timeout` (300 seconds) bounds a hang. Repeated runs give identical numbers. `--scenes` names scenes and `--filter` takes a
+regular expression over their names, such as `--filter hidpi` or
+`--filter '^unit-'`; `--renderers` limits the backends. `--prepare` makes the
+saves the scenes load: the memory scenario's Honeycomb 256 save at tick 30000,
+and the same game played on to tick 40000 (`honeycomb-256-tick-40000.game.gz`),
+which has fights, damaged buildings and swimmers. It needs a perf `glob2`.
+
+The matrix (`matrix()` in the script) covers:
+
+- the local colony at every zoom (overview, far, 0.5x, 1x, 1.5x, 2x, 3x, 4x),
+  either side of the [HD sprite policy's](../architecture/rendering.md#hd-sprite-policy)
+  threshold (0.9x, 1.1x), on a 2x display, and with HD artwork off;
+- building states and unit actions, framed by the benchmark's
+  `GLOB2_BENCH_FOCUS` as their owner sees them (`GLOB2_BENCH_TEAM`): a
+  construction site, an upgrade, a complete building selected, a damaged
+  building, a flag, a worker carrying a resource, an explorer, a warrior,
+  warriors fighting and a swimmer, some also on a 2x display or with HD off;
+- the bare map with every tile visible: the torus corner and wrap seams, the
+  Honeycomb hexes (stone, sand, forest and fields, a bridge, a shore with
+  algae), Oazis, Archipelago, Sand River, Wild River (not square), Mazury and
+  SmallForTwo, at several zooms, with areas and with health bars.
+
+Inputs are pinned so renderers draw the same thing: device tier `high`
+(`--device-tier`), HD artwork as each scene says (`--hd on|off` pins it for
+all), the desktop HUD (`GLOB2_MOBILE_UI=0`), a fixed animation phase, no
+clouds, particles or unit interpolation, and whole-tile camera positions. Each
+log's `BENCH_SETTINGS` line records the resolved settings. A `-hidpi` scene
+emulates a 2x display the way a Retina screen behaves: the window is twice
+`--window-size` in pixels and `GLOB2_UI_SCALE=2` keeps the interface at
+`--window-size` logical points, so the captures are 2560 by 1600 pixels of a
+1280 by 800 screen. On macOS `--hidpi native` (the default there) draws them
+like the other scenes, relying on a real HiDPI display. SDL GPU and
+programmable GL need their shaders: pass `--shader-dir` (or set
+`GLOB2_RENDERER_SHADER_DIR`), or `--glslang PATH` to generate them with
+`tools/shaders/generate.py` first. On Linux the runner sets
+`SDL_VIDEO_DRIVER=x11` when a display is available, and turns off waiting for
+vertical blank (`__GL_SYNC_TO_VBLANK=0`, `vblank_mode=0`): a swap on the hidden
+window otherwise costs legacy GL over a minute of start-up. Runs need a real
+display (in an agent session, outside its sandbox). On macOS the windows are
+created hidden. `--jobs` (6 by default) draws that many renderer processes at
+once across scenes; the captures do not depend on it. `--reanalyse` compares
+a label's existing captures again without drawing them, for example after
+changing `--max-over-8` or `--shift`.
+
+For each scene the runner builds a consensus image, the per-pixel median of the
+GPU renderers' captures, and measures each renderer against it and each GPU
+pair against each other. A pixel takes the smallest difference to the other
+image within `--shift` pixels (1 by default), so an edge one pixel out of place
+does not count while a missing sprite or a wrong colour does. **The bar:** a
+scene fails when a GPU renderer has more than the bar's share of its pixels
+(2% without HD block compression, 5% with it) more than 8 levels from the consensus, or two GPU renderers
+are that far apart, or a GPU renderer fails to draw it. HD sprite frames are
+block-compressed by default (`GLOB2_HD_BLOCK_COMPRESSION=0` turns that off), and
+their 4x4 blocks differ from the portable renderer's RGBA at team-colour edges by
+up to about 2.6% of a zoomed-in screen (legacy GL, which uploads plain BC3, up to 3.9%). So the runner draws every scene twice by
+default (`--compression both`): with compression off under `<label>/off`, where
+the renderers must agree within 2% (`--max-over-8-uncompressed`), and with it on
+under `<label>/on`, the shipped configuration, within 5% (`--max-over-8`). It then
+measures each renderer against itself across the two passes
+(`<label>/compression.md`): portable SDL and the software renderer never
+compress and must match themselves exactly, so any difference there is renderer
+nondeterminism; on the others the difference is what compression alone costs,
+and more than `--max-over-8` fails the run. `--compression on` or `off` draws a
+single pass. The report groups the
+GPU renderers that agree within the bar and names the outlier: the odd one out
+in a three-to-one split, or `split: a+b / c+d` when they divide evenly. The
+consensus is a majority, not the truth: when two or three renderers share a
+defect (say, blurred terrain), the correct one is the outlier, which is why the
+sheets must be looked at. A failing scene therefore also compares the detail
+each GPU renderer holds over the pixels where they disagree (the luminance's
+squared difference from its 3x3 neighbourhood). Where one group holds less than
+`--sharpness-split` (0.6) of the detail of the next sharper one, the report
+names the split instead of the outlier: `HD residency mismatch: sharp a /
+soft b+c+d` in a scene above a density of one with HD on, where the
+[HD sprite policy](../architecture/rendering.md#hd-sprite-policy) has every
+renderer draw HD, and `detail split` elsewhere. It adds `(the consensus
+follows the soft ...)` when the soft renderers are the majority, so the bar
+blames the renderer that does draw HD. `summary.json` keeps each renderer's
+detail relative to the sharpest (`sharpness`). `--reference NAME` adds each renderer's distance from one renderer. The
+software renderer is drawn and measured for information only, so a crash or a
+blank capture still shows, but it is left out of the consensus and the exit
+status: it has no filtering, draws native artwork at every zoom and leaves out
+several effects. The run exits 1 when any scene fails.
+
+Results go to `artifacts/renderer-parity/<label>/`: `index.html` shows every
+scene's contact sheet in one page to scroll through, failures marked;
+`<scene>.png` is the sheet: the GPU captures side by side at full logical size
+(2x scenes at half their pixels), each renderer's heat map against the
+consensus (yellow to red where a pixel differs by more than 8 levels), the
+software capture, then nearest-upscaled crops, every renderer side by side
+with the consensus and a difference panel, of the densest differences, a
+stretch of flat terrain and the view's centre (the framed unit or building).
+`report.md` is the scene-by-renderer table of consensus distances with the
+worst pair, and `summary.json` holds every metric, crop position and the
+seconds each renderer took; each scene's directory keeps the captures (PNG)
+and gzipped logs.
+
+**Look at the sheets, not only the numbers.** A pass under the bar can still hide a
+visible bug (a blurred texture, a missing overlay, a wrong scale or team
+colour), and a fail can be harmless sub-pixel noise. A renderer PR includes a
+visual review: open `index.html`, look at every failing scene and a sample of
+passing ones across zooms, 2x display and HD on and off, and say in the PR what
+the crops show, with the most telling sheets attached.
+
+`tools/rendering/parity_diagnose.py FIRST.png SECOND.png --region panel|topbar|map|all|x0,y0,x1,y1`
+explains one difference that the parity run found (`--scale 2` for a 2x
+scene's captures). It reports how much of the difference remains after the
+best whole-pixel and half-pixel shifts (position or rounding), the share on
+edges as against flat areas (filtering lives on edges; a wrong colour, blend
+or missing layer shows on flat areas too), the mean signed difference on
+differing edges (premultiplication or blending darkens or brightens fringes
+consistently), and the ratio of gradient energy (one side softer: linear
+against nearest sampling, or another mip level).
+
+### Browser renderers
+
+`tools/rendering/browser_parity.py` measures the browser's WebGL2 renderer
+(legacy GL through Emscripten) against a native run's consensus with the same
+metric. It draws the scenes with `torus-render-benchmark` built for the
+browser (`web-render-parity` in `cmake/web.cmake`: the release build's game
+objects and asset packages, never packaged), loads the same save with the same
+pinned inputs and settle frames in headless Chromium
+(`platforms/web/benchmarks/render-parity.cjs`), and writes sheets, heat maps
+and `report.md` to `artifacts/browser-parity/<label>/`. The browser always
+uploads RGBA, so it compares with the native compression-off pass (`<label>/off`,
+or a `--compression off` run) and its bar is 2%.
+
+```sh
+python3 tools/rendering/renderer_parity.py --prepare --quick --compression off --label native
+python3 tools/dev_build.py target=web release=1 web-render-parity web-package
+python3 tools/rendering/browser_parity.py --quick --native-label native --label mine
+```
+
+Chromium draws through ANGLE on SwiftShader (as CI does). A hardware ANGLE
+backend (`--angle`) needs `--allow-gpu`: never run it on a machine that is
+doing native GPU work at the same time, since a browser sharing the GPU with
+native benchmarks has hung the driver. Run the native captures first, and the
+browser after they finish. The browser's WebGPU renderer cannot run this
+benchmark: its frame loop blocks the application worker and completes each
+frame with a synchronous readback, which the browser's WebGPU device does not
+offer. On a desktop smaller than a `-hidpi` scene's window (2560 by 1600 by
+default) the window manager resizes some renderers' windows, so the native
+captures differ in size and have no consensus; draw those scenes with a smaller
+`--window-size` (such as `640x400`) under their own label and compare the
+browser with that label.
+
+The benchmark options behind it: `GLOB2_BENCH_GUI=1` draws the game screen in
+the flat fixture, centred on the local colony at `GLOB2_BENCH_ZOOM`, with
+`GLOB2_BENCH_PAN_X`/`_Y` moving it by that many tiles;
+`GLOB2_BENCH_FOCUS=tile:X,Y` or a kind (`site`, `upgrade`, `repair`,
+`damaged`, `complete`, `flag`, `carrying`, `explorer`, `warrior`, `fighting`,
+`swimming`) centres it on that tile or on the first such building or unit, the
+local team's first, and fails when there is none; `GLOB2_BENCH_TEAM=N` views
+the game as team N's player; `GLOB2_BENCH_SELECT=unit` or `building` selects
+the local team's first one; `GLOB2_BENCH_HD=0|1` pins HD artwork. In the bare
+map, `GLOB2_BENCH_PAN_X`/`_Y` give the top-left tile. All of them only read the
+game state. `torus-render-benchmark` also captures the software renderer.
+
+## Terrain fallbacks
+
+`tools/rendering/fallback_scenario.py` measures how much terrain the view draws
+from fallbacks while terrain composes in the background. It loads the memory
+scenario's save (or `--save` another, such as a short game on a 512 by 512
+map, whose overview the cache cannot hold whole) in
+`torus-render-benchmark` with `GLOB2_BENCH_CAMERA_SCRIPT=fallback`: from the
+first frame of the game, cycles of eight seconds at 60 frames a second, each
+starting with a jump to a far place (as a minimap click), then a hold, a pan at
+fifteen tiles a second, six wheel steps out towards the overview, a hold, six
+steps back and a hold. Each frame prints `FRAME_FALLBACK` with the visible cells
+by source (`TerrainFallbackMetrics`): pages drawn from another density, missing
+pages over the overview backdrop, pages fading in, and overview cells drawn from
+the other density, the whole-map base, or nothing (transparent). The runner
+prints the frames and share of visible cells per source and, for each kind of
+camera event, the median and longest time until a frame shows no fallback, and
+how often the next event came first.
+
+```sh
+python3 tools/dev_build.py perf=1 torus-render-benchmark
+python3 tools/rendering/fallback_scenario.py --label master --renderer portable-sdl
+python3 tools/rendering/fallback_scenario.py --label change --renderer portable-sdl --compare master
+```
+
+`--workers N` measures a phone-class worker count, `--hd` switches HD terrain on
+after about a second, and results go to `artifacts/render-fallback/<label>/`.
+
+`GLOB2_BENCH_RAPID_ZOOM=N` replaces the script's slow wheel with a player
+spinning it: a step every N frames, out `GLOB2_BENCH_RAPID_DEPTH` steps (6 by
+default) and straight back, over the cycle's zoom window. That is the case where
+an art atlas is still filling when the next density change arrives.
+
+## Terrain in motion
+
+The parity matrix compares settled frames, so it cannot see what a moving view
+draws while terrain refills. `tools/rendering/motion_parity.py` plays the
+fallback script with a fast wheel (two frames a step, three steps out) twice
+per renderer: once as a player sees it, and once with
+`GLOB2_BENCH_COMPLETE_TERRAIN=1`, which completes every frame's terrain first.
+It compares the captured frames of the pan and the wheel in blocks of 1/80 of
+the width. Stand-ins may be softer, but a block whose mean colour differs by more
+than 24 levels in a channel shows foreign art: another variant's tile, an empty
+slot or a hole. It also reports frame times (median, p99, maximum, frames over
+16.7 and 33.3 ms) from a third run without captures, whose readbacks would stall
+frames, and the direct pass's `FRAME_DIRECT_ART`
+counters (variants drawing the resident low-resolution art, and stale records,
+which must be zero).
+
+```sh
+python3 tools/dev_build.py perf=1 torus-render-benchmark
+python3 tools/rendering/motion_parity.py --label master
+```
+
+It exits 1 when a renderer shows foreign blocks or a stale record, and writes
+`summary.json` and each renderer's worst frame beside its complete frame to
+`artifacts/render-motion/<label>/`. Run it with the parity matrix for any change
+to terrain streaming, atlases or stand-ins.
 
 ## Renderer memory
 
 `tools/rendering/memory_scenario.py` runs the standard memory scenario and reports
 peak memory by owner. It loads a mid-game save of a 256×256 Honeycomb Isles map
-in `torus-render-benchmark`, draws the flat game view on legacy OpenGL with HD
-artwork, and pans while cycling the zoom between the minimum and four times
-that. Build the perf tier first; `--prepare` generates the save (map seed 7,
+in `torus-render-benchmark`, draws the flat game view on legacy OpenGL (`--renderer` picks
+another backend, such as `sdl-gpu` or `portable-sdl`) with HD artwork, and pans while cycling the zoom between the minimum and four times
+that; `--zoom 1` cycles from one to four instead, where the portable renderer
+draws HD sprites and pages. Build the perf tier first; `--prepare` generates the save (map seed 7,
 four AIs, tick 30000) under `artifacts/render-memory/`.
 
 ```sh
@@ -270,8 +516,9 @@ python3 tools/rendering/memory_scenario.py --label change --compare master
 
 The table it prints goes in the pull request. Peak process resident memory and,
 on Linux, the GPU driver's per-process memory (`drm-memory-*` in
-`/proc/<pid>/fdinfo`) come from sampling the process; an integrated GPU's driver
-memory is system RAM. The remaining rows are the renderer's own tracked bytes,
+`/proc/<pid>/fdinfo`, or `nvidia-smi` on the NVIDIA driver, which has no fdinfo
+memory) come from sampling the process; an integrated GPU's driver memory is
+system RAM. The remaining rows are the renderer's own tracked bytes,
 which the benchmark prints as `FRAME_RENDER_MEMORY` with `GLOB2_BENCH_FRAME_TIMES`
 and as `RENDER_MEMORY` when a pass ends:
 
@@ -284,7 +531,11 @@ and as `RENDER_MEMORY` when a pass ends:
 | `gpu_surface_bytes` | Sprite and atlas textures |
 | `gpu_array_bytes` | Texture-array pages, which duplicate their source textures |
 | `gpu_direct_terrain_bytes`, `gpu_terrain_page_bytes` | Direct terrain atlases and composed terrain pages |
+| `cpu_terrain_page_bytes`, `cpu_terrain_page_pixel_bytes` | The page cache's budget accounting (pixels, bookkeeping and texture reservations) and the CPU pixels its pages actually hold |
+| `gpu_backend_texture_bytes`, `gpu_backend_peak_texture_bytes` | Textures the portable SDL renderer holds, current and peak, which no surface accounts for; on phones they share system memory |
 | `gpu_frame_cache_bytes`, `gpu_skin_atlas_bytes`, `gpu_view_tile_bytes` | Render targets no surface owns |
+| `device_resource_bytes` | A render device's own total (SDL GPU, Programmable GL, WebGPU): resident textures, depth, geometry and staging; the `gpu_*` surface rows stay zero on these devices |
+| `device_snapshot_bytes`, `device_retained_bytes` | The logical CPU copies `RenderResources` keeps so a device can restore its textures, and the part retained for surfaces whose own pixels were released |
 | `image_decodes`, `image_decoded_bytes` | Image decodes since launch and the pixels they produced; growth during camera motion is streaming churn |
 | `peak_rss_bytes` | The process's peak resident set (zero on Windows and in the browser) |
 
@@ -302,6 +553,13 @@ game does before the player moves, so background work such as the whole-map
 base mask finishes; a camera that never rests starves that work. Camera motion applies to the
 flat pass, so a saved-game memory run needs `GLOB2_BENCH_FLAT=1` as well as
 `GLOB2_BENCH_GAME`.
+
+`--trim-at N` (`GLOB2_BENCH_TRIM_AT=N`) sends a low-memory presentation trim
+before measured frame N. The benchmark prints `PRESENTATION_TRIM` with the device
+registry's snapshot bytes and the device's resource bytes, then
+`PRESENTATION_TRIM_AFTER` every ten frames for sixty frames; compare them, and
+the `FRAME_RENDER_MEMORY` lines around frame N, to see what the trim freed. Set
+`GLOB2_RENDER_BUDGET=mobile` to run the scenario under the phone budgets.
 
 In the game client, legacy OpenGL records the same tracked GPU total as the
 `render.resource_bytes` gauge, and `GLOB2_TEAM_TIMELINE=1` adds a

@@ -5016,6 +5016,10 @@ FFmpeg ไม่​พร้อม​ใช้งาน ดังนั้น​
 เกียรติยศ
 [stat prestige about]
 เกียรติยศ​ของ​อาณานิคม​จาก​อาคาร​ระดับ​สูงสุด แมตช์​ที่​ตั้งเป้า​เกียรติยศ​จะ​จบ​เมื่อ​ถึง​เป้า
+[stat prestige needed]
+เกียรติยศ​ที่​ต้อง​ใช้​เพื่อ​ชนะ
+[stat prestige needed about]
+เกียรติยศ​ที่​อาณานิคม​ยัง​ต้อง​ได้​เพิ่ม​เพื่อ​ชนะ​ด้วย​เกียรติยศ คือ​มาก​พอ​ให้​เกียรติยศ​รวม​ของ​แมตช์​ถึง​เป้า​และ​แซง​อาณานิคม​อื่น​ทุก​แห่ง​ที่​ยัง​อยู่​รอด บันทึก​เฉพาะ​เมื่อ​แมตช์​ตั้งเป้า​เกียรติยศ
 [stat band combat]
 การต่อสู้
 [stat band starvation]
@@ -7102,3 +7106,33 @@ AI สำหรับ​ทุก​อาณานิคม​ที่​ค�
 อัปเดต​คำสั่ง​ต่อเนื่อง​ไม่สำเร็จ คำสั่ง​ถูก​พัก​ไว้​บน​อุปกรณ์​นี้ ลอง​ใช้​ปุ่ม​ควบคุม​อีกครั้ง
 [tundra]
 พื้นดินทุนดรา
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

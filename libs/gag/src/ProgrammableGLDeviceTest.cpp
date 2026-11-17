@@ -4,6 +4,8 @@
 #include <cstring>
 #include <ProgrammableGLDevice.h>
 #include <SpriteRenderAtlas.h>
+#include <AssetLoader.h>
+#include <array>
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
 #include <glob2/BuildPaths.h>
@@ -80,6 +82,79 @@ TEST_SUITE("ProgrammableGLDevice")
         GLFixture fixture;
         REQUIRE(fixture.device->capabilities().directTerrain);
         verifyDirectTerrainReadback(*fixture.device);
+    }
+    GLOB2_TEST_CASE("streamed terrain textures apply queued writes in place and are lost on reset", "[display]")
+    {
+        GLFixture fixture;
+        if (!fixture.device->capabilities().directTerrainStreaming) {
+            MESSAGE("terrain-direct-hd unavailable; streamed terrain omitted");
+            return;
+        }
+        using Terrain = DirectTerrainDraw;
+        const auto streamedDraw = [] {
+            auto terrain = std::make_shared<Terrain>();
+            for (unsigned slot = 0; slot < Terrain::StreamedCount; ++slot) {
+                if (slot == Terrain::MaskIndex || slot == Terrain::HdPreviousIndex) continue; // Placeholders.
+                auto texture = std::make_shared<StreamedTexture>();
+                texture->width = 4; texture->height = 2;
+                texture->write({0, 0, 4, 2}, std::vector<std::uint8_t>(32, 0));
+                texture->write({1, 1, 2, 1}, std::vector<std::uint8_t>(8, 255));
+                terrain->streamed[slot] = texture;
+            }
+            terrain->wholeMap = true;
+            terrain->hd.mapSize[0] = terrain->hd.mapSize[1] = 2;
+            terrain->hd.artSize[0] = terrain->hd.artSize[1] = 4;
+            return terrain;
+        };
+        const auto frame = [](std::uint64_t identity, std::shared_ptr<const Terrain> terrain) {
+            DrawPacket tile;
+            tile.kind = DrawPacket::Kind::DirectTerrain;
+            tile.blend = DrawPacket::Blend::Premultiplied;
+            tile.directTerrain = std::move(terrain);
+            const SDL_FColor white{1, 1, 1, 1};
+            const SDL_Vertex a{{0, 0}, white, {0, 0}}, b{{16, 0}, white, {2, 0}},
+                             c{{16, 16}, white, {2, 2}}, d{{0, 16}, white, {0, 2}};
+            tile.vertices = {a, b, c, a, c, d};
+            RenderFrame result;
+            result.identity = identity;
+            result.logicalWidth = result.logicalHeight = 16;
+            result.packets = {tile};
+            result.vertexCount = 6;
+            return result;
+        };
+        auto terrain = streamedDraw();
+        const auto before = fixture.device->telemetry().resourceBytes;
+        REQUIRE(fixture.device->submit(frame(1, terrain)));
+        fixture.device->present();
+        for (const auto &texture : terrain->streamed) {
+            if (!texture) continue;
+            CHECK(texture->writes.empty());
+            CHECK(texture->queuedBytes == 0);
+            CHECK(texture->applied == 2);
+            CHECK_FALSE(texture->lost);
+        }
+        CHECK(fixture.device->telemetry().resourceBytes >= before + 12 * 32);
+        // Later writes apply in place; the texture is not recreated.
+        terrain->streamed[Terrain::Cells]->write({0, 0, 1, 1}, std::vector<std::uint8_t>(4, 7));
+        REQUIRE(fixture.device->submit(frame(2, terrain)));
+        fixture.device->present();
+        CHECK(terrain->streamed[Terrain::Cells]->applied == 3);
+        // A reset drops what was applied: the owner sees the loss, the draw is
+        // skipped, and new owners start again.
+        fixture.device->reset();
+        REQUIRE(fixture.device->submit(frame(3, terrain)));
+        fixture.device->present();
+        CHECK(terrain->streamed[Terrain::Cells]->lost);
+        auto fresh = streamedDraw();
+        REQUIRE(fixture.device->submit(frame(4, fresh)));
+        fixture.device->present();
+        CHECK_FALSE(fresh->streamed[Terrain::Cells]->lost);
+        CHECK(fresh->streamed[Terrain::Cells]->applied == 2);
+        // Owners that go release their textures.
+        const auto held = fixture.device->telemetry().resourceBytes;
+        terrain.reset(); fresh.reset();
+        fixture.device->trimRetiredResources();
+        CHECK(fixture.device->telemetry().resourceBytes + 12 * 32 <= held);
     }
     GLOB2_TEST_CASE("ordered primitive segments share uploads across state and point changes", "[display]")
     {
@@ -729,6 +804,93 @@ TEST_SUITE("ProgrammableGLDevice")
         const auto generation = fixture.device->generation(); fixture.device->reset();
         CHECK(fixture.device->generation() == generation + 1);
         CHECK(fixture.device->completion(submission) == RenderCompletion::Cancelled);
+    }
+    GLOB2_TEST_CASE("deferrable frames cap new textures and finish them over later frames", "[display]")
+    {
+        GLFixture fixture; auto &device = *fixture.device;
+        RenderResources resources; std::vector<TextureSnapshot> sources;
+        for (int i = 0; i < 100; ++i) {
+            auto pixels = surface(4, 4); REQUIRE(pixels);
+            REQUIRE(SDL_FillSurfaceRect(pixels.get(), nullptr, SDL_MapSurfaceRGBA(pixels.get(), 255, 0, 0, 255)));
+            const auto handle = resources.create(pixels.get(), 1); REQUIRE(handle);
+            sources.push_back(resources.snapshot(handle));
+        }
+        const auto frame = [&](bool deferrable) {
+            RenderFrame value; value.logicalWidth = value.logicalHeight = 16; value.deferrable = deferrable;
+            for (const auto &source : sources) {
+                DrawPacket packet; packet.kind = DrawPacket::Kind::Blit; packet.texture = source;
+                packet.source = {0, 0, 4, 4}; packet.destination = {0, 0, 1, 1}; value.packets.push_back(packet);
+            }
+            return value;
+        };
+        // 96 creations a deferrable frame; the frame defers and the next one finishes.
+        CHECK_THROWS_AS(device.submit(frame(true)), RenderAdmissionDeferred);
+        device.discardFrame();
+        CHECK(device.submit(frame(true))); device.present();
+        // Frames that are not deferrable create everything they draw.
+        sources.clear();
+        for (int i = 0; i < 100; ++i) {
+            auto pixels = surface(4, 4); REQUIRE(pixels);
+            const auto handle = resources.create(pixels.get(), 2); REQUIRE(handle);
+            sources.push_back(resources.snapshot(handle));
+        }
+        CHECK(device.submit(frame(false))); device.present();
+    }
+    GLOB2_TEST_CASE("GL samples premultiplied block chains from block-only restoration snapshots", "[display]")
+    {
+        for (bool es : {false, true}) {
+            GLFixture fixture(es); auto &device = *fixture.device;
+            const auto capabilities = device.capabilities();
+            const auto format = capabilities.bc3Textures ? TextureCompression::BC3 :
+                capabilities.astc4x4Textures ? TextureCompression::ASTC4x4 : TextureCompression::Uncompressed;
+            if (format == TextureCompression::Uncompressed) { MESSAGE("Context samples no block format"); continue; }
+            const auto encoding = format == TextureCompression::BC3 ? AssetImage::BlockCompression::PremultipliedBC3
+                                                                    : AssetImage::BlockCompression::PremultipliedASTC4x4;
+            RenderResources resources; auto base = surface(8, 8); REQUIRE(base);
+            // Level zero opaque red, level one half-transparent green; 2x2 and 1x1 carry no blocks.
+            const std::array<SDL_Color, 2> colours{{{255, 0, 0, 255}, {0, 255, 0, 128}}};
+            std::array<std::vector<unsigned char>, 2> encoded; std::array<RenderMipLevel, 4> levels{{{8, 8}, {4, 4}, {2, 2}, {1, 1}}};
+            for (unsigned level = 0; level < 2; ++level) {
+                const int size = 8 >> level; std::vector<unsigned char> rgba(std::size_t(size) * size * 4);
+                for (std::size_t i = 0; i < rgba.size(); i += 4) {
+                    rgba[i] = colours[level].r; rgba[i + 1] = colours[level].g; rgba[i + 2] = colours[level].b; rgba[i + 3] = colours[level].a;
+                }
+                encoded[level] = AssetImage::compressBlocks(rgba.data(), size, size, encoding, false);
+                REQUIRE(encoded[level].size() == compressedLevelBytes(size, size));
+                levels[level].compression = format;
+                levels[level].blocks = {reinterpret_cast<const std::byte *>(encoded[level].data()), encoded[level].size()};
+            }
+            TextureDescriptor descriptor; descriptor.compression = format; descriptor.sampling = TextureDescriptor::Sampling::Linear;
+            descriptor.alpha = TextureDescriptor::Alpha::Premultiplied; descriptor.mips = TextureDescriptor::Mips::Generated;
+            auto handle = resources.create(base.get(), 1, descriptor, levels); REQUIRE(handle);
+            auto snapshot = resources.snapshot(handle); REQUIRE(snapshot);
+            CHECK_FALSE(snapshot->pixels); CHECK(snapshot->bytes == 80);
+            std::uint64_t identity = 0;
+            const auto draw = [&](int size) {
+                DrawPacket fill; fill.kind = DrawPacket::Kind::Fill; fill.destination = {0, 0, 16, 16}; fill.color = {0, 0, 0, 255};
+                DrawPacket packet; packet.kind = DrawPacket::Kind::Blit; packet.texture = snapshot; packet.linear = true;
+                packet.source = {0, 0, 8, 8}; packet.destination = {0, 0, float(size), float(size)};
+                RenderFrame frame; frame.identity = ++identity; frame.logicalWidth = frame.logicalHeight = 16;
+                frame.packets = {fill, packet}; REQUIRE(device.submit(std::move(frame))); device.present();
+                CaptureRequest request; request.identity = identity;
+                Surface capture(device.captureSynchronously(request), SDL_DestroySurface); REQUIRE(capture);
+                SDL_Color colour{}; REQUIRE(SDL_ReadSurfacePixel(capture.get(), size / 2, size / 2, &colour.r, &colour.g, &colour.b, &colour.a));
+                return colour;
+            };
+            const auto uploaded = device.telemetry().uploadBytes;
+            auto red = draw(8); CHECK(red.r >= 250); CHECK(red.g <= 4); CHECK(red.b <= 4);
+            CHECK(device.telemetry().uploadBytes - uploaded == 80);
+            // The blocks hold premultiplied colour, blended over black once.
+            auto green = draw(4); CHECK(green.r <= 4); CHECK(std::abs(int(green.g) - 128) <= 6); CHECK(green.b <= 4);
+            // Trimming forgets the GPU copy; the block-only snapshot restores it.
+            const auto deadline = SDL_GetTicks() + 5000;
+            while (device.completion({identity, device.generation()}) == RenderCompletion::Pending && SDL_GetTicks() < deadline) SDL_Delay(1);
+            device.trimRetiredResources(); red = draw(8); CHECK(red.r >= 250);
+            auto invalid = std::make_shared<TextureRevision>(*snapshot); invalid->blocks.back().pop_back();
+            DrawPacket broken; broken.kind = DrawPacket::Kind::Blit; broken.texture = invalid; broken.source = {0, 0, 4, 4}; broken.destination = {0, 0, 4, 4};
+            RenderFrame frame; frame.logicalWidth = frame.logicalHeight = 16; frame.packets = {broken};
+            CHECK_THROWS_AS(device.submit(std::move(frame)), std::invalid_argument);
+        }
     }
 }
 

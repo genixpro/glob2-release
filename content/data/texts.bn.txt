@@ -5016,6 +5016,10 @@ JavaScript এআই আমদানি করুন
 মর্যাদা
 [stat prestige about]
 উপনিবেশের মর্যাদা, যা শীর্ষ-স্তরের ভবনগুলোর মাধ্যমে অর্জিত হয়। মর্যাদার লক্ষ্যমাত্রা অর্জিত হলে একটি ম্যাচ শেষ হয়ে যায়।
+[stat prestige needed]
+জয়ের জন্য প্রয়োজনীয় মর্যাদা
+[stat prestige needed about]
+মর্যাদার মাধ্যমে জিততে উপনিবেশকে এখনও যে মর্যাদা অর্জন করতে হবে: যথেষ্ট পরিমাণ, যাতে ম্যাচের মোট মর্যাদা লক্ষ্যমাত্রায় পৌঁছায় এবং টিকে থাকা অন্য প্রতিটি উপনিবেশকে ছাড়িয়ে যায়। কেবল ম্যাচে মর্যাদার লক্ষ্যমাত্রা থাকলেই রেকর্ড করা হয়।
 [stat band combat]
 যুদ্ধ
 [stat band starvation]
@@ -7102,3 +7106,33 @@ MCP সার্ভার চালু করুন
 স্থায়ী আদেশ আপডেট ব্যর্থ হয়েছে। আপনার আদেশটি স্থানীয়ভাবে স্থগিত করা হয়েছে; সংশ্লিষ্ট নিয়ন্ত্রণটি আবার ব্যবহার করুন।
 [tundra]
 তুন্দ্রার ভূমি
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

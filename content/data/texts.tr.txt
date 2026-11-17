@@ -5048,6 +5048,10 @@ Kazanma olasılığı
 Prestij
 [stat prestige about]
 Koloninin en üst seviye binalarla kazandığı prestij. Prestij hedefi olan bir maç, hedefe ulaşıldığında biter.
+[stat prestige needed]
+Kazanmak için gereken prestij
+[stat prestige needed about]
+Koloninin prestijle kazanmak için hâlâ kazanması gereken prestij: maçın toplam prestijinin hedefe ulaşmasına ve hayatta kalan diğer tüm kolonileri geçmesine yetecek kadar. Yalnızca maçın bir prestij hedefi olduğunda kaydedilir.
 [stat band combat]
 Savaş
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Adım %0: %1 ms gerçek süre
 Bilgisayar kontrollü tüm koloniler için yapay zekâ
 [tundra]
 Tundra toprağı
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

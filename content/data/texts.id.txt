@@ -5048,6 +5048,10 @@ Perkiraan peluang aliansi Anda menang, diukur sepanjang pertandingan. Sekutu ber
 Prestise
 [stat prestige about]
 Prestise koloni, diperoleh dari bangunan tingkat tertinggi. Pertandingan dengan target prestise berakhir saat target tercapai.
+[stat prestige needed]
+Prestise yang dibutuhkan untuk menang
+[stat prestige needed about]
+Prestise yang masih harus diperoleh koloni untuk menang lewat prestise: cukup agar gabungan prestise pertandingan mencapai target, dan untuk melampaui setiap koloni lain yang masih bertahan. Hanya dicatat jika pertandingan memiliki target prestise.
 [stat band combat]
 Pertempuran
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Langkah %0: %1 ms waktu nyata
 AI untuk semua koloni yang dikendalikan komputer
 [tundra]
 Tanah tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

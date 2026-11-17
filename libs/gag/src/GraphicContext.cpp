@@ -26,6 +26,9 @@
 #ifndef _WIN32
 #include <dlfcn.h>
 #endif
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+#include <sys/mman.h>
+#endif
 #include <iostream>
 #include <memory>
 #include <string>
@@ -40,6 +43,41 @@ extern "C" void glob2_gl_restore_texture_units(int previous);
 
 namespace GAGCore
 {
+	SDL_Surface *createFrameSurface(int w, int h, SDL_PixelFormat format)
+	{
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+		// SDL_CreateSurface clears its pixels, making every page resident.
+		// Anonymous mappings start zeroed without touching them.
+		const int pitch = w > 0 ? w * SDL_BYTESPERPIXEL(format) : 0;
+		const size_t bytes = size_t(pitch) * size_t(std::max(h, 0));
+		if (pitch > 0 && bytes >= 256 * 1024 && SDL_BYTESPERPIXEL(format) == 4)
+		{
+			void *pixels = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+			if (pixels != MAP_FAILED)
+			{
+				struct Mapping { void *pixels; size_t bytes; };
+				SDL_Surface *surface = SDL_CreateSurfaceFrom(w, h, format, pixels, pitch);
+				if (!surface)
+				{
+					munmap(pixels, bytes);
+					return nullptr;
+				}
+				// SDL runs the cleanup itself if storing the property fails.
+				if (SDL_SetPointerPropertyWithCleanup(SDL_GetSurfaceProperties(surface),
+						"glob2.frame.mapping", new Mapping{pixels, bytes}, [](void *, void *value) {
+							auto *owned = static_cast<Mapping *>(value);
+							munmap(owned->pixels, owned->bytes);
+							delete owned;
+						}, nullptr))
+					return surface;
+				SDL_DestroySurface(surface);
+				return nullptr;
+			}
+		}
+#endif
+		return SDL_CreateSurface(w, h, format);
+	}
+
 namespace
 {
 // GLOB2_TEST_HIDDEN_WINDOWS=1 (set by test/run_tests.py for [display] cases and by
@@ -100,6 +138,33 @@ int GraphicContext::maximumTextureSize() const
 	// Storage for the static globals declared in graphic_context_private.h.
 	GraphicContext *_gc = NULL;
 	SDL_PixelFormatDetails _glFormat = *SDL_GetPixelFormatDetails(SDL_PIXELFORMAT_ARGB8888);
+	AssetImage::BlockCompression preferredDeviceBlockCompression(const RenderDeviceCapabilities &capabilities)
+	{
+		// The device honours GLOB2_TEXTURE_COMPRESSION when it reports formats.
+		// BC3 wherever it is sampled (desktop): etcpak encodes it several times
+		// faster than astcenc does ASTC. ASTC 4x4 where only it is (phones), at
+		// the same 16 bytes per block. The browser build has no ASTC encoder.
+		if (capabilities.bc3Textures) return AssetImage::BlockCompression::PremultipliedBC3;
+#ifndef GLOB2_WEBGL2
+		if (capabilities.astc4x4Textures) return AssetImage::BlockCompression::PremultipliedASTC4x4;
+#endif
+		return AssetImage::BlockCompression::Uncompressed;
+	}
+	// The chains workers prepare are HD sprite frames, drawn only where the HD
+	// sprite policy shows HD. Block compression stores them in a quarter of
+	// the memory; its 4x4 blocks step slightly along the edges where a frame's
+	// base and team layers meet. GLOB2_HD_BLOCK_COMPRESSION=0 draws them
+	// uncompressed instead, like the portable renderer's.
+	static bool highResolutionBlocksWanted()
+	{
+		const char *wanted = SDL_getenv_unsafe("GLOB2_HD_BLOCK_COMPRESSION");
+		return !wanted || std::string_view(wanted) != "0";
+	}
+	void selectDeviceBlockCompression(const RenderDevice &device)
+	{
+		AssetImage::highResolutionCompression = highResolutionBlocksWanted()
+			? preferredDeviceBlockCompression(device.capabilities()) : AssetImage::BlockCompression::Uncompressed;
+	}
 	const bool EXPERIMENTAL = false;
 
 #ifdef HAVE_OPENGL
@@ -137,7 +202,8 @@ int GraphicContext::maximumTextureSize() const
 #endif
 		blockCompressionFormat = blockCompression == AssetImage::BlockCompression::BC3 ? 0x83F3 // COMPRESSED_RGBA_S3TC_DXT5_EXT
 			: blockCompression == AssetImage::BlockCompression::ETC2 ? 0x9278 : 0; // COMPRESSED_RGBA8_ETC2_EAC
-		AssetImage::highResolutionCompression = blockCompression;
+		AssetImage::highResolutionCompression = highResolutionBlocksWanted()
+			? blockCompression : AssetImage::BlockCompression::Uncompressed;
 		const char *glVendor = (const char *)glGetString(GL_VENDOR);
 		if (strstr(glVendor, "ATI"))
 			useATIWorkaround = true; // ugly temporary bug fix for bug 13823. We think it is an ATI driver bug
@@ -334,34 +400,38 @@ int GraphicContext::maximumTextureSize() const
 		sdlsurface = NULL;
 		optionFlags = DEFAULT;
         backendStatus.requested = initialBackend.value_or(RendererBackend::Auto);
-        automaticBackend = (flags & USEGPU) ? RendererBackend::LegacyGL :
-            (flags & PORTABLEGPU) ? RendererBackend::PortableSDL : RendererBackend::Software;
-#ifdef __EMSCRIPTEN__
-        automaticBackend = glob2_surface_startup_uses_gl() ? RendererBackend::LegacyGL : RendererBackend::Software;
-#endif
-#ifndef HAVE_OPENGL
-        if (automaticBackend == RendererBackend::LegacyGL) automaticBackend = RendererBackend::Software;
-#endif
-#ifdef GLOB2_MOBILE
-        automaticBackend = RendererBackend::PortableSDL;
-#endif
+        automaticOrder = automaticRendererOrder(flags);
         const bool explicitBackend = initialBackend.has_value();
         initialBackend.reset();
         if (!explicitBackend)
             if (const char *selected = SDL_getenv_unsafe("GLOB2_RENDERER"))
                 backendStatus.requested = parseRendererBackend(selected).value_or(RendererBackend::Auto);
-        configuredBackend = backendStatus.requested == RendererBackend::Auto ? automaticBackend : backendStatus.requested;
+        // An explicit choice is tried first; Auto's order follows it as the
+        // fallback chain. Each family that is unavailable or fails to start
+        // adds its reason, which the BACKEND line reports as fallback_reason.
         const auto available = rendererAvailability();
-        const auto chosen = std::find_if(available.begin(), available.end(), [&](const auto &entry) { return entry.backend == configuredBackend; });
-        if (chosen == available.end() || !chosen->available) {
-            backendStatus.reason = chosen == available.end() ? "Unknown rendering backend." : chosen->reason;
-            backendStatus.phase = RendererSwitchPhase::Failed;
-            configuredBackend = automaticBackend;
+        std::vector<RendererBackend> candidates;
+        // Why each family was passed over, in attempt order; only those ahead of
+        // the family that starts are reported.
+        std::vector<RendererBackend> attempts;
+        std::vector<std::pair<RendererBackend, std::string>> skipped;
+        const auto noteFallback = [&](RendererBackend backend, const std::string &why) {
+            skipped.emplace_back(backend, why.empty() ? "failed to start" : why);
+        };
+        {
+            if (backendStatus.requested != RendererBackend::Auto) attempts.push_back(backendStatus.requested);
+            for (auto backend : automaticOrder)
+                if (std::find(attempts.begin(), attempts.end(), backend) == attempts.end()) attempts.push_back(backend);
+            for (auto backend : attempts) {
+                const auto chosen = std::find_if(available.begin(), available.end(), [&](const auto &entry) { return entry.backend == backend; });
+                if (chosen != available.end() && chosen->available) candidates.push_back(backend);
+                else noteFallback(backend, chosen == available.end() ? "Unknown rendering backend." : chosen->reason);
+            }
         }
-        if (configuredBackend == RendererBackend::ProgrammableGL || configuredBackend == RendererBackend::SDLGPU || configuredBackend == RendererBackend::WebGPU) flags &= ~(USEGPU | PORTABLEGPU);
-        if (configuredBackend == RendererBackend::Software) flags &= ~(USEGPU | PORTABLEGPU);
-        if (configuredBackend == RendererBackend::LegacyGL) { flags |= USEGPU; flags &= ~PORTABLEGPU; }
-        if (configuredBackend == RendererBackend::PortableSDL) { flags |= PORTABLEGPU; flags &= ~USEGPU; }
+        // Auto resolves to the first available family until startup proves otherwise.
+        automaticBackend = RendererBackend::Software;
+        for (auto backend : automaticOrder)
+            if (std::find(candidates.begin(), candidates.end(), backend) != candidates.end()) { automaticBackend = backend; break; }
 
 		// Request native Mac momentum before Cocoa registers application defaults.
 		SDL_SetHint(SDL_HINT_MAC_SCROLL_MOMENTUM, "1");
@@ -393,22 +463,46 @@ int GraphicContext::maximumTextureSize() const
 		}
 
 #ifdef __EMSCRIPTEN__
-        const bool delayedWebGPU = configuredBackend == RendererBackend::WebGPU;
-        if (delayedWebGPU) {
-            configuredBackend = RendererBackend::Software;
-            flags &= ~(USEGPU | PORTABLEGPU);
-        }
+        // WebGPU prepares asynchronously: start on Software and queue it.
+        const bool delayedWebGPU = !candidates.empty() && candidates.front() == RendererBackend::WebGPU;
+        if (delayedWebGPU) candidates.front() = RendererBackend::Software;
 #endif
-        if (!setRes(w, h, flags)) {
-            backendStatus.reason = SDL_GetError();
-            backendStatus.phase = RendererSwitchPhase::Failed;
+        const auto startupFlags = [flags](RendererBackend backend) {
+            Uint32 result = flags & ~(USEGPU | PORTABLEGPU);
+            if (backend == RendererBackend::LegacyGL) result |= USEGPU;
+            if (backend == RendererBackend::PortableSDL) result |= PORTABLEGPU;
+            return result;
+        };
+        bool started = false;
+        for (auto backend : candidates) {
+            configuredBackend = backend;
+            if (setRes(w, h, startupFlags(backend))) { started = true; break; }
+            const std::string error = SDL_GetError();
+            SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Renderer %s failed to start: %s",
+                std::string(rendererBackendName(backend)).c_str(), error.c_str());
+            noteFallback(backend, error);
+        }
+        if (!started) {
             configuredBackend = RendererBackend::Software;
-            if (!setRes(w, h, flags & ~(USEGPU | PORTABLEGPU)) &&
-                !setRes(800, 600, flags & ~(USEGPU | PORTABLEGPU))) {
+            if (!setRes(800, 600, startupFlags(RendererBackend::Software))) {
                 fprintf(stderr, "Toolkit: no presentation surface available: %s\n", SDL_GetError());
                 exit(1);
             }
         }
+        if (backendStatus.requested == RendererBackend::Auto) automaticBackend = configuredBackend;
+        std::string fallbackReason;
+        for (auto backend : attempts) {
+            if (backend == configuredBackend) break;
+            const auto found = std::find_if(skipped.begin(), skipped.end(), [&](const auto &entry) { return entry.first == backend; });
+            if (found == skipped.end()) continue;
+            if (!fallbackReason.empty()) fallbackReason += "; ";
+            fallbackReason += std::string(rendererBackendName(backend)) + ": " + found->second;
+        }
+        backendStatus.reason = fallbackReason;
+        // Auto falling through its order is not a failed choice; an explicit
+        // family that could not start is.
+        if (backendStatus.requested != RendererBackend::Auto && configuredBackend != backendStatus.requested)
+            backendStatus.phase = RendererSwitchPhase::Failed;
 #ifdef __EMSCRIPTEN__
         if (delayedWebGPU) { nextBackend = RendererBackend::WebGPU; nextBackendPersists = false; backendStatus.phase = RendererSwitchPhase::Queued; }
 #endif
@@ -491,6 +585,7 @@ int GraphicContext::maximumTextureSize() const
             mapTransformActive = uiTransformActive = false;
             mapScale = 1;
         }
+        cpuMapClip = false;
         // Both native-display and transformed passes borrow this owner.
         // Invalidate the active pointer before destroying its target/backend.
         if (renderer == softwareRasterizer.get()) renderer = nullptr;
@@ -575,7 +670,7 @@ int GraphicContext::maximumTextureSize() const
 		if (((optionFlags & RESIZABLE) || (optionFlags & FULLSCREEN) || scaleChanged)
 			&& (getW() != logicalW || getH() != logicalH))
 		{
-			SDL_Surface *resized = SDL_CreateSurface(logicalW, logicalH, SDL_PIXELFORMAT_ARGB8888);
+			SDL_Surface *resized = createFrameSurface(logicalW, logicalH);
 			if (!resized) return;
 			if (!(optionFlags & FULLSCREEN)) {
 				requestedW = windowW;
@@ -597,7 +692,6 @@ int GraphicContext::maximumTextureSize() const
 			if (renderer) renderer->logicalSize(logicalW, logicalH);
 			setClipRect();
 		}
-		if (renderer) renderer->outputSize(drawableW, drawableH);
 		#ifdef HAVE_OPENGL
 		if (optionFlags & USEGPU)
 		{
@@ -605,6 +699,9 @@ int GraphicContext::maximumTextureSize() const
 			applyGLViewport();
 		}
 		#endif
+		// Device renderers draw in window pixels (HiDPI) as GL does.
+		if (presentationDevice) SDL_GetWindowSizeInPixels(window, &drawableW, &drawableH);
+		if (renderer) renderer->outputSize(drawableW, drawableH);
 	}
 
 	void GraphicContext::windowToLogical(float &x, float &y)
@@ -764,6 +861,8 @@ int GraphicContext::maximumTextureSize() const
             case SDL_EVENT_RENDER_TARGETS_RESET:
                 if (_gc->renderer) _gc->renderer->reset();
                 ++renderResets;
+                // HD frames whose pixels went after upload had only those textures.
+                Sprite::discardUnbackedHighResolution();
                 break;
 			case SDL_EVENT_MOUSE_MOTION:
                 // SDL3 keeps all renderer events in window coordinates. Convert
@@ -829,7 +928,7 @@ int GraphicContext::maximumTextureSize() const
         const int logicalW = std::max(1, static_cast<int>(w / uiScale + 0.5f));
         const int logicalH = std::max(1, static_cast<int>(h / uiScale + 0.5f));
         if (w == windowW && h == windowH && logicalW == getW() && logicalH == getH()) return true;
-        SDL_Surface* replacement = SDL_CreateSurface(logicalW, logicalH, SDL_PIXELFORMAT_ARGB8888);
+        SDL_Surface* replacement = createFrameSurface(logicalW, logicalH);
         if (!replacement) return false;
         // This API updates presentation immediately; SDL3 resize requests can
         // otherwise still be pending when we read the window geometry below.
@@ -845,6 +944,7 @@ int GraphicContext::maximumTextureSize() const
         ownsSurface = true;
         SDL_GetWindowSize(window, &windowW, &windowH);
         drawableW = windowW; drawableH = windowH;
+        if (presentationDevice) SDL_GetWindowSizeInPixels(window, &drawableW, &drawableH);
 #ifdef HAVE_OPENGL
         if (optionFlags & USEGPU) {
             SDL_GetWindowSizeInPixels(window, &drawableW, &drawableH);
@@ -878,6 +978,8 @@ int GraphicContext::maximumTextureSize() const
         deviceRenderer.reset();
         presentationDevice.reset();
         deviceResources.reset();
+        // Frames released on the device had only its snapshots: reload them.
+        Sprite::discardUnbackedHighResolution();
         softwareTransform = false;
 #ifdef HAVE_OPENGL
         if (context) { releaseSurfaceTextures(); destroySkinRenderer(); destroyUnitShader(); destroyCloudCover(); releaseNativeMipmaps(context); }
@@ -885,7 +987,12 @@ int GraphicContext::maximumTextureSize() const
 		if (context) SDL_GL_DestroyContext(context);
 		context = nullptr;
 		renderer = nullptr;
-        portableRenderer.reset();
+        if (portableRenderer) {
+            portableRenderer.reset();
+            // HD frames whose pixels went after a portable upload had only
+            // those textures: their sprites load them again.
+            Sprite::discardUnbackedHighResolution();
+        }
 		freeOwnedSurface();
 		if (window) {
 			removeMacScrollMonitor();
@@ -1016,9 +1123,13 @@ int GraphicContext::maximumTextureSize() const
             }
             renderer->outputSize(drawableW, drawableH);
         }
+		// The portable and software renderers sample RGBA pixels: workers
+		// building an HD level for them encode no blocks. A device or legacy
+		// GL names its own format below.
+		if (!(flags & USEGPU)) AssetImage::highResolutionCompression = AssetImage::BlockCompression::Uncompressed;
 		applyWindowMinimumSize();
 		// Own the drawing surface: SDL invalidates its window surface during resizing.
-		sdlsurface = SDL_CreateSurface(logicalW, logicalH, SDL_PIXELFORMAT_ARGB8888);
+		sdlsurface = createFrameSurface(logicalW, logicalH);
 		ownsSurface = true;
 		if (!sdlsurface)
 		{
@@ -1065,6 +1176,9 @@ int GraphicContext::maximumTextureSize() const
 				#endif
 			}
             if (configuredBackend == RendererBackend::ProgrammableGL || configuredBackend == RendererBackend::SDLGPU || configuredBackend == RendererBackend::WebGPU) {
+                // Device renderers present in window pixels, which on HiDPI exceed the
+                // window's points even without a GL context to measure them.
+                SDL_GetWindowSizeInPixels(window, &drawableW, &drawableH);
                 try {
                     if (configuredBackend == RendererBackend::ProgrammableGL)
                         presentationDevice = makeProgrammableGLDevice(window, rendererShaderDirectory());
@@ -1073,6 +1187,7 @@ int GraphicContext::maximumTextureSize() const
 #else
                     else presentationDevice = makeSDLGPUDevice(window, drawableW, drawableH, rendererShaderDirectory());
 #endif
+                    selectDeviceBlockCompression(*presentationDevice);
                     deviceResources = std::make_unique<RenderResources>();
                     deviceRenderer = makeDeviceRenderBackend(*presentationDevice, *deviceResources, logicalW, logicalH);
                     renderer = deviceRenderer.get();
@@ -1088,6 +1203,9 @@ int GraphicContext::maximumTextureSize() const
 			if (optionFlags & USEGPU)
 			{
 				glState.checkExtensions();
+				// checkExtensions chooses legacy OpenGL's straight-alpha blocks;
+				// a presentation device (programmable GL) samples premultiplied ones.
+				if (presentationDevice) selectDeviceBlockCompression(*presentationDevice);
                 restoreSurfaceTextures();
 				// A failed compile/link logs once and leaves hasUnitShader() false;
 				// callers fall back to the CPU team-color cache for this context's
@@ -1246,9 +1364,31 @@ int GraphicContext::maximumTextureSize() const
 		}
 	}
 
+	void GraphicContext::resetFrameAllowances()
+	{
+        deviceReleasesThisFrame = 0;
+        deviceUploadsThisFrame = 0;
+        deviceMipBuildBytesThisFrame = 0;
+	}
+
+	void GraphicContext::holdPresentation(unsigned frames)
+	{
+		presentationHoldFrames = frames;
+	}
+
 	void GraphicContext::nextFrame(void)
 	{
+        // A held frame is drawn, submitted and completed like any other, but
+        // the window keeps showing the last presented one (holdPresentation).
+        const bool held = presentationHoldFrames > 0;
+        if (held && !heldPresentationStart) heldPresentationStart = SDL_GetTicks();
+        if (held && !--presentationHoldFrames)
+        {
+            SDL_Log("PRESENTATION_HOLD released ms=%llu", (unsigned long long)(SDL_GetTicks() - heldPresentationStart));
+            heldPresentationStart = 0;
+        }
         ++captureFrameIdentity;
+        resetFrameAllowances();
         endBrowserTextFrame();
 		DrawableSurface::nextFrame();
 		if (sdlsurface)
@@ -1285,8 +1425,13 @@ int GraphicContext::maximumTextureSize() const
 			{
 				if (renderer == portableRenderer.get() || renderer == deviceRenderer.get())
 				{
-					try { renderer->present(); }
-                    catch (const std::exception &error) { handleDeviceFailure(error.what()); return; }
+					try
+					{
+						renderer->setPresentationHeld(held);
+						renderer->present();
+						renderer->setPresentationHeld(false);
+					}
+                    catch (const std::exception &error) { renderer->setPresentationHeld(false); handleDeviceFailure(error.what()); return; }
                     // Budget deferral retains allocations so sliced uploads can progress.
                     // Only content recorded by an aborted frame needs regeneration.
                     if (presentationDevice && !didPresentDeviceFrame(*renderer) &&
@@ -1308,7 +1453,13 @@ int GraphicContext::maximumTextureSize() const
             // at every CPU frame boundary, independent of that borrowed pointer.
             if (softwareRasterizer) softwareRasterizer->present();
 			cacheFrame();
-			if (optionFlags & USEGPU)
+			if (held)
+			{
+#ifdef HAVE_OPENGL
+				if (optionFlags & USEGPU) glFlush(); // Run the frame's work without showing it.
+#endif
+			}
+			else if (optionFlags & USEGPU)
 				swapBuffers();
 			else
 				presentLastFrame();

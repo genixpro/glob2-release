@@ -3,6 +3,7 @@
 #include "ScopedEnvironment.h"
 #include "GraphicContextPrivate.h"
 #include <AssetLoader.h>
+#include <RenderDevice.h>
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -155,6 +156,24 @@ void portablePreparation(bool cpu)
 } // namespace
 TEST_SUITE("GpuTexturePreparation")
 {
+	TEST_CASE("render devices get premultiplied BC3 where sampled, else premultiplied ASTC 4x4")
+	{
+		using Compression = AssetImage::BlockCompression;
+		RenderDeviceCapabilities capabilities;
+		CHECK(preferredDeviceBlockCompression(capabilities) == Compression::Uncompressed);
+		capabilities.astc4x4Textures = true;
+#if defined(GLOB2_WEBGL2)
+		CHECK(preferredDeviceBlockCompression(capabilities) == Compression::Uncompressed);
+#else
+		// Phones: ASTC alone.
+		CHECK(preferredDeviceBlockCompression(capabilities) == Compression::PremultipliedASTC4x4);
+#endif
+		// Desktop GPUs, and the few that sample both: etcpak's faster BC3.
+		capabilities.bc3Textures = true;
+		CHECK(preferredDeviceBlockCompression(capabilities) == Compression::PremultipliedBC3);
+		capabilities.astc4x4Textures = false;
+		CHECK(preferredDeviceBlockCompression(capabilities) == Compression::PremultipliedBC3);
+	}
 	TEST_CASE("SDL premultiplication preserves pixels state and queued revisions [display]")
 	{
 		portablePreparation(false);
@@ -162,6 +181,65 @@ TEST_SUITE("GpuTexturePreparation")
 	TEST_CASE("SDL CPU fallback preserves pixels state and queued revisions [display]")
 	{
 		portablePreparation(true);
+	}
+	TEST_CASE("SDL region uploads match complete uploads for each preparation [display]")
+	{
+		// Straight, CPU premultiplied and GPU premultiplied textures update only
+		// the dirty rectangles of the previous revision, and draw exactly as a
+		// complete upload of the edited surface. Other revisions upload whole.
+		for (bool linear : {false, true})
+			for (bool cpu : {false, true})
+			{
+				if (!linear && cpu) continue;
+				glob2test::ScopedEnvironment disable("GLOB2_DISABLE_GPU_TEXTURE_PREPARATION", cpu ? "1" : "");
+				TestWindow window(false);
+				auto backend = makeSDLRenderBackend(window.window, 256, 256);
+				auto edited = pixels(256, 256, 2), reference = pixels(256, 256, 2);
+				const SDL_Rect src{0, 0, 256, 256};
+				const SDL_FRect dst{0, 0, 256, 256};
+				const auto draw = [&](SDL_Surface *surface, std::uint64_t revision)
+				{
+					backend->present(); // Each capture starts from a cleared target.
+					if (linear)
+						backend->blitLinear(surface, surface, revision, src, dst, 255);
+					else
+						backend->blit(surface, surface, revision, false, src, dst, 255);
+					return Surface(backend->capture(), SDL_DestroySurface);
+				};
+				backend->prepareTexture(edited.get(), edited.get(), 1, linear);
+				const std::vector<SDL_Rect> dirty = {{0, 0, 32, 32}, {64, 96, 96, 32}, {224, 224, 32, 32}};
+				for (const auto &rect : dirty)
+				{
+					REQUIRE(SDL_FillSurfaceRect(edited.get(), &rect, 0x80406080u));
+					REQUIRE(SDL_FillSurfaceRect(reference.get(), &rect, 0x80406080u));
+				}
+				const auto before = backend->operations();
+				backend->prepareTextureRegions(edited.get(), edited.get(), 2, 1, dirty, linear);
+				const auto after = backend->operations();
+				INFO("linear " << linear << " cpu " << cpu);
+				CHECK(after.textureUploads - before.textureUploads == dirty.size());
+				CHECK(after.textureUploadBytes - before.textureUploadBytes == (32 * 32 + 96 * 32 + 32 * 32) * 4);
+				auto partial = draw(edited.get(), 2);
+				auto complete = draw(reference.get(), 1);
+				REQUIRE(partial != nullptr);
+				REQUIRE(complete != nullptr);
+				REQUIRE(partial->pitch == complete->pitch);
+				CHECK(std::memcmp(partial->pixels, complete->pixels, std::size_t(partial->pitch) * partial->h) == 0);
+				// A refresh asking for the other sampling keeps the mode the
+				// texture was drawn with and patches it in place.
+				const auto crossed = backend->operations();
+				backend->prepareTextureRegions(edited.get(), edited.get(), 3, 2, dirty, !linear);
+				CHECK(backend->operations().textureCreates == crossed.textureCreates);
+				CHECK(backend->operations().textureDestroys == crossed.textureDestroys);
+				CHECK(backend->operations().textureUploads - crossed.textureUploads == dirty.size());
+				// A texture at any other revision waits for its next draw to
+				// upload the whole surface.
+				const auto stale = backend->operations();
+				backend->prepareTextureRegions(edited.get(), edited.get(), 5, 4, dirty, linear);
+				CHECK(backend->operations().textureUploadBytes == stale.textureUploadBytes);
+				draw(edited.get(), 5);
+				CHECK(backend->operations().textureUploadBytes - stale.textureUploadBytes == 256u * 256u * 4u);
+			}
 	}
 	TEST_CASE("SDL linear upload timing [display][benchmark]")
 	{

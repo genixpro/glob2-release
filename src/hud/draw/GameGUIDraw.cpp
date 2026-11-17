@@ -192,6 +192,50 @@ void GameGUI::drawPanel(void)
 	drawPanelButtons(YPOS_BASE_DEFAULT-32);
 
 	dispatchSelectionPanel();
+	GAGCore::ApplicationHost::hudDrawn(drawnPanelName(), selectionModeName());
+}
+
+const char *GameGUI::drawnPanelName() const
+{
+	switch (selectionMode)
+	{
+	case BUILDING_SELECTION: return "building";
+	case UNIT_SELECTION: return "unit";
+	case RESOURCE_SELECTION: return "resource";
+	default: break;
+	}
+	if (globalContainer->isViewingGame())
+	{
+		switch (replayDisplayMode)
+		{
+		case RDM_REPLAY_VIEW: return "replay";
+		case RDM_STAT_TEXT_VIEW: return "stats";
+		case RDM_STAT_GRAPH_VIEW: return "overlays";
+		default: return "unknown";
+		}
+	}
+	switch (displayMode)
+	{
+	case CONSTRUCTION_VIEW: return "construction";
+	case FLAG_VIEW: return "flags";
+	case STAT_TEXT_VIEW: return "stats";
+	case STAT_GRAPH_VIEW: return "overlays";
+	default: return "unknown";
+	}
+}
+
+const char *GameGUI::selectionModeName() const
+{
+	switch (selectionMode)
+	{
+	case NO_SELECTION: return "none";
+	case BUILDING_SELECTION: return "building";
+	case UNIT_SELECTION: return "unit";
+	case RESOURCE_SELECTION: return "resource";
+	case TOOL_SELECTION: return "tool";
+	case BRUSH_SELECTION: return "brush";
+	}
+	return "unknown";
 }
 
 void GameGUI::dispatchSelectionPanel(void)
@@ -766,6 +810,10 @@ void GameGUI::drawInGameScrollableText(void)
 void GameGUI::drawAll(int team)
 {
 	PERF_SCOPE_TIME(Render);
+	// The game shows its previous frame when one defers and captures device
+	// frames asynchronously, so a device may spread a burst of work (texture
+	// creation after a trim) over its next frames.
+	globalContainer->gfx->allowDeviceFrameDeferral();
 	// Apply any simulation notices not consumed yet and resolve the selection
 	// for the renderer (view.selectedBuilding/selectedUnit). With a simulation
 	// thread, that happens in threadedClientStep against the immutable PresentationFrame.
@@ -797,6 +845,7 @@ void GameGUI::drawAll(int team)
 	globalContainer->gfx->setClipRect();
 	globalContainer->gfx->drawFilledRect(0,0,globalContainer->gfx->getW(),globalContainer->gfx->getH(),0,0,32);
     if (touch) touch->prepareDraw();
+	GameGUITouch::LayoutFrame touchLayout(touch.get());
 	prepareHudOwnership();
 	HudControlPaint controls(*this);
     const int sidebar=touch->usesHUD() ? 0 : RIGHT_MENU_WIDTH;
@@ -915,7 +964,10 @@ void GameGUI::drawAll(int team)
 	minimap.draw(drawnScene(), localTeamNo, viewportX, viewportY, int(std::ceil(camera.visibleW()/32)), int(std::ceil(camera.visibleH()/32)) );
 
 	// draw the progress bar if this is a replay
-	if (globalContainer->replaying && !touch->usesHUD()) drawReplayProgressBar();
+	// A replay stopped by a failed checksum or damaged file has no valid reader
+	// while its message screen is shown over the last frame.
+	if (globalContainer->replaying && globalContainer->replayReader && globalContainer->replayReader->isValid()
+		&& !touch->usesHUD()) drawReplayProgressBar();
 
 	// draw the top bar and other infos
 	globalContainer->gfx->setClipRect();

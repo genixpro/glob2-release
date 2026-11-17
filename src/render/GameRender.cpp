@@ -33,6 +33,7 @@
 
 #include "GameRenderInternal.h"
 #include "SoftwareTerrainCache.h"
+#include <HighResolutionPolicy.h>
 #include "terrain/DirectTerrain.h"
 #include "unit/render/UnitMotion.h"
 #include "UnitEffects.h"
@@ -129,10 +130,10 @@ void MapDrawer::anchorBars(int x, int y, MapRenderState* drawnRender, float opac
 }
 
 
-void MapDrawer::drawStatusPip(int x, int y, MapOverlayQueue::StatusIcon icon, MapRenderState* drawnRender, float opacity, bool beside)
+void MapDrawer::drawStatusPip(int x, int y, MapOverlayQueue::StatusIcon icon, float severity, MapRenderState* drawnRender, float opacity, bool beside)
 {
 	if (drawnRender)
-		drawnRender->overlays.pip(*globalContainer->gfx, x, y, icon, drawnRender->detail.statusPip * opacity, beside);
+		drawnRender->overlays.pip(*globalContainer->gfx, x, y, icon, severity, drawnRender->detail.statusPip * opacity, beside);
 }
 
 
@@ -184,7 +185,7 @@ void MapDrawer::prepareSceneMapFrame(const PresentationFrame &scene, int localTe
 {
     view.render.skinPreview().setVisible(globalContainer->settings.showColonySkins);
     view.render.skinPreview().poll();
-    view.render.animationTime += view.render.animationClock.advance(paused);
+    view.render.advanceAnimation(paused);
     const Uint32 visibleTeams = globalContainer->isViewingGame() ? globalContainer->replayVisibleTeams
         : scene.entities.teams[localTeam].mask;
     if (globalContainer->settings.smoothFog && !(drawOptions & Game::DRAW_WHOLE_MAP))
@@ -238,6 +239,9 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 	GAGCore::FrameDrawBatch frameBatch(globalContainer->gfx);
 	const SceneMap& map = scene.map;
 	int& time = view.render.animationTime;
+	// Terrain animation interpolates within steps: its crossfades and surf move
+	// by exactly the time elapsed every frame (AnimationClock).
+	const AnimationTime presentation = view.render.animationNow();
 	int left = (sx >> 5);
 	int top = (sy >> 5);
 	int right = ((sx + sw + 31) >> 5);
@@ -249,9 +253,8 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 	// HD sprite textures follow the zoom; interface drawing still needs the
 	// display's own scale. Captures draw once at their own scale and keep it.
 	if (!(drawOptions & Game::DRAW_TILED_CAPTURE))
-		GAGCore::Sprite::setHighResolutionDensity(std::max(
-			double(globalContainer->gfx->mapTransformScale() * globalContainer->gfx->getRasterScale()),
-			double(globalContainer->gfx->getRasterScale())));
+		GAGCore::Sprite::setHighResolutionDensity(GAGCore::HighResolutionPolicy::density(
+			globalContainer->gfx->mapTransformScale(), globalContainer->gfx->getRasterScale()));
 	// Queue constant-size overlays for this frame, and draw whatever the later
 	// passes queued however drawMap returns.
 	MapRenderState* drawnRender = globalContainer->settings.adaptiveZoomDetail ? &view.render : nullptr;
@@ -309,14 +312,24 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 	bool overviewOnly = view.render.detail.terrainOverview >= 1;
 	// Browser builds drive Legacy GL through the WebGL2 bridge, which has no
 	// direct pass: their views compose pages, native until HD artwork streams in.
-	const bool legacy = frame.target.isLegacyGLScreen() && DirectTerrain::legacyPassAvailable();
+	// Devices with streamed textures (SDL GPU, Programmable GL) draw the same streamed pass as
+	// Legacy GL, HD artwork included; where it cannot fit they compose pages.
+	const bool legacyScreen = frame.target.isLegacyGLScreen();
+	const auto *existingDirect = view.render.existingDirectTerrain();
+	const bool streamedDevice = !legacyScreen && DirectTerrain::streamedPassAvailable(frame.target) &&
+		!(existingDirect && existingDirect->failedFor(scene.map));
+	const bool legacy = (legacyScreen && DirectTerrain::legacyPassAvailable()) || streamedDevice;
 	bool direct = false;
 	bool terrainBackdrop = false;
 	const bool hdArtwork = globalContainer->settings.highResolutionArtwork;
-	const auto drawBackdrop = [&]
+	view.render.fallback = {};
+	// The overview beneath terrain that is not ready; `shownPages` limits it to
+	// the detailed pages missing from the view.
+	const auto drawBackdrop = [&](const std::vector<SDL_Point> *shownPages = nullptr)
 	{
 		const auto alpha = view.render.detail.terrainOverview;
 		view.render.detail.terrainOverview = 1;
+		view.render.overviewBackdropPages = shownPages;
 		try
 		{
 			drawMapOverview(frame.left, frame.top, frame.right, frame.bottom,
@@ -324,9 +337,11 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 		}
 		catch (const std::bad_alloc &)
 		{
+			view.render.overviewBackdropPages = nullptr;
 			view.render.detail.terrainOverview = alpha;
 			return;
 		}
+		view.render.overviewBackdropPages = nullptr;
 		view.render.detail.terrainOverview = alpha;
 		terrainBackdrop = true;
 	};
@@ -345,10 +360,10 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 			if (terrain.needsBackdrop(frame.target, scene.map))
 				drawBackdrop();
 			if (terrain.prepare(frame.target, scene.map, frame.left, frame.top, frame.right, frame.bottom,
-				frame.viewportX, frame.viewportY, frame.visibleTeams, frame.options & Game::DRAW_WHOLE_MAP, time, complete))
+				frame.viewportX, frame.viewportY, frame.visibleTeams, frame.options & Game::DRAW_WHOLE_MAP, presentation, complete))
 			{
 				terrain.drawPrepared(frame.target, frame.viewportX, frame.viewportY,
-					frame.options & Game::DRAW_WHOLE_MAP, time);
+					frame.options & Game::DRAW_WHOLE_MAP, presentation);
 				direct = true;
 			}
 		}
@@ -364,7 +379,7 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 		{
 			direct = view.render.directTerrain().draw(frame.target, scene.map, frame.left, frame.top,
 				frame.right, frame.bottom, frame.viewportX, frame.viewportY, frame.visibleTeams,
-				frame.options & Game::DRAW_WHOLE_MAP, time);
+				frame.options & Game::DRAW_WHOLE_MAP, presentation);
 		}
 		catch (const std::bad_alloc &) { /* Pages remain available. */ }
 	}
@@ -379,17 +394,41 @@ void MapDrawer::drawSceneMapRegion(const PresentationFrame& scene, int sx, int s
 		catch (const std::bad_alloc &)
 		{ /* Keep the uncached renderer available under memory pressure. */ }
 	}
+	// Interactive views draw stand-ins while workers compose missing pages; the
+	// editor, captures and complete draws still finish every page first.
+	if (pagesForView)
+		pagesForView->deferBuilds = !scene.editor && !frame.target.drawingOffscreen() &&
+			!(frame.options & (Game::DRAW_TILED_CAPTURE | Game::DRAW_COMPLETE_TERRAIN));
 	const bool cached = pagesForView && pagesForView->prepare(scene.map, frame.terrain,
 		frame.left, frame.top, frame.right, frame.bottom, frame.viewportX, frame.viewportY,
-		frame.visibleTeams, frame.options & Game::DRAW_WHOLE_MAP, time,
+		frame.visibleTeams, frame.options & Game::DRAW_WHOLE_MAP, presentation,
 		frame.options & Game::DRAW_TILED_CAPTURE);
 	if (cached)
 	{
+		// Pages still composing show the overview until they arrive.
+		const auto &coverage = pagesForView->frameCoverage();
+		view.render.fallback.pageCells = coverage.pageCells;
+		view.render.fallback.standInCells = coverage.standInCells;
+		view.render.fallback.backdropCells = coverage.backdropCells;
+		view.render.fallback.fadingCells = coverage.fadingCells;
+		if (!pagesForView->complete() && !terrainBackdrop)
+			drawBackdrop(&pagesForView->backdropPages());
 		PERF_SCOPE_TIME(Terrain);
 		pagesForView->draw(frame.target);
 	}
 	else if (!overviewOnly && !direct && !terrainBackdrop && !legacy)
-		drawMapTerrain(left, top, right, bot, viewportX, viewportY, localTeam, drawOptions, scene.map, time);
+	{
+		// An interactive device view whose pages could not prepare this frame
+		// (the device refused page composition, say) shows the overview:
+		// composing uncached pages here, on the graphics thread, through the
+		// device took seconds a frame and repeated every frame the admission
+		// kept failing. CPU renderers still stream pages a view too large for
+		// the cache needs.
+		if (pagesForView && pagesForView->deferBuilds && frame.target.renderDevice())
+			drawBackdrop();
+		else
+			drawMapTerrain(left, top, right, bot, viewportX, viewportY, localTeam, drawOptions, scene.map, time);
+	}
 
     const auto *atlas = view.render.existingDirectTerrain();
     const auto *pages = view.render.existingTerrainCache();

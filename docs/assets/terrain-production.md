@@ -246,8 +246,8 @@ a crisp bright crest over a short lavender lee shadow, with quiet flats and fain
 ripples between. Its ridges are a plane wave with whole wave numbers on the block, so
 only the smooth warps and drift heights vary between layouts. The helpers keep the block contract: geometry comes from
 the shared stream at the block edge, interiors vary, and any normalisation or
-lighting uses the common reference. Obstacles are lit from the top left and cast
-onto grass, and void casts onto every neighbour. Feature sizes are judged
+lighting uses the common reference. Obstacles are lit from the top left, the
+[canonical sun](lighting.md), and cast onto grass, and void casts onto every neighbour. Feature sizes are judged
 against the globs, not against a photograph: a tile is about a glob across, so
 a brick, a cobble, a sand ripple or a crack in the ice should be the size it
 would be beside a glob standing on it, and nothing but broad tone should span
@@ -364,7 +364,7 @@ three-quarter view:
 - Boulders are tall: 128×128 frames whose stones are a faceted, lit top on a
   front face extruded down to the ground, flaring slightly toward it. The
   largest stand most of a cell above their own. Each stone's footprint, swept
-  along a low sun to the lower right, gives a long shadow that fades with
+  along the sun to the lower right, gives a long shadow that fades with
   distance and lies on the ground under every stone.
 
 Hedge and thicket use connected canopy surfaces rather than shaded bushes
@@ -380,8 +380,8 @@ strokes and soft crowns. Thicket has sparser olive foliage with visible branches
 Hedge rises sixteen native pixels above its ground material and thicket
 fourteen; both sample one continuous canopy texture across a 4×4 block of
 cells. Their front wall shows the foliage just behind the rim above it, and the
-raised mass casts a long shadow straight down the screen into the 16 pixels
-below its cell, fading to nothing; where the canopy continues, the next row's
+raised mass casts a long shadow down the screen, drifting a little to the right,
+into the 16 pixels below its cell, fading to nothing; where the canopy continues, the next row's
 frame covers it. Thicket has broader
 boundary irregularity and woody gaps between crowns. The other sets are faceted boulders and rubble, clusters of faceted crags along
 a shared grain, and broad stepped bedrock blocks with sparse lichen. Ridge and
@@ -551,8 +551,9 @@ boundary cells in every layout.
 Lava, molten lava pools, and ember fields use four 8×8 layouts with four phases, frame
 `cell + 64 * layout + 256 * phase` (frames 0–1023), catalogued with
 `animation_frames 4`, `animation_stride 256`, `animation_ticks 16` and
-`animation_blend_steps 4` (the recipe's `blend_steps`): the crossfade moves in
-four steps per phase, holding each weight for four render ticks. A full loop
+`animation_blend_steps 4` (the recipe's `blend_steps`): on composed pages the
+crossfade moves in four steps per phase, holding each weight for four render
+ticks; the direct pass blends it continuously. A full loop
 takes 64 render ticks. Each layout's crust is shared by its phases; only the glow
 ramp moves.
 
@@ -682,9 +683,11 @@ current and next only. Unused variants, phases and HD sources are retired as the
 selection changes; offscreen materials do not advance their prepared revisions
 merely because the visual clock changes.
 
-Published CPU material snapshots own their RGBA pixels. Retiring a source or
-changing the active selection therefore leaves a retained snapshot usable by
-an in-flight composition batch. CPU jobs snapshot only the recipes in each
+Published CPU material snapshots share ownership of their RGBA pixels with the
+compositor's prepared textures, which copy them before writing while a
+snapshot holds them, so a snapshot of unchanged textures holds no second copy.
+Retiring a source or changing the active selection therefore leaves a retained
+snapshot usable by an in-flight composition batch. CPU jobs snapshot only the recipes in each
 bounded group, reducing the group size when necessary to stay within the existing
 4 MiB in-flight reservation. Reloading unchanged native sources after eviction
 does not invalidate already composed pages. Compiled-pack data and catalog metadata remain

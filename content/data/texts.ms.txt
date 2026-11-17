@@ -5034,6 +5034,10 @@ Anggaran peluang perikatan anda menang. Sampel diambil sepanjang perlawanan. Sek
 Prestij
 [stat prestige about]
 Prestij koloni, yang diperoleh melalui bangunan tahap tertinggi. Perlawanan dengan sasaran prestij tamat apabila sasaran itu dicapai.
+[stat prestige needed]
+Prestij yang diperlukan untuk menang
+[stat prestige needed about]
+Prestij yang masih perlu diperoleh koloni untuk menang melalui prestij: cukup supaya jumlah prestij perlawanan mencapai sasaran, dan untuk mengatasi setiap koloni lain yang masih bertahan. Direkodkan hanya apabila perlawanan mempunyai sasaran prestij.
 [stat band combat]
 Pertempuran
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Detik %0: %1 ms masa berlalu
 Kemas kini arahan tetap gagal. Arahan anda dijeda secara setempat; cuba semula melalui kawalan berkenaan.
 [tundra]
 Tanah tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

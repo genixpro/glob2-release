@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "TorusView.h"
 #include "TorusGeometry.h"
+#include "render/Sunlight.h"
 #include "render/SoftwareTerrainCache.h"
 #include "Game.h"
 #include "render/MapDrawer.h"
@@ -61,18 +62,19 @@ class SourceMapPhaseScope
     unsigned options;
     bool paused;
     int initialAnimation;
+    float initialFraction;
     AnimationClock initialClock;
     int exceptions;
 public:
     SourceMapPhaseScope(MapRenderState &state,unsigned drawOptions,bool animationsPaused)
         : render(state),options(drawOptions),paused(animationsPaused),
-          initialAnimation(state.animationTime),initialClock(state.animationClock),exceptions(std::uncaught_exceptions())
-    { render.animationTime+=render.animationClock.advance(paused); }
+          initialAnimation(state.animationTime),initialFraction(state.animationFraction),initialClock(state.animationClock),exceptions(std::uncaught_exceptions())
+    { render.advanceAnimation(paused); }
     ~SourceMapPhaseScope()
     {
         // The caller draws the ordinary map after a fatal torus exception.
         // Leave that fallback to advance the source phases once for this turn.
-        if(std::uncaught_exceptions()>exceptions){render.animationTime=initialAnimation;render.animationClock=initialClock;}
+        if(std::uncaught_exceptions()>exceptions){render.animationTime=initialAnimation;render.animationFraction=initialFraction;render.animationClock=initialClock;}
         else MapDrawer::finishMapCapture(render,options,paused);
     }
 };
@@ -278,8 +280,9 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
             // tile. Map capture is 2D: only RGBA color is allocated, with no
             // depth or second atlas. The completed main image covers progress.
             // Reserve bounded authored source chains and upload staging separately.
-            constexpr std::size_t targetBudget = 128u * 1024 * 1024;
-            constexpr std::size_t deviceBudget = 256u * 1024 * 1024;
+            // The platform's limits (smaller on phones), as the device enforces them.
+            const std::size_t targetBudget = GAGCore::platformRenderBudget().classLimit(GAGCore::TextureDescriptor::BudgetClass::TerrainPage);
+            const std::size_t deviceBudget = GAGCore::platformRenderBudget().total;
             constexpr std::size_t uploadReserve = 8u * 1024 * 1024;
             // The largest HD authored terrain block is ~22.4 MiB including
             // mip levels. Keep additional glyph/sprite admission headroom.
@@ -335,7 +338,7 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
         // advancing on holds.
         const int sourceSteps = sourcePaused ? 0 : sourceRender.animationClock.steps();
         captureRender.animationTime = sourceRender.animationTime-sourceSteps;
-        captureRender.animationClock.presetNext(sourceSteps);
+        captureRender.animationClock.presetNext(sourceSteps, sourceRender.animationFraction);
         captureRender.areaAnimationTick = sourceRender.areaAnimationTick;
         captureRender.areaClock = sourceRender.areaClock;
         captureRender.unitMotion = sourceRender.unitMotion;
@@ -565,7 +568,7 @@ bool TorusView::drawDevice(const PresentationFrame &frame, GameGUI *gui, int tea
     }
     WorldMaterial material;
     material.projection = {2.f/gfx->getW(),0,0,0, 0,-2.f/gfx->getH(),0,0, 0,0,-1.f/20000,0, -1,1,.5f,1};
-    float lx = -1, ly = .25f, lz = .15f;
+    float lx = Sunlight::glancingX, ly = Sunlight::glancingY, lz = Sunlight::glancingZ;
     const float ll = std::sqrt(lx*lx+ly*ly+lz*lz); lx/=ll; ly/=ll; lz=lz/ll+1;
     const float hl = std::sqrt(lx*lx+ly*ly+lz*lz);
     material.sunSpecular = {lx/hl,ly/hl,lz/hl,.18f*roll};

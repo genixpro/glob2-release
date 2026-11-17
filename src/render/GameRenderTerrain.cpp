@@ -41,6 +41,7 @@
 #include <AssetLoader.h>
 #include <Toolkit.h>
 #include <atomic>
+#include <optional>
 #include "Team.h"
 
 namespace
@@ -53,13 +54,16 @@ constexpr int DecorLayerKey = 4;
 // Cache ONE complete canonical row per layer, retain source traversal order
 // inside texture runs, and select the exact source tile range with binary
 // searches. Splitting rectangles vertically would change the painter order.
-// Partial discovery uses the ordinary path below instead.
+// Renderers without a geometry cache (every one but Legacy GL) draw the rows'
+// recorded frames sprite by sprite, so a frame does no per-cell decor, overlay
+// or resource lookups; they also check partial discovery per drawn cell, which
+// cached Legacy GL geometry cannot, so there it uses the ordinary path below.
 bool drawCachedResources(Uint64 mapIdentity, const SceneMap& map, int left, int top,
-    int right, int bottom, int viewportX, int viewportY, MapRenderState &render)
+    int right, int bottom, int viewportX, int viewportY, MapRenderState &render, bool wholeMap, Uint32 visibleTeams)
 {
     auto *gfx = globalContainer->gfx;
     auto *batch = gfx->getRenderBatch();
-    if (!batch) return false;
+    if (batch && !wholeMap) return false;
     auto *sprite = globalContainer->resources;
     if (!sprite) return false;
     const auto &compositor = globalContainer->terrainCompositor(map.frozenAssetBundle());
@@ -77,10 +81,11 @@ bool drawCachedResources(Uint64 mapIdentity, const SceneMap& map, int left, int 
     // they twinkle in the editor, where the simulation tick never moves.
     const int animationTime = render.animationTime;
     auto &metrics = render.resourceRowMetrics;
-    GAGCore::MapGeometryCache *cache;
+    GAGCore::MapGeometryCache *cache = nullptr;
     try
     {
-        cache = &batch->geometryCache();
+        if (batch)
+            cache = &batch->geometryCache();
         if (!render.resourceRows)
             render.resourceRows = std::make_unique<ResourceRowCache>();
         auto &rows = *render.resourceRows;
@@ -217,16 +222,44 @@ bool drawCachedResources(Uint64 mapIdentity, const SceneMap& map, int left, int 
         render.resourceRows.reset();
         return false;
     }
-    GAGCore::MapGeometryCache::Layer layer(*cache);
-    auto drawLayer = [&](GAGCore::Sprite *layerSprite, const std::vector<int> &layerFrames,
-        int layerKey, int y, int mapY, std::uint64_t revision)
+    std::optional<GAGCore::MapGeometryCache::Layer> layer;
+    if (cache)
+        layer.emplace(*cache);
+    // A row records each frame's HD or native layer as it stands. HD frames
+    // stream in later (decor only above 32 pixels a cell) without changing the
+    // row's frames, so the row also names the newest HD layer among its frames:
+    // when one of them gains a layer, the cache keeps replaying the previous
+    // resolution until part of the frame's build budget re-records the row.
+    const auto rowArtwork = [](ResourceRowCache::Layer &rowLayer, const GAGCore::Sprite &layerSprite)
     {
+        const auto spriteRevision = layerSprite.highResolutionRevision();
+        if (rowLayer.artworkFrames != rowLayer.revision || rowLayer.artworkSprite != spriteRevision)
+        {
+            rowLayer.artwork = 0;
+            for (const int frame : rowLayer.frames)
+                if (frame >= 0)
+                    rowLayer.artwork = std::max(rowLayer.artwork, layerSprite.highResolutionRevision(unsigned(frame)));
+            rowLayer.artworkFrames = rowLayer.revision;
+            rowLayer.artworkSprite = spriteRevision;
+        }
+        // The HD sprite policy switching between HD and native frames changes
+        // the artwork as a new HD layer would.
+        return rowLayer.artwork + GAGCore::Sprite::highResolutionPolicyRevision();
+    };
+    auto drawLayer = [&](GAGCore::Sprite *layerSprite, ResourceRowCache::Layer &rowLayer,
+        int layerKey, int y, int mapY)
+    {
+        const auto &layerFrames = rowLayer.frames;
+        const auto revision = rowLayer.revision;
+        const auto layerArtwork = rowArtwork(rowLayer, *layerSprite);
         auto draw = [&](int first, int last, int originX, int originY)
         {
             for (int mapX = first; mapX <= last; ++mapX)
             {
                 int frame = layerFrames[mapX];
                 if (frame < 0) continue;
+                if (!wholeMap && !map.isMapPartiallyDiscovered(mapX - 1, mapY - 1, mapX + 1, mapY + 1, visibleTeams))
+                    continue;
                 const int h = layerSprite->getH(frame);
                 int dx = (layerSprite->getW(frame) - 32) >> 1;
                 int dy = layerKey >= DecorLayerKey ? TerrainVisual::decorOffsetY(h) +
@@ -239,17 +272,23 @@ bool drawCachedResources(Uint64 mapIdentity, const SceneMap& map, int left, int 
         {
             int mapX = (x + viewportX) & map.getMaskW();
             int width = std::min(right - x + 1, map.getW() - mapX);
+            if (!cache)
+            {
+                draw(mapX, mapX + width - 1, x - mapX, y);
+                x += width;
+                continue;
+            }
             bool drawn = false;
             try
             {
                 drawn = cache->draw({mapIdentity, layerKey, 0, mapY, map.getW(), 1}, layerFrames,
                     [&] { draw(0, map.getW() - 1, 0, 0); }, mapX, mapX + width - 1,
-                    float((x - mapX) * 32), float(y * 32), revision);
+                    float((x - mapX) * 32), float(y * 32), revision, layerArtwork);
             }
             catch (const std::bad_alloc&) {}
             if (!drawn)
             {
-                layer.prepareFallback();
+                layer->prepareFallback();
                 // Cold-cache budget exhaustion must retain the family
                 // batching path instead of reverting to one HD bind per sprite.
                 GAGCore::SpriteDrawBatch fallback(gfx, layerSprite);
@@ -259,24 +298,23 @@ bool drawCachedResources(Uint64 mapIdentity, const SceneMap& map, int left, int 
         }
     };
     // Every overlay row draws before the raised decor and resources.
-    const auto &rows = render.resourceRows->rows;
+    auto &rows = render.resourceRows->rows;
     if (overlaySprite)
         for (int y = top; y <= bottom; ++y)
         {
             const int mapY = (y + viewportY) & map.getMaskH();
-            const auto &overlay = rows[mapY].overlay;
+            auto &overlay = rows[mapY].overlay;
             if (overlay.visibleFrames)
-                drawLayer(overlaySprite, overlay.frames, 3, y, mapY, overlay.revision);
+                drawLayer(overlaySprite, overlay, 3, y, mapY);
         }
     for (int y = top; y <= bottom; ++y)
     {
         const int mapY = (y + viewportY) & map.getMaskH();
-        const auto &row = rows[mapY];
+        auto &row = rows[mapY];
         for (unsigned slot = 0; slot < row.decor.size(); ++slot)
             if (row.decor[slot].visibleFrames)
-                drawLayer(decorSprite, row.decor[slot].frames, DecorLayerKey + int(slot), y, mapY,
-                    row.decor[slot].revision);
-        drawLayer(sprite, row.resources.frames, 1, y, mapY, row.resources.revision);
+                drawLayer(decorSprite, row.decor[slot], DecorLayerKey + int(slot), y, mapY);
+        drawLayer(sprite, row.resources, 1, y, mapY);
     }
     return true;
 }
@@ -315,8 +353,8 @@ void MapDrawer::drawMapResources(int left, int top, int right, int bot, int view
         left -= (reach.side + 31) >> 5;
         right += (reach.side + 31) >> 5;
     }
-    if (render && (drawOptions & Game::DRAW_WHOLE_MAP) && drawCachedResources(sceneMap.cacheKey(), sceneMap, left, top,
-            right, bot, viewportX, viewportY, *render)) return;
+    if (render && drawCachedResources(sceneMap.cacheKey(), sceneMap, left, top, right, bot, viewportX, viewportY,
+            *render, drawOptions & Game::DRAW_WHOLE_MAP, visibleTeams)) return;
     auto& catalog = ResourceSprites::resolve(sceneMap.frozenResourceRegistry(), sceneMap.frozenAssetBundle());
     const bool capture = (drawOptions & Game::DRAW_TILED_CAPTURE) != 0;
     const auto &compositor = globalContainer->terrainCompositor(sceneMap.frozenAssetBundle());
@@ -424,22 +462,68 @@ void MapDrawer::drawMapResources(int left, int top, int right, int bot, int view
 void MapDrawer::drawMapOverview(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const SceneMap& sceneMap, MapRenderState& render)
 {
 	const Uint8 alpha = Uint8(std::clamp(render.detail.terrainOverview, 0.f, 1.f) * 255);
-	if (!alpha)
-		return;
 	PERF_SCOPE_TIME(Terrain);
 	Uint32 visibleTeams = Team::teamNumberToMask(localTeam);
 	if (globalContainer->isViewingGame()) visibleTeams = globalContainer->replayVisibleTeams;
-	constexpr int samples = TerrainVisual::Compositor::OverviewSamples;
 	const int columns = right-left+1, rows = bot-top+1;
-	if (!render.overview)
-		render.overview = std::make_unique<GAGCore::DrawableSurface>(columns*samples, rows*samples);
-	else if (render.overview->getW()!=columns*samples || render.overview->getH()!=rows*samples)
-		render.overview->setRes(columns*samples, rows*samples);
 	if (!render.overviewCache)
 		render.overviewCache = std::make_unique<OverviewTerrainCache>();
-	render.overviewCache->update(sceneMap, left, top, right, bot, viewportX, viewportY,
-								 visibleTeams, drawOptions & Game::DRAW_WHOLE_MAP, *render.overview);
-	globalContainer->gfx->drawSurface(left*32, top*32, columns*32, rows*32, render.overview.get(), alpha);
+	const bool complete = (drawOptions & (Game::DRAW_TILED_CAPTURE | Game::DRAW_COMPLETE_TERRAIN)) ||
+		globalContainer->gfx->drawingOffscreen();
+	// Fill the zoomed-out overview in the background from the first frame (under
+	// the opening cloud bank), around the view and at the density the farthest
+	// zoom draws, so a zoom out finds its pages ready. A one-shot draw has no
+	// later frames to fill.
+	if (!complete)
+	{
+		const double farCell = 32 * render.minimumZoom * globalContainer->gfx->getRasterScale();
+		const int farSamples = render.minimumZoom > 0
+			? OverviewTerrainCache::samplesFor(farCell, 0,
+				int(std::max(globalContainer->gfx->getW(), globalContainer->gfx->getH()) / (32 * render.minimumZoom)) + 1,
+				globalContainer->gfx->maximumTextureSize())
+			: OverviewTerrainCache::FewSamples;
+		render.overviewCache->prewarm(sceneMap, visibleTeams, drawOptions & Game::DRAW_WHOLE_MAP,
+			(left + right) / 2 + viewportX, (top + bot) / 2 + viewportY, farSamples);
+	}
+	if (!alpha)
+	{
+		// Pages prewarmed for the zoom out go to the device ahead of it.
+		if (!complete)
+			render.overviewCache->uploadAhead();
+		return;
+	}
+	// Size the image to what the screen can show: a cell's device pixels.
+	const double pixelsPerCell = 32 * globalContainer->gfx->mapTransformScale() * globalContainer->gfx->getRasterScale();
+	const int samples = OverviewTerrainCache::samplesFor(pixelsPerCell, render.overviewCache->samples(),
+		std::max(columns, rows), globalContainer->gfx->maximumTextureSize());
+	if (complete)
+	{
+		// A one-shot draw (export, capture) assembles the view into one image and
+		// draws it once: drawn page by page, a view scaled far below a page per
+		// pixel rounds every page edge and can leave the last row uncovered.
+		if (!render.overview)
+			render.overview = std::make_unique<GAGCore::DrawableSurface>(columns*samples, rows*samples);
+		else if (render.overview->getW()!=columns*samples || render.overview->getH()!=rows*samples)
+			render.overview->setRes(columns*samples, rows*samples);
+		render.overviewCache->update(sceneMap, left, top, right, bot, viewportX, viewportY,
+									 visibleTeams, drawOptions & Game::DRAW_WHOLE_MAP, samples, *render.overview);
+		globalContainer->gfx->drawSurface(left*32, top*32, columns*32, rows*32, render.overview.get(), alpha);
+		return;
+	}
+	// Each page is its own texture: panning and zooming draw cached pages, and
+	// interactive views compose missing cells on background workers.
+	render.overview.reset();
+	render.overviewCache->draw(sceneMap, left, top, right, bot, viewportX, viewportY, visibleTeams,
+							   drawOptions & Game::DRAW_WHOLE_MAP, samples, *globalContainer->gfx, alpha, false,
+							   render.overviewBackdropPages);
+	// What the view left of the frame's upload allowance.
+	render.overviewCache->uploadAhead();
+	const auto &drawn = render.overviewCache->drawMetrics();
+	render.fallback.overviewCells += drawn.cells;
+	render.fallback.overviewOtherCells += drawn.other;
+	render.fallback.overviewBaseCells += drawn.base;
+	render.fallback.overviewHoleCells += drawn.holes;
+	render.fallback.overviewFadingCells += drawn.fading;
 }
 
 void MapDrawer::drawMapTerritory(int left, int top, int right, int bot, int viewportX, int viewportY, int localTeam, Uint32 drawOptions, const PresentationFrame& scene, float opacity)

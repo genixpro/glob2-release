@@ -32,7 +32,7 @@ def align(value, alignment):
 
 def metadata(root=ROOT):
     manifest = json.loads((root / MANIFEST).read_text())
-    if manifest['version'] != 1 or manifest['variants'] != ['skin', 'skin-rig', 'primitive', 'world', 'cloud', 'point', 'terrain-direct', 'terrain-compose', 'terrain-reduce']:
+    if manifest['version'] != 1 or manifest['variants'] != ['skin', 'skin-rig', 'primitive', 'world', 'cloud', 'point', 'terrain-direct', 'terrain-direct-hd', 'terrain-compose', 'terrain-reduce', 'team-color']:
         raise ValueError('unsupported renderer manifest version or variants')
     registry = skin_materials.load_registry(root)
     skin_materials.check_shader(root, registry)
@@ -84,7 +84,8 @@ def declarations(block, native):
     return '\n'.join('uniform ' + line for line in members.splitlines()) + '\n'
 
 
-def direct_terrain_sources(root, meta, dialect, split=False):
+def direct_terrain_sources(root, meta, dialect, split=False, hd=False):
+    """Direct terrain; hd adds streamed artwork and display-density masks (Legacy GL's pass)."""
     native = dialect == 'vulkan'
     version = {'webgl2': '#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n',
                'desktop-gl': '#version 330 core\n', 'vulkan': '#version 450\n'}[dialect]
@@ -95,24 +96,33 @@ def direct_terrain_sources(root, meta, dialect, split=False):
     vertex = (version + attributes + declarations(meta['uniformBlocks']['terrain-direct'], native) +
               varying + 'out vec2 world;\n' +
               'void main(){world=texcoord;gl_Position=vec4(position/viewport*vec2(2,-2)+vec2(-1,1),0,1);}')
+    textures = meta['terrainDirectTextures'] + (meta['terrainDirectHdTextures'] if hd else [])
+    # The whole-map base masks take the native coverage and edge bindings, unused here.
+    defines = ''
+    if hd:
+        defines = '#define DIRECT_TERRAIN_ANIMATION\n#define DIRECT_TERRAIN_HD_MASKS\n'
+        defines += ('#define hdBaseCoverageTexture coverageTexture\n#define hdBaseCoverageSampler coverageSampler\n'
+                    '#define hdBaseEdgesTexture edgesTexture\n' if split else
+                    '#define hdBaseCoverage coverage\n#define hdBaseEdges edges\n')
     samplers = ''
     if split:
         version += '#extension GL_EXT_samplerless_texture_functions : require\n'
-        for texture in meta['terrainDirectTextures']:
+        for texture in textures:
             name, binding = texture['name'], texture['binding'] * 2
             samplers += 'layout(set=2,binding=%d) uniform texture2D %sTexture;\n' % (binding, name)
-            if name in ('art', 'coverage', 'shoreCalm'):
+            if name in ('art', 'coverage', 'shoreCalm', 'hdCoverage', 'hdPreviousCoverage'):
                 samplers += 'layout(set=2,binding=%d) uniform sampler %sSampler;\n' % (binding + 1, name)
         samplers += ('#define DIRECT_TERRAIN_SAMPLE(image, uv) textureLod(sampler2D(image ## Texture, image ## Sampler), uv, 0.0)\n'
                      '#define DIRECT_TERRAIN_FETCH(image, xy) texelFetch(image ## Texture, xy, 0)\n')
     else:
-        for texture in meta['terrainDirectTextures']:
+        for texture in textures:
             binding = 'layout(set=%d,binding=%d) ' % (texture['set'], texture['binding']) if native else ''
             samplers += binding + 'uniform sampler2D %s;\n' % texture['name']
     source = (root / meta['passSources']['terrain-directFragment']).read_text()
     shared_code = '#ifndef DIRECT_TERRAIN_SAMPLE'
     body = shared_code + source.split(shared_code, 1)[1].rsplit(')"', 1)[0]
-    fragment = (version + samplers + declarations(meta['uniformBlocks']['terrain-direct-fragment'], native) +
+    block = meta['uniformBlocks']['terrain-direct-hd-fragment' if hd else 'terrain-direct-fragment']
+    fragment = (version + defines + samplers + declarations(block, native) +
                 varying + 'in vec2 world;\nlayout(location=0) out vec4 terrainColor;\n' +
                 '#define DIRECT_TERRAIN_PACKED\n'
                 '#define wholeMap (wholeMapValue > 0.5)\n' + body)
@@ -120,8 +130,8 @@ def direct_terrain_sources(root, meta, dialect, split=False):
 
 
 def sources(root, meta, dialect, variant):
-    if variant == 'terrain-direct':
-        return direct_terrain_sources(root, meta, dialect)
+    if variant in ('terrain-direct', 'terrain-direct-hd'):
+        return direct_terrain_sources(root, meta, dialect, hd=variant == 'terrain-direct-hd')
     native = dialect == 'vulkan'
     version = {'webgl2': '#version 300 es\nprecision highp float;\nprecision highp int;\n',
                'desktop-gl': '#version 330 core\n', 'vulkan': '#version 450\n'}[dialect]
@@ -129,6 +139,21 @@ def sources(root, meta, dialect, variant):
         version += 'precision highp usampler2D;\n'
     attributes = ''.join('layout(location=%d) in vec%d %s;\n' %
                          (a['location'], a['components'], a['name']) for a in meta['vertexLayouts'][variant]['attributes'])
+    if variant == 'team-color':
+        # Team-colour vertices carry a grey tint in x, the hue shift in degrees
+        # in y and alpha in w; the hue is flat so it reaches every fragment exact.
+        location = lambda index: 'layout(location=%d) ' % index if native else ''
+        vertex = (version + attributes + declarations(meta['uniformBlocks'][variant], native) +
+                  location(0) + 'out vec2 uv;\n' + location(1) + 'out vec4 tint;\n' + location(2) + 'flat out float hue;\n' +
+                  'void main(){uv=texcoord;tint=vec4(vertexColor.xxx,vertexColor.w);hue=vertexColor.y;'
+                  'gl_Position=vec4(position.x*2.0/viewport.x-1.0,1.0-position.y*2.0/viewport.y,0.0,1.0);}')
+        texture = meta['teamColorTexture']
+        fragment = (version + ('layout(set=%d,binding=%d) ' % (texture['set'], texture['binding']) if native else '') +
+                    'uniform sampler2D %s;\n' % texture['name'] + declarations(meta['uniformBlocks']['team-color-fragment'], native) +
+                    location(0) + 'in vec2 uv;\n' + location(1) + 'in vec4 tint;\n' + location(2) + 'flat in float hue;\n' +
+                    'layout(location=0) out vec4 color;\n' +
+                    (root / meta['passSources']['team-colorFragment']).read_text())
+        return {'vert': vertex, 'frag': fragment}
     if variant in ('primitive', 'point', 'terrain-compose', 'terrain-reduce'):
         vertex = (version + attributes + declarations(meta['uniformBlocks'][variant], native) +
                   ('layout(location=0) ' if native else '') + 'out vec2 uv;\n' +
@@ -205,8 +230,8 @@ def webgpu_sources(root, meta, variant):
     Material code remains verbatim; the atlas sampling wrapper is extracted
     from that same source, with constructors placed directly at texture calls.
     """
-    if variant == 'terrain-direct':
-        return direct_terrain_sources(root, meta, 'vulkan', split=True)
+    if variant in ('terrain-direct', 'terrain-direct-hd'):
+        return direct_terrain_sources(root, meta, 'vulkan', split=True, hd=variant == 'terrain-direct-hd')
     result = sources(root, meta, 'vulkan', variant)
     fragment = result['frag']
     if variant in ('skin', 'skin-rig'):
@@ -228,6 +253,8 @@ def webgpu_sources(root, meta, variant):
         textures = [meta['terrainReduceTexture']]
     elif variant == 'primitive':
         textures = [meta['primitiveTexture']]
+    elif variant == 'team-color':
+        textures = [meta['teamColorTexture']]
     elif variant in ('world', 'cloud'):
         textures = [meta['worldTexture']]
     else:
@@ -265,7 +292,7 @@ def layout_header(meta):
             lines.append('inline constexpr std::uint32_t %s_%s = %d;' % (key, field, block[field]))
         for member in block['members']:
             lines.append('inline constexpr std::uint32_t %s_%s_offset = %d;' % (key, member['name'], member['offset']))
-    for texture in meta['textures'] + [meta['primitiveTexture'], meta['worldTexture']] + meta['terrainDirectTextures'] + meta['terrainComposeTextures'] + [meta['terrainReduceTexture']]:
+    for texture in meta['textures'] + [meta['primitiveTexture'], meta['teamColorTexture'], meta['worldTexture']] + meta['terrainDirectTextures'] + meta['terrainDirectHdTextures'] + meta['terrainComposeTextures'] + [meta['terrainReduceTexture']]:
         for field in ('set', 'binding'):
             lines.append('inline constexpr std::uint32_t %s_%s = %d;' % (texture.get('layoutName', texture['name']), field, texture[field]))
     return '\n'.join(lines + ['}']) + '\n'
@@ -366,8 +393,12 @@ def generate(output, compiler=None, root=ROOT, naga=None, spirv_cross=None, dxc=
             raise ValueError('native translation requires pinned glslang and SPIRV-Cross')
         pins = meta['nativeTranslationTools']
         cross_digest = hashlib.sha256(Path(spirv_cross).read_bytes()).hexdigest()
-        if cross_digest != pins['spirvCross']['linuxX86BinarySha256']:
-            raise ValueError('SPIRV-Cross binary does not match pinned Linux build')
+        # The pinned Ubuntu binary, or one buildsys/spirv_cross_tool.py built from
+        # the same pinned source on this host (it translates byte-identically).
+        import spirv_cross_tool
+        if cross_digest != pins['spirvCross']['linuxX86BinarySha256'] and not spirv_cross_tool.verified_build(spirv_cross):
+            raise ValueError('SPIRV-Cross binary is neither the pinned Linux build nor built from the pinned source '
+                             '(python3 buildsys/spirv_cross_tool.py)')
         if dxc:
             dxc_digest = hashlib.sha256(Path(dxc).read_bytes()).hexdigest()
             dxc_version = subprocess.check_output([dxc, '--version'], text=True).strip()
@@ -408,29 +439,102 @@ def generate(output, compiler=None, root=ROOT, naga=None, spirv_cross=None, dxc=
     return meta
 
 
-def compile_metal(output, sdk, tool_lock, root=ROOT, developer_dir=None):
-    """Compile translated sources using an explicitly verified Apple tool lock.
+# A Metal tool lock for one SDK holds exactly these keys (compile_metal's input).
+# The committed lock, buildsys/metal-tool-lock.json, is the trust anchor for every
+# shipped .metallib on macOS and iOS. It lists each reviewed Apple toolchain (one
+# per release runner image and developer Xcode):
+#   {"toolchains": [{"xcodeVersion": ..., "sdks": {sdk: {sdkVersion, metalSha256,
+#    metallibSha256}}}, ...]}
+# tools/shaders/metal_tool_lock.py writes, combines and checks it.
+METAL_TOOL_LOCK_KEYS = ('xcodeVersion', 'sdk', 'sdkVersion', 'metalSha256', 'metallibSha256')
+METAL_SDK_KEYS = ('sdkVersion', 'metalSha256', 'metallibSha256')
+COMMITTED_METAL_TOOL_LOCK = Path('buildsys/metal-tool-lock.json')
+METAL_TOOL_LOCK_REMEDY = ('If Xcode or a runner image changed, run the "Apple Metal tool lock" workflow '
+                          '(.github/workflows/apple-metal-tool-lock.yml), or python3 tools/shaders/metal_tool_lock.py '
+                          '--output LOCK on that Mac, and add the reviewed toolchain to buildsys/metal-tool-lock.json '
+                          'in a pull request (docs/architecture/rendering.md, "Apple Metal shaders").')
 
-    Xcode selection remains local to these subprocesses. Unknown compiler/SDK
-    binaries fail closed; source translation alone never advertises Metal.
+
+def xcode_pin(root=ROOT):
+    return json.loads((Path(root) / 'platforms/mobile/toolchain.json').read_text())['ios']['xcode']
+
+
+def metal_tool_lock_entries(committed, sdk):
+    """Every reviewed flat single-SDK lock for sdk in a committed lock (possibly none)."""
+    toolchains = committed.get('toolchains') if isinstance(committed, dict) else None
+    entries = []
+    for toolchain in toolchains if isinstance(toolchains, list) else []:
+        entry = toolchain.get('sdks', {}).get(sdk) if isinstance(toolchain, dict) else None
+        if isinstance(entry, dict):
+            entries.append({'xcodeVersion': toolchain.get('xcodeVersion'), 'sdk': sdk, **entry})
+    return entries
+
+
+def observe_metal_tools(sdk, root=ROOT, developer_dir=None, require_pin=True):
+    """Return the tool lock the selected Xcode would produce, and the resolved binaries.
+
+    With require_pin (every committed lock and every release build), refuses any
+    Xcode other than the repository pin in platforms/mobile/toolchain.json.
+    Development builds on a Mac with another Xcode observe it without the pin.
     """
-    lock = json.loads(Path(tool_lock).read_text())
-    xcode_pin = json.loads((root / 'platforms/mobile/toolchain.json').read_text())['ios']['xcode']
     prefix = ['/usr/bin/env', 'DEVELOPER_DIR=' + developer_dir] if developer_dir else []
     xcrun = prefix + ['xcrun', '--sdk', sdk]
     xcode = subprocess.check_output(prefix + ['xcodebuild', '-version'], text=True).strip()
-    if xcode.splitlines()[0] != 'Xcode ' + xcode_pin or lock['xcodeVersion'] != xcode:
-        raise ValueError('Metal requires the repository-pinned Xcode and verified build version')
-    sdk_version = subprocess.check_output(xcrun + ['--show-sdk-version'], text=True).strip()
-    if lock['sdk'] != sdk or lock['sdkVersion'] != sdk_version:
-        raise ValueError('Metal SDK does not match verified tool lock')
+    pin = xcode_pin(root)
+    if require_pin and (not xcode or xcode.splitlines()[0] != 'Xcode ' + pin):
+        raise ValueError('Metal requires the repository-pinned Xcode ' + pin + ' (found ' +
+                         repr(xcode.splitlines()[0] if xcode else '') + '); select it with DEVELOPER_DIR')
+    observed = {'xcodeVersion': xcode, 'sdk': sdk,
+                'sdkVersion': subprocess.check_output(xcrun + ['--show-sdk-version'], text=True).strip()}
     binaries = {}
     for name in ('metal', 'metallib'):
         binary = Path(subprocess.check_output(xcrun + ['--find', name], text=True).strip())
-        digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-        if digest != lock[name + 'Sha256']:
-            raise ValueError('Metal tool binary does not match verified lock: ' + name)
+        observed[name + 'Sha256'] = hashlib.sha256(binary.read_bytes()).hexdigest()
         binaries[name] = binary
+    return observed, binaries
+
+
+def metal_tool_lock_differences(lock, observed):
+    """(key, locked, observed) for every lock field that differs; unknown keys count too."""
+    if not isinstance(lock, dict):
+        return [('<lock>', lock, 'a JSON object')]
+    keys = list(METAL_TOOL_LOCK_KEYS) + sorted(set(lock) - set(METAL_TOOL_LOCK_KEYS))
+    return [(key, lock.get(key), observed.get(key)) for key in keys if lock.get(key) != observed.get(key)]
+
+
+def compile_metal(output, sdk, tool_lock, root=ROOT, developer_dir=None, lock_kind='committed'):
+    """Compile translated sources using an explicitly verified Apple tool lock.
+
+    tool_lock is a path or object: a single-SDK lock, or the committed multi-SDK
+    lock (its entry for sdk is used). A 'development' lock_kind is one a local
+    build recorded from a non-pinned Xcode; it is never acceptable for release
+    (renderer_shaders.prepare enforces that) and is recorded in the receipt.
+    Xcode selection remains local to these subprocesses. Unknown compiler/SDK
+    binaries fail closed; source translation alone never advertises Metal.
+    """
+    output = Path(output)
+    lock = tool_lock if isinstance(tool_lock, dict) else json.loads(Path(tool_lock).read_text())
+    # iOS ships only from the pinned Xcode; macOS from any reviewed runner toolchain.
+    observed, binaries = observe_metal_tools(sdk, root, developer_dir,
+                                             require_pin=lock_kind != 'development' and sdk != 'macosx')
+    if isinstance(lock, dict) and 'toolchains' in lock:
+        entries = metal_tool_lock_entries(lock, sdk)
+        lock = next((entry for entry in entries if not metal_tool_lock_differences(entry, observed)),
+                    entries[0] if entries else {'sdk': '<no reviewed toolchain for ' + sdk + '>'})
+    differences = metal_tool_lock_differences(lock, observed)
+    if differences:
+        keys = [key for key, _, _ in differences]
+        if 'xcodeVersion' in keys:
+            reason = 'Metal requires the repository-pinned Xcode and verified build version'
+        elif 'sdk' in keys or 'sdkVersion' in keys:
+            reason = 'Metal SDK does not match verified tool lock'
+        elif keys[0] in ('metalSha256', 'metallibSha256'):
+            reason = 'Metal tool binary does not match verified lock: ' + keys[0][:-len('Sha256')]
+        else:
+            reason = 'Metal tool lock has unexpected fields'
+        raise ValueError(reason + ' (' + str(tool_lock) + ': ' + ', '.join(keys) + '). ' + METAL_TOOL_LOCK_REMEDY)
+    prefix = ['/usr/bin/env', 'DEVELOPER_DIR=' + developer_dir] if developer_dir else []
+    xcrun = prefix + ['xcrun', '--sdk', sdk]
     metadata_path = output / 'metadata.json'
     meta = json.loads(metadata_path.read_text())
     sources = meta.get('nativeTranslationReceipt', {}).get('metalSources')
@@ -464,7 +568,8 @@ def compile_metal(output, sdk, tool_lock, root=ROOT, developer_dir=None):
     for variant, stage, library, source in produced:
         register_artifact(meta, output, 'metal', variant, stage, library, 'metallib', source['entrypoint'])
         meta['shaderArtifacts']['metal'][variant][stage]['sourceSha256'] = source['sha256']
-    meta['nativeTranslationReceipt'].update({'metalLibrariesProduced': True, 'metalToolLock': lock})
+    meta['nativeTranslationReceipt'].update({'metalLibrariesProduced': True, 'metalToolLock': lock,
+                                             'metalToolLockKind': lock_kind})
     metadata_path.write_text(json.dumps(meta, indent=2) + '\n')
     return meta
 

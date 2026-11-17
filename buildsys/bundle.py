@@ -77,12 +77,23 @@ def createBundle(target, source, env) :
         if (assets/directory).is_dir():
             shutil.copytree(assets/directory, Path(bundleDir)/'Contents/Resources'/directory)
     copy_localizations(env.get('BUNDLE_RESOURCEDIRS', []), Path(bundleDir)/'Contents/Resources')
+    # SDL GPU's shaders, Metal libraries included; the runtime finds Resources/shaders
+    # through the file manager (GraphicContext::rendererShaderDirectory).
+    import renderer_shaders
+    shaders = Path(env['BUILDDIR'])/'shaders'
+    renderer_shaders.install_runtime_shaders(shaders, Path(bundleDir)/'Contents/Resources/shaders')
+    missing = renderer_shaders.missing_sdl_gpu_shaders(Path(bundleDir)/'Contents/Resources/shaders', 'macos')
+    if missing:
+        if renderer_shaders.require_committed_metal_lock():
+            renderer_shaders.require_sdl_gpu_shaders(Path(bundleDir)/'Contents/Resources/shaders', 'macos')
+        print('WARNING: Glob2.app has no SDL GPU Metal shaders (SDL GPU unavailable): ' + missing[0], file=sys.stderr)
     if env.get('RECORDING_PREFIX'):
         shutil.copytree(Path(env['RECORDING_PREFIX'])/'share/licenses/recording',Path(bundleDir)/'Contents/Resources/licenses/recording',dirs_exist_ok=True)
     run('cp COPYING %s/Contents/Resources/' % bundleDir)
     run('cp content/data/javascript-licenses.txt %s/Contents/Resources/' % bundleDir)
     run('cp content/data/json-license.txt %s/Contents/Resources/' % bundleDir)
     run('cp content/data/etcpak-license.txt %s/Contents/Resources/' % bundleDir)
+    run('cp content/data/astcenc-license.txt %s/Contents/Resources/' % bundleDir)
     run('cp docs/assets/source-attribution.md %s/Contents/Resources/' % bundleDir)
     # write Info.plist -- TODO actually write it not copy it
     plistFile = env['BUNDLE_PLIST']

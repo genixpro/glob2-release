@@ -5048,6 +5048,10 @@ Anslået chance for at din alliance vinder, målt gennem hele kampen. Allierede 
 Prestige
 [stat prestige about]
 Koloniens prestige, optjent med bygninger på højeste niveau. En kamp med et prestigemål slutter, når målet nås.
+[stat prestige needed]
+Prestige nødvendig for at vinde
+[stat prestige needed about]
+Den prestige, kolonien stadig skal optjene for at vinde på prestige: nok til, at kampens samlede prestige når målet, og til at overgå alle andre overlevende kolonier. Registreres kun, når kampen har et prestigemål.
 [stat band combat]
 Kamp
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Tik %0: %1 ms vægurstid
 AI for alle computerstyrede kolonier
 [tundra]
 Tundrajord
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

@@ -5058,6 +5058,10 @@ Tinatayang tsansang manalo ang iyong alyansa, na pana-panahong sinusukat habang 
 Prestihiyo
 [stat prestige about]
 Prestihiyo ng kolonya na nakukuha mula sa mga gusaling nasa pinakamataas na antas. Matatapos ang laban kapag naabot ang layuning prestihiyo nito.
+[stat prestige needed]
+Prestihiyong kailangan para manalo
+[stat prestige needed about]
+Ang prestihiyong kailangan pang makuha ng kolonya para manalo sa prestihiyo: sapat para maabot ng pinagsamang prestihiyo ng laban ang layunin, at para malampasan ang bawat iba pang kolonyang nakaligtas. Itinatala lamang kapag may layuning prestihiyo ang laban.
 [stat band combat]
 Labanan
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Hakbang %0: %1 ms na lumipas
 Nabigo ang pag-update ng standing order. Naka-pause ang iyong utos sa device na ito; gamitin muli ang kaukulang kontrol.
 [tundra]
 Lupang tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

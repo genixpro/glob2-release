@@ -5016,6 +5016,10 @@ FFmpeg не е наличен, така че записът е изключен.
 Престиж
 [stat prestige about]
 Престижът на колонията, спечелен от сгради от най-високо ниво. Мач с цел за престиж приключва, когато тя бъде достигната.
+[stat prestige needed]
+Престиж, нужен за победа
+[stat prestige needed about]
+Престижът, който колонията още трябва да спечели, за да победи чрез престиж: достатъчно, за да достигне общият престиж в мача целта, и да изпревари всяка друга оцеляла колония. Записва се само когато мачът има цел за престиж.
 [stat band combat]
 Бой
 [stat band starvation]
@@ -7102,3 +7106,33 @@ MCP сървър
 ИИ за всички компютърни колонии
 [tundra]
 Тундрова почва
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

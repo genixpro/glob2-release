@@ -457,12 +457,16 @@ profile, a low-roughness contour, so the waterline is a gentle curve the wash ca
 follow instead of a row of teeth. A material with surf counts as
 animated: its pages re-blend whenever the wash advances, also without texture
 animation. The optional `ticks` (default 1, at most `period`) advances the wash
-only once per that many animation ticks, so a material with still artwork can
-re-blend its pages about ten times a second (`ticks` 6) instead of every frame.
-The shipped waters all animate and re-blend every frame for their texture
-crossfade, so they keep `ticks` 1 for the smoothest wash. Surf is presentation only and never touches the
-simulation. `TerrainVisual::applySurf` is the integer reference that the
-`terrain-compose` shader mirrors exactly.
+of composed pages only once per that many animation ticks, so a material with
+still artwork can re-blend its pages about ten times a second (`ticks` 6)
+instead of every frame. The shipped waters all animate and re-blend every frame
+for their texture crossfade, so they keep `ticks` 1. Surf is presentation only
+and never touches the simulation. `TerrainVisual::applySurf` is the integer
+reference that the `terrain-compose` shader mirrors exactly. The direct pass
+moves the wash continuously instead: its phase is the reference's at every
+whole surf step and interpolates linearly between them (see
+[animation clock and smoothness](#animation-clock-and-smoothness)), so it
+matches the reference to well under one 1024th of a wash at whole steps.
 
 ## Caches and compatibility
 
@@ -473,8 +477,14 @@ only `LegacyTerrainFrames.h` still decodes classic frames, for old script memori
 
 `TerrainVisual::Compositor` owns prepared material sources. Source lifetime and
 content revisions, animation phase and native/HD selection invalidate prepared
-pixels. View caches hold 16×16-cell composed pages and compare recipes including
+pixels. View caches hold square composed pages and compare recipes including
 the surrounding lattice, so edits update neighboring tiles and wrapped chunks.
+A page is 512 pixels wide at every density: 16 cells at native density, 8 at
+twice and 4 at four times (`SoftwareTerrainCache::pageTilesAt`). A view at
+three or four times density (zoom 1.5 or 2 on a 2x display) then needs little
+more than its own area in pages and fits the budget below, where 16-cell pages
+(2048 pixels at four times) cost up to twice that for their alignment and
+dropped the view to twice density, a softer image than the other renderers' HD.
 Each page and tile tracks revisions only for materials used by its discovered
 recipes; an animation outside that dependency set does not rebuild the page.
 Sampling density is part of the page key. Old densities retain their composed
@@ -484,12 +494,84 @@ discovery and material revisions before reusing its pixels.
 The historical `SoftwareTerrainCache` name is retained for benchmark controls,
 but the cache also draws GPU pages. Software page storage stays bounded by
 32 MiB. GPU density selection retains its 128 MiB allowance, and resident
-textures remain bounded by 128 MiB of conservative texture/mip reservations.
+textures remain bounded by 128 MiB of conservative texture reservations: a
+page's texture and its mips (three times its pixels with the CPU copy), or
+twice its pixels on the portable SDL renderer, whose page textures have no
+mips. `TERRAIN_PAGE_ADMISSION` on stderr records each change of a view's page
+density, page size and the reason it is coarser than the compositor's
+(`page budget`, `texture size`).
 On desktop, the total GPU-page cache has a 256 MiB ceiling including CPU pixels,
 bookkeeping and resident texture reservations. The additional 128 MiB lets
 inactive zoom densities retain their CPU pixels without sacrificing sampling
 quality. Android and browser builds retain the 128 MiB total ceiling.
 These are maximum memory allowances, not up-front allocations.
+
+Interactive views on accelerated page renderers without device composition (the
+portable SDL renderer, and browser legacy OpenGL composing HD pages) never
+compose a page inside the frame. A cold page is described from the scene on the
+graphics thread and composed by the shared presentation workers
+(`render/BackgroundWork.h`) from an immutable material snapshot; a page at a
+reduced density whose native page is retained is reduced on the workers from a
+copy of that page instead, except its mixed cells, which off the render devices
+compose at the reduced density (`Compositor::compose` with a reduction) so their
+shore lines match the direct pass. There are half as many workers as logical CPUs,
+between two and four: at normal game speed the simulation needs about one core,
+and in the pan-and-zoom benchmark more than four workers neither filled missing
+pages faster nor kept frames shorter, because the graphics thread's per-frame
+launch and install budgets set the pace. `GLOB2_BACKGROUND_RENDER_WORKERS=N` (1 to 64)
+overrides the count for measurements. Until it
+arrives the view draws the same place at its nearest other density (the larger
+page holding it, clipped to it, or the smaller pages within it), or the
+overview beneath where none, or only part, exists; the overview then draws, and
+composes, only those missing pages. The portable renderer also keeps a resident
+base: the whole map in native 16-cell pages reduced to 16 pixels a cell (8 or 4
+on maps too large for half the platform's `TerrainPage` texture allowance:
+64 MiB on desktop, 32 MiB with the mobile budget), composed two pages a frame
+from the view outward on the workers' lower lane from the first interactive
+frame, uploaded on arrival with their CPU pixels released, and never evicted. A
+missing page whose other densities do not cover it draws its base page, with any
+nearer partial density over it, so a fast zoom or jump shows textured terrain at
+no coarser than 16 pixels a cell rather than the flat-coloured overview. A base
+page whose cells' terrain or discovery changed draws nothing and composes again;
+its animated cells animate like any page's (see
+[Animated terrain on the portable renderer](#animated-terrain-on-the-portable-renderer)). A page that arrives where the view drew either fallback
+fades in over it in 150 ms rather than popping. Pages around the view also
+compose ahead of the camera: a ring one page wide, widened in the direction of a
+pan by about half a second of its recent motion and all round while the view is
+growing in a zoom out. Those launches wait until every visible page has
+arrived, use only the frame's leftover launch budget and half the in-flight room, run on the workers' lower priority lane
+(`BackgroundWork::Priority::Ahead`, taken only while no visible work waits), and
+admit a finished page only into free cache room or room held by pages the view
+has not used for two seconds, so they never displace a stand-in. A page composing
+ahead that the view reaches is queued again as visible work; each job runs once,
+whichever lane takes it. Visible pages install before pages composed ahead. On
+browser Legacy OpenGL composing HD pages, uniform animated cells (open water) draw over
+their page from one shared tile per material variant at the page's density, so
+an animation step recomposes and uploads those few tiles, not the pages. Any
+other animation or surf step of a valid page (shorelines) queues its changed
+cells the same way while the view keeps drawing the current pixels; finished
+cells upload as dirty rectangles. The portable renderer animates from keyframes
+instead (below). Each frame describes at most
+4096 cells for launches (a native page copied for a reduction counts as 64)
+within 2 ms of graphics-thread time spent describing (one launch always goes),
+keeps at most four visible pages per worker plus four in flight and 64 MiB of
+page buffers, and installs at most sixteen finished pages within 8 MiB. Missing
+pages that nothing stands in for (where the overview shows) go first, then
+those nearest the view centre, and work for pages the view left is cancelled. Missing pages take build
+slots first: refreshes use at most half of them, and none while a missing page
+waited for a slot the frame before, so animated water cannot starve the edges
+of the view. Pages record the discovery
+revision they were checked against, so unchanged views skip per-cell fog checks.
+The compositor caches the material variants each 16×16 page uses until the
+terrain revision changes, so preparing a view unions short lists rather than
+visiting every cell. On the portable renderer a drawn page that is not
+native density and has nothing animated outside the shared tiles keeps only its
+texture: its CPU pixels go, and a change, an evicted texture or a renderer reset
+composes it again. Pages neither drawn nor standing in for about ten seconds
+leave the cache, as do animated tile sets, and the last material snapshot goes
+two seconds after the last launch. The editor, tiled captures, offscreen draws
+(map exports) and `DRAW_COMPLETE_TERRAIN` draws still compose every page before
+drawing.
 Generated/edited pages keep alpha-weighted mip filtering but upload uncompressed
 textures. Driver-side DXT encoding is reserved for artwork with prepared mip
 chains; repeating that encoding on animated terrain updates stalls rendering.
@@ -500,6 +582,9 @@ to that many recompositions per phase (see
 reuses their pixels. Interactive HD terrain on Legacy OpenGL draws animated
 cells, including mixed shorelines, through the atlas shader. A separate source
 atlas holds visible current/next HD phases within 16 MiB and blends every frame.
+While a phase draws, the workers filter the endpoint after next
+(`Animation::Entry::ahead`), so the step that needs it writes it at once: a
+step never draws a stale endpoint while its new one is filtered.
 Static page draws omit those complete cells, so alpha and fog apply once.
 Shore calming fades wave contrast over two tiles from the shoreline.
 Device composition keeps up to 1024 material source
@@ -539,19 +624,57 @@ for recipes and bookkeeping plus density-dependent pixel storage. Increasing it
 can retain more detail but does not remove the need to handle oversized views.
 If the complete view cannot retain all of its textures simultaneously, but its
 CPU pages and one texture upload fit, the cache keeps those CPU pages and retires
-textures in drawing order as needed. This preserves the selected sampling and
+textures in drawing order as needed. Before retiring a texture the frame draws,
+an upload retires idle textures and then drops idle pages that hold only pixels
+(such as HD pages parked before a zoom out); when every remaining page is drawn
+this frame, the page waits for a later frame instead of failing it. This preserves the selected sampling and
 avoids repeated boundary composition near page-alignment budget thresholds.
 Only a view whose CPU pages and one upload cannot fit uses composition streaming.
 First-time composition still evaluates native terrain before reduction; this
 policy removes repeated work on warm frames, not the cost of a cold frame.
 
-Overview palette samples have a separate 32 MiB CPU page cache. Its pages keep
-canonical world coordinates across viewport movement, atlas tiles and zooms.
-Vertex windows include the contextual contour halo; terrain seeds, immutable
-terrain/resource registries and map asset bundles also invalidate the samples.
-Resource tint is refreshed when its type or discovery changes. Texture animation
-and blend opacity do not change the overview palette. The viewport scratch image
-continues to use the original 4×4 samples per cell and rendering path.
+Overview palette samples have a separate 48 MiB page cache (CPU pixels and the
+texture each page uploads). A view larger than that keeps all its pages, and the
+cache drops back to the budget once the view is smaller again. Interactive views
+compose overview cells on the presentation workers within a per-frame budget
+(1.5 ms of graphics-thread time describing cells). Beneath cells still composing
+the view draws the other density where it has them and otherwise the whole-map
+base: one linearly filtered texel per cell, the mean of its corners' overview
+colours, composed by a worker from the snapshot's immutable vertex storage as the
+map loads and again after a terrain edit (4 bytes a cell, twice for its texture;
+2 MiB for a 512 by 512 map). The overview therefore never shows a transparent
+patch once the base is ready, a frame or two after the map loads. A page whose
+first cells arrive after it was drawn empty fades in over the base in 150 ms.
+A page covers 64 by 64 cells (the whole map when it is smaller), so a whole 256
+by 256 map is 16 page textures. From the start of a game the cache also prewarms pages at the density the
+farthest zoom draws, spiralling out from the view's centre within three
+quarters of its allowance (less what the view holds) on the workers' lower priority lane, and
+starts the spiral again around a new centre after a jump or a pan of two pages;
+a prewarming batch for a page the view then waits on is queued again as visible
+work. On a presentation device the complete prewarmed pages are then admitted to
+the device adapter ahead of the zoom, nearest the view first, with the upload
+allowance the frame leaves, so a zoom out draws all of them on its first frame (that
+frame copies them to the GPU, 4 MiB for a 256 by 256 map at four samples). Describing cells stops at the frame budget
+even within a page, checked every 64 described cells. Captures, exports and other one-shot draws compose every cell first. Its pages keep canonical world coordinates across
+viewport movement, atlas tiles and zooms that keep the same samples per cell. Vertex windows include the contextual
+contour halo; terrain seeds, immutable terrain/resource registries and map asset
+bundles also invalidate the samples. Texture animation and blend opacity do not
+change the overview palette.
+
+A cell takes 8×8 samples once it covers at least six device pixels on screen and
+4×4 below that (switching back below five), so the image never holds much more
+detail than the display can show. A view whose 8×8 image would exceed the
+device's maximum texture size uses 4×4. A density change replaces every page.
+
+A resource leaves the terrain colour visible and adds a square in its minimap
+colour, centred in the cell, that grows with the cell's stock out of the
+resource's total yield capacity. Its side is 1 sample at the lowest stock and
+rounds down, so only full stock reaches half the cell: 1, 1, 1, 1, 2 samples at
+4×4 and 1, 2, 2, 3, 4 at 8×8 for stocks 1 to 5 of 5. An odd leftover sample
+falls below and to the right of the square, so a 1-sample square sits just
+above and left of the centre and the gap between neighbouring squares is half
+a cell at full stock. A cell is
+recomposed when its resource type, square size or discovery changes.
 
 The `TerrainPresentation` tests cover zoomed-out cache admission and warm reuse,
 wrapped views, alpha-weighted coast reduction, terrain-edit invalidation,
@@ -578,5 +701,119 @@ decoding. Map image interchange colors and editor experiment gates remain semant
 metadata.
 Keep reference screenshots, benchmark output and temporary compiled tilesets under
 `artifacts/`; publish review evidence separately from durable documentation.
+
+## Animation clock and smoothness
+
+Water, surf and lava move by exactly the time elapsed on every presented frame,
+at any frame rate, and in step across the view and the renderers.
+`AnimationClock` (`src/render/AnimationClock.h`) counts real time in steps of
+1/60 s, the rate the materials' `animation_ticks` were tuned at; each frame it
+returns the whole steps and the fraction of the next step already elapsed. A
+view's presentation time (`MapRenderState::animationNow()`, an `AnimationTime`)
+is those steps plus that fraction, the same for every consumer of the frame. A
+long frame counts as at most 0.1 s, a pause freezes both parts, and
+`fixedSteps` (whole steps, no fraction), `simulatedFrameNs` (a fixed frame
+interval, fractions included) and `presetNext` keep tests and captures
+deterministic.
+
+What reads it:
+
+- **Direct pass** (SDL GPU, Programmable GL, Legacy OpenGL). `DirectTerrain`
+  hands the shaders the time wrapped at `TerrainVisual::animationPeriod`, the
+  least common multiple of every flipbook cycle (frames × ticks) and surf period
+  of the catalogue (81600 ticks, 22.7 minutes, for the shipped one). Every
+  animation repeats within it, so the wrap is seamless, and a float resolves
+  1/128 of a tick there however long a session runs. `material()` in
+  `DirectTerrainShader.h` crossfades by the elapsed share of the flipbook frame,
+  and `surf()` takes the wash phase from the continuous time; authored blend
+  steps and surf `ticks` quantise composed pages only.
+- **Portable SDL** draws each animated cell's next keyframe at the elapsed share
+  of the keyframe interval (`AnimationTime::cycle`,
+  `SoftwareTerrainCache::keyframeAlpha`), from the same presentation time.
+- **Whole-step consumers** read `steps`: flipbook frame selection and the HD
+  streaming window, composed pages (the software renderer and browser Legacy
+  OpenGL, which stay correct and in phase but move only on frames that cross a
+  step), fertile-glint overlays, area markers and clouds.
+
+These guards must stay green; they fail if any link of the chain rounds time
+back to whole steps:
+
+- `AnimationClock` unit cases (headless): at 30, 60, 120 and 144 Hz, with and
+  without jitter, every frame's presentation time advances by exactly the
+  elapsed time; crossfade weights move by the elapsed share of their interval;
+  the wrapped time stays continuous and precise after a month of steps.
+- `TerrainAnimation` headless cases: the shipped catalogue's animations all
+  repeat within its wrap period; the direct pass's crossfade weight and wash
+  phase, computed as `DirectTerrainShader.h` computes them (whose expressions the
+  case also pins) from the uniform `DirectTerrain` passes, move by exactly the
+  elapsed time every frame and across the wrap; the portable keyframe alpha
+  moves by the elapsed share every frame.
+- `TerrainAnimation` display cases, two per renderer: a sand island in water
+  drawn through the whole map draw path for 24 frames at each rate, starting
+  just before the wrap. The first case waits until terrain has settled at each
+  frame's time; the second draws the frames back to back at the display's pace
+  while background work lands when it lands. For each frame, the crossfade
+  weight the open water shows between the two flipbook frames around its time
+  (a least-squares fit over the channels those frames differ in by 12 levels or
+  more, so 8-bit rounding averages out) must be within 0.03 of the share of the
+  flipbook frame elapsed. The water and the wash change every frame; the wash
+  moves at a steady pace with no shoreline flashes; open-water cells in
+  different pages that matched at the start stay identical. The software
+  renderer instead shows the weight of the whole step and changes exactly on
+  the frames that cross a step. The mean change of one 8-bit frame is no
+  measure of smoothness at high frame rates: a water frame differs from the next
+  by a few levels, so most pixels move by less than one level a frame, and
+  rounding, not the animation, sets which frames change most. A last case
+  draws the same scene on every renderer at a whole step and half a step later
+  and checks they agree, and that each interpolating renderer's half-step image
+  is nearer the reference's at that time than at the step before.
+  `GLOB2_ANIMATION_TEST_RENDERERS` limits the renderers on a machine where some
+  must not run.
+
+## Animated terrain on the portable renderer
+
+The portable SDL renderer has only 2D textures and blend modes, so it cannot
+evaluate the animation per pixel as the direct pass's shader does. Its
+interactive views keep animation out of the pages altogether: a page holds
+still pixels, and animation changes no page's recorded revisions. Every
+discovered cell that an animated material covers, or whose surf band reaches
+from a halo neighbour, draws over its page each frame as a crossfade of two
+**keyframes**: its composition at the animation times `k * K` and
+`(k + 1) * K`, where `k` is the current time divided by `K`, the shortest
+`animation_ticks` of the catalogue's animated materials (6 for the shipped
+waters; 6 for a material whose surf alone moves). The keyframe `k` draws at the
+page's opacity and `k + 1` over it at the fraction of `K` elapsed, the weight the
+direct pass blends its two endpoints with. Composition is linear in each
+animated texel, so this crossfade equals the composition of the crossfaded
+textures: for water, whose blend steps equal its ticks, it is the direct pass's
+image to within 8-bit alpha rounding. The weight comes from the
+presentation time, fraction included, so the crossfade moves every frame (see
+[animation clock and smoothness](#animation-clock-and-smoothness)). Surf is
+interpolated linearly between keyframes 0.1 s apart, well under a pixel of
+wash. Lava (16 ticks, 4 blend steps) is sampled every 6 ticks and so blends
+between its own composed steps: smooth, and within an eighth of its frame
+difference of the direct pass's continuous crossfade.
+
+Keyframes compose on the presentation workers from a material snapshot of the
+compositor prepared at the keyframe's time: the view prepares the compositor
+for `k + 2`, the keyframe needed next, so each one composes a whole interval
+before it shows, and keeps the snapshots of `k` and `k + 1`. A missing snapshot
+(after a jump, or with the clock stopped) is prepared first; one taken from older
+artwork (HD frames that have since arrived, or changed still materials) or
+without a variant a cell needs is prepared again at most every ten frames, and its
+cells' keyframes compose again. A uniform uncalmed cell shares one keyframe per
+variant with every cell of its material at its page's density; a mixed,
+calmed or halo cell has its own, composed from the page's kept coverage mask
+and, where an earlier keyframe of the cell holds the same still artwork, only
+over the samples animation changes. Each set of keyframes is an atlas with a
+band per keyframe of a three-slot ring, every slot bordered by a copy of its
+edge for linear sampling; the keyframes a frame installs upload as one rectangle
+per band. The cells the view shows and a margin of two cells want the keyframes
+`k` to `k + 2`, the current one first, at most 2048 cells a frame and 8192 in
+flight. Stand-ins (other densities and the resident base) animate the same way
+at their own density. A cell with neither keyframe yet shows its page's still
+pixels; a page arriving over a fallback holds its fade, for at most 500 ms,
+until its visible animated cells have keyframes. Keyframe sets of pages the view
+left for two seconds, and shared sets unused for ten, are released.
 
 Related: [asset production](README.md).

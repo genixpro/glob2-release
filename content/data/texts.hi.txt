@@ -5016,6 +5016,10 @@ AI टेलीमेट्री
 प्रतिष्ठा
 [stat prestige about]
 सर्वोच्च स्तर की इमारतों से मिली बस्ती की प्रतिष्ठा। प्रतिष्ठा लक्ष्य वाला मैच लक्ष्य पूरा होने पर समाप्त होता है।
+[stat prestige needed]
+जीत के लिए आवश्यक प्रतिष्ठा
+[stat prestige needed about]
+वह प्रतिष्ठा जो बस्ती को प्रतिष्ठा से जीतने के लिए अभी और अर्जित करनी होगी: इतनी कि मैच की कुल प्रतिष्ठा लक्ष्य तक पहुँचे, और बची हुई हर दूसरी बस्ती से आगे निकल जाए। केवल तभी दर्ज होती है जब मैच में प्रतिष्ठा लक्ष्य हो।
 [stat band combat]
 युद्ध
 [stat band starvation]
@@ -7102,3 +7106,33 @@ MCP सर्वर चालू करें
 स्थायी आदेश को अपडेट करना विफल रहा। आपका आदेश इस डिवाइस पर अस्थायी रूप से रोका गया है; संबंधित नियंत्रण का उपयोग करके फिर से प्रयास करें।
 [tundra]
 टुंड्रा की भूमि
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

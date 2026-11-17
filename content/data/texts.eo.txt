@@ -5048,6 +5048,10 @@ Taksita ŝanco, ke via alianco venkos, specimenigita dum la tuta matĉo. Alianca
 Prestiĝo
 [stat prestige about]
 La prestiĝo de la kolonio, gajnita per plej altnivelaj konstruaĵoj. Matĉo kun prestiĝa celo finiĝas kiam ĝi estas atingita.
+[stat prestige needed]
+Prestiĝo bezonata por venki
+[stat prestige needed about]
+La prestiĝo, kiun la kolonio ankoraŭ devus gajni por venki per prestiĝo: sufiĉe por ke la kuna prestiĝo de la matĉo atingu la celon, kaj por superi ĉiun alian pluvivantan kolonion. Registrata nur kiam la matĉo havas prestiĝan celon.
 [stat band combat]
 Batalo
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Takto %0: %1 ms reala tempo
 AI por ĉiuj komputile regataj kolonioj
 [tundra]
 Tundra grundo
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

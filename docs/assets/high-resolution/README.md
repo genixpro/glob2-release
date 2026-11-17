@@ -7,9 +7,16 @@ rigs. The pack also includes reviewed AI-enhanced sprites, original-based terrai
 resampled masks, and complete padded resource/terrain mip atlases.
 All overlapping original-derived frames remain byte-identical.
 
-World artwork includes both hives, 3 flags, 5 construction frames, 10 trees, 8 wheat, 5 papyrus,
+World artwork includes both hives, 3 flags, 5 construction frames, 10 trees, 10 wheat (two ripe frames recoloured from stage 4 by
+`tools/artwork/ripen_wheat.py`), 5 papyrus,
 completed middle school, first two racetracks and 24 area markers, plus the
 hand-authored farm-area marker (8 frames drawn as SVG in `content-src/gfx/authored`).
+The 12 carried-material icons (`ressourcemini`, drawn beside a harvesting unit
+and in the unit panel) are SVG too, drawn in the style of each material's map
+resource. Their classic icons stay as they are; `render_authored.py --check`
+keeps each icon's downscaled mean colour within CIEDE2000 2 of its classic
+icon, or within 12 for stone and the later materials, whose classic icons are
+far duller than their map art.
 
 Assemble approved PNG sources: `python3 tools/artwork/package_runtime.py`.
 Client builds encode those sources with the shared WebP pipeline. For a complete
@@ -26,6 +33,11 @@ The HD terrain atlas covers 272 legacy connected tiles. The catalogue materials
 production folder; `tools/artwork/terrain_synth.py` writes and registers them
 together with the classic tiles. Catalog ice now has procedural HD artwork;
 the old connected ice frames and legacy cobblestone sprites retain native fallback.
+Every AI-upscaled base layer then goes through `tools/artwork/sharpen_upscales.py`:
+resource frames get a crisp outline and sharpened shading, while buildings, walls
+and effects get colour sharpening only, so soft shadows, smoke and glow survive.
+Team-colour layers stay unchanged. It reads its inputs from Git, so rerunning it
+reproduces the committed pixels, then rebuilds the resource atlas.
 AI candidates are generated into fresh staging directories only; see the
 [candidate pipeline](../../../tools/artwork/ai/README.md). Production packaging
 reproduces the committed reviewed finals without model inference.

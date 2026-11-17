@@ -5048,6 +5048,10 @@ A szövetséged győzelmének becsült esélye, a játék során folyamatosan m�
 Presztízs
 [stat prestige about]
 A kolónia presztízse, amelyet a legmagasabb szintű épületek hoznak. A presztízscélú mérkőzés a cél elérésekor véget ér.
+[stat prestige needed]
+A győzelemhez szükséges presztízs
+[stat prestige needed about]
+Az a presztízs, amelyet a kolóniának még meg kellene szereznie a presztízsgyőzelemhez: elég ahhoz, hogy a mérkőzés összesített presztízse elérje a célt, és hogy megelőzzön minden más túlélő kolóniát. Csak akkor rögzül, ha a mérkőzésnek van presztízscélja.
 [stat band combat]
 Harc
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Szükséges várakozások: %0 ms; tulajdonos-összevárások: %1 ms; zárolások
 MI minden számítógép vezérelte kolóniához
 [tundra]
 Tundratalaj
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

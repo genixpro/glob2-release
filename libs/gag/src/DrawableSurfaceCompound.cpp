@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "GraphicContextPrivate.h"
+#include <HighResolutionPolicy.h>
 #include <Toolkit.h>
 #include <SurfaceRaster.h>
 #include <FileManager.h>
@@ -280,9 +281,9 @@ namespace GAGCore
 	// recoloured copy of the team layer in memory or on the GPU. Units reach it
 	// from the world and from UI previews, and pick native or HD per
 	// blockHasCompleteHD (one resolution throughout an action); other sprites
-	// with a team layer (buildings) take whichever resolution each layer has.
-	// The quad always has the sprite's logical size: HD only adds sampling
-	// density. False, drawing nothing, when the frame has no team layer or the
+	// with a team layer (buildings) draw HD only once every layer is HD. Both
+	// draw native whenever the HD sprite policy does. The quad always has the
+	// sprite's logical size: HD only adds sampling density. False, drawing nothing, when the frame has no team layer or the
 	// shader is unavailable (software renderer, or a compile or link failure);
 	// the caller then draws the layers separately.
 	bool DrawableSurface::drawTeamShaderSprite(float x, float y, float w, float h, Sprite *sprite, unsigned index, Uint8 alpha)
@@ -290,9 +291,10 @@ namespace GAGCore
 		if (this != _gc || !(_gc->getOptionFlags() & GraphicContext::USEGPU) || !_gc->hasUnitShader())
 			return false;
 		DrawableSurface *base, *team;
+		const bool shown = Sprite::highResolutionShown();
 		if (sprite->dynamicTeamColor)
 		{
-			const bool useHD = sprite->blockHasCompleteHD(index)
+			const bool useHD = shown && sprite->blockHasCompleteHD(index)
 				&& (sprite->experimentImages[index] || sprite->experimentRotated[index]);
 			base = useHD ? sprite->experimentImages[index] : sprite->images[index];
 			team = useHD
@@ -301,14 +303,99 @@ namespace GAGCore
 		}
 		else
 		{
-			const auto *hdTeam = index < sprite->experimentRotated.size() ? sprite->experimentRotated[index] : nullptr;
 			const auto *nativeTeam = sprite->rotated[index];
-			if (!hdTeam && !nativeTeam) return false;
+			const auto *hdTeam = index < sprite->experimentRotated.size() ? sprite->experimentRotated[index] : nullptr;
 			auto *hdBase = index < sprite->experimentImages.size() ? sprite->experimentImages[index] : nullptr;
-			base = hdBase ? hdBase : sprite->images[index];
-			team = hdTeam ? hdTeam->orig : nativeTeam->orig;
+			if (!hdTeam && !nativeTeam) return false;
+			const bool hd = HighResolutionPolicy::frameDrawsHighResolution(shown, sprite->images[index], nativeTeam,
+				hdBase, hdTeam);
+			base = hd ? hdBase : sprite->images[index];
+			team = hd ? (hdTeam ? hdTeam->orig : nullptr) : (nativeTeam ? nativeTeam->orig : nullptr);
+			if (!team) return false;
 		}
 		return _gc->drawTeamColoredQuad(base, team, x, y, w, h, alpha, sprite->teamHueShiftDegrees());
+	}
+
+	bool DrawableSurface::drawDeviceTeamLayer(float x, float y, float w, float h, Sprite *sprite, unsigned index,
+	                                          bool experiment, Uint8 alpha)
+	{
+		if (this != _gc || !_gc->hasDeviceTeamColor())
+			return false;
+		// The layer prepareDrawSurface would recolour, uncoloured: the shader
+		// applies the hue, so no team-coloured copy is made or cached.
+		DrawableSurface *team = nullptr;
+		if (experiment && index < sprite->experimentRotated.size() && sprite->experimentRotated[index] &&
+		    sprite->experimentRotated[index]->orig->hasPixels())
+			team = sprite->experimentRotated[index]->orig;
+		else if (sprite->rotated[index])
+			team = sprite->rotated[index]->orig;
+		if (!team)
+			return true;
+		if (w < 0)
+		{
+			w = static_cast<float>(team->getW());
+			h = static_cast<float>(team->getH());
+		}
+		return _gc->drawTeamColorSurface(x, y, w, h, team, sprite->teamHueShiftDegrees(), alpha);
+	}
+
+	bool DrawableSurface::drawHighResolution(float x, float y, float w, float h, Sprite *sprite, unsigned index,
+	                                         Uint8 alpha)
+	{
+		if (this != _gc)
+			return false;
+		// A released frame lives only in the renderer's texture (portable) or
+		// the device's retained snapshot: another pass (a capture's offscreen
+		// pass) draws the native frame instead.
+		if (index < sprite->experimentImages.size() && sprite->experimentImages[index] &&
+			!sprite->experimentImages[index]->hasPixels())
+		{
+			const auto *hd = sprite->experimentImages[index];
+			const bool held = (hd->portableReleased() && _gc->renderer == _gc->portableRenderer.get()) ||
+				(hd->deviceReleased() && _gc->renderer && _gc->renderer == _gc->deviceRenderer.get());
+			if (!held) return false;
+		}
+		if (!sprite->highResolutionDrawable(index))
+			return false;
+		if (auto *surface = sprite->prepareDrawSurface(index, false, true))
+		{
+			drawSurface(x, y, w, h, surface, alpha);
+			// Uploaded now: the texture can hold the only copy.
+			sprite->releaseDrawnHighResolution(index);
+		}
+		// A device with the team-colour material samples the HD team layer
+		// itself; elsewhere a recoloured copy draws.
+		if (sprite->rotated[index] && drawDeviceTeamLayer(x, y, w, h, sprite, index, true, alpha))
+			return true;
+		if (auto *surface = sprite->prepareDrawSurface(index, true, true))
+		{
+			drawSurface(x, y, w, h, surface, alpha);
+			sprite->releaseDrawnTeamColor(index);
+		}
+		return true;
+	}
+
+	namespace
+	{
+		// Team-coloured building frames leave nearest-sampling ties unbiased
+		// while they draw (GraphicContext::nearestTiesUnbiased).
+		struct NearestTieScope
+		{
+			GraphicContext *context = nullptr;
+			bool previous = false;
+			NearestTieScope(DrawableSurface *target, GraphicContext *gc, bool building)
+			{
+				if (target != gc || !building)
+					return;
+				context = gc;
+				previous = gc->exchangeNearestTiesUnbiased(true);
+			}
+			~NearestTieScope()
+			{
+				if (context)
+					context->exchangeNearestTiesUnbiased(previous);
+			}
+		};
 	}
 
 	void DrawableSurface::drawSprite(float x, float y, Sprite *sprite, unsigned index,  Uint8 alpha)
@@ -321,8 +408,12 @@ namespace GAGCore
 		if (drawTeamShaderSprite(x, y, static_cast<float>(sprite->getW(index)),
 		                         static_cast<float>(sprite->getH(index)), sprite, index, alpha))
 			return;
+		if (drawHighResolution(x, y, static_cast<float>(sprite->getW(index)),
+		                               static_cast<float>(sprite->getH(index)), sprite, index, alpha))
+			return;
 
-		const bool wantsHDRoute = sprite->highResolutionAtlas || sprite->experimentImages[index] || sprite->experimentRotated[index];
+		const bool wantsHDRoute = Sprite::highResolutionShown() &&
+			(sprite->highResolutionAtlas || sprite->experimentImages[index] || sprite->experimentRotated[index]);
 		// A dynamicTeamColor sprite (unit) with an incomplete HD block must not
 		// take the per-frame HD routing below: that could mix HD and native
 		// resolutions across poses in one action. Falling through renders native.
@@ -335,9 +426,10 @@ namespace GAGCore
 		// Plain fallback: native only. Reached by the software renderer, by a
 		// shader-unavailable GPU without an HD counterpart to fall back to via
 		// the sized overload above, and by every sprite with no team layer.
+		NearestTieScope tie(this, _gc, sprite->rotated[index] && !sprite->dynamicTeamColor);
 		if (sprite->images[index])
 			drawSurface(x, y, sprite->images[index], alpha);
-		if (sprite->rotated[index])
+		if (sprite->rotated[index] && !drawDeviceTeamLayer(x, y, -1, -1, sprite, index, false, alpha))
 			drawSurface(x, y, sprite->getRotatedSurface(index), alpha);
 	}
 
@@ -351,12 +443,21 @@ namespace GAGCore
 		if (drawTeamShaderSprite(static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
 		                         static_cast<float>(h), sprite, index, alpha))
 			return;
-		bool experiment = this == _gc && (_gc->getOptionFlags() & GraphicContext::USEGPU);
+		if (drawHighResolution(static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
+		                               static_cast<float>(h), sprite, index, alpha))
+			return;
+		// Legacy GL draws HD layers only where the HD sprite policy shows them.
+		bool experiment = this == _gc && (_gc->getOptionFlags() & GraphicContext::USEGPU) &&
+			Sprite::highResolutionShown();
+		NearestTieScope tie(this, _gc, sprite->rotated[index] && !sprite->dynamicTeamColor);
 		if (auto surface = sprite->prepareDrawSurface(index, false, experiment))
 			drawSurface(x, y, w, h, surface, alpha);
 		// The team layer draws into the exact same destination box as the base
 		// layer above, regardless of the HD/native texture's own pixel size --
 		// drawSurface always stretches a surface's content to fit (x,y,w,h).
+		if (drawDeviceTeamLayer(static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
+		                        static_cast<float>(h), sprite, index, experiment, alpha))
+			return;
 		if (auto surface = sprite->prepareDrawSurface(index, true, experiment))
 			drawSurface(x, y, w, h, surface, alpha);
 	}
@@ -371,9 +472,17 @@ namespace GAGCore
 		if (drawTeamShaderSprite(static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
 		                         static_cast<float>(h), sprite, index, alpha))
 			return;
-		bool experiment = this == _gc && (_gc->getOptionFlags() & GraphicContext::USEGPU);
+		if (drawHighResolution(static_cast<float>(x), static_cast<float>(y), static_cast<float>(w),
+		                               static_cast<float>(h), sprite, index, alpha))
+			return;
+		// Legacy GL draws HD layers only where the HD sprite policy shows them.
+		bool experiment = this == _gc && (_gc->getOptionFlags() & GraphicContext::USEGPU) &&
+			Sprite::highResolutionShown();
+		NearestTieScope tie(this, _gc, sprite->rotated[index] && !sprite->dynamicTeamColor);
 		if (auto surface = sprite->prepareDrawSurface(index, false, experiment))
 			drawSurface(x, y, w, h, surface, alpha);
+		if (drawDeviceTeamLayer(x, y, w, h, sprite, index, experiment, alpha))
+			return;
 		if (auto surface = sprite->prepareDrawSurface(index, true, experiment))
 			drawSurface(x, y, w, h, surface, alpha);
 	}

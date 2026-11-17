@@ -5016,6 +5016,10 @@ AI టెలిమెట్రీ
 ప్రతిష్ట
 [stat prestige about]
 అగ్రశ్రేణి భవనాల ద్వారా కాలనీ ప్రతిష్ట లభిస్తుంది. ప్రతిష్ట లక్ష్యాన్ని చేరుకున్నప్పుడు, ఆ మ్యాచ్ ముగుస్తుంది.
+[stat prestige needed]
+గెలవడానికి అవసరమైన ప్రతిష్ట
+[stat prestige needed about]
+ప్రతిష్టతో గెలవడానికి కాలనీ ఇంకా సంపాదించాల్సిన ప్రతిష్ట: మ్యాచ్ మొత్తం ప్రతిష్ట లక్ష్యాన్ని చేరేంత, మిగిలి ఉన్న ప్రతి ఇతర కాలనీని అధిగమించేంత. మ్యాచ్‌కు ప్రతిష్ట లక్ష్యం ఉన్నప్పుడు మాత్రమే నమోదు అవుతుంది.
 [stat band combat]
 పోరాటం
 [stat band starvation]
@@ -7102,3 +7106,33 @@ GL మాత్రమే
 స్థాయీ ఆదేశాన్ని నవీకరించడం విఫలమైంది. మీ ఆదేశం ఈ పరికరంలో తాత్కాలికంగా నిలిపివేయబడింది; సంబంధిత నియంత్రణను మళ్లీ ఉపయోగించండి.
 [tundra]
 టండ్రా నేల
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

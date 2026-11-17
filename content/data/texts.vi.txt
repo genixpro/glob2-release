@@ -5048,6 +5048,10 @@ Xác suất thắng
 Uy danh
 [stat prestige about]
 Uy danh của thuộc địa, có được nhờ các công trình cấp cao nhất. Trận đấu có mục tiêu uy danh sẽ kết thúc khi đạt mục tiêu đó.
+[stat prestige needed]
+Uy danh cần để thắng
+[stat prestige needed about]
+Uy danh mà thuộc địa vẫn cần đạt thêm để thắng bằng uy danh: đủ để tổng uy danh của trận đấu đạt mục tiêu, và vượt qua mọi thuộc địa còn sống sót khác. Chỉ được ghi lại khi trận đấu có mục tiêu uy danh.
 [stat band combat]
 Chiến đấu
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Nhịp %0: %1 ms thời gian thực
 AI cho mọi thuộc địa do máy tính điều khiển
 [tundra]
 Đất lãnh nguyên
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

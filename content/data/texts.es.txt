@@ -5048,6 +5048,10 @@ Probabilidad estimada de que tu alianza gane, muestreada a lo largo de la partid
 Prestigio
 [stat prestige about]
 El prestigio de la colonia, que se obtiene con edificios de nivel máximo. Una partida con objetivo de prestigio termina cuando se alcanza.
+[stat prestige needed]
+Prestigio necesario para ganar
+[stat prestige needed about]
+El prestigio que la colonia aún tendría que obtener para ganar por prestigio: suficiente para que el prestigio conjunto de la partida alcance el objetivo y para superar a todas las demás colonias supervivientes. Solo se registra cuando la partida tiene objetivo de prestigio.
 [stat band combat]
 Combate
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Ciclo %0: %1 ms de tiempo real
 IA para todas las colonias controladas por ordenador
 [tundra]
 Suelo de tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

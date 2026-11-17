@@ -5048,6 +5048,10 @@ Uppskattad chans att din allians vinner, mätt under hela matchen. Allierade del
 Prestigevärde
 [stat prestige about]
 Kolonins prestige, som tjänas in av byggnader på högsta nivå. En match med ett prestigemål slutar när det nås.
+[stat prestige needed]
+Prestige som krävs för att vinna
+[stat prestige needed about]
+Den prestige kolonin fortfarande skulle behöva tjäna in för att vinna på prestige: tillräckligt för att matchens sammanlagda prestige ska nå målet, och för att gå om varje annan överlevande koloni. Registreras bara när matchen har ett prestigemål.
 [stat band combat]
 Strid
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Steg %0: %1 ms väggtid
 AI för alla datorstyrda kolonier
 [tundra]
 Tundramark
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

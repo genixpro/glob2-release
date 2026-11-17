@@ -4,6 +4,7 @@
 #include "GraphicContextPrivate.h"
 #include <SpriteDrawBatch.h>
 #include <RenderBackend.h>
+#include <RenderDevice.h>
 #ifdef HAVE_OPENGL
 #include <AlphaMapRender.h>
 #endif
@@ -19,6 +20,18 @@ namespace GAGCore
 {
 namespace
 {
+// Admits one draw's texture in its surface's device budget class.
+struct BudgetClassScope
+{
+    RenderBackend &backend;
+    BudgetClassScope(RenderBackend &backend, TextureDescriptor::BudgetClass budget) : backend(backend)
+    {
+        backend.textureBudgetClass(budget);
+    }
+    ~BudgetClassScope() { backend.textureBudgetClass(TextureDescriptor::BudgetClass::General); }
+    BudgetClassScope(const BudgetClassScope &) = delete;
+    BudgetClassScope &operator=(const BudgetClassScope &) = delete;
+};
 template<class Alpha>
 void recordAlphaMap(RenderBackend &backend, std::span<const Alpha> map,
                     int mapW, int mapH, int x, int y, int cellW, int cellH,
@@ -46,6 +59,44 @@ void recordAlphaMap(RenderBackend &backend, std::span<const Alpha> map,
         if (batch.size()==chunkVertices) {backend.triangles(batch);batch.clear();}
     }
     if (!batch.empty()) backend.triangles(batch);
+}
+// The portable renderer draws an alpha map as one small texture of its
+// lattice, stretched with linear filtering so each texel centre lands on its
+// lattice point. One upload and one quad replace four triangles per cell.
+void drawAlphaMapTexture(RenderBackend &backend, std::span<const unsigned char> map, int mapW, int mapH,
+                         int x, int y, int cellW, int cellH, const Color &color)
+{
+    struct Slot
+    {
+        std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> pixels{nullptr, SDL_DestroySurface};
+        Uint32 rgb = 0;
+        std::uint64_t used = 0;
+    };
+    static Slot slots[4];
+    static std::uint64_t clock = 0, revision = 0;
+    const Uint32 rgb = Uint32(color.r) << 16 | Uint32(color.g) << 8 | color.b;
+    Slot *slot = nullptr;
+    for (auto &candidate : slots)
+        if (candidate.pixels && candidate.rgb == rgb)
+            slot = &candidate;
+    if (!slot)
+        slot = &*std::min_element(std::begin(slots), std::end(slots),
+                                  [](const Slot &a, const Slot &b) { return a.used < b.used; });
+    slot->used = ++clock;
+    slot->rgb = rgb;
+    if (!slot->pixels || slot->pixels->w != mapW || slot->pixels->h != mapH)
+    {
+        slot->pixels.reset(SDL_CreateSurface(mapW, mapH, SDL_PIXELFORMAT_ARGB8888));
+        if (!slot->pixels) throw std::bad_alloc();
+    }
+    for (int j = 0; j < mapH; ++j)
+    {
+        auto *row = reinterpret_cast<Uint32 *>(static_cast<Uint8 *>(slot->pixels->pixels) + j * slot->pixels->pitch);
+        for (int i = 0; i < mapW; ++i)
+            row[i] = Uint32(map[size_t(j) * mapW + i]) << 24 | rgb;
+    }
+    backend.blitLinear(slot, slot->pixels.get(), ++revision, SDL_Rect{0, 0, mapW, mapH},
+                       SDL_FRect{x - cellW * .5f, y - cellH * .5f, float(mapW * cellW), float(mapH * cellH)}, 255);
 }
 struct SpriteBatchState
 {
@@ -309,12 +360,130 @@ SpriteDrawBatch::~SpriteDrawBatch() noexcept(false)
 			DrawableSurface::drawSurface(x, y, w, h, surface, sx, sy, sw, sh, alpha);
 	}
 
+	std::vector<RenderMipLevel> GraphicContext::deviceMipLevels(DrawableSurface *surface, SDL_Surface *pixels)
+	{
+		// Use the existing alpha-weighted CPU chain for every device.
+		// Mutation creates a new owned upload revision before submission.
+		// Worker-prepared premultiplied blocks the device samples replace
+		// the RGBA levels; a chain that kept only blocks is prepared
+		// again for a device that cannot sample them.
+		const auto blocksFor = [this](AssetImage::BlockCompression prepared) {
+			const auto format = prepared == AssetImage::BlockCompression::PremultipliedBC3 ? TextureCompression::BC3
+				: prepared == AssetImage::BlockCompression::PremultipliedASTC4x4 ? TextureCompression::ASTC4x4
+				: TextureCompression::Uncompressed;
+			return presentationDevice->capabilities().supports(format) ? format : TextureCompression::Uncompressed;
+		};
+		auto blockFormat = surface->preparedMips.empty() || surface->preparedMips.front().compressed.empty()
+			? TextureCompression::Uncompressed : blocksFor(surface->preparedCompression);
+		const bool pixelsReleased = !surface->preparedMips.empty() && surface->preparedMips.front().pixels.empty();
+		if (surface->preparedUploadRevision != surface->contentRevision() || surface->preparedMips.empty() ||
+			(pixelsReleased && blockFormat == TextureCompression::Uncompressed)) {
+			AssetImage prepared(nullptr);
+			prepared.surface = SDL_ConvertSurface(pixels, SDL_PIXELFORMAT_ARGB8888);
+			if (!prepared.surface) throw std::runtime_error(SDL_GetError());
+			// RGBA levels only: block encoding (ASTC especially) belongs
+			// on asset workers, never here on the render thread.
+			prepared.prepareUpload(true, false);
+			surface->preparedUploadPixels = std::move(prepared.uploadPixels);
+			surface->preparedMips = std::move(prepared.mips);
+			surface->preparedCompression = prepared.compression;
+			surface->preparedUploadRevision = surface->contentRevision();
+			blockFormat = surface->preparedMips.front().compressed.empty()
+				? TextureCompression::Uncompressed : blocksFor(surface->preparedCompression);
+		}
+		std::vector<RenderMipLevel> levels;
+		levels.reserve(surface->preparedMips.size());
+#if defined(GLOB2_WEBGL2) || SDL_BYTEORDER == SDL_BIG_ENDIAN
+		constexpr auto format = SDL_PIXELFORMAT_RGBA32;
+#else
+		constexpr auto format = SDL_PIXELFORMAT_ARGB8888;
+#endif
+		for (const auto &level : surface->preparedMips) {
+			RenderMipLevel view{level.width, level.height, format,
+				{reinterpret_cast<const std::byte *>(level.pixels.data()), level.pixels.size()}};
+			if (blockFormat != TextureCompression::Uncompressed && !level.compressed.empty()) {
+				view.compression = blockFormat;
+				view.blocks = {reinterpret_cast<const std::byte *>(level.compressed.data()), level.compressed.size()};
+			}
+			levels.push_back(view);
+		}
+		return levels;
+	}
+
+	void GraphicContext::releaseDeviceRgbaLevels(DrawableSurface *surface, std::span<const RenderMipLevel> levels)
+	{
+		if (levels.empty() || levels.front().compression == TextureCompression::Uncompressed ||
+			surface->preparedMips.empty() || surface->preparedMips.front().pixels.empty())
+			return;
+		for (auto &level : surface->preparedMips) std::vector<unsigned char>().swap(level.pixels);
+	}
+
+	bool GraphicContext::deviceHighResolutionRoom() const
+	{
+		if (!deviceRenderer || renderer != deviceRenderer.get()) return true;
+		constexpr auto General = TextureDescriptor::BudgetClass::General;
+		// retainDeviceTexture admits up to half the class; new HD frames stop
+		// a quarter short of that, so other released surfaces keep their room.
+		return retainedDeviceTextureBytes(*deviceRenderer, General) < deviceTextureClassLimit(*deviceRenderer, General) / 8 * 3;
+	}
+
+	bool GraphicContext::hasDeviceTeamColor() const
+	{
+		// GLOB2_DISABLE_UNIT_SHADER selects the CPU team-colour cache here too,
+		// for A/B measurements and pixel comparisons.
+		static const bool disabled = SDL_getenv_unsafe("GLOB2_DISABLE_UNIT_SHADER") != nullptr;
+		if (disabled) return false;
+		const auto *device = renderDevice();
+		return device && device->capabilities().teamColor;
+	}
+
+	bool GraphicContext::drawTeamColorSurface(float x, float y, float w, float h, DrawableSurface *team, float hueShift, Uint8 alpha)
+	{
+		if (!team || !hasDeviceTeamColor()) return false;
+		prepareDraw();
+		auto *pixels = team->getSDLSurface();
+		if (w <= 0 || h <= 0 || !pixels || pixels->w <= 0 || pixels->h <= 0) return true;
+		if (radialFade.active()) {
+			// The fade's grid, as drawSurface draws it, with the hue in each vertex.
+			const auto vertices = radialFadeTriangles(radialFade, x, y, w, h,
+				float(team->getTexX()) / pixels->w, float(team->getTexY()) / pixels->h,
+				float(team->getTexX() + team->getW()) / pixels->w, float(team->getTexY() + team->getH()) / pixels->h, alpha / 255.f);
+			if (!renderer->trianglesTeamColor(vertices, team, pixels, team->contentRevision(), hueShift)) return false;
+			++drawCalls;
+			return true;
+		}
+		std::vector<RenderMipLevel> levels;
+		// An HD sprite frame samples its one level linearly (HighResolutionPolicy).
+		if (team->highResolutionSampling && !team->singleLevelSampling) levels = deviceMipLevels(team, pixels);
+		const SDL_Rect source{team->getTexX(), team->getTexY(), team->getW(), team->getH()};
+		if (!renderer->blitTeamColor(team, pixels, team->contentRevision(), levels, source, SDL_FRect{x, y, w, h}, alpha, hueShift,
+		                             team->singleLevelSampling))
+			return false;
+		releaseDeviceRgbaLevels(team, levels);
+		++drawCalls;
+		return true;
+	}
+
 	void GraphicContext::drawSurface(float x, float y, float w, float h, DrawableSurface *surface, int sx, int sy, int sw, int sh, Uint8 alpha)
 	{
 		if (renderer) prepareDraw();
         if (renderer) {
             if (w <= 0 || h <= 0 || sw <= 0 || sh <= 0) return;
             auto* pixels=surface->getSDLSurface();
+            if (!pixels && surface->portableReleased() && renderer == portableRenderer.get())
+            {
+                // Its texture holds the only copy; a reset lost it until its owner reloads.
+                if (spriteBatch.owner == this) spriteBatch.flush();
+                if (renderer->blitCached(surface, SDL_Rect{sx,sy,sw,sh}, SDL_FRect{x,y,w,h}, alpha)) ++drawCalls;
+                return;
+            }
+            if (!pixels && surface->deviceReleased() && renderer == deviceRenderer.get())
+            {
+                // The device adapter retains its snapshot; resets restore from it.
+                if (spriteBatch.owner == this) spriteBatch.flush();
+                if (renderer->blitCached(surface, SDL_Rect{sx,sy,sw,sh}, SDL_FRect{x,y,w,h}, alpha)) ++drawCalls;
+                return;
+            }
             if (!pixels || pixels->w <= 0 || pixels->h <= 0) return;
             if (radialFade.active()) {
                 const DrawableSurface *uploadSource=surface;
@@ -330,37 +499,66 @@ SpriteDrawBatch::~SpriteDrawBatch() noexcept(false)
                 ++drawCalls;
                 return;
             }
-            if (renderer == deviceRenderer.get() && surface->highResolutionSampling) {
-                // Use the existing alpha-weighted CPU chain for every device.
-                // Mutation creates a new owned upload revision before submission.
-                if (surface->preparedUploadRevision != surface->contentRevision() || surface->preparedMips.empty()) {
-                    AssetImage prepared(nullptr);
-                    prepared.surface = SDL_ConvertSurface(pixels, SDL_PIXELFORMAT_ARGB8888);
-                    if (!prepared.surface) throw std::runtime_error(SDL_GetError());
-                    prepared.prepareUpload(true);
-                    surface->preparedUploadPixels = std::move(prepared.uploadPixels);
-                    surface->preparedMips = std::move(prepared.mips);
-                    surface->preparedUploadRevision = surface->contentRevision();
-                }
-                std::vector<RenderMipLevel> levels;
-                levels.reserve(surface->preparedMips.size());
-#if defined(GLOB2_WEBGL2) || SDL_BYTEORDER == SDL_BIG_ENDIAN
-                constexpr auto format = SDL_PIXELFORMAT_RGBA32;
-#else
-                constexpr auto format = SDL_PIXELFORMAT_ARGB8888;
-#endif
-                for (const auto &level : surface->preparedMips)
-                    levels.push_back({level.width, level.height, format,
-                        {reinterpret_cast<const std::byte *>(level.pixels.data()), level.pixels.size()}});
+            if (renderer == deviceRenderer.get() && surface->singleLevelSampling) {
+                // An HD sprite frame: its one level, sampled linearly, as every
+                // renderer samples it (HighResolutionPolicy).
                 if (spriteBatch.owner == this) spriteBatch.flush();
-                renderer->blitMipmapped(surface, pixels, surface->contentRevision(), levels,
-                    SDL_Rect{sx,sy,sw,sh}, SDL_FRect{x,y,w,h}, alpha);
+                BudgetClassScope budget(*renderer, surface->deviceBudgetClass);
+                renderer->blitLinear(surface, pixels, surface->contentRevision(), SDL_Rect{sx,sy,sw,sh},
+                                     SDL_FRect{x,y,w,h}, alpha);
+                ++drawCalls;
                 return;
             }
+            if (renderer == deviceRenderer.get() && surface->highResolutionSampling) {
+                // A changed surface (a terrain page that animation rewrote)
+                // builds its mip chain here, on the graphics thread: at most
+                // 8 MiB of level-zero pixels a frame. Past that a surface the
+                // adapter already holds draws its previous upload this frame.
+                const bool rebuild = surface->preparedUploadRevision != surface->contentRevision() || surface->preparedMips.empty();
+                const std::size_t buildBytes = std::size_t(pixels->w) * pixels->h * 4;
+                constexpr std::size_t MipBuildBytesPerFrame = 8u << 20;
+                if (rebuild && deviceMipBuildBytesThisFrame && deviceMipBuildBytesThisFrame + buildBytes > MipBuildBytesPerFrame) {
+                    if (spriteBatch.owner == this) spriteBatch.flush();
+                    if (renderer->blitCached(surface, SDL_Rect{sx,sy,sw,sh}, SDL_FRect{x,y,w,h}, alpha)) { ++drawCalls; return; }
+                }
+                if (rebuild) deviceMipBuildBytesThisFrame += buildBytes;
+                const auto levels = deviceMipLevels(surface, pixels);
+                if (spriteBatch.owner == this) spriteBatch.flush();
+                BudgetClassScope budget(*renderer, surface->deviceBudgetClass);
+                renderer->blitMipmapped(surface, pixels, surface->contentRevision(), levels,
+                    SDL_Rect{sx,sy,sw,sh}, SDL_FRect{x,y,w,h}, alpha);
+                releaseDeviceRgbaLevels(surface, levels);
+                return;
+            }
+            if (renderer == portableRenderer.get() && surface->highResolutionSampling)
+            {
+                // HD sprite layers and reduced terrain pages are drawn away from
+                // their texel size: sample them linearly, with premultiplied
+                // alpha, after the nearest-sampled batch drawn before them.
+                if (spriteBatch.owner == this) spriteBatch.flush();
+                renderer->blitLinear(surface, pixels, surface->contentRevision(), SDL_Rect{sx,sy,sw,sh},
+                                     SDL_FRect{x,y,w,h}, alpha);
+                ++drawCalls;
+                return;
+            }
+            // The portable renderer's nearest sampling leaves a pixel centre on
+            // a texel boundary (every one at half zoom) to the driver's
+            // interpolation, which took the upper texel in some sprites (algae,
+            // some trees) where the devices take the lower. Bias plain sprites
+            // toward the lower texel as legacy GL does (drawSurface below).
+            // Team-coloured building frames stay unbiased: the driver already
+            // resolves their ties as the devices do, at every zoom.
+            // The biased coordinates stay within the texture: SDL repeats one
+            // that leaves it, which drew the far edge's texels along the near
+            // edge. A clamped end keeps the bias for every interior tie.
+            const bool portable = renderer == portableRenderer.get();
+            const float tie = portable && !nearestTiesUnbiased ? -0.00141421356f : 0.f;
+            const auto coordinate = [tie](int texel, int size)
+            { return std::clamp((float(texel) + tie) / size, 0.f, 1.f); };
+            const float u0 = coordinate(sx, pixels->w), v0 = coordinate(sy, pixels->h);
+            const float u1 = coordinate(sx + sw, pixels->w), v1 = coordinate(sy + sh, pixels->h);
             if (spriteBatch.owner == this && renderer != deviceRenderer.get())
             {
-                const float u0 = float(sx)/pixels->w, v0 = float(sy)/pixels->h;
-                const float u1 = float(sx+sw)/pixels->w, v1 = float(sy+sh)/pixels->h;
                 spriteBatch.backend = renderer;
                 if (spriteBatch.append({surface, 0, pixels, surface->contentRevision()},
                                        alpha, x, y, w, h, u0, v0, u1, v1)) ++drawCalls;
@@ -371,6 +569,18 @@ SpriteDrawBatch::~SpriteDrawBatch() noexcept(false)
             if(renderer==deviceRenderer.get() && surface->spriteSource &&
                 surface->spriteSource->resolveDeviceAtlas(*surface,source,uploadSource))
                 pixels=const_cast<DrawableSurface*>(uploadSource)->getSDLSurface();
+            BudgetClassScope budget(*renderer, uploadSource->deviceBudgetClass);
+            if (portable)
+            {
+                // A blit's whole-texel source rectangle cannot carry the bias.
+                const SDL_FColor c{1, 1, 1, alpha / 255.0f};
+                const SDL_Vertex a{{x, y}, c, {u0, v0}}, b{{x + w, y}, c, {u1, v0}},
+                    d{{x, y + h}, c, {u0, v1}}, e{{x + w, y + h}, c, {u1, v1}};
+                const SDL_Vertex quad[] = {a, b, e, a, e, d};
+                renderer->triangles(quad, surface, pixels, surface->contentRevision());
+                ++drawCalls;
+                return;
+            }
             renderer->blit(uploadSource, pixels, uploadSource->contentRevision(),
                            renderer == softwareRasterizer.get() && surface->hasOpaquePixels(),
                            source, SDL_FRect{x,y,w,h}, alpha);
@@ -396,8 +606,12 @@ SpriteDrawBatch::~SpriteDrawBatch() noexcept(false)
 			// sprites and atlas frames. A symmetric inset crosses texel boundaries
 			// in opposite directions depending on floating-point atlas offsets.
 			// sqrt(2)/1000 texels avoids alignment with common fractional HiDPI scales.
-			const float biasX = 0.00141421356f * surface->texMultX;
-			const float biasY = 0.00141421356f * surface->texMultY;
+			// The bias is toward the lower texel, the one the render devices and
+			// the portable renderer take: at half zoom every pixel centre falls on
+			// a texel boundary, and the upper texel drew a native resource sprite
+			// at a different per-cell pattern from theirs.
+			const float biasX = -0.00141421356f * surface->texMultX;
+			const float biasY = -0.00141421356f * surface->texMultY;
 			const float u0 = static_cast<float>(sx) * surface->texMultX + biasX;
 			const float u1 = static_cast<float>(sx + sw) * surface->texMultX + biasX;
 			const float v0 = static_cast<float>(sy) * surface->texMultY + biasY;
@@ -753,7 +967,11 @@ SpriteDrawBatch::~SpriteDrawBatch() noexcept(false)
 			renderBatch->barrier();
 		if (renderer) prepareDraw();
         if (renderer) {
-            recordAlphaMap(*renderer,map,mapW,mapH,x,y,cellW,cellH,color,255.0f);
+            if (renderer == portableRenderer.get() && mapW >= 2 && mapH >= 2 &&
+                size_t(mapW) * size_t(mapH) <= map.size())
+                drawAlphaMapTexture(*renderer,map,mapW,mapH,x,y,cellW,cellH,color);
+            else
+                recordAlphaMap(*renderer,map,mapW,mapH,x,y,cellW,cellH,color,255.0f);
             return;
         }
 	#ifdef HAVE_OPENGL

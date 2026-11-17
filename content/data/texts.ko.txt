@@ -5048,6 +5048,10 @@ AI 원격 측정
 명성
 [stat prestige about]
 최고 레벨 건물로 얻는 식민지의 명성입니다. 명성 목표가 있는 경기는 목표에 도달하면 끝납니다.
+[stat prestige needed]
+승리에 필요한 명성
+[stat prestige needed about]
+명성으로 승리하려면 식민지가 아직 더 얻어야 하는 명성입니다. 경기의 명성 합계가 목표에 도달하고, 살아남은 다른 모든 식민지를 앞지르기에 충분한 양입니다. 경기에 명성 목표가 있을 때만 기록됩니다.
 [stat band combat]
 전투
 [stat band starvation]
@@ -7102,3 +7106,33 @@ AI
 모든 컴퓨터 제어 식민지의 AI
 [tundra]
 툰드라 지형
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

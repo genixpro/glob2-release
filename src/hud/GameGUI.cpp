@@ -24,6 +24,9 @@
 #include "TorusView.h"
 #include "render/ViewState.h"
 #include "render/scene/SceneExtract.h"
+#include "render/terrain/DirectTerrain.h"
+#include "render/MapRenderState.h"
+#include "render/terrain/TerrainCompositor.h"
 #include "online/SkinDownloads.h"
 #include "render/ColonySkinPreview.h"
 #include "GameGUITouch.h"
@@ -295,6 +298,18 @@ void GameGUI::selectViewedTeam(int team)
         globalContainer->replayVisibleTeams = shown.mask;
 }
 
+void GameGUI::loadTerrainArtwork()
+{
+	if (globalContainer->runNoX)
+		return;
+	SceneRequest request;
+	request.includePanels = false;
+	const auto world = game.captureReadBoundary(SceneExtractor::captureOptions(request));
+	SceneMap map;
+	map.bindSnapshot(world, game.map.displayViewportW, game.map.displayViewportH, game.map.displayedTeam);
+	map.prepareChunk(0, size_t(world.width) * world.height);
+	globalContainer->terrainCompositor(map.frozenAssetBundle()).finishMaterials(map);
+}
 void GameGUI::adjustInitialViewport()
 {
 	assert(localTeam);
@@ -535,6 +550,15 @@ const bool replayHeaderSkipperRegistered = [] {
 }
 
 Team *GameGUI::getLocalTeam(void) { return game.teams[localTeamNo]; }
+
+void GameGUI::prepareDirectTerrain()
+{
+	if (globalContainer->runNoX || !globalContainer->gfx)
+		return;
+	PresentationFrame scene;
+	prepareLocalPresentation(scene);
+	view.render.directTerrain().preload(*globalContainer->gfx, scene.map);
+}
 
 void GameGUI::prepareLocalPresentation(PresentationFrame& scene)
 {

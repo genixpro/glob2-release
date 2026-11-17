@@ -68,6 +68,10 @@ Terrain, discovery and material revisions are checked when an old zoom level
 returns. Kept coverage masks for mixed cells beside animated materials add at
 most 16 MiB in software mode or 32 MiB in GPU mode. Native and
 HD rendering share CPU composition; GPU backends upload the resulting pages.
+The portable SDL renderer composes HD pages only above one screen pixel per
+logical pixel and returns to native pages ten seconds after the view zooms out
+past it, discarding its HD pages then
+([rendering](rendering.md#batching-and-geometry-cache-invariants)).
 The [terrain authoring guide](../assets/terrain-materials.md) describes the catalog,
 boundary resolver, source preparation, budgets and asset pipeline.
 Its deterministic world-space displacement continues contours across tiles at
@@ -83,7 +87,39 @@ transparent holes. Views are destroyed before their backing page.
 Each page validates the canonical terrain neighborhood, discovery decisions and
 revisions of the materials its recipes use. Animation or source changes in unrelated
 materials do not invalidate it; a phase change of an animated material (water,
-deep water, lava, ember field) recomposes only the pages that use it. Pages store
+deep water, lava, ember field) recomposes only the pages that use it. Within an
+unchanged mixed cell, an animation step recomposes only the samples its changed
+textures or advanced surf can reach (`Compositor::Refresh`); the page keeps that
+list beside the cell's coverage mask and every other sample's pixels. GPU pages
+then upload only their rewritten cells (`DrawableSurface::markPixelsChanged(dirty)`,
+`RenderBackend::prepareTextureRegions`). A region update keeps the sampling mode
+the page's last draw used, and a texture it cannot patch in place (a missed revision
+or a changed size) waits for its next draw to upload whole. On native device pages (no HD scale or
+reduction) uniform cells of an animated opaque material draw from one shared tile
+per variant over their page, which keeps an earlier frame underneath, so open water
+recomposes and uploads one small atlas per step; the page keeps the cells beside
+its own cells current, because linear sampling at their edge reads them.
+
+While pages build on background workers, the view shows one animation phase
+everywhere (`SoftwareTerrainCache::shownPhase`): the shared tiles compose from
+that phase's material snapshot, not the live compositor. An animation round
+takes the next phase's snapshot and has the workers recompose every drawn page's
+changed cells that the view shows, with a margin of one cell, stand-ins included.
+Finished cells are written into the page pixels but not uploaded. Once no drawn page
+waits for the phase, every staged cell uploads and the shared tiles change, in the
+same frame, and the next round launches. A round publishing more than 8 MiB lets the
+next round launch in the following frame. Cells left out of view become stale and
+are recomposed when the view reaches them. A page whose sheets are still loading
+keeps its pixels instead of holding the round. A page arriving from a cold build
+carries the phase it was launched with until the next round reaches it. The shared
+tiles the view uses compose during preparation, so each atlas uploads once a frame.
+
+Composition at native scale reads
+HD sources through compact per-variant copies of the texels it samples. All of
+these produce the same page pixels as composing every cell again. Drawn output is
+identical too except where the shared water tiles are sampled linearly (zoomed out on
+an accelerated SDL renderer): there the different texture coordinates round up to two
+levels differently along the water. Pages store
 raw color/alpha. Map replacement (a new `Map::identity()`) clears the cache;
 editor terrain changes, wrapped neighbors and visible-team changes are detected
 during preparation. Resources, actors, fog and overlays keep their existing
@@ -120,6 +156,10 @@ share composition and regional pixel kernels, so shared kernel improvements also
 benefit immediate drawing. There is no automatic selection policy. The former `auto`
 spelling remains an alias for `immediate` for existing launch scripts. CPU execution
 selection is independent of renderer backend selection (`--renderer`).
+Animated water is slower in parallel groups than in immediate mode: every
+crossfade step publishes a new `CpuMaterials` snapshot of the full HD variants, which
+jobs then sample with a stride, and groups recompose uniform animated cells into
+their pages rather than drawing them from shared tiles.
 These are development overrides, not gameplay settings; set them before launch. The
 recorder reads execution mode when its backend is created. `GLOB2_RENDER_WORKERS=N`
 accepts 1–64 and caps admitted scene/graphics concurrency at the smaller of the
@@ -148,9 +188,9 @@ CPU terrain preparation separates owner planning, disjoint cell composition and 
 metadata installation. Published materials contain only immutable composition pixels for the
 changed cells' referenced materials and catalog definitions. Planning finds changed
 cells before acquiring material snapshots, so a sparse edit does not copy unchanged
-materials. Unchanged material revisions share storage; the compositor keeps bounded weak
-records per material revision, allowing reuse while any snapshot still owns unchanged
-pixels. Each cache charges its retained lease against subsequent admission. Current-page
+materials. Snapshots share the compositor's prepared pixels rather than copying them,
+and a prepare that rewrites pixels a snapshot holds writes a fresh copy, so unchanged
+material revisions share storage with the compositor and every snapshot. Each cache charges its retained lease against subsequent admission. Current-page
 masks remain protected until the synchronous group finishes. Hidden cells release
 obsolete discovery masks during canonical installation. The owner locks the unpublished
 cache page once and supplies disjoint cell pointers and its pitch to workers. Workers

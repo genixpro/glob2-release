@@ -27,6 +27,8 @@ namespace GAGCore
 		SDL_GetWindowSize(window, &pointsW, &pointsH);
 		if (pointsW <= 0 || pointsH <= 0 || (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)) return true;
 		pixelsW = pointsW; pixelsH = pointsH;
+		// Device renderers draw in window pixels (HiDPI) as GL does.
+		if (presentationDevice && renderer == deviceRenderer.get()) SDL_GetWindowSizeInPixels(window, &pixelsW, &pixelsH);
 #ifdef HAVE_OPENGL
 		if (optionFlags & USEGPU) SDL_GetWindowSizeInPixels(window, &pixelsW, &pixelsH);
 		else
@@ -54,7 +56,7 @@ namespace GAGCore
 		if (changed)
 		{
 			std::unique_ptr<SDL_Surface, decltype(&SDL_DestroySurface)> replacement(
-				SDL_CreateSurface(surfaceW, surfaceH, sdlsurface->format), SDL_DestroySurface);
+				createFrameSurface(surfaceW, surfaceH, sdlsurface->format), SDL_DestroySurface);
 			if (!replacement) return false;
 			std::unique_ptr<RenderBackend> backend;
 			try
@@ -319,6 +321,12 @@ namespace GAGCore
         return frameCache.valid && frameCache.surface ? frameCache.surface : sdlsurface;
     }
 
+    std::pair<std::uint64_t, std::uint64_t> GraphicContext::portableTextureMemory() const
+    {
+        if (!portableRenderer) return {0, 0};
+        const auto memory = portableRenderer->textureMemory();
+        return {memory.bytes, memory.peak};
+    }
     RenderOperations GraphicContext::backendOperations() const
     {
         return portableRenderer ? portableRenderer->operations() : softwareRasterizer ? softwareRasterizer->operations() : RenderOperations{};

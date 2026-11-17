@@ -26,11 +26,26 @@ sources under a soft 2 ms budget. Original textures draw while preparation is
 pending, and mutation/deletion cancels pending IDs. A texture
 upload or deletion must flush commands referring to the old pixels and invalidate
 array views before the driver can reuse a texture name. Cached geometry must also
-be invalidated selectively when its source texture or array page changes; unrelated
-uploads must preserve reusable entries. A mutation serial rejects interrupted
-captures but does not globally clear the cache. These are
+be invalidated selectively when its source texture or array page changes;
+unrelated uploads must preserve reusable entries. A mutation serial rejects
+interrupted captures but does not globally clear the cache. These are
 presentation caches owned by the graphics context, released while that context
 is current; they are neither saved nor consulted by simulation code.
+
+Cached map rows record each frame's HD or native layer as it stands when they
+are captured. Streamed HD frames (decor only above 32 pixels a cell) arrive
+later without changing any row's frames or touching a native texture, so each
+resource, decor and overlay row also passes the newest
+`Sprite::highResolutionRevision(frame)` among its frames as the entry's artwork
+revision. An entry whose frames match but whose artwork is older stays
+drawable: it is re-recorded within half of the frame's build budget, and until
+then, or while a capture is rejected for uploading a new HD texture, it replays
+at the previous resolution rather than falling back to a direct draw. A capture
+that fails for any other reason drops the old entry, so the row draws the new
+artwork directly instead of keeping the old for good. Deleting an HD layer needs
+no revision: a standalone layer's texture goes with it, which invalidates the
+entries that recorded it, and an atlas page stays alive until the atlas is
+replaced, which invalidates them then.
 
 High-resolution sprite layers are shared by gameplay, editors and background
 scenes. Changing screens preserves published layers and pending reload work.
@@ -38,22 +53,336 @@ Preference changes, a new asset source generation or a different pack directory
 start a reload; unchanged requests do not. Explicit synchronous reloads used by
 tools still refresh unchanged artwork. Disabling the preference releases the
 optional layers through asset polling, rather than through screen destruction.
+Every renderer chooses between HD and native sprite frames by the
+[HD sprite policy](#hd-sprite-policy) below. Legacy OpenGL loads every
+sprite's HD layers with the sprite; every other renderer loads them on demand.
+There a drawn sprite loads only the 32-frame blocks its draws reach (a unit's
+action), batched into one reload a frame, and demands its team layers with its
+base ones; back on native frames (ten seconds below the threshold) it releases
+the layers that drawing demanded. Once a frame's HD base layer is uploaded its
+CPU pixels go (into the portable renderer's texture or the device's retained
+snapshot), unless something samples them through `Sprite::baseFrame` (a
+released frame then answers with its native frame and reloads with pixels;
+`Sprite::drawFrame` serves draw-only callers such as skin shadows), and a
+renderer reset, a lost device or rebuilding the portable renderer reloads frames
+that had only textures (a capture's offscreen pass draws such a frame's native
+layer). A unit draws HD only once its whole action is; at most eight frames a
+frame draw in HD for the first time (each one uploads), and a device renderer
+admits new HD frames only while its retained General textures stay under three
+eighths of that class's budget, so a full budget leaves frames native. HD layers
+sample linearly with premultiplied alpha. Device renderers with the team-colour
+material sample the HD team layer directly; elsewhere recoloured HD team layers,
+buildings' included, share each sprite's 64 MiB recolour cache; once drawn, a
+cached recolour keeps only its texture, and one whose texture a reset took is
+recoloured again from the HD team layer, which keeps its pixels for the other
+colours. A sprite that only `Sprite::baseFrame` reaches (terrain composition,
+skin shadows and editor swatches) loads only its uncolored base layers, once
+`baseFrame` or an HD window first asks for them. The first answers can be native
+frames, as with any streamed layer. Switching to legacy OpenGL reloads every
+sprite; switching away releases layers nothing asked for.
+
+### HD sprite policy
+
+HD artwork is drawn at the zooms where it shows, and native artwork otherwise
+and as the fallback. One policy, `GAGCore::HighResolutionPolicy`
+(`libs/gag/include/HighResolutionPolicy.h`), held by `Sprite` and fed once a
+frame by the map view (`Sprite::setHighResolutionDensity`), decides it for
+every renderer; no renderer keeps a threshold of its own.
+
+- **Density** is the screen pixels one logical pixel covers: map scale times the
+  display's raster scale (the display's scale alone for interface drawing, and
+  before any map view). HD frames hold four texels a logical pixel.
+- **Above a density of one** sprite frames draw from their HD layers: up to two,
+  at half resolution (two texels a logical pixel), beyond two at full
+  resolution. **At or below one** native frames draw: HD would only be shrunk
+  back to them. Terrain pages take HD materials at the same threshold
+  (`HighResolutionPolicy::wantsHighResolution`).
+- **Hysteresis**: a level with more detail is taken at once; one with less only
+  after the view has wanted it for ten seconds (`DetailHysteresis`), so zooming
+  across a threshold and back reloads nothing.
+- **Fallback is always native**: where the policy wants HD but a frame's HD
+  layers are not all there (still streaming, evicted, failed, missing from the
+  pack, or past a device's budget), the native frame draws, never nothing and
+  never a wait. A frame draws HD only once every layer its native frame has
+  (base and team colour) is HD (`HighResolutionPolicy::frameDrawsHighResolution`),
+  and a unit only once its whole action is. The HD setting off draws native
+  everywhere.
+- **Room on devices**: the on-demand device renderers upload at most eight new
+  HD frames a frame and keep each one as the only copy of its pixels, within
+  3/8 of the General budget class (`GraphicContext::deviceHighResolutionRoom`;
+  about 96 MiB on desktop, 18 MiB on phones). When a new frame finds no room it
+  draws native, and the next frame evicts the sprites' 32-frame blocks drawn
+  longest ago, among those idle for at least 120 frames, until there is room
+  (`Sprite::evictIdleHighResolution`). A block's base and team layers go
+  together, and drawing it again reloads it. Units and buildings share this
+  room, so frames that left the view give way to the ones in it. Terrain banks
+  retire their frames through their own windows instead.
+
+Every renderer samples the one level the policy names, so all settle to the
+same pixels (`DrawableSurface::singleLevelSampling`):
+
+| Renderer | Half resolution (1 to 2) | Full resolution (above 2) |
+| --- | --- | --- |
+| Legacy OpenGL | detail band 1: the chain's second level alone, sampled linearly | band 0: the first level alone |
+| SDL GPU, programmable OpenGL, portable SDL | the frame's half-resolution level, sampled linearly | the full frame, sampled linearly |
+
+The software renderer draws native frames (and native terrain pages) at every
+zoom: it has no filtering, and it is exempt from renderer parity.
+
+Filtering is in premultiplied colour everywhere. The devices and the portable
+renderer premultiply their textures; legacy OpenGL keeps straight alpha, so
+its texture-array program filters a page holding one linear level itself,
+premultiplying its four texels, and un-premultiplies the result for its
+blending. Hardware filtering of straight alpha would blend the colour of
+transparent texels (black in most artwork) into every sprite edge. The
+resource sheet draws from standalone frames on legacy OpenGL too, not from a
+trilinearly sampled HD atlas. Native frames are sampled nearest; at half zoom
+every pixel centre falls on a texel boundary, and legacy OpenGL biases those
+ties to the lower texel, as the other renderers resolve them. The portable
+renderer biases the texture coordinates of its nearest-sampled quads the same
+way (`GraphicContext::drawSurface`): left to the driver, it took the upper
+texel in some frames (the resource sheet's algae, some trees) where the devices
+take the lower. Team-coloured building frames stay unbiased there
+(`nearestTiesUnbiased`), since the driver already resolves their ties as the
+devices do, at half zoom and at others such as 0.9. Lines, circles
+and rectangle outlines are one logical unit wide on every accelerated
+renderer: a quad along the line, circles of such segments, and outlines of
+the rectangle's own edge pixels.
+
+Terrain takes its half-resolution level the same way everywhere: an HD
+material composed or streamed below its own size is box-filtered in
+premultiplied colour, one output texel the average of the block it covers.
+The streamed direct pass filters its art tiles so (`DirectTerrain`), and the
+page compositor its sources (`Compositor::boxFilter`, mirrored by the
+`terrain-compose` shader), rather than sampling every second texel.
+
+Legacy OpenGL's bands load the HD frames with the levels a view needs left out
+(band 2, a quarter of the frame, while the policy is native), reloading in the
+background on a band change while the current textures draw. The on-demand
+renderers take the half-resolution level from the CPU mip chain the asset
+workers build with the frame (`DrawableSurface::fromReducedLevel`); a change between half and full resolution
+reloads the blocks drawing reached, and the current frames draw until the new
+ones are published. Sprites a caller samples on the CPU keep their full frames.
+One level sampled linearly shrinks a frame at most twice, which a mip chain
+would only blur further.
+
+`tools/rendering/renderer_parity.py` holds scenes on either side of the
+threshold (`gui-below-1x`, `gui-above-1x`) besides the zoomed-out, default and
+zoomed-in ones, and `SpriteSheetTest.cpp` checks the policy and that each
+available renderer draws native at density one and HD at two.
+
+Below one screen pixel per logical pixel the portable renderer's native pages
+are reduced to the density the direct pass's art tiles take there: the smallest
+power of two at least 32 times the density pixels a cell (16 at half zoom, 8 at
+a quarter), and sampled linearly. A uniform cell is box-filtered from its native
+composition. A mixed cell composes at that density as the direct pass draws its
+masks there: each pixel blends the alpha-weighted mean of its block of samples,
+then takes the contact shade, fringe and surf of the block's centre sample
+(`Compositor::compose` with a reduction). Box-filtering the composed cell
+instead averaged the one-sample dark contact line and pale surf band with their
+surroundings into a wider, paler shore. The render devices' page fallback keeps
+the box filter, which their own page composition (`terrain-reduce`) mirrors. An unreduced native page is sampled
+nearest there, which drew grainy, high-contrast sand where the other renderers
+draw filtered terrain.
+
+The portable SDL renderer's terrain pages ask for HD material frames only where
+they show: above one screen pixel per logical pixel (map scale times raster
+scale, 32 pixels a cell on a 1x display), the threshold legacy OpenGL's direct
+terrain uses. Native frames are the HD frames reduced by four, so at or below it
+an HD page holds four times the texels, composed and uploaded for nothing. A
+view starts on native frames and takes HD at once when it zooms in, but drops back
+only after it has wanted native frames for ten seconds (`GAGCore::DetailHysteresis`
+on the clock of the legacy OpenGL sprite bands), so zooming across the threshold
+and back streams nothing again; pages meanwhile compose the HD frames at the
+display density (below). Then pages compose from native frames, the HD pages
+are discarded, the streamed banks' frames retire into the shared budget for
+[retired frames](../development/rendering-benchmarks.md#direct-terrain) and whole sheets a page demanded through `Sprite::baseFrame`
+release their layers until the next demand. Decor HD frames stream there only
+while the [HD sprite policy](#hd-sprite-policy) shows HD; below that it draws
+decor from native frames and retires them.
+
+Whatever frames they use, the portable renderer's pages compose at the
+density the direct pass draws its art tiles and coverage masks at: the
+smallest power of two at least the display density, up to four times native.
+HD frames compose below their size box-filtered, as the direct pass filters
+its art tiles, so at zoom 1.5 a page holds 64 pixels a cell rather than HD's
+128, which drawn at 48 without mips aliased where the other renderers draw
+filtered tiles. With HD artwork off at zoom 3 a page composes four times
+native density from native frames, sampled nearest as the direct pass samples
+them, so shorelines and borders are as smooth as on the other renderers
+rather than native coverage magnified into steps.
+A view's decor window holds only the frames its cells draw (each 16 by 16
+cell page's decor frames are kept until the terrain changes, and the view widens
+by the decor's reach), not every frame of every material in view. Drawn decor
+HD frames free their CPU pixels like other drawn HD frames (the
+material banks, which composition samples, keep theirs); retired frames count
+only the pixels they still hold, and when a reset takes the textures, the bank
+keeps the frames that kept their pixels and declares its window again so the
+lost ones decode once more. Captures keep their own density and HD artwork.
+
+The game's compositors load the native sheets of the installed terrain
+materials on demand (`TerrainVisual::MaterialSheets`): startup decodes none of
+them. A map's materials are found by a scan of its terrain a few rows a frame
+(again, keeping those found, after an edit), and their sheets load on the asset
+workers through `Toolkit::requestSprite` and publish within the frame's asset
+budget; composition, the editor's palette and phase pixels also ask for a sheet
+the moment they need one; sheets of materials in view load first, and the rest
+of the map's at most two at a time behind them. A page whose cells need a sheet
+still loading stays uncomposed (`Compositor::sheetsReady`), so the fallback
+chain draws there (another density, the overview, the whole-map base) and the
+page fades in once composed, like any other; a page already composed keeps its
+pixels. Only the editor palette's icon shows a material's preview colour while
+its sheet loads.
+Direct terrain builds its tables only once the map's sheets are in (pages draw
+meanwhile) and builds them again if an edit baked a preview colour for a sheet
+that has since arrived. Complete draws wait explicitly, off the interactive
+frame: tiled captures, `MapRender` exports, editor swatches
+(`Compositor::prepareForRecipes`), the whole-catalogue `Compositor::prepare` and a
+complete direct terrain draw call `Compositor::finishMaterials`, as do a game
+while it loads (`GameGUI::loadTerrainArtwork`) and the menu colony while the
+loading screen is still up (`MenuColony::load`), so neither first paints with
+its sheets still loading. Sheets no map
+retains go after the retired HD frames' lifetime, sooner when they and those
+frames exceed that shared byte budget. Map asset bundles' own sheets and
+compositors built outside the game (tools, tests) still load every sheet at
+construction; `GLOB2_TERRAIN_SHEETS=eager` restores that in the game. The shared
+decor and overlay sheets still load at startup.
 
 Terrain uses the shared CPU material compositor and bounded 16 by 16 cell pages
 on software and GPU backends; see [terrain materials](../assets/terrain-materials.md).
 [Direct terrain](../development/rendering-benchmarks.md#direct-terrain)
 uses map-space atlases for Original artwork on desktop legacy OpenGL, programmable
-OpenGL, SDL GPU, and WebGPU; desktop legacy OpenGL also draws HD artwork with it. SDL GPU and WebGPU use offline shader assets. The atlas builder packs terrain data independently of the device. The
+OpenGL, SDL GPU, and WebGPU; desktop legacy OpenGL, SDL GPU and programmable OpenGL also draw HD artwork with it. SDL GPU and WebGPU use offline shader assets. The atlas builder packs terrain data independently of the device. The
 camera transforms a terrain quad while its fragment shader blends material
-variants, coverage and shoreline effects. The page renderer handles HD artwork on
-the other backends, backends without direct terrain, tiled captures outside legacy
-OpenGL, and the browser's WebGL2 renderer (legacy OpenGL through Emscripten's WebGL2
+variants, coverage and shoreline effects.
+
+SDL GPU and programmable OpenGL draw legacy OpenGL's streamed pass rather than the whole-map native
+atlas: the same per-cell tables, artwork streamed at the display density, coverage
+masks built by background workers at that density, the retired atlas a zoom
+keeps, the whole-map base masks and the corner split, through the
+`terrain-direct-hd` shader. Its textures are `StreamedTexture`s
+(`libs/gag/include/RenderFrame.h`): device textures written in place with no CPU
+copy of their pixels. Writes queue on the texture until a submitted frame applies
+them, all before that frame draws; a dropped frame leaves them queued.
+Programmable OpenGL applies them with `glTexSubImage2D` as it submits the frame
+that draws them, clears a new texture through a framebuffer rather than a CPU
+copy, charges the textures to its total budget and never evicts them; it loads
+the generated `terrain-direct-hd` GLSL (desktop 3.30 or ES 3.00) and needs 14
+texture units. A device
+that advertises `directTerrainStreaming` takes this pass at every zoom, with HD
+artwork on or off. Legacy OpenGL and the devices share one atlas policy, so
+they coarsen alike. The mask atlas stays at 2048 square. The art atlas starts
+at 2048 and grows once to 4096 when the view's variants do not fit: at 128
+pixels a cell (zoom 2 on a 2x display) a 2048 atlas holds only 256 tiles, fewer
+than a typical view's variants. It grows only under the desktop budget, with
+4096 textures, and while the renderer's resident bytes leave room in the
+platform's `RenderBudget` for twice the new atlas and an eighth of the budget
+besides (the old atlas draws while the new one fills); otherwise the view takes
+coarser tiles. A game on a 2x display holds 200 to 230 MiB, so the atlas needs a
+total of about 400 MiB to grow: under the former 256 MiB desktop total every
+renderer drew zoomed-in Retina views from 32-pixel art instead of 64. A device counts its resident resources; legacy OpenGL, which has
+no device budget, counts its direct terrain and its other textures up to the
+General class a device would keep them in. `DIRECT_TERRAIN_ADMISSION` on stderr records each change of a
+view's art atlas, tile density and the reason it is coarser than the display
+wants (`device budget`, `atlas size`, `atlas full`), for legacy OpenGL and the
+devices alike. An
+animated variant holds a pair of art tiles (its current and next phase) and a
+static one a single tile, so at 64 pixels a cell (the default zoom on a 2x
+display) the 2048 atlas holds about a thousand static variants. Art tiles are box-filtered on the background workers
+(`BackgroundWork`), from copies of their sources, up to 192 a batch and one
+batch at a time; the graphics thread only copies the sources and uploads the
+finished tiles. An interactive view whose artwork density or atlas size
+changes fills a second art atlas that way while the old one keeps drawing (its
+water stops animating meanwhile), and switches to it with its own variant
+table once every visible variant is in it. Animation steps likewise draw their
+previous phase until the workers deliver the next. A variant new to the drawing
+atlas is filtered at once, with its record, and a complete draw refilters
+everything at once.
+
+A variant record names a tile only while the drawing atlas holds that
+variant's art in every tile it draws. Every other record holds tile 65535, and
+the shader draws that variant from the resident low-resolution art: every
+palette variant's first native frame at 16 pixels a cell, built at game load
+(`DIRECT_TERRAIN_LOW_ART`, about 7 MB for a 256 by 256 map) and extended when an
+edit adds variants. The streamed pass binds it in the native mask index's slot,
+which that pass does not use. So while a fast zoom fills the second atlas, the
+variants the old atlas never held (most of them, zooming out) draw softer art,
+never another variant's tile or an empty one. Uploads build the table from the
+atlas's entries, an eviction marks its record absent, and a visible variant the
+atlas holds without filled tiles gets them at once. `DirectTerrain::artMetrics`
+counts the visible variants drawing the low-resolution art (`absent`) and any
+record pointing at a tile its atlas does not hold for it (`stale`, always zero).
+
+The streamed devices always have a low-resolution version of the whole map to draw: only HD
+masks and artwork stream in and out. Game loading (`GameGUI::prepareDirectTerrain`,
+from `Engine::finalAdjustments`) builds the map's per-cell tables and then the
+whole-map base masks, the masks on up to eight threads (`DIRECT_TERRAIN_PRELOAD`
+and `DIRECT_TERRAIN_BASE` report the time), so the first frame finds them and no
+frame draws a mixed cell as a corner split for want of a base mask. Nothing in
+the render loop blocks on them: a view without that load, or one whose device
+lost its streamed textures, builds the tables in 3 ms slices and the base on the
+mask workers (ahead of the view's masks, with 2 ms of recipes a frame), and
+draws the overview, with its always-resident whole-map base beneath, until every
+base mask is back. A complete draw (a capture, the editor) at the base's density
+or below builds the base first and draws from it alone; one finer than the base,
+such as a torus capture's own view, builds its visible masks at its density and
+not a whole-map base it would never sample, unless its cells overflow the mask
+atlas. Workers take base jobs (cells an edit invalidated) ahead of
+the view's masks. View masks queue 64 per worker, nearest the view centre first,
+and upload within a few milliseconds a frame (at most 16 MiB) rather than a fixed
+count. When the device loses a streamed texture (a reset, or staging that stays
+over its budget for 30 frames; a texture already drawing defers the frame until
+then) or its writes stop draining, the view starts its streamed textures again
+(`DIRECT_TERRAIN_RESTART`) and never falls back to pages; only a map whose tables
+exceed the device's texture size does. `GLOB2_BENCH_DEVICE_RESET_AT` resets the
+device at one benchmark frame, and `fallback_scenario.py --reset-at` reports the
+restarts and the cells drawn as corner splits. Discovery updates
+revisit only the 16x16 sectors whose discovery stamps moved
+(`SceneMap::discoveryStamps`) and rewrite only the changed rows of the
+discovery table.
+
+The page renderer handles HD artwork on
+WebGPU, backends without direct terrain or the streamed pass, tiled captures outside legacy
+OpenGL and the streamed devices, streamed-device maps too large for its direct terrain tables, and the browser's WebGL2 renderer (legacy OpenGL through Emscripten's WebGL2
 bridge), where pages draw native artwork until the view's HD families arrive.
-Fully revealed resources use canonical map rows, with sorted source-tile indices
+Interactive page and overview views never compose on the graphics thread and
+never block on it: until wanted terrain arrives they draw the best real terrain
+they have, in painter order beneath it: the same page at another density, then
+the overview limited to the missing pages, then the overview's whole-map base,
+which a worker composes as the map loads, so no transparent or flat patch shows.
+On a device renderer a frame whose pages cannot prepare at all (the device
+refused page composition) draws the overview too, never uncached pages composed
+on the graphics thread.
+Pages and overview pages that arrive over a fallback fade in over 150 ms with
+presentation-only alpha on their ordinary draw. On a presentation device at most
+eight new overview page textures upload a frame (`DrawableSurface::takeDeviceUpload`):
+past that a page draws its previous upload over the base, or the base alone. An
+overview page covers 64 by 64 cells (16 textures for a 256 by 256 map), and the
+pages prewarmed at the farthest zoom's density are admitted to the device adapter
+ahead of the zoom out with whatever allowance the frame leaves
+(`OverviewTerrainCache::uploadAhead`, through `DrawableSurface::prepareDeviceTexture`,
+which keeps the adapter's texture snapshot; the GPU copy happens in the first frame
+that draws the page), each content revision once, so a fast
+zoom out on SDL GPU or Programmable GL draws every overview page, its contours
+and resource squares, on its first frame, as Legacy GL and the portable renderer
+already did; a page the device evicted since uploads again within a frame or two.
+Likewise a changed HD surface (a terrain page animation rewrote) builds its mip
+chain on the graphics thread within 8 MiB of level-zero pixels a frame; past
+that a surface the device adapter already holds draws its previous upload. Pages and overview cells ahead of
+the camera compose on the workers' lower priority lane. Each frame's
+`TerrainFallbackMetrics` (in `MapRenderState`) counts the visible cells drawn
+from each fallback; `tools/rendering/fallback_scenario.py` reports them for a
+scripted game of jumps, pans and zooms, see
+[terrain rendering](../assets/terrain-rendering.md).
+Resources, decor and ground overlays draw from canonical map rows of recorded
+frames (`ResourceRowCache`) on every renderer: Legacy GL replays each row's cached
+geometry, and renderers without that cache draw the recorded frames sprite by
+sprite, checking partial discovery per drawn cell, so a frame does no per-cell
+decor, overlay or resource lookups. On Legacy GL, fully revealed resources use canonical map rows, with sorted source-tile indices
 selecting the contiguous visible vertex range. Translation places a canonical row
 at its wrapped-map position, so camera panning does not change its vertices.
 Cached rows reuse frame data until their resource or terrain revisions change. Animated cells update their selected frames as the scene tick advances.
-Partial-discovery resources keep the ordinary drawing path. The resource geometry budget
+Partial-discovery resources keep the ordinary drawing path there. The resource geometry budget
 is 32 MiB of buffer payload with at most 4096 entries and least-recently-used
 eviction; CPU metadata and driver allocation overhead are additional. Each scene
 attempts at most 16 geometry builds under a separate soft 2 ms budget; validated
@@ -65,6 +394,27 @@ including equal-size terrain tiles. Fractional zoom and camera offsets can put
 a covered pixel arbitrarily close to a frame edge; the nearest-sampling tie
 bias must land in that frame's border rather than a neighboring frame. Keep
 the border copy unblended so transparent edges retain their original RGBA.
+On the device renderers a draw checks only its own frame's stamp against the
+sheet's atlas, and a sheet that cannot have one (team-coloured or rotated
+frames, frames without pixels, too large, no atlas memory) tries again after
+120 frames rather than on every draw.
+
+The portable SDL renderer merges its blits, fills and triangle lists into
+`SDL_RenderGeometry` runs keyed by texture, blend mode, scale mode and SDL's
+per-call clamp or wrap choice. A draw may join an earlier compatible run only
+when no later pending run covers any cell of a coarse 16-unit occupancy grid
+under its output bounds, so overlapping draws keep painter order whatever their
+blending. Draws that only share an edge may reorder on accelerated renderers,
+whose fill rules rasterize a shared edge once; SDL's software renderer keeps a
+whole output pixel between them because it rounds rectangle edges. At most 64
+runs are pending; clip, render scale and target changes, texture uploads or
+destruction, readback, flush and present submit them first. Lists of 384 or
+more vertices (terrain, bars) follow the pending runs as their own call. On
+SDL's software renderer each run carries indices that reproduce SDL's per-call
+duplicate-vertex detection, so triangle pairs still become the same rectangle
+copies. Fully opaque fills replace the target instead of blending (alpha 255
+gives the same pixels): accelerated renderers draw them with
+`SDL_BLENDMODE_NONE`, and the software renderer fills their rectangles directly.
 
 Native array/cache optimizations require supported desktop OpenGL features.
 Software, portable SDL and unsupported native contexts retain their existing
@@ -248,6 +598,97 @@ this preference. Headless runs, offline image exports and renderer benchmarks do
 not opt into the interactive limiter. Recording output FPS remains independent;
 recordings cannot gain new visual detail from frames the application did not draw.
 
+### Device profile and adaptive defaults
+
+`DeviceProfile` (`src/app/DeviceProfile.h`) classifies the device once at startup
+as low, mid or high and records its inputs. Everything that adapts to the device
+reads this profile; nothing probes hardware itself, and nothing in the simulation
+path reads it, so simulation checksums and `SIM_REVISION` are unaffected.
+
+Inputs: `SDL_GetSystemRAM` (on iOS this is `hw.memsize`, the same figure as
+`NSProcessInfo.physicalMemory`; browsers use `navigator.deviceMemory`, because SDL
+reports the WebAssembly heap limit there) and the hardware thread count, which
+`AssetLoader::Options::environment` also budgets from; whether the device is a
+phone or tablet (`GAGCore::platformIsMobile`; in a browser `userAgentData.mobile`,
+an Android, iPhone or iPad user agent, or a Mac user agent with touch points,
+which is iPadOS); on Android
+`ActivityManager.isLowRamDevice()`, `getMemoryClass()`, `getLargeMemoryClass()`
+and `MemoryInfo.totalMem` through `Glob2Activity.getMemoryProfile` (totalMem
+replaces SDL's figure when known); on Windows and Linux windowed runs, the largest
+device-local heap of a discrete Vulkan GPU, probed on a background thread and
+folded in by `DeviceProfile::poll()`. Phones share memory between CPU and GPU,
+integrated GPUs use system memory and legacy GL has no portable query, so they
+have no VRAM rule.
+
+The thresholds are provisional until phone measurements exist, and all of them
+live in `deviceThresholds`:
+
+| Tier | Rule | Auto artwork | New-map default |
+| --- | --- | --- | --- |
+| Low | under 3 GiB or an Android low-RAM device; or at most 2 hardware threads (map size only) | original (high resolution when only the cores are low) | 128×128 |
+| Mid | 3 to 6 GiB, or a phone that reports nothing | high resolution | 128×128 on phones, 256×256 elsewhere |
+| High | over 6 GiB, or nothing reported off phones | high resolution | 256×256 |
+
+A phone or tablet that reports no memory is Mid: Safari, every iOS browser and
+Firefox have no `navigator.deviceMemory`, and most such phones hold 4 to 8 GB.
+A discrete desktop GPU with less than 1 GiB of device-local memory also starts
+with original artwork. `GLOB2_DEVICE_TIER=low|mid|high` or
+`play --device-tier low|mid|high` overrides the tier for testing.
+
+**Auto semantics.** Adaptive settings have an Auto state, and Auto is the
+default; Original and High resolution are explicit choices that the device never
+overrides. Settings > Display shows what Auto resolved to and why, for example
+"Automatic: original on this device (2.7 GB RAM)". Preferences store
+`highResolutionArtworkChoice=auto|off|on` and keep writing the legacy
+`highResolutionArtwork` key (0 only for Off) for older builds. Profiles from
+before Auto wrote `highResolutionArtwork=1` whether or not the player chose it,
+so `1` migrates to Auto and `0`, which departs from the old default, stays an
+explicit Off; on mid and high devices Auto resolves to the old value.
+
+**Browser graphics detail.** In the browser, the eight detail effects (clouds,
+cloud shadows, building particles, full magic effects, translucent panels and
+path lines, smooth progress indicators, decorative animations) start on a
+shared adaptive default: all on, except all off on a Low device. Changing any
+one of them in Settings, or launching with `--graphics-detail`, ends the
+default for good, and preferences store it as `graphicsDetailAdaptive`. Native
+builds start with every effect on and no adaptive default.
+
+The map size is gameplay, so only the defaults adapt: a custom game without a
+saved lobby, Reset to defaults, and a new map in the editor start at the tier's
+size where the landscape can host the colonies at it (otherwise they keep 256×256,
+so the lobby stays startable), and the player can still choose any size. A saved lobby keeps the size it
+was played at. Online rooms use the host's map; a low-tier device in a room whose
+generated map is larger than its default sees a warning, and the match never
+changes.
+
+**Session step-down.** With artwork on Auto, high resolution turns off for the
+rest of the session, through the asynchronous `Sprite::requestHighResolution(false)`
+path, when the OS reports memory pressure or the game sustains hitches: 40
+presented frames over 50 ms within 15 seconds, outside the first 20 seconds of a
+match and ignoring gaps over a second (an O(1) ring of timestamps). The player is
+told once in game, and Settings > Display offers to keep original artwork as the
+default. Memory signals respond by severity (`DeviceAdaptation::respond`):
+
+| Signal | Response |
+| --- | --- |
+| iOS memory warning (`SDL_EVENT_LOW_MEMORY`) | trim caches; step down at once |
+| Android `TRIM_MEMORY_RUNNING_MODERATE` | trim caches |
+| Android `TRIM_MEMORY_RUNNING_LOW` | trim caches; step down at once |
+| Android `TRIM_MEMORY_RUNNING_CRITICAL`, `onLowMemory` | smallest budgets; step down at once |
+| Android `TRIM_MEMORY_UI_HIDDEN`, `BACKGROUND` and higher | background trim; no step-down |
+
+SDL 3.4's `SDLActivity` turns every `onTrimMemory` level into one ungraded
+`SDL_EVENT_LOW_MEMORY`, so `Glob2Activity` also passes the level to native code,
+where a lock-free queue hands it to the game thread once a frame; on Android the
+ungraded SDL event only feeds `ScreenStack`'s existing handling. An explicit
+artwork choice is never stepped down, but caches are still trimmed. All trims go
+through `DeviceAdaptation::trimPresentationMemory`, which forwards to the
+renderer's bounded `GraphicContext::trimPresentationMemory` (a background trim
+for `Background`, a low-memory trim otherwise) and keeps the retired HD frames'
+budget at zero after a critical signal. Render budgets stay as the device was
+created with. The tier, its inputs and every step-down with its OS signal are
+logged in the [performance telemetry](../development/performance-telemetry.md).
+
 ### Simulation thread
 
 Interactive sessions run the simulation on its own thread (`src/engine/sim/SimulationRunner.h`)
@@ -300,6 +741,24 @@ also remains the headless default and the equivalence reference.
   background is therefore not caught up after resuming, as in serial execution.
   GUI updates use `SDL_GetTicks()` instead: touch event timestamps and momentum
   must share the SDL clock, including after the session clock has been suspended.
+- Threads carry a scheduling role (`GAGCore::ThreadSupport::ThreadRole`) in three tiers.
+  *Interactive* is the core loop (the windowed client's main thread, which also draws,
+  and the simulation thread) plus the audio mixer, which SDL then raises to high
+  priority so playback does not stutter. *Worker* is every other thread: the compute
+  executor (including the simulation barriers the core loop waits on), parallel
+  presentation, asset streaming, the gradient coordinator, previews, recording, network
+  transports and helper threads. `ThreadSupport::launch` starts threads as workers, and
+  threads created directly set the role themselves. *Background* is work nothing waits
+  on: `render/BackgroundWork.h` composition and the background file writer. Roles map to
+  QoS classes on Apple platforms (user-interactive, user-initiated, utility; utility
+  also prefers efficiency cores), thread priorities on Windows (above normal, normal,
+  below normal) and nice values on Linux and Android (−4, +2, +5). Unprivileged Linux
+  processes cannot go below nice 0, so there the core loop and audio stay at 0, still
+  ahead of workers. Headless commands leave the main thread at the default, so batch
+  runs do not crowd the desktop. Roles never change what a tick computes;
+  `GLOB2_THREAD_PRIORITY=0` turns them off for comparisons. Under contention the core
+  loop can wait on workers that run behind it (priority inversion); the tiers are an
+  architectural choice that favours frame and input latency in that case.
 - Values the client sets while drawing and preparation reads (viewport, drawn map size,
   overlay, observed building) go through `ClientRequests`, never through `Game` or `Map`
   fields. To check for races, build with `CXXFLAGS="-g -fsanitize=thread"
@@ -456,7 +915,8 @@ additively blended blit:
 
 - **Device renderers** (SDL GPU, programmable GL, WebGPU): a `DrawPacket` blit with
   `Blend::Additive`.
-- **Portable SDL renderer:** `SDL_BLENDMODE_ADD` on the texture for that draw only.
+- **Portable SDL renderer:** `SDL_BLENDMODE_ADD` on the texture for that run only;
+  additive draws batch separately from ordinary draws of the same texture.
 - **Legacy GL:** an immediate quad with `GL_SRC_ALPHA, GL_ONE`.
 
 The software renderer draws the surface normally. A backend opts in through
@@ -491,6 +951,15 @@ lattice when zooming out to half size or smaller. Patches retain at most their c
 time remain unchanged, but distant clouds have less fine detail. The torus view
 retains its separate sampling budget.
 
+Renderers without a cloud shader, including the portable SDL renderer, sample
+the shadow and cloud lattices on the CPU. A cloud thread of its own samples the
+next lattices, with a margin of three cells around the view, while frames draw;
+the graphics thread draws the newest finished lattices at their world position
+and samples on the graphics thread (with a few helper threads) only when none
+covers the view, as on the first frame or after a jump. The portable SDL
+renderer draws each alpha map as one small lattice texture stretched with linear
+filtering, texel centres on lattice points, instead of four triangles per cell.
+
 Point bars batch opaque fills within each bar using bounded OpenGL or SDL geometry
 submissions. OpenGL outlines and translucent fills preserve their original order;
 software surfaces retain their existing path. Full-map terrain and resource passes
@@ -518,6 +987,36 @@ straight alpha. The fragment `textured` flag disables sampling for solid fills. 
 clamps sampling to the selected source rectangle's texel centres, preventing
 linear filtering from bleeding adjacent atlas entries; generic triangles use
 the full texture bounds.
+
+The `team-color` material draws a sprite's team layer on the device renderers
+(SDL GPU and programmable GL) with the CPU recolour computed per texel in the
+shader: `DrawableSurface::shiftHSV`'s hue-only shift through
+`RGBtoHSV`/`HSVtoRGB` and `Color::setHSV`'s truncation, with unpremultiply and
+the upload's integer premultiply around it for premultiplied (linear, HD)
+textures. It fetches texels itself and recolours each before its own bilinear
+or trilinear filter, as the CPU recolours its copy before upload. Vertices use
+the primitive layout with a grey tint in colour x and the hue shift, in degrees,
+in colour y, read through a `flat` varying, so draws of one texture batch across
+teams. A `DrawPacket` with `Material::TeamColor` and `teamHue` carries it, and
+devices advertise it with `RenderDeviceCapabilities::teamColor`; SDL GPU loads
+its shaders and both blend pipelines with the device. `DrawableSurface::drawSprite`
+then draws the uncoloured team layer through `GraphicContext::drawTeamColorSurface`,
+so `Sprite::getColoredSurface` makes no clone: rotation maps and the unit recolour
+cache stay empty and `Sprite::highResolutionStats().coloredFrames` stays zero.
+A radial fade (a swimmer) draws its faded grid through the same material.
+Without the material (older shader sets, a driver that rejects it, WebGPU, or
+`GLOB2_DISABLE_UNIT_SHADER` set) team layers keep the CPU recolour, as do sprites
+drawn into a CPU surface rather than the screen; the
+memory report's `cpu_team_color_bytes` and `team_color_frames` count those copies.
+Sector and truncation boundaries make the recolour discontinuous, so the shader
+follows the CPU's single-precision operations exactly: it divides with integers
+(GPU division is not correctly rounded) and multiplies each product that feeds an
+addition by an opaque uniform one, so contracting it into a fused multiply-add
+rounds the same. On SDL GPU the result equals the CPU recolour drawn by the same
+device; linear filtering differs by at most one level (fixed-point hardware
+weights), and minified mip chains differ where a level averages different hues
+before recolouring rather than after (`SDLGPUDeviceTest`, `DeviceTeamColor`).
+Mesa's programmable GL moves a few channels by one level.
 
 Pass `--glslang /path/to/glslangValidator` to compile native SPIR-V ahead of time.
 The manifest pins build-only glslang **15.1.0** and Vulkan 1.0; another compiler
@@ -553,6 +1052,71 @@ source and library hashes with the entrypoint. Failed or incomplete builds leave
 Metal unavailable. A verified Apple tool lock and actual SDK compilation are
 required before producing release libraries; mock tests verify invocation and
 receipt handling only.
+Apple builds run all of this automatically; see [Apple Metal shaders](#apple-metal-shaders).
+
+#### Apple Metal shaders
+
+Every macOS app and iOS device build compiles SDL GPU's Metal libraries as part
+of its ordinary shader step, with no environment or manual translation: the CMake
+build passes `--apple-sdk macosx` on macOS hosts, and iOS device builds use
+`iphoneos` (the pinned SDL GPU does not run in the Simulator, so simulator builds
+have none). `buildsys/renderer_shaders.py` then:
+
+1. provisions pinned glslang (`buildsys/glslang.json`) and SPIRV-Cross
+   (`buildsys/spirv-cross.json`, tag `sdk-1.3.239.0`) from hash-verified source into
+   the development store, once per machine (`python3 buildsys/spirv_cross_tool.py`
+   does it ahead of time). The source-built SPIRV-Cross translates byte-for-byte
+   like the pinned Ubuntu `2021.01.15+1.3.239.0-1build1` binary, so a Mac produces
+   the same `metalSources` receipts Linux does; `generate.py` accepts either the
+   pinned Ubuntu binary or a receipted build of the pinned source;
+2. compiles the translated sources with `xcrun metal` and `metallib`, checked against
+   the committed lock `buildsys/metal-tool-lock.json`;
+3. ships the runtime artifacts: `buildsys/bundle.py` copies the shader set,
+   Metal libraries included, into `Glob2.app/Contents/Resources/shaders`, which the
+   runtime finds through the file manager, and `platforms/mobile/ios.py` into the
+   iOS app. Translated sources, AIR and the layout header stay behind.
+
+The lock lists every reviewed Apple toolchain: the exact `xcodebuild -version`
+output and, per SDK, the SDK version and SHA-256 digests of the resolved `metal`
+and `metallib` executables:
+
+```json
+{"toolchains": [{"xcodeVersion": "Xcode 27.2\nBuild version 27B52",
+                 "sdks": {"macosx": {"sdkVersion": "27.2", "metalSha256": "…", "metallibSha256": "…"},
+                          "iphoneos": {"sdkVersion": "27.2", "metalSha256": "…", "metallibSha256": "…"}}}]}
+```
+
+A build compiles with a listed toolchain when one matches this Mac. iOS entries
+also require the Xcode pinned in `platforms/mobile/toolchain.json`; macOS entries
+cover each release runner image's own Xcode. Otherwise:
+
+- **Development builds** record this Mac's toolchain as
+  `BUILD/metal-development-lock-SDK.json`, warn, and compile with it, so a developer
+  Mac on another Xcode still gets SDL GPU. The receipt marks the libraries
+  `metalToolLockKind: development`. Without full Xcode, or when the translators
+  cannot be provisioned, a development build warns and carries on without Metal
+  (SDL GPU then reports itself unavailable).
+- **Release builds** set `GLOB2_METAL_REQUIRE_COMMITTED_LOCK=1` (the macOS release,
+  Mac App Store, GOG and TestFlight workflows do) and fail instead: on an unlisted
+  toolchain, on missing translators, or when the packaged app lacks the complete
+  Metal set.
+
+`tools/shaders/metal_tool_lock.py` writes a Mac's entry (`--output`), merges entries
+(`--combine`) and checks the committed lock against a Mac (`--check`, printing the
+nearest entry's differing fields and the entry that would match). The lock changes
+only through a reviewed pull request. The **Apple Metal tool lock** workflow
+(`.github/workflows/apple-metal-tool-lock.yml`) runs on every release runner image
+(`macos-15`, `macos-15-intel`, `macos-26`, and `xcode-27` with the pinned Xcode for
+iOS) on manual dispatch and on pull requests that change the lock, the Xcode pin or
+the lock tooling. It fails while any release runner's toolchain is missing, and
+uploads each runner's entry plus a combined candidate lock to review and commit.
+When a runner image moves, its release job fails with the differences; dispatch the
+workflow, review the candidate, and commit it, dropping toolchains no release job
+uses any more.
+
+`GLOB2_RENDER_SHADER_INPUT` with `GLOB2_METAL_SDK` and `GLOB2_METAL_TOOL_LOCK`
+remains for importing an externally translated bundle (below); an Apple build that
+imports one without them compiles it with the automatic lock choice.
 
 
 Native skin shaders convert GL clip depth to Vulkan's 0..w range;
@@ -594,15 +1158,84 @@ validation remains a separate release gate.
 `RendererBackend` stores stable family identifiers: `auto`, `sdl-gpu`,
 `programmable-gl`, `webgpu`, `portable-sdl`, `software`, and `legacy-gl`.
 Availability depends on the build, shader assets, device and presentation surface.
-A family listed as unavailable cannot be selected. New devices remain experimental
-until their full feature and hardware release gates pass; Auto retains the existing
-platform policy.
+A family listed as unavailable cannot be selected.
+
+Auto tries an ordered list (`GraphicContext::automaticRendererOrder()`) and starts
+on the first family that is available and starts. Measurements choose the order,
+not the renderer's architecture; the per-platform rows live in one table,
+`PreferredRendererOrder` in `libs/gag/src/GraphicContextRenderer.cpp`:
+
+| Platform | Auto order |
+| --- | --- |
+| Linux, Windows | programmable GL, Legacy GL (builds with OpenGL), SDL GPU, Portable SDL, Software |
+| macOS | programmable GL, SDL GPU, Legacy GL, Portable SDL, Software |
+| Android, iOS | SDL GPU (Vulkan, Metal), Portable SDL, Software |
+| Browser | on a probed WebGL2 adapter: programmable GL, Legacy GL (builds with it), Software; otherwise Software. WebGPU stays opt-in |
+
+The Linux row comes from a 1x perf build (master `d6488cac13`): the honeycomb-256
+memory scenario (3,600 pan and zoom frames) and the fast wheel zoom of the motion
+parity timing run.
+
+| Renderer | Frame p50 | p99 | Max | Peak RSS | Peak GPU driver | Zoom median | Zoom p99 | Zoom max | Zoom frames over 16.7 ms |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| programmable GL | 5.4 ms | 26.9 ms | 64 ms | 539 MiB | 217 MiB | 5.0 ms | 19.9 ms | 50 ms | 11 |
+| Legacy GL | 6.2 ms | 23.5 ms | 50 ms | 626 MiB | 233 MiB | 4.8 ms | 20.6 ms | 48 ms | 7 |
+| SDL GPU | 6.0 ms | 33.3 ms | 146 ms | 604 MiB | 202 MiB | 6.1 ms | 27.2 ms | 163 ms | 45 |
+| Portable SDL | 8.5 ms | 34.7 ms | 75 ms | 867 MiB | 177 MiB | 5.7 ms | 19.3 ms | 76 ms | 7 |
+
+Programmable GL has the lowest median and resident memory with a tail close to
+Legacy GL's, so it leads; SDL GPU's tail (p99, maximum and zoom frames over budget)
+is the worst, so it follows both GL renderers. Windows runs the same GL renderers
+and has no measurements of its own yet, so it shares the Linux row. The macOS row
+comes from the same memory scenario on a Retina Mac (master `5524479f28`, a
+3840x2160 drawable; footprint counts unified GPU memory):
+
+| Renderer | Frame p50 | p99 | Max | Peak RSS | Peak footprint |
+| --- | --- | --- | --- | --- | --- |
+| programmable GL | 11.2 ms | 29.3 ms | 108 ms | 1346 MiB | 1562 MiB |
+| SDL GPU (Metal) | 11.3 ms | 33.7 ms | 173 ms | 1163 MiB | 1419 MiB |
+| Legacy GL | 11.5 ms | 27.6 ms | 163 ms | 1218 MiB | 1651 MiB |
+| Portable SDL | 4.5 ms | 57.7 ms | 418 ms | 2347 MiB | 2730 MiB |
+
+Programmable GL has the best tail, SDL GPU the smallest footprint, and Legacy GL
+the largest footprint. Phones put SDL GPU first (user decision, 2026-11-17): it is the fully GPU
+renderer on Vulkan and Metal, and the packages ship and verify its shaders
+(Android requires the Vulkan set, iOS device builds the Metal set). Portable SDL
+follows where the device or shaders are unavailable, as in the iOS Simulator, or
+when the device is lost. Revisit the rows when phone measurements land.
+
+In the browser, programmable GL leads on a probed WebGL2 adapter (user decision,
+2026-11-17): Legacy GL there runs on Emscripten's fixed-function emulation, which
+warns that it may not work, and builds without it (`web_legacy_gl=0`) previously
+fell to Software even with WebGL2 available. There are no real-GPU browser
+measurements yet; revisit with them.
+
+The game asks for this order with the `PREFERDEVICE` startup flag, which
+`startupScreenFlags()` adds without persisting it; tools and tests that create a
+context without it keep the historical mapping (`USEGPU` to Legacy GL,
+`PORTABLEGPU` to Portable SDL, otherwise Software, Portable SDL on mobile).
+
+A family that is unavailable, or whose device, shaders or surface fail at startup,
+falls through to the next; Software ends every order, so startup never leaves a
+black window. Each skipped family adds `family: reason` to the switch status reason,
+which the game logs at startup and benchmarks print as
+`BACKEND requested=... active=... fallback_reason=...`. Auto falling through is not a
+failed choice: the status phase stays idle and Settings shows the active renderer
+without an "unavailable" notice. An explicit choice is tried first and, if it
+cannot start, falls into Auto's order with a failed status. A device lost while
+running falls to the next available family in the same order (WebGPU still falls to
+programmable GL), not straight to Software.
 
 Startup precedence is an explicit command-line option or browser query, then the
 native `GLOB2_RENDERER` environment variable, persisted preference, and Auto. Existing
 `gpu`, `webgl2`, `opengl` and `sdl` aliases remain accepted. Startup overrides are
-session state. Settings without the new preference migrate their previous renderer
-flags; a new profile uses Auto.
+session state. A new profile uses Auto. Settings without the `rendererBackend`
+preference migrate their previous renderer flags: on desktop, where the old toggle
+offered only Software (the default, no GPU flag) or OpenGL, both answers migrate to
+Auto, since either meant "what this machine draws best with" rather than a family;
+a saved `PORTABLEGPU` flag stays Portable SDL. Browsers and mobile keep mapping
+`USEGPU` to Legacy GL and no flag to Software. A saved `rendererBackend`, including
+`legacy-gl`, is an explicit choice and is kept.
 
 Graphics settings request a transition through `requestBackendSwitch()`. The status
 reports requested and active families, phase and failure reason. Requests coalesce
@@ -615,6 +1248,17 @@ the new device commits the preference. Failure restores the previous family, wit
 software as the final fallback; failure does not save the unsuccessful preference.
 Rendering preference changes do not require restarting the game.
 
+After the loading screen, the first screen's first 30 frames (the main menu
+and its colony, or a first-run question in front of them) are drawn but not
+shown (`GraphicContext::holdPresentation`, from `Application`): every renderer
+streams terrain, HD artwork and atlases and settles while the last loading-screen
+frame stays up, about half a second. A held frame is recorded, submitted and
+completed like any other; only the final step differs: SDL GPU acquires no
+swapchain image and waits for the frame's work (the swapchain wait normally
+paces it), programmable GL skips its screen blit and swap, the portable renderer
+flushes instead of presenting, and legacy OpenGL and the software renderer skip
+their swap. `PRESENTATION_HOLD released ms=` logs when it ends.
+
 Switch status also reports the completed transition duration. Context recovery
 recreates the device and shader objects before restoring logical resources. A fatal
 submission error schedules fallback at a presentation boundary; an unavailable
@@ -625,6 +1269,57 @@ with explicit depth passes and premultiplied atlas composition. Paint and materi
 revisions remain immutable for submitted draws. Source, geometry and atlas caches
 are rebuilt after switching or recovery.
 
+HD sprite frames are block-compressed on SDL GPU, programmable GL and legacy GL,
+in a quarter of the memory of RGBA. The 4x4 blocks of premultiplied colour step
+slightly along the edges where a frame's base and team layers meet (about 2% of the
+zoomed-in game screen differs from the portable renderer in the parity scenes).
+`GLOB2_HD_BLOCK_COMPRESSION=0` draws them uncompressed instead. SDL GPU and programmable GL sample
+block-compressed HD artwork where the device reports the format (`RenderDeviceCapabilities::bc3Textures`, `astc4x4Textures`;
+programmable GL reports BC3 with `GL_EXT_texture_compression_s3tc` and ASTC 4x4 on
+GL ES contexts with `GL_KHR_texture_compression_astc_ldr`, never in the browser). On entering the device,
+asset workers prepare each HD chain as premultiplied BC3 (`PremultipliedBC3`,
+etcpak) where the device samples BC3 (desktop GPUs), otherwise as premultiplied
+ASTC 4x4 (`PremultipliedASTC4x4`, astcenc) where it samples ASTC (phones), and
+otherwise not at all (`preferredDeviceBlockCompression`); the draw passes the
+blocks with the RGBA levels, and the adapter stores a
+compressed `TextureRevision` holding only the blocks of the levels at least 4x4,
+charged at their size. The device uploads them unchanged into a
+`BC3_RGBA_UNORM` or `ASTC_4x4_UNORM` texture, a quarter of the RGBA chain on the GPU and in the
+restoration snapshot, and restores trimmed or lost textures from them. Workers
+keep only the blocks of those levels, and a chain prepared earlier releases its
+RGBA levels once the blocks reach the device; a device that
+cannot sample them (or legacy OpenGL, which never uploads premultiplied blocks)
+prepares the chain again from the surface pixels, as RGBA. Devices with neither
+format sample RGBA. Only asset workers encode blocks: a chain the draw must
+prepare itself (mutated content, or released pixels on a device without the
+blocks' format) gets RGBA levels and no blocks, so the render thread never runs
+an encoder and never waits for one; the HD loader keeps drawing the native
+frame until the worker's chain arrives. `GLOB2_TEXTURE_COMPRESSION=none|bc3|astc`
+restricts the formats SDL GPU and programmable GL report, for comparisons (`astc` exercises the
+phone path on a desktop GPU that samples ASTC, such as Mesa's lavapipe). The class budgets stay
+byte budgets, so the same budget holds about four times as much compressed artwork.
+
+ASTC encoding uses the vendored astcenc
+([inventory](../../third_party/README.md#astc-texture-compression)) with its
+fastest preset trimmed further (one partition, one candidate, one refinement
+pass: about 1.6 times faster than the plain preset for about 1.3 dB of PSNR at
+about 50 dB on the shipped frames), the same premultiply rounding as the BC3
+path, and one child codec context per worker thread sharing one table set. The
+`ImageAssets` case `HD frame block encoding timing [artifacts][benchmark]`
+measures every 32nd shipped HD frame's chain. On a desktop x86-64 core (perf
+build) ASTC takes about 6 to 7 ms per frame (worst about 200 ms for the largest
+padded chains), about 200 s for all 31,541 shipped frames on one thread, while
+etcpak's BC3 takes about 0.6 ms per frame; that tenfold gap is why BC3 stays the
+choice wherever it is sampled. Phones encode with NEON on slower cores, so expect
+a few times the desktop time per frame on each asset worker; the HD loader
+requests only visible frames and a short lookahead, and keeps drawing the native
+frame meanwhile. The added code is about 205 KB on Android `arm64-v8a` and
+`armeabi-v7a` and 230 KB on `x86_64` (stripped, `-O2`), and about 225 to 260 KB
+on desktop x86-64 Linux and Windows (`-O3`). Coverage: native Linux, Windows and
+macOS builds and Android and iOS compile the encoder (NEON on arm64, SSE4.2 on
+Android x86_64, SSE2 on desktop x86, where BC3 is chosen anyway, scalar on
+32-bit ARM); the browser build leaves it out.
+
 Native texture restoration uses bounded upload slices when a full authored mip
 chain cannot coexist with retained depth atlases and its transfer buffer. Upload-only
 preparation can complete independently of a deferred draw frame; sampling waits for
@@ -634,15 +1329,106 @@ budgets do not imply that all classes fit simultaneously. Torus captures use the
 terrain density when the full tiled layout fits the terrain-target and aggregate
 resource budgets. SDL GPU charges texture and depth allocations once over their
 owned lifetime, including pending submissions and captures, instead of rebuilding
-the complete texture lease set during each admission check. Staging buffers remain
-charged separately until their work completes. Explicit trimming releases completed GPU copies that can be
+the complete texture lease set during each admission check. Its bookkeeping is
+constant time per frame: running totals for live textures (per budget class),
+geometry, coverage, retiring work and readbacks; cache admissions since the last
+submission listed apart, so a submitted or failed frame marks or drops only
+those; and dead CPU revisions retired 128 cache entries per call from a cursor
+(all of them only when a budget class is full). Staging buffers remain
+charged separately until their work completes; upload and readback staging buffers
+and each frame's vertex buffer, up to 16 MiB, are then kept for reuse in
+power-of-two classes (at most 24 MiB idle, a tenth of the total budget on phones),
+and released colour textures for an allocation of the same size and format (at
+most 32 MiB, an eighth on phones; every allocation is uploaded, cleared or copied
+whole before it is sampled). Idle memory (`RenderTelemetry::idleBytes`) is kept only
+while it fits beside the resources within the total budget, and an admission that
+would fail and an explicit trim release it first. Creating a Vulkan buffer for
+every frame's vertices, uploads and the benchmark's completion readback, and
+freeing it, cost more CPU in driver calls than filling it; SDL's Vulkan backend
+also submits a command buffer for every texture it creates, so in a game frame
+a submission creates at most 96 new cache textures for packets drawn to the
+screen: past that it keeps the uploads made so far and defers the frame, and
+the previous frame shows while later frames create the rest (a resume after a
+background trim, a first zoom out). Only frames their owner marks deferrable
+(`allowDeviceFrameDeferral`, which `GameGUI::drawAll` calls; device captures
+in game are asynchronous) are capped; a synchronous capture ends the mark
+before it flushes, and other frames, such as menus, tests and complete draws,
+are never capped. Offscreen composition, such as terrain pages, is exempt,
+since a page left half composed would start again. Programmable GL caps a
+deferrable frame the same way, at 96 new textures or 16 MiB of their uploads,
+and keeps the same constant-time bookkeeping: sampled textures on intrusive
+least-recently-used lists by budget class, and dead revisions retired 128 cache
+entries per call from a cursor. Explicit trimming releases completed GPU copies that can be
 restored from logical CPU snapshots, while preserving in-flight work, unfinished
 uploads and externally owned rendered targets. Actual pressure can reduce density,
 rather than a fixed low pixel cap.
 
+On the presentation devices (SDL GPU, programmable GL, WebGPU), a surface's CPU
+pixels and upload staging can go once the device adapter holds a restoration
+snapshot of its current revision (`DrawableSurface::releaseDevicePixels`, the
+counterpart of the portable renderer's release). The adapter then *retains* that
+snapshot: it leaves the least-recently-used eviction list (an intrusive list, so
+admission evicts in constant time) and draws with `blitCached` in the sampling it
+was recorded with. Retained snapshots are capped at half of each budget class, so
+ordinary admission always has room, and at most 16 surfaces are released a frame.
+A device reset keeps them, and context recovery moves every snapshot to the
+replacement adapter (`adoptDeviceTextures`), so neither reloads anything. A backend
+switch or a failed recovery drops them; `Sprite::discardUnbackedHighResolution`
+then drops the HD layers that had only those snapshots, which draw native frames
+until their background reload publishes. HD base layers are released this way
+after a direct draw (`Sprite::releaseDrawnHighResolution`: skin shadows through
+`Sprite::drawFrame`), never when the CPU samples them: a released layer that
+`Sprite::baseFrame` reaches answers with its native frame and queues a background
+reload with pixels, while the released layer keeps drawing until it publishes.
+Terrain materials and decor, which CPU page composition samples, keep their pixels.
+Offscreen CPU exports cannot draw a device-released surface.
+
+SDL GPU, programmable GL, the CPU restoration registry (`RenderResources`) and
+the terrain page and torus planners share one `RenderBudget`
+(`platformRenderBudget()`). Desktop keeps 512 MiB in total, General 256 MiB, SkinAtlas
+64 MiB, TerrainPage 128 MiB, TerrainMask 32 MiB and 64 MiB of geometry. On-demand
+renderers (every renderer but legacy OpenGL) keep uploaded HD sprite frames within
+3/8 of General (`GraphicContext::deviceHighResolutionRoom`); 256 MiB holds all
+3,680 HD unit frames (about 77 MiB block-compressed with mips), so every unit
+animation stays HD however many the game has shown. Under the former 64 MiB the
+first frames drawn filled the room and the rest (harvesting, warriors, explorers)
+drew native until restart; `Sprite::highResolutionDrawCounts` counts HD draws and
+native ones by reason (`FRAME_HD_SPRITES` in the torus benchmark). Phones
+and tablets (`GAGCore::platformIsMobile`: the Android and iOS builds, and the
+browser build on Android, iPhone or iPad) use 160 MiB, 48, 32, 64 and 16 MiB and
+32 MiB of geometry: phones
+share one memory pool between CPU and GPU, and the system kills a large
+backgrounded game first. Each mobile class still holds twice its largest single
+texture (the 22.4 MiB authored HD terrain block, 16 MiB skin atlas pages, sixteen
+downsampled 1024x1024 terrain pages), since a class limit is also the largest
+texture it admits; GPU terrain composition falls back to CPU pages when the view's
+pages exceed the TerrainPage class. `GLOB2_RENDER_BUDGET=mobile` (or `desktop`)
+overrides the choice to measure one platform's budget on another, and
+`GLOB2_RENDER_BUDGET_TOTAL_MIB` replaces the total alone (the class limits stay),
+for tests and memory experiments that need the combined limit to bind. WebGPU keeps its own limits.
+
+`SDL_EVENT_LOW_MEMORY` and backgrounding (`SDL_EVENT_WILL_ENTER_BACKGROUND`,
+`SDL_EVENT_DID_ENTER_BACKGROUND`) call `GraphicContext::trimPresentationMemory`,
+which frees what can be rebuilt without a renderer reset: the device's completed
+GPU copies (`trimRetiredResources`), the adapter's CPU restoration snapshots whose
+owners keep their pixels (`trimDeviceTextures`, which walks the adapter's
+least-recently-used list from its oldest end, so each step is constant time;
+retained snapshots are not on it), terrain pages off the view
+(through `PresentationTrimSubscription`) and the retired HD frames of streamed
+banks. Backgrounded nothing is drawn, so all of it goes at once. In the
+foreground, presentation devices trim instead of resetting, which would upload
+the whole view again in one frame: at most 64 snapshots a frame, only those not
+drawn in the last two frames, eight idle terrain pages a frame and 64 retired
+frames a poll, so the view keeps drawing from what it holds. Erased snapshots and
+pages are re-created from their owners' pixels or recomposed in the background
+when next drawn. Other renderers still reset on low memory, and trim terrain
+pages and retired frames when backgrounded. `GLOB2_BENCH_TRIM_AT=<frame>` (or
+`memory_scenario.py --trim-at`) sends a low-memory trim during a benchmark.
+
 The command adapter preserves adjacent painter order and flushes at 4096 commands.
 Cloud alpha maps retain complete cell fans in painter order, submitting at most
-4092 vertices per chunk instead of allocating a packet for each cell. Legacy GL
+4092 vertices per chunk instead of allocating a packet for each cell (the
+portable SDL renderer uses its lattice texture instead). Legacy GL
 float alpha maps also group complete fans into bounded submissions, retaining
 their integer centers and existing clamped colors. Software nearest blits use
 direct coordinate offsets on unscaled axes; scaled axes retain the original
@@ -699,11 +1485,15 @@ owned arrays, supporting shared memory and memory growth. Logical resource
 revisions use independent device allocations; submitted frames retain snapshots
 until queue completion. Discard fences also cover uploads prepared before packet
 submission; backend recreation shares the adapter’s issued completion timeline.
-Texture/depth allocations are bounded to 256 MiB in total, with General and
-SkinAtlas class budgets of 64 MiB, TerrainPage 128 MiB, and TerrainMask 32 MiB;
-persistent geometry to 32 MiB. Eight pending presentation frames and three capture
+Texture/depth allocations are bounded to 512 MiB in total on desktop, with class
+budgets of General 256 MiB, SkinAtlas 64 MiB, TerrainPage 128 MiB, and TerrainMask 32 MiB;
+persistent geometry to 32 MiB. Terrain imagery the CPU composes (view pages,
+overview pages and animated tiles, `TerrainVisual::Surface`) is admitted in the
+TerrainPage class on every device, matching the page cache's own 128 MiB plan;
+in the General class they would compete with HD sprites, and on phones a view's
+high-density pages alone could exceed its 48 MiB, deferring every frame. Eight pending presentation frames and three capture
 requests bound GPU admission. Recorder flushes within one presentation share a
-fence and admission slot; all transient buffers also count toward the 256 MiB
+fence and admission slot; all transient buffers also count toward that
 aggregate device limit. Capture maps complete asynchronously in admission
 order; recording timestamps and context remain in the originating C++ request.
 Submission, presentation and capture CPU times and completed capture latency
@@ -840,8 +1630,8 @@ mip chains keep their existing upload and compression path. Unsupported contexts
 creation retain CPU preparation. Native scratch textures and shaders are released
 before their owning context is destroyed.
 
-Asset workers also compress each authored level into 4x4 blocks with the
-vendored etcpak encoders (`AssetImage::compressBlocks`,
+Unless `GLOB2_HD_BLOCK_COMPRESSION=0` (see above), asset workers also compress each authored level into 4x4
+blocks with the vendored etcpak encoders (`AssetImage::compressBlocks`,
 [inventory](../../third_party/README.md#texture-block-compression)), so the
 graphics thread uploads blocks and the driver never encodes. Desktop legacy
 OpenGL picks the format at context creation: BC3 where the device has S3TC, as
@@ -867,14 +1657,22 @@ published images when mip preparation or CPU restoration requirements change.
 The previous artwork remains visible until publication, and failed upgrades keep
 a valid existing layer. Its linear textures need
 premultiplied alpha: accelerated SDL renderers prepare them by blending a
-straight-alpha staging texture onto a transparent target. The staging texture is
-shared by the renderer, and compatible cached textures are updated in place when
-pixels change. SDL's per-target viewport, clip, scale and logical presentation
+straight-alpha staging texture onto a transparent target. The renderer keeps up
+to four staging textures, one per texture size, since pages, HD sprite frames and
+animated tiles of different sizes upload in the same frame, and releases each
+after 300 presented frames unused; compatible cached
+textures are updated in place when pixels change. SDL's per-target viewport, clip, scale and logical presentation
 state is restored before drawing resumes. A bounded 256×256 startup probe checks
 all byte colour/alpha pairs against the CPU integer result. Drivers whose blend
 units differ retain CPU conversion and log their conformance mismatch count.
 Software renderers and unsupported target/blend combinations also keep CPU
-conversion. Preparation uses the existing
+conversion. Region updates (`RenderBackend::prepareTextureRegions`, used by
+terrain pages that rewrote a few cells) patch only the dirty rectangles of a
+texture holding the immediately preceding revision, with the same bytes a whole
+upload stores: the CPU path premultiplies each rectangle with the same integer
+rounding, and GPU-prepared textures clear and re-blend just those rectangles from
+the staging texture. A region update keeps the sampling mode the texture's last
+draw chose, and pending batched draws are submitted before it. Preparation uses the existing
 SDL renderer APIs across OpenGL ES, Metal and other accelerated SDL backends.
 
 For a native preparation comparison, set
@@ -895,7 +1693,7 @@ string services remain alive until the context has delivered completed captures
 and retired its presentation surface. A completed asynchronous screenshot can
 still need these services while the context is being destroyed.
 
-`RendererSelection` defines stable backend-family identifiers, aliases, capabilities and startup precedence. The application coordinator applies this policy through the live-switch transaction described above. Auto defaults remain unchanged, and renderer selection stays outside simulation state.
+`RendererSelection` defines stable backend-family identifiers, aliases, capabilities and startup precedence. The application coordinator applies this policy through the live-switch transaction described above. Auto's per-platform order is described in [Runtime backend selection](#runtime-backend-selection), and renderer selection stays outside simulation state.
 
 ### CPU presentation batches
 

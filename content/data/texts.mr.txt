@@ -5016,6 +5016,10 @@ JavaScript AI आयात करा
 प्रतिष्ठा
 [stat prestige about]
 उच्च-स्तरीय इमारती उभारून मिळवलेली वसाहतीची प्रतिष्ठा. प्रतिष्ठेचे ध्येय असलेला सामना ते ध्येय गाठल्यावर संपतो.
+[stat prestige needed]
+जिंकण्यासाठी आवश्यक प्रतिष्ठा
+[stat prestige needed about]
+प्रतिष्ठेने जिंकण्यासाठी वसाहतीला अजून मिळवावी लागणारी प्रतिष्ठा: सामन्याची एकूण प्रतिष्ठा ध्येयापर्यंत पोहोचेल आणि टिकून राहिलेल्या प्रत्येक इतर वसाहतीला मागे टाकता येईल इतकी. सामन्याला प्रतिष्ठेचे ध्येय असेल तेव्हाच नोंदवली जाते.
 [stat band combat]
 लढाई
 [stat band starvation]
@@ -7102,3 +7106,33 @@ MCP सर्व्हर सक्षम करा
 स्थायी आदेश अद्ययावत करता आला नाही. तुमचा आदेश या उपकरणावर थांबवण्यात आला आहे; संबंधित नियंत्रण पुन्हा वापरा.
 [tundra]
 टुंड्राची जमीन
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

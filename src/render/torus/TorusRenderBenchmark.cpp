@@ -18,6 +18,9 @@
 #include "ComputeThreads.h"
 #include "Team.h"
 #include "Unit.h"
+#include "Building.h"
+#include "BuildingType.h"
+#include "render/AnimationClock.h"
 #include "Player.h"
 #include "AI.h"
 #include "Order.h"
@@ -28,6 +31,7 @@
 #include <RenderBatch.h>
 #include <RenderDevice.h>
 #include <RendererSelection.h>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string_view>
@@ -62,12 +66,192 @@
 GlobalContainer *globalContainer = nullptr;
 class TorusRenderBenchmark
 {
+    // The camera script's event on the frame being measured (FRAME_FALLBACK).
+    static inline const char *cameraEvent = nullptr;
+    static inline Uint64 benchmarkStart = 0;
+    struct ScriptedCamera
+    {
+        double zoom;
+        double x, y; // Top-left corner, in map pixels.
+        const char *event;
+    };
+    // GLOB2_BENCH_CAMERA_SCRIPT=fallback: what a player does, in cycles of
+    // eight seconds at 60 frames a second, each from a new place on the map,
+    // starting with the game: a jump (as a minimap click), a hold, a pan at
+    // fifteen tiles a second, six wheel steps out to the overview, a hold, six
+    // steps back in and a hold.
+    static ScriptedCamera scriptedCamera(int frame, double zoom, int mapW, int mapH)
+    {
+        constexpr int Cycle = 480;
+        const int cycle = frame / Cycle, t = frame % Cycle;
+        // Places spread over the map, far apart from one cycle to the next.
+        const double placeX = std::fmod(0.13 + cycle * 0.618034, 1.0) * mapW * 32;
+        const double placeY = std::fmod(0.29 + cycle * 0.414214, 1.0) * mapH * 32;
+        ScriptedCamera camera{zoom, placeX, placeY, nullptr};
+        if (t == 0)
+            camera.event = cycle ? "jump" : "start";
+        const int pan = std::clamp(t - 120, 0, 120);
+        camera.x += pan * 8.0;
+        camera.y += pan * 4.0;
+        if (t == 120)
+            camera.event = "pan";
+        int steps = 0;
+        if (t >= 240 && t < 360)
+            steps = std::min(6, (t - 240) / 10 + 1);
+        else if (t >= 360 && t < 420)
+            steps = 6 - std::min(6, (t - 360) / 10 + 1);
+        if (t >= 240 && t < 300 && (t - 240) % 10 == 0)
+            camera.event = "zoom_out";
+        if (t >= 360 && t < 420 && (t - 360) % 10 == 0)
+            camera.event = "zoom_in";
+        // GLOB2_BENCH_RAPID_ZOOM=N: a player spinning the wheel, one step every
+        // N frames, out to six steps and back without pause, over the zoom window.
+        static const int rapid = std::getenv("GLOB2_BENCH_RAPID_ZOOM") ? std::atoi(std::getenv("GLOB2_BENCH_RAPID_ZOOM")) : 0;
+        if (rapid > 0 && t >= 240 && t < 420)
+        {
+            static const int depth = std::getenv("GLOB2_BENCH_RAPID_DEPTH") ? std::atoi(std::getenv("GLOB2_BENCH_RAPID_DEPTH")) : 6;
+            const int step = (t - 240) / rapid, phase = step % (2 * depth);
+            steps = phase <= depth ? phase : 2 * depth - phase;
+            camera.event = (t - 240) % rapid ? nullptr : phase < depth ? "zoom_out" : "zoom_in";
+            // GLOB2_BENCH_RAPID_HOLD: spin out once and hold the far zoom until
+            // frame 360 of the cycle, then spin back in, to watch what the
+            // farthest zoom shows on each frame after it arrives.
+            static const bool hold = std::getenv("GLOB2_BENCH_RAPID_HOLD");
+            if (hold)
+            {
+                const int in = t < 360 ? 0 : (t - 360) / rapid + 1;
+                steps = t < 360 ? std::min(depth, step) : std::max(0, depth - in);
+                camera.event = (t - 240) % rapid ? nullptr
+                    : t < 360 ? (step < depth ? "zoom_out" : nullptr) : (in <= depth ? "zoom_in" : nullptr);
+            }
+        }
+        // Wheel steps keep the view's centre where it was.
+        const double scale = std::pow(0.7, steps);
+        camera.zoom = zoom * scale;
+        return camera;
+    }
     static void prepareScene(GameGUI &gui)
     {
         gui.game.snapshots().invalidateBoundary(); // Synthetic fixtures edit public records.
         const auto request = gui.sceneRequest();
         SceneExtractor().prepare(gui.game.captureReadBoundary(SceneExtractor::captureOptions(request)), request, gui.view.render.ownScene);
         gui.view.scene = &gui.view.render.ownScene;
+    }
+
+    // GLOB2_BENCH_FOCUS names what a parity scene frames: tile:X,Y, or the
+    // first building (site, upgrade, repair, damaged, complete, flag) or unit
+    // (carrying, explorer, warrior, fighting, swimming) of that kind, the
+    // local team's first. Returns the world pixel to centre on. Read only.
+    static std::pair<double, double> focusPoint(Game &game, int localTeam, std::string_view kind)
+    {
+        int tileX = 0, tileY = 0;
+        if (std::sscanf(std::string(kind).c_str(), "tile:%d,%d", &tileX, &tileY) == 2)
+            return {tileX * 32.0 + 16, tileY * 32.0 + 16};
+        const auto buildingMatches = [&](const Building &b) {
+            const BuildingType &t = *b.type;
+            if (kind == "flag") return t.isVirtual != 0;
+            if (t.isVirtual) return false;
+            if (kind == "site") return t.isBuildingSite && b.constructionResultState == Building::NEW_BUILDING;
+            if (kind == "upgrade") return t.isBuildingSite && b.constructionResultState == Building::UPGRADE;
+            if (kind == "repair") return t.isBuildingSite && b.constructionResultState == Building::REPAIR;
+            if (kind == "damaged") return !t.isBuildingSite && t.hpMax && b.hp < t.hpMax;
+            if (kind == "complete") return !t.isBuildingSite && t.maxUnitWorking && b.hp == t.hpMax;
+            return false;
+        };
+        const auto unitMatches = [&](const Unit &u) {
+            if (u.movement == Unit::MOV_INSIDE) return false;
+            if (kind == "carrying") return u.typeNum == WORKER && u.carriedMaterial >= 0;
+            if (kind == "explorer") return u.typeNum == EXPLORER;
+            if (kind == "warrior") return u.typeNum == WARRIOR;
+            if (kind == "fighting") return u.typeNum == WARRIOR && u.action == ATTACK_SPEED;
+            if (kind == "swimming") return u.action == SWIM;
+            return false;
+        };
+        const int teams = game.mapHeader.getNumberOfTeams();
+        for (int i = 0; i < teams; ++i)
+        {
+            Team *team = game.teams[(localTeam + i) % teams];
+            for (Building *b : team->liveBuildings.entries())
+                if (buildingMatches(*b))
+                {
+                    std::printf("BENCH_FOCUS kind=%.*s team=%d tile=%d,%d\n", int(kind.size()), kind.data(), team->teamNumber, b->posX, b->posY);
+                    return {b->posX * 32.0 + b->type->width * 16.0, b->posY * 32.0 + b->type->height * 16.0};
+                }
+            for (Unit *u : team->liveUnits.entries())
+                if (unitMatches(*u))
+                {
+                    std::printf("BENCH_FOCUS kind=%.*s team=%d tile=%d,%d\n", int(kind.size()), kind.data(), team->teamNumber, u->posX, u->posY);
+                    return {u->posX * 32.0 + 16, u->posY * 32.0 + 16};
+                }
+        }
+        throw std::invalid_argument("GLOB2_BENCH_FOCUS found no " + std::string(kind));
+    }
+
+    // The game's initial view (the local team's colony) at the requested
+    // zoom; GLOB2_BENCH_FOCUS centres it elsewhere, and GLOB2_BENCH_PAN_X/Y
+    // move its top-left tile by that many tiles.
+    static void prepareGuiScreen(GameGUI &gui, double zoom)
+    {
+        auto &settings = globalContainer->settings;
+        settings.unitInterpolation = false;
+        settings.buildingParticles = false;
+        gui.drawHealthFoodBar = true;
+        gui.prepareLocalPresentation();
+        gui.updateCamera();
+        gui.camera.setZoom(zoom, gui.camera.offsetX + gui.camera.width / 2, gui.camera.offsetY + gui.camera.height / 2);
+        if (const char *focus = std::getenv("GLOB2_BENCH_FOCUS"))
+        {
+            const auto [x, y] = focusPoint(gui.game, gui.localTeamNo, focus);
+            gui.camera.originX = x - gui.camera.visibleW() / 2;
+            gui.camera.originY = y - gui.camera.visibleH() / 2;
+        }
+        if (const char *x = std::getenv("GLOB2_BENCH_PAN_X")) gui.camera.originX += 32.0 * std::atoi(x);
+        if (const char *y = std::getenv("GLOB2_BENCH_PAN_Y")) gui.camera.originY += 32.0 * std::atoi(y);
+        // Whole tiles, so sub-pixel camera offsets do not differ by renderer.
+        gui.camera.originX = std::floor(gui.camera.originX / 32) * 32;
+        gui.camera.originY = std::floor(gui.camera.originY / 32) * 32;
+        gui.camera.normalize();
+        gui.viewportX = gui.camera.tileX();
+        gui.viewportY = gui.camera.tileY();
+        // GLOB2_BENCH_SELECT=unit|building selects the local team's first such
+        // entity, so the panel and the selection marker are in the picture.
+        if (const char *select = std::getenv("GLOB2_BENCH_SELECT"))
+        {
+            const std::string_view kind(select);
+            Team *team = gui.game.teams[gui.localTeamNo];
+            bool selected = false;
+            if (kind == "building")
+                for (Building *b : team->liveBuildings.entries())
+                    if (!selected && !b->type->isVirtual && b->type->maxUnitWorking)
+                    {
+                        gui.setSelection(GameGUI::BUILDING_SELECTION, b);
+                        selected = true;
+                    }
+            if (kind == "unit")
+                for (Unit *u : team->liveUnits.entries())
+                    if (!selected)
+                    {
+                        gui.setSelection(GameGUI::UNIT_SELECTION, u);
+                        selected = true;
+                    }
+            if (!selected) throw std::invalid_argument("GLOB2_BENCH_SELECT found nothing to select");
+        }
+        gui.game.snapshots().invalidateBoundary();
+        gui.prepareLocalPresentation();
+        std::printf("BENCH_GUI zoom=%.6f viewport=%d,%d\n", gui.camera.zoom, gui.viewportX, gui.viewportY);
+    }
+
+    static void drawGuiScreen(GameGUI &gui)
+    {
+        // The HUD's tick rate and the map animation follow the wall clock;
+        // hold both so a capture does not depend on when it was taken.
+        const Uint32 now = Uint32(SDL_GetTicks());
+        gui.tickRate = {};
+        gui.tickRate.sample(now - TickRateMeter::UPDATE_MS, 0, 0);
+        gui.tickRate.sample(now, 0, 0);
+        AnimationClock::fixedSteps = 1;
+        gui.view.render.pinAnimation(21);
+        gui.drawAll(gui.localTeamNo);
     }
 
     static int population(const Game &game)
@@ -93,11 +277,15 @@ class TorusRenderBenchmark
     static void populateSynthetic(Game &game, int worldW, int worldH)
     {
         const char *requested = std::getenv("GLOB2_BENCH_UNITS");
-        const int count = requested ? std::atoi(requested) : 1000;
         // Distinct interior cells avoid seam copies and viewport clipping.
-        const int columns = std::min(worldW / 32, game.map.getW()) - 4;
-        const int rows = std::min(worldH / 32, game.map.getH()) - 4;
-        assert(columns > 0 && rows > 0 && count >= 0 && count <= columns * rows);
+        const int columns = std::max(0, std::min(worldW / 32, game.map.getW()) - 4);
+        const int rows = std::max(0, std::min(worldH / 32, game.map.getH()) - 4);
+        // The default fills the view with up to 1000 units; a small or close
+        // view holds fewer. An explicit count must fit.
+        const int count = requested ? std::atoi(requested) : std::min(1000, columns * rows);
+        if (count < 0 || count > columns * rows)
+            throw std::invalid_argument("GLOB2_BENCH_UNITS=" + std::to_string(count) + " does not fit the " +
+                std::to_string(columns) + "x" + std::to_string(rows) + " interior cells of the view");
         for (int team = game.mapHeader.getNumberOfTeams(); team < Team::MAX_COUNT; ++team) game.addTeam();
         GameHeader header;
         header.setRandomSeed(1);
@@ -105,13 +293,16 @@ class TorusRenderBenchmark
         for (int team = 0; team < Team::MAX_COUNT; ++team)
             header.getBasePlayer(team) = BasePlayer(team, "Benchmark", team, BasePlayer::P_LOCAL);
         game.setGameHeader(header, false);
+        // The synthetic flat map takes a unit in every cell; a real map's
+        // water or obstacles refuse some, which are left empty.
+        int placed = 0;
         for (int i = 0; i < count; ++i)
         {
             const int cell = int(static_cast<long long>(i) * columns * rows / std::max(1, count));
-            Unit *unit = game.addUnit(2 + cell % columns, 2 + cell / columns,
-                i % Team::MAX_COUNT, i % 3, 0, (i * 17) & 255, 0, 0);
-            assert(unit);
+            placed += game.addUnit(2 + cell % columns, 2 + cell / columns,
+                i % Team::MAX_COUNT, i % 3, 0, (i * 17) & 255, 0, 0) != nullptr;
         }
+        std::printf("BENCH_UNITS requested=%d placed=%d\n", count, placed);
     }
 
     static void advanceAiTick(GameGUI &gui)
@@ -175,11 +366,15 @@ class TorusRenderBenchmark
             if(!completion)throw std::runtime_error("Benchmark completion readback failed");
             return true;
         }
+        // Portable SDL batches its own commands: submit them first.
+        if(auto *sdlRenderer=SDL_GetRenderer(SDL_GetWindowFromID(gfx->windowID())))SDL_FlushRenderer(sdlRenderer);
 #ifdef HAVE_OPENGL
-        glFinish();assert(glGetError()==GL_NO_ERROR);return true;
-#else
-        throw std::runtime_error("Benchmark requires a rendering device");
+        // Legacy GL, and portable SDL over OpenGL, complete with glFinish.
+        // Portable SDL over Metal or Direct3D, and the software renderer,
+        // have no current GL context: their flush above submitted the frame.
+        if(SDL_GL_GetCurrentContext()){glFinish();assert(glGetError()==GL_NO_ERROR);}
 #endif
+        return true;
     }
     static void captureFramebuffer(const char *path = nullptr)
     {
@@ -191,6 +386,29 @@ class TorusRenderBenchmark
             std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> original(device->captureSynchronously({}),SDL_DestroySurface);
             std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(SDL_ConvertSurface(original.get(),SDL_PIXELFORMAT_RGB24),SDL_DestroySurface);
             if(!pixels)throw std::runtime_error("Benchmark full capture failed");
+            std::ofstream image(path,std::ios::binary);image<<"P6\n"<<pixels->w<<" "<<pixels->h<<"\n255\n";
+            for(int y=0;y<pixels->h;++y)image.write(static_cast<const char *>(pixels->pixels)+y*pixels->pitch,pixels->w*3);
+            if(!image.good())throw std::runtime_error("Benchmark capture write failed");
+            return;
+        }
+        if(gfx->backendSwitchStatus().active==GAGCore::RendererBackend::PortableSDL) {
+            // SDL's renderer can leave a render-target texture bound, so read
+            // its window through the backend rather than the current GL framebuffer.
+            auto *backend=ContextAccess::backend(*gfx);
+            backend->flush();
+            std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> original(backend->capture(),SDL_DestroySurface);
+            std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(
+                original?SDL_ConvertSurface(original.get(),SDL_PIXELFORMAT_RGB24):nullptr,SDL_DestroySurface);
+            if(!pixels)throw std::runtime_error("Benchmark portable capture failed");
+            std::ofstream image(path,std::ios::binary);image<<"P6\n"<<pixels->w<<" "<<pixels->h<<"\n255\n";
+            for(int y=0;y<pixels->h;++y)image.write(static_cast<const char *>(pixels->pixels)+y*pixels->pitch,pixels->w*3);
+            if(!image.good())throw std::runtime_error("Benchmark capture write failed");
+            return;
+        }
+        if(!gfx->rendererCapabilities().accelerated && gfx->getSDLSurface()) {
+            std::unique_ptr<SDL_Surface,decltype(&SDL_DestroySurface)> pixels(
+                SDL_ConvertSurface(gfx->getSDLSurface(),SDL_PIXELFORMAT_RGB24),SDL_DestroySurface);
+            if(!pixels)throw std::runtime_error("Benchmark software capture failed");
             std::ofstream image(path,std::ios::binary);image<<"P6\n"<<pixels->w<<" "<<pixels->h<<"\n255\n";
             for(int y=0;y<pixels->h;++y)image.write(static_cast<const char *>(pixels->pixels)+y*pixels->pitch,pixels->w*3);
             if(!image.good())throw std::runtime_error("Benchmark capture write failed");
@@ -269,6 +487,11 @@ static int run(int argc, char **argv)
         launchArgs.insert(launchArgs.end(),argv+1,argv+argc);
         globalContainer->applyCommand(Cli::parse(launchArgs));
     globalContainer->load();
+    // GLOB2_BENCH_HD=0|1 pins HD artwork instead of the device's Auto default,
+    // so renderer comparisons get identical inputs.
+    if (const char *hd = std::getenv("GLOB2_BENCH_HD"))
+        globalContainer->settings.setHighResolutionArtworkChoice(std::atoi(hd)
+            ? Settings::AdaptiveChoice::On : Settings::AdaptiveChoice::Off);
     // Finish deferred HD publication before comparing renderer workloads.
     GAGCore::Sprite::setHighResolution(globalContainer->settings.highResolutionArtwork);
     auto *gfx=globalContainer->gfx;
@@ -277,11 +500,17 @@ static int run(int argc, char **argv)
     std::printf("BACKEND requested=%.*s active=%.*s fallback_reason=%s\n",int(requested.size()),requested.data(),int(active.size()),active.data(),gfx->backendSwitchStatus().reason.c_str());
     const auto capabilities=gfx->rendererCapabilities();
     const auto deviceCapabilities=gfx->renderDevice()?gfx->renderDevice()->capabilities():GAGCore::RenderDeviceCapabilities{};
+    std::printf("BENCH_SETTINGS high_resolution_artwork=%d adaptive_zoom_detail=%d smooth_fog=%d window=%dx%d\n",
+        int(globalContainer->settings.highResolutionArtwork), int(globalContainer->settings.adaptiveZoomDetail),
+        int(globalContainer->settings.smoothFog), gfx->getW(), gfx->getH());
     std::printf("BENCH_CAPABILITIES torus=%d skin_materials=%d async_capture=%d terrain_composition=%d gpu_timing=%d max_texture=%d\n",
         capabilities.torus,capabilities.liveSkins,capabilities.asynchronousCapture,deviceCapabilities.terrainComposition,
         deviceCapabilities.gpuTiming,deviceCapabilities.maximumTextureSize);
-    if(!std::getenv("GLOB2_BENCH_FLAT") && !gfx->rendererCapabilities().torus)
-        throw std::runtime_error("Selected benchmark backend does not support torus");
+    // A backend without the torus view (portable SDL, software) measures the
+    // flat view instead of stopping.
+    const bool flatOnly = !std::getenv("GLOB2_BENCH_FLAT") && !gfx->rendererCapabilities().torus;
+    if(flatOnly)
+        std::printf("BENCH_FLAT_FALLBACK backend has no torus view; measuring the flat view\n");
     if(!std::getenv("GLOB2_BENCH_VISIBLE")) {
         int count=0;auto **windows=SDL_GetWindows(&count);
         if(windows){for(int i=0;i<count;++i)SDL_HideWindow(windows[i]);SDL_free(windows);}
@@ -339,9 +568,13 @@ static int run(int argc, char **argv)
             assert(gui.loadFromHeaders(mapHeader, gameHeader, true, true));
         }
         gui.game.map.configureCompute(resolveComputeThreadCount(globalContainer->computeThreads));
-        gui.localPlayer = gui.localTeamNo = 0;
+        // GLOB2_BENCH_TEAM=N views the game as team N's player (its fog,
+        // colour and panel), so a scene can frame another team's units.
+        gui.localPlayer = gui.localTeamNo = std::getenv("GLOB2_BENCH_TEAM") ? std::atoi(std::getenv("GLOB2_BENCH_TEAM")) : 0;
         gui.adjustLocalTeam();
         gui.adjustInitialViewport();
+        gui.loadTerrainArtwork(); // As Engine::finalAdjustments does.
+        gui.prepareDirectTerrain(); // As Engine::finalAdjustments does.
         prepareScene(gui);
         int width = globalContainer->gfx->getW() - 160, height = globalContainer->gfx->getH();
         int x = 0, y = 0;
@@ -371,10 +604,42 @@ static int run(int argc, char **argv)
             // so memory measurements pace frames like a display would.
             const int frameIntervalMs = std::max(0, std::getenv("GLOB2_BENCH_FRAME_INTERVAL_MS")
                 ? std::atoi(std::getenv("GLOB2_BENCH_FRAME_INTERVAL_MS")) : 0);
+            // GLOB2_BENCH_ANIMATION_FRAME_US: map animation advances by exactly this
+            // many microseconds each frame instead of the wall clock, as a display
+            // at that rate would, so frame sequences are reproducible.
+            if (const char *animationFrame = std::getenv("GLOB2_BENCH_ANIMATION_FRAME_US"))
+                AnimationClock::simulatedFrameNs = std::uint64_t(std::max(0.0, std::atof(animationFrame) * 1000.0));
+            benchmarkStart = SDL_GetPerformanceCounter();
+            // A low-memory trim at one measured frame (GLOB2_BENCH_TRIM_AT=frame).
+            // Unset means never: warmup frames are negative, so -1 would trim
+            // (and reset the device) on the last warmup frame of every run.
+            constexpr int Never = std::numeric_limits<int>::min();
+            const int trimAt = std::getenv("GLOB2_BENCH_TRIM_AT") ? std::atoi(std::getenv("GLOB2_BENCH_TRIM_AT")) : Never;
+            // A device reset at one measured frame (GLOB2_BENCH_DEVICE_RESET_AT=frame):
+            // the device drops every texture, streamed direct terrain included.
+            const int resetAt = std::getenv("GLOB2_BENCH_DEVICE_RESET_AT") ? std::atoi(std::getenv("GLOB2_BENCH_DEVICE_RESET_AT")) : Never;
             for (int i = -warmupFrames; i < frames; ++i)
             {
                 if (i == 0) initialCoverage = compositor.highResolutionCoverage();
+                const auto snapshotBytes = [&] { return gfx->renderResources() ? gfx->renderResources()->retainedBytes() : 0; };
+                const auto deviceBytes = [&] { return gfx->renderDevice() ? gfx->renderDevice()->telemetry().resourceBytes : 0; };
+                if (i == trimAt) {
+                    std::printf("PRESENTATION_TRIM frame=%d reason=low-memory snapshot_bytes=%zu device_bytes=%zu\n", i,
+                        snapshotBytes(), deviceBytes());
+                    gfx->trimPresentationMemory(GAGCore::PresentationTrim::LowMemory);
+                }
+                if (i == resetAt && gfx->renderDevice()) {
+                    std::printf("DEVICE_RESET frame=%d\n", i);
+                    gfx->renderDevice()->reset();
+                }
+                if (trimAt >= 0 && i > trimAt && i <= trimAt + 60 && (i - trimAt) % 10 == 0)
+                    std::printf("PRESENTATION_TRIM_AFTER frame=%d frames=%d pending=%d snapshot_bytes=%zu device_bytes=%zu\n", i,
+                        i - trimAt, int(gfx->presentationTrimPending()), snapshotBytes(), deviceBytes());
                 if(!finishRendering())ContextAccess::backend(*gfx)->present();
+                // Frames present through the backend, not nextFrame: start the
+                // per-frame device upload allowances as a game frame does, or
+                // after the first few uploads nothing new (overview pages) shows.
+                gfx->resetFrameAllowances();
                 const auto telemetryBefore=gfx->renderDevice()?gfx->renderDevice()->telemetry():GAGCore::RenderTelemetry{};
                 const auto scopesBefore = PerformanceTelemetry::collector().window;
                 Uint64 start = SDL_GetPerformanceCounter();
@@ -422,36 +687,91 @@ static int run(int argc, char **argv)
                         PerformanceTelemetry::Id::Resources, PerformanceTelemetry::Id::GroundUnits})
                         std::printf("FRAME_SCOPE frame=%d scope=%u elapsed_ms=%.6f\n", i, unsigned(id),
                             (scopes[unsigned(id)].time.total - scopesBefore[unsigned(id)].time.total) / 1e6);
+                    // Texture uploads since the previous frame's line (the portable
+                    // renderer counts them; other backends report zero).
+                    if (auto *backend = ContextAccess::backend(*gfx))
+                    {
+                        static GAGCore::RenderOperations previous{};
+                        const auto ops = backend->operations();
+                        std::printf("FRAME_UPLOADS frame=%d uploads=%llu upload_bytes=%llu\n", i,
+                            static_cast<unsigned long long>(ops.textureUploads - previous.textureUploads),
+                            static_cast<unsigned long long>(ops.textureUploadBytes - previous.textureUploadBytes));
+                        previous = ops;
+                    }
                     if (auto *direct = gui.view.render.existingDirectTerrain())
                         std::printf("FRAME_HD frame=%d pending=%zu texture_bytes=%zu\n", i, direct->pendingHdMasks(),
                             direct->textureBytes());
                     if (auto *cache = gui.view.render.existingTerrainCache())
-                        std::printf("FRAME_CACHE frame=%d bytes=%zu texture_bytes=%zu mask_bytes=%zu rebuilds=%llu hits=%llu reductions=%llu resolution=%d downsample=%d\n", i,
+                        std::printf("FRAME_CACHE frame=%d bytes=%zu texture_bytes=%zu mask_bytes=%zu rebuilds=%llu hits=%llu reductions=%llu stand_ins=%llu uncovered=%llu resolution=%d downsample=%d\n", i,
                             cache->bytes(), cache->residentTextureBytes(), cache->maskBytes(), static_cast<unsigned long long>(cache->cacheRebuilds()),
                             static_cast<unsigned long long>(cache->cacheHits()),
                             static_cast<unsigned long long>(cache->cacheReductions()),
+                            static_cast<unsigned long long>(cache->cacheStandIns()),
+                            static_cast<unsigned long long>(cache->cacheUncovered()),
                             cache->samplingResolution(), cache->samplingReduction());
                     const auto *pages = gui.view.render.existingTerrainCache();
                     const auto *atlas = gui.view.render.existingDirectTerrain();
-                    std::printf("FRAME_TERRAIN_RESIDENCY frame=%d direct_bytes=%zu page_bytes=%zu page_retained_bytes=%zu peak_texture_bytes=%zu\n",
+                    std::printf("FRAME_TERRAIN_RESIDENCY frame=%d direct_bytes=%zu page_bytes=%zu page_retained_bytes=%zu peak_texture_bytes=%zu page_pixel_bytes=%zu\n",
                         i, atlas ? atlas->textureBytes() : 0, pages ? pages->residentTextureBytes() : 0,
-                        pages ? pages->bytes() : 0, gui.view.render.peakTerrainTextureBytes);
+                        pages ? pages->bytes() : 0, gui.view.render.peakTerrainTextureBytes,
+                        pages ? pages->pixelBytes() : 0);
                     std::printf("FRAME_RENDER_MEMORY frame=%d %s\n", i, RenderMemoryReport::fields(gui.view.render).c_str());
+                    {
+                        const auto hd = GAGCore::Sprite::highResolutionDrawCounts();
+                        std::printf("FRAME_HD_SPRITES frame=%d drawn=%zu not_loaded=%zu first_draw_cap=%zu room=%zu\n",
+                            i, hd.drawn, hd.notLoaded, hd.firstDrawCap, hd.room);
+                    }
                     const auto &rows = gui.view.render.resourceRowMetrics;
                     std::printf("FRAME_RESOURCE_ROWS frame=%d eligibility_cells=%llu frame_cells=%llu animated_cells=%llu\n", i,
                         static_cast<unsigned long long>(rows.eligibilityCells), static_cast<unsigned long long>(rows.frameCells),
                         static_cast<unsigned long long>(rows.animatedCells));
                     if (const auto *direct = gui.view.render.existingDirectTerrain())
                     {
-                        std::printf("FRAME_DIRECT_TERRAIN frame=%d draws=%u texture_bytes=%zu uploaded_bytes=%zu\n",
-                            i, direct->draws(), direct->textureBytes(), direct->uploadBytes());
+                        std::printf("FRAME_DIRECT_TERRAIN frame=%d draws=%u texture_bytes=%zu uploaded_bytes=%zu split_cells=%zu base_pending=%zu restarts=%u\n",
+                            i, direct->draws(), direct->textureBytes(), direct->uploadBytes(), direct->splitCells(),
+                            direct->pendingBaseMasks(), direct->restartCount());
+                        const auto art = direct->artMetrics();
+                        std::printf("FRAME_DIRECT_ART frame=%d visible=%zu absent=%zu stale=%zu low_art_bytes=%zu\n",
+                            i, art.visible, art.absent, art.stale, art.lowArtBytes);
                         const auto fog = direct->discoveryMetrics();
                         std::printf("FRAME_DIRECT_DISCOVERY frame=%d rebuilt_cells=%zu\n",
                             i, fog.rebuilt);
                     }
                     if (gui.view.render.overviewCache)
-                        std::printf("FRAME_OVERVIEW frame=%d composed_cells=%llu\n", i,
-                            static_cast<unsigned long long>(gui.view.render.overviewCache->composedCells()));
+                        std::printf("FRAME_OVERVIEW frame=%d composed_cells=%llu uploaded_ahead=%llu\n", i,
+                            static_cast<unsigned long long>(gui.view.render.overviewCache->composedCells()),
+                            static_cast<unsigned long long>(gui.view.render.overviewCache->pagesUploadedAhead()));
+                    {
+                        const auto &fallback = gui.view.render.fallback;
+                        std::printf("FRAME_FALLBACK frame=%d time_ms=%.3f event=%s page_cells=%llu stand_in_cells=%llu "
+                            "backdrop_cells=%llu fading_cells=%llu overview_cells=%llu overview_other_cells=%llu "
+                            "overview_base_cells=%llu overview_hole_cells=%llu overview_fading_cells=%llu\n",
+                            i, 1000.0 * (SDL_GetPerformanceCounter() - benchmarkStart) / SDL_GetPerformanceFrequency(),
+                            cameraEvent ? cameraEvent : "-",
+                            static_cast<unsigned long long>(fallback.pageCells),
+                            static_cast<unsigned long long>(fallback.standInCells),
+                            static_cast<unsigned long long>(fallback.backdropCells),
+                            static_cast<unsigned long long>(fallback.fadingCells),
+                            static_cast<unsigned long long>(fallback.overviewCells),
+                            static_cast<unsigned long long>(fallback.overviewOtherCells),
+                            static_cast<unsigned long long>(fallback.overviewBaseCells),
+                            static_cast<unsigned long long>(fallback.overviewHoleCells),
+                            static_cast<unsigned long long>(fallback.overviewFadingCells));
+                        cameraEvent = nullptr;
+                    }
+                }
+                // GLOB2_BENCH_CAPTURE_FRAMES lists frames (comma separated) to save
+                // as <GLOB2_BENCH_CAPTURE_PREFIX>-<frame>.ppm, for frame sequences,
+                // with or without GLOB2_BENCH_FRAME_TIMES.
+                if (const char *list = std::getenv("GLOB2_BENCH_CAPTURE_FRAMES"))
+                {
+                    const std::string wanted = std::string(",") + list + ",";
+                    if (wanted.find("," + std::to_string(i) + ",") != std::string::npos)
+                    {
+                        const char *prefix = std::getenv("GLOB2_BENCH_CAPTURE_PREFIX");
+                        const std::string path = std::string(prefix ? prefix : "frame") + "-" + std::to_string(i) + ".ppm";
+                        captureFramebuffer(path.c_str());
+                    }
                 }
                 if (i < 0 && i >= -warmupFrames && i < -warmupFrames + 8)
                     std::printf("WARMUP frame=%d elapsed_ms=%.3f process_cpu_ms=%.3f\n", i + warmupFrames, ms,
@@ -512,7 +832,7 @@ static int run(int argc, char **argv)
             std::fflush(stdout);
             if (std::strncmp(label, "Torus", 5) == 0) captureFramebuffer();
         };
-        if (std::getenv("GLOB2_BENCH_FLAT"))
+        if (std::getenv("GLOB2_BENCH_FLAT") || flatOnly)
         {
             if (const char *density = std::getenv("GLOB2_BENCH_TERRAIN_PIXELS_PER_TILE"))
             {
@@ -561,6 +881,13 @@ static int run(int argc, char **argv)
                 globalContainer->settings.smoothFog = std::atoi(smoothFog) != 0;
             const Uint32 options = (std::getenv("GLOB2_BENCH_FOG") ? 0 : Game::DRAW_WHOLE_MAP) | (std::getenv("GLOB2_BENCH_BARS") ? Game::DRAW_HEALTH_FOOD_BAR : 0)
                 | (std::getenv("GLOB2_BENCH_AREAS") ? Game::DRAW_AREA : 0);
+            // GLOB2_BENCH_GUI=1 draws the whole in-game screen (GameGUI::drawAll:
+            // map, HUD panel, minimap, top bar, health bars and selection) at a
+            // fixed camera instead of the bare map, with presentation-only
+            // motion pinned so every renderer draws the same image.
+            const bool guiScreen = std::getenv("GLOB2_BENCH_GUI");
+            if (guiScreen)
+                prepareGuiScreen(gui, camera.zoom);
             std::printf("mapped_units=%d (excludes units inside buildings)\n", mappedPopulation(gui.game));
             std::printf("flat zoom=%.6f world=%dx%d total_units=%d shader=%d cloud_grid_limit=%d\n", camera.zoom, worldW, worldH, count, globalContainer->gfx->hasUnitShader(), cloudGridLimit);
             for (bool clouds : {false, true})
@@ -592,6 +919,11 @@ static int run(int argc, char **argv)
                         crossedDiscovery = true;
                     }
                     Uint32 frameOptions = options;
+                    // GLOB2_BENCH_COMPLETE_TERRAIN: every frame finishes its terrain
+                    // first (as captures do), the reference a moving view is
+                    // compared with (tools/rendering/motion_parity.py).
+                    static const bool completeTerrain = std::getenv("GLOB2_BENCH_COMPLETE_TERRAIN");
+                    if (completeTerrain) frameOptions |= Game::DRAW_COMPLETE_TERRAIN;
                     if (const auto *terrainSwitch = std::getenv("GLOB2_BENCH_TERRAIN_SWITCH"))
                     {
                         const bool switchToHD = std::string_view(terrainSwitch) == "hd";
@@ -616,6 +948,11 @@ static int run(int argc, char **argv)
                         }
                     }
                     gfx->resetDrawCallCount();
+                    if (guiScreen)
+                    {
+                        drawGuiScreen(gui);
+                        return;
+                    }
                     gfx->setClipRect();
                     gfx->drawFilledRect(0, 0, gfx->getW(), gfx->getH(), GAGCore::Color(0, 0, 0));
                     const bool sweep = std::getenv("GLOB2_BENCH_CAMERA_SWEEP");
@@ -635,6 +972,30 @@ static int run(int argc, char **argv)
                         : sweep ? (cameraFrame*37)%gui.game.map.getW() : fixedPanX;
                     const int panY = pan ? (fixedPanY + cameraFrame / 16)%gui.game.map.getH()
                         : sweep ? (cameraFrame*19)%gui.game.map.getH() : fixedPanY;
+                    if (const char *script = std::getenv("GLOB2_BENCH_CAMERA_SCRIPT"))
+                    {
+                        if (std::string_view(script) != "fallback")
+                            throw std::invalid_argument("GLOB2_BENCH_CAMERA_SCRIPT supports only fallback");
+                        static const double scriptZoom = std::getenv("GLOB2_BENCH_ZOOM") ? camera.zoom : 1.0;
+                        auto scripted = scriptedCamera(cameraFrame, scriptZoom, gui.game.map.getW(), gui.game.map.getH());
+                        scripted.zoom = std::max(scripted.zoom, camera.minimumZoom());
+                        cameraEvent = scripted.event;
+                        // The centre stays put across zoom steps.
+                        const double centreX = scripted.x + width / scriptZoom / 2, centreY = scripted.y + height / scriptZoom / 2;
+                        const double left = centreX - width / scripted.zoom / 2, top = centreY - height / scripted.zoom / 2;
+                        const double mapPixelsW = gui.game.map.getW() * 32.0, mapPixelsH = gui.game.map.getH() * 32.0;
+                        const double wrappedX = left - std::floor(left / mapPixelsW) * mapPixelsW;
+                        const double wrappedY = top - std::floor(top / mapPixelsH) * mapPixelsH;
+                        const int tileX = int(wrappedX / 32), tileY = int(wrappedY / 32);
+                        const float fractionX = float(wrappedX - tileX * 32.0), fractionY = float(wrappedY - tileY * 32.0);
+                        const int scriptW = int(std::ceil(width / scripted.zoom)) + 32, scriptH = int(std::ceil(height / scripted.zoom)) + 32;
+                        globalContainer->gfx->beginMapTransform(scripted.zoom, -fractionX * scripted.zoom,
+                            -fractionY * scripted.zoom, 0, 0, width, height);
+                        MapDrawer::drawMap(0, 0, scriptW, scriptH, 0, 0, tileX, tileY, 0, gui.view, frameOptions,
+                            nullptr, nullptr, false, detailForZoom(gui.game, scripted.zoom));
+                        globalContainer->gfx->endMapTransform();
+                        return;
+                    }
                     int drawW = int(std::ceil(width/zoom)), drawH = int(std::ceil(height/zoom));
                     if (!sweep && std::getenv("GLOB2_BENCH_FULL_MAP"))
                     {
@@ -648,7 +1009,7 @@ static int run(int argc, char **argv)
                         -(pan ? cameraFrame % 8 * 4.f : fraction)*zoom,
                         -(pan ? cameraFrame % 16 * 2.f : fraction)*zoom, 0, 0, width, height);
                     const bool pausePresentation = std::getenv("GLOB2_BENCH_PAUSE_PRESENTATION");
-                    if (pausePresentation) gui.view.render.animationTime = 22;
+                    if (pausePresentation) gui.view.render.pinAnimation(22);
                     MapDrawer::drawMap(0, 0, drawW, drawH, 0, 0,
                         panX, panY, 0, gui.view, frameOptions, nullptr, nullptr, pausePresentation,
                         detailForZoom(gui.game, zoom));
@@ -659,9 +1020,9 @@ static int run(int argc, char **argv)
                 {
                     const auto geometry = batch->geometryCache().stats();
                     const auto textures = batch->stats();
-                    std::printf("STEADY_CACHE pending=%zu attempts=%llu promotions=%llu array_bytes=%zu geometry_bytes=%zu builds=%llu deferred=%llu\n",
+                    std::printf("STEADY_CACHE pending=%zu attempts=%llu promotions=%llu array_bytes=%zu geometry_bytes=%zu builds=%llu deferred=%llu stale_artwork=%llu\n",
                         textures.pendingTextures, static_cast<unsigned long long>(textures.warmAttempts), static_cast<unsigned long long>(textures.warmPromotions),
-                        textures.textureBytes, geometry.bytes, geometry.builds, geometry.deferred);
+                        textures.textureBytes, geometry.bytes, geometry.builds, geometry.deferred, geometry.staleArtwork);
                 }
                 PerformanceTelemetry::collector().write(std::cout, "BENCH_SCOPE", 0, false);
                 assert(discoveryCrossing || gui.game.checkSum(nullptr, nullptr, nullptr, true) == initialChecksum);
@@ -702,7 +1063,7 @@ static int run(int argc, char **argv)
                             gfx->drawFilledRect(0, 0, gfx->getW(), gfx->getH(), GAGCore::Color(0, 0, 0));
                             gfx->resetDrawCallCount();
                             gfx->beginMapTransform(zoom, 0, 0, 0, 0, width, height);
-                            gui.view.render.animationTime = 22;
+                            gui.view.render.pinAnimation(22);
                             glFinish();
                             const auto cpuStart = std::clock();
                             MapDrawer::drawMap(0, 0, drawW, drawH, 0, 0, panX, panY, 0,
@@ -771,13 +1132,13 @@ static int run(int argc, char **argv)
         {
             const bool pausePresentation=std::getenv("GLOB2_BENCH_PAUSE_PRESENTATION");
             gui.gamePaused=pausePresentation;
-            if(pausePresentation)gui.view.render.animationTime=22;
+            if(pausePresentation)gui.view.render.pinAnimation(22);
             const Uint32 initialChecksum = gui.game.checkSum(nullptr, nullptr, nullptr, true);
             globalContainer->settings.clouds = clouds;
             globalContainer->settings.cloudShadows = clouds;
             measure(clouds ? "2D clouds" : "2D no clouds", [&](int) {
                 globalContainer->gfx->setClipRect();
-                if(pausePresentation)gui.view.render.animationTime=22;
+                if(pausePresentation)gui.view.render.pinAnimation(22);
                 MapDrawer::drawMap(0, 0, width, height, 0, 0, x, y, 0, gui.view, Game::DRAW_WHOLE_MAP,
                     nullptr,nullptr,pausePresentation);
             });
@@ -791,7 +1152,7 @@ static int run(int argc, char **argv)
                 ringZoom = std::clamp(float(std::atof(zoom)), ringZoom, float(MapCamera::MAX_ZOOM));
             assert(view.draw(gui.view.drawnScene(),gui.game.gui, 0, Game::DRAW_WHOLE_MAP, x, y, width, height, ringZoom));
             measure(clouds ? "Torus clouds" : "Torus no clouds", [&](int) {
-                if(pausePresentation)gui.view.render.animationTime=22;
+                if(pausePresentation)gui.view.render.pinAnimation(22);
                 view.amount = 1;
                 view.lastFrame = SDL_GetTicks();
                 view.setViewport((x + 1) & gui.game.map.getMaskW(), (y + 1) & gui.game.map.getMaskH());

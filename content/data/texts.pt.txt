@@ -5048,6 +5048,10 @@ Probabilidade estimada de a sua aliança vencer, amostrada ao longo da partida. 
 Prestígio
 [stat prestige about]
 O prestígio da colónia, obtido com edifícios de nível máximo. Uma partida com objetivo de prestígio termina quando este é atingido.
+[stat prestige needed]
+Prestígio necessário para vencer
+[stat prestige needed about]
+O prestígio que a colónia ainda teria de obter para vencer por prestígio: o suficiente para que o prestígio conjunto da partida atinja o objetivo e para ultrapassar todas as outras colónias sobreviventes. Registado apenas quando a partida tem objetivo de prestígio.
 [stat band combat]
 Combate
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Ciclo %0: %1 ms de tempo real
 IA para todas as colónias controladas pelo computador
 [tundra]
 Solo de tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

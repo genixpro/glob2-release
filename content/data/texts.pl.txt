@@ -5048,6 +5048,10 @@ Szacowana szansa zwycięstwa Twojego sojuszu, mierzona przez cały mecz. Sojuszn
 Prestiż
 [stat prestige about]
 Prestiż kolonii, zdobywany dzięki budynkom najwyższego poziomu. Mecz z celem prestiżu kończy się po jego osiągnięciu.
+[stat prestige needed]
+Prestiż potrzebny do zwycięstwa
+[stat prestige needed about]
+Prestiż, który kolonia musiałaby jeszcze zdobyć, aby wygrać prestiżem: tyle, by łączny prestiż meczu osiągnął cel i by wyprzedzić każdą inną ocalałą kolonię. Rejestrowany tylko wtedy, gdy mecz ma cel prestiżu.
 [stat band combat]
 Walka
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Takt %0: %1 ms czasu rzeczywistego
 SI dla wszystkich kolonii sterowanych przez komputer
 [tundra]
 Gleba tundrowa
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

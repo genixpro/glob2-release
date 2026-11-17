@@ -5048,6 +5048,10 @@ Geschatte kans dat je alliantie wint, gemeten gedurende de hele wedstrijd. Bondg
 Roem
 [stat prestige about]
 De roem van de kolonie, verdiend met gebouwen van het hoogste niveau. Een wedstrijd met een roemdoel eindigt als dat bereikt is.
+[stat prestige needed]
+Roem nodig om te winnen
+[stat prestige needed about]
+De roem die de kolonie nog zou moeten verdienen om op roem te winnen: genoeg om de gezamenlijke roem van de wedstrijd het doel te laten halen, en om elke andere overlevende kolonie te overtreffen. Alleen vastgelegd als de wedstrijd een roemdoel heeft.
 [stat band combat]
 Gevecht
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Tik %0: %1 ms kloktijd
 AI voor alle computergestuurde kolonies
 [tundra]
 Toendrabodem
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

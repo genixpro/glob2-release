@@ -137,21 +137,28 @@ vec2 hdMaskUV(float index, vec2 pixel, vec2 size, float tile) {
     vec2 samplePixel = clamp(pixel * (tile / 32.0), vec2(0.5), vec2(tile - 0.5));
     return (hdTileBase(index, size, tile) + samplePixel) / size;
 }
-vec3 hdEdgeTexel(sampler2D image, float index, vec2 texel, vec2 size, float tile) {
-    float packedEdge = readScalar(image, (hdTileBase(index, size, tile) + texel + 0.5) / size, size);
+// Edge atlases are chosen by number rather than passed as samplers, so the
+// shader also translates to separate textures: 0 current, 1 retired, 2 base.
+float hdEdgeScalar(int atlas, vec2 uv, vec2 size) {
+    if (atlas == 0) return readScalar(hdEdges, uv, size);
+    if (atlas == 1) return readScalar(hdPreviousEdges, uv, size);
+    return readScalar(hdBaseEdges, uv, size);
+}
+vec3 hdEdgeTexel(int atlas, float index, vec2 texel, vec2 size, float tile) {
+    float packedEdge = hdEdgeScalar(atlas, (hdTileBase(index, size, tile) + texel + 0.5) / size, size);
     float selectors = floor(packedEdge / 4096.0);
     return vec3(mod(packedEdge, 4096.0), mod(selectors, 4.0), floor(selectors / 4.0));
 }
 // As edgeAt, at one texel per sample.
-vec3 hdEdgeAt(sampler2D image, float index, vec2 pixel, vec2 size, float tile) {
+vec3 hdEdgeAt(int atlas, float index, vec2 pixel, vec2 size, float tile) {
     vec2 p = pixel * (tile / 32.0) - 0.5;
     vec2 low = clamp(floor(p), vec2(0.0), vec2(tile - 2.0));
     vec2 f = p - low;
     vec2 high = low + 1.0;
-    vec3 e00 = hdEdgeTexel(image, index, low, size, tile);
-    vec3 e10 = hdEdgeTexel(image, index, vec2(high.x, low.y), size, tile);
-    vec3 e01 = hdEdgeTexel(image, index, vec2(low.x, high.y), size, tile);
-    vec3 e11 = hdEdgeTexel(image, index, high, size, tile);
+    vec3 e00 = hdEdgeTexel(atlas, index, low, size, tile);
+    vec3 e10 = hdEdgeTexel(atlas, index, vec2(high.x, low.y), size, tile);
+    vec3 e01 = hdEdgeTexel(atlas, index, vec2(low.x, high.y), size, tile);
+    vec3 e11 = hdEdgeTexel(atlas, index, high, size, tile);
     vec3 nearest = f.y < 0.5 ? (f.x < 0.5 ? e00 : e10) : (f.x < 0.5 ? e01 : e11);
     if (nearest.y == nearest.z)
         return nearest;
@@ -167,18 +174,46 @@ vec4 variantRecord(float index, float field) {
     return readRecord(variants, slot, variantSize);
 }
 
+#ifdef DIRECT_TERRAIN_HD_MASKS
+// The streamed pass binds every variant's art at LowArtTile pixels a cell, by
+// variant number, in place of the native mask index (coverageIndex, sized by
+// coverageSize). A record whose tile is 65535 has no tile in the art atlas
+// (it is being replaced at another density): the cell draws that art.
+const float LowArtTile = 16.0;
+vec4 lowArt(float index, vec2 uv) {
+    float columns = coverageSize.x / LowArtTile;
+    vec2 base = vec2(mod(index, columns), floor(index / columns)) * LowArtTile;
+    vec2 pixel = clamp(uv * (LowArtTile / 32.0), vec2(0.5), vec2(LowArtTile - 0.5));
+    return DIRECT_TERRAIN_SAMPLE(coverageIndex, (base + pixel) / coverageSize);
+}
+#endif
+
 vec4 material(float index, vec2 uv, float calm) {
     vec4 data = variantRecord(index, 0.0);
+    vec4 color;
+#ifdef DIRECT_TERRAIN_HD_MASKS
+    if (data.x >= 65535.0) {
+        color = lowArt(index, uv);
+        color.rgb *= color.a;
+    } else
+#endif
+    {
+    // animationTime is continuous (whole clock steps plus the elapsed
+    // fraction, wrapped at a common period of every animation), so the
+    // crossfade moves by exactly the time elapsed each frame. data.w (the
+    // authored blend steps) only enables it here: the steps quantise page
+    // composition, not this pass.
     float stepTime = mod(animationTime, data.z);
     float phase = mod(floor(animationTime / data.z), data.y);
-    vec4 color = DIRECT_TERRAIN_SAMPLE(art, atlasUV(data.x + phase, uv, artSize));
+    color = DIRECT_TERRAIN_SAMPLE(art, atlasUV(data.x + phase, uv, artSize));
     // Blend premultiplied endpoints so transparent artwork cannot tint a fade.
     color.rgb *= color.a;
     if (data.w > 0.0) {
-        float blend = floor(stepTime * data.w / data.z) / data.w;
+        float blend = clamp(stepTime / data.z, 0.0, 1.0);
         vec4 nextColor = DIRECT_TERRAIN_SAMPLE(art, atlasUV(data.x + mod(phase + 1.0, data.y), uv, artSize));
         nextColor.rgb *= nextColor.a;
         color = mix(color, nextColor, blend);
+    }
     }
     if (calm > 0.0) {
         vec4 quiet = variantRecord(index, 7.0);
@@ -254,8 +289,10 @@ vec3 surf(vec4 indices, vec2 uv, vec3 edge, vec3 color) {
     vec3 foam = variantRecord(index, 4.0).rgb / 255.0;
     // Q8 shore wash of the land material across the shoreline, stored as its damping.
     float land = 256.0 - variantRecord(liquidSide ? indices[neighbor] : indices[dominant], 4.0).w;
-    float time = animationTime - mod(animationTime, shallow.w);
-    float phase = floor(mod(time, shape.x) * 1024.0 / shape.x);
+    // The wash moves continuously: its phase is the integer reference's
+    // (TerrainVisual::surfPhase) at whole surf steps and interpolates
+    // linearly between them, rather than holding each step (shallow.w).
+    float phase = mod(animationTime, shape.x) * 1024.0 / shape.x;
     vec2 position = mod(floor(world), mapSize) * 8192.0 + floor(uv) * 256.0 + 128.0;
     float offset = bump(mod(floor(position.x / 128.0), 1024.0)) +
                    bump(mod(floor(position.y / 128.0), 1024.0)) +
@@ -366,9 +403,7 @@ void main() {
         if (weights.w > 0.0) color += weights.w * material(indices.w, uv, calm);
 #ifdef DIRECT_TERRAIN_HD_MASKS
         // The split carries no edge: no contact shading or surf until the mask lands.
-        vec3 edge = split ? vec3(0.0) : base ? hdEdgeAt(hdBaseEdges, hd - 1.0, uv, atlasSize, atlasTile)
-                  : retired ? hdEdgeAt(hdPreviousEdges, hd - 1.0, uv, atlasSize, atlasTile)
-                            : hdEdgeAt(hdEdges, hd - 1.0, uv, atlasSize, atlasTile);
+        vec3 edge = split ? vec3(0.0) : hdEdgeAt(base ? 2 : retired ? 1 : 0, hd - 1.0, uv, atlasSize, atlasTile);
 #else
         vec3 edge = edgeAt(mask - 1.0, uv);
 #endif

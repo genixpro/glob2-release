@@ -36,17 +36,23 @@ it is saved, checksummed or read by the simulation.
   the map point a bar keeps fixed while its size changes.
 - Bars hold their 100% size from 48 down to 20 points per tile and change slowly
   outside that. Between 20 and 16 points every bar fades together. From there down
-  to the overview a status badge marks what needs attention: a disc, red for harm
-  and amber for a missing supply, carrying an icon of the problem. A unit shows
-  hurt (60% health or less) before hungry (starving), beside its top right so the
-  badge, larger on screen than a unit this far out, does not cover it. A building
-  shows, at its top right and in this order of precedence, damaged, a tower without
-  ammunition, an inn without food (the hungry icon) and under half its workers.
-  Badges are 18 points across, shrinking with the other overlays to no less than
-  16; the icon keeps about 12 pixels on a standard display and 24 on a HiDPI one.
+  to the overview a status badge marks what needs attention: an icon of the
+  problem, drawn bare with a dark outline and blended from yellow, when the
+  condition has just begun, to red at its worst. A unit shows hungry (food at 1 in
+  10 or less; red once it is starving) before hurt (60% health or less; red as it
+  nears death), beside its top right so the badge, larger on screen than a unit
+  this far out, does not cover it. A building shows, at its top right and in this
+  order of precedence, damaged (a repair wrench, red as it nears destruction; never
+  on a construction site), a tower without ammunition, an inn without food (the hungry
+  icon) and under half its workers (red with nobody working; a building too small
+  for a step between the first shortfall and none stays yellow). The tower and
+  inn badges are yellow. Badges are a constant 14 points across, 28 pixels on a
+  HiDPI display: they appear only once the bars have faded, where shrinking them
+  with the map would make them illegible.
   Their icons (`MapOverlayQueue::StatusIcon`) come from the SVGs in
   `content-src/icons/status/`, rasterised by the same script as the map icons into
-  `content/data/gfx/statusicon*.png` at sizes from 8 pixels.
+  `content/data/gfx/statusicon*.png` at sizes from 8 pixels, every icon in a yellow
+  and a red variant.
 - Zones cross-fade from pattern sprites with an outline to a flat translucent tint
   without one: an area keeps its shape at any scale where a one-pixel line cannot.
   `GraphicContext::drawMapFill` snaps fill edges to target pixels so translucent
@@ -58,12 +64,24 @@ it is saved, checksummed or read by the simulation.
   leaves hairline seams.
   The outline stroke stops thickening at two points.
 - In the cross-fade `MapDrawer::drawMapOverview` fades in terrain palette colours sampled
-  from the detailed compositor's material coverage of each cell's corners. Four samples per tile axis keep coastlines aligned
-  during the fade; resource minimap colours tint their gameplay cells over that
-  ground. In the overview this replaces the water, terrain and resource passes.
-  The reusable image stretches over the map in a single draw, avoiding thousands
-  of translucent fills. A stationary view reuses the image and its texture
-  while its terrain, resources and discovery inputs are unchanged.
+  from the detailed compositor's material coverage of each cell's corners. Four or eight samples per tile axis,
+  chosen from the cell's size in device pixels, keep coastlines aligned during the
+  fade; each resource draws a square in its minimap colour centred in the
+  cell, sized by its stock, over that ground
+  ([caches and compatibility](../assets/terrain-rendering.md#caches-and-compatibility)). In the overview this replaces the water, terrain and resource passes.
+  Each 16 by 16 cell overview page is its own texture and draws as one quad,
+  avoiding thousands of translucent fills; panning and zooming draw the cached
+  pages and upload only cells that changed. Interactive views check pages and
+  describe missing cells within a fixed graphics-thread budget per frame;
+  background workers compose those cells and the graphics thread copies a
+  bounded number into their pages each frame. Until a page is complete it draws
+  over its other density where that exists. Tiled captures, offscreen draws (map
+  exports) and complete draws compose every visible cell first and draw the
+  view as one assembled image, since page edges far below a pixel apart would
+  round and could leave a row uncovered. From a game's first frame, under the
+  opening cloud bank, the same budget also composes the whole map at four
+  samples in the background (maps whose pages fit half the allowance), so the
+  first zoom out finds every page ready.
   When detailed resources come into view, installed resource sprites are
   requested on demand through the asset loader. The resource marker is used
   while its sprite is pending. Tiled captures and cached editor swatches wait
@@ -126,9 +144,13 @@ it is saved, checksummed or read by the simulation.
   only when necessary. Narrow edge tiles reuse the same sampling density and warm
   pages. Streaming fallback follows the same density choice.
   Overview palette samples are cached in canonical CPU pages independently of
-  zoom and animation. Terrain vertices (including the contour halo), the terrain
-  seed, registry/asset replacement and resource visibility invalidate those pages;
-  camera movement and blend opacity do not resample unchanged contours.
+  animation and zoom. Pages of both sample densities stay within a shared
+  48 MiB allowance (CPU pixels and their textures), always keeping the current
+  view's pages, so crossing the density threshold recomposes nothing already
+  seen. Terrain vertices (including the contour halo), the terrain seed and
+  registry/asset replacement invalidate those pages; a cell is recomposed when
+  its resource visibility, type or square size changes. Camera
+  movement and blend opacity do not resample unchanged contours.
 
 When tuning, capture the same save across zooms with `SoftwareRenderBenchmark`
 (`PROFILE_ZOOM`, `PROFILE_CAPTURE`); `PROFILE_ADAPTIVE_ZOOM=0` draws uniform scaling

@@ -4,9 +4,11 @@
 #include "AnimationClock.h"
 #include "FogFade.h"
 #include "MapOverlayQueue.h"
+#include "TerrainFallbackMetrics.h"
 #include "ZoomDetail.h"
 #include "scene/Scene.h"
 
+#include <SDL3/SDL_rect.h>
 #include <SDL3/SDL_stdinc.h>
 
 #include <memory>
@@ -38,7 +40,25 @@ struct MapRenderState
 	//! Water and cloud phase in steps of 1/60 s of real time, advanced by
 	//! animationClock each drawn frame; frozen while paused.
 	int animationTime = 0;
+	//! The part of the next step elapsed (AnimationClock::fraction), so that
+	//! animationNow() moves by exactly the real time each frame.
+	float animationFraction = 0;
 	AnimationClock animationClock;
+	//! This frame's presentation time, the same for every consumer.
+	AnimationTime animationNow() const { return {animationTime, animationFraction}; }
+	//! Advances the presentation time once for a drawn frame.
+	void advanceAnimation(bool paused)
+	{
+		animationTime += animationClock.advance(paused);
+		animationFraction = animationClock.fraction();
+	}
+	//! Holds the presentation time at a whole step (captures, benchmarks).
+	void pinAnimation(int steps)
+	{
+		animationTime = steps;
+		animationFraction = 0;
+		animationClock.clearFraction();
+	}
 	//! Phase of the animated area (forbidden/guard/clear/farm) markers, in the
 	//! same steps, advanced by areaClock on frames that draw the areas.
 	int areaAnimationTick = 0;
@@ -57,6 +77,11 @@ struct MapRenderState
 	//! The terrain overview's sampled palette image, kept between frames.
 	std::unique_ptr<GAGCore::DrawableSurface> overview;
 	std::unique_ptr<OverviewTerrainCache> overviewCache;
+	//! Set while the overview draws as the backdrop of missing detailed pages:
+	//! the world tile origins of those pages, the only places it shows.
+	const std::vector<SDL_Point> *overviewBackdropPages = nullptr;
+	//! This frame's terrain drawn from fallbacks; reset by MapDrawer::drawMap.
+	TerrainFallbackMetrics fallback;
 	//! The furthest this view's camera can zoom out, set by its owner; 0 when
 	//! unknown. It anchors the far end of the detail curves (ZoomDetail::rampTile).
 	double minimumZoom = 0;

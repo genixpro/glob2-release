@@ -5048,6 +5048,10 @@ FFmpeg недоступний, тому запис вимкнено. Устан�
 Престиж
 [stat prestige about]
 Престиж колонії, що його дають будівлі найвищого рівня. Матч із метою престижу завершується, коли її досягнуто.
+[stat prestige needed]
+Престиж, потрібний для перемоги
+[stat prestige needed about]
+Престиж, який колонії ще треба здобути, щоб перемогти за престижем: стільки, щоб загальний престиж матчу досяг мети і щоб випередити кожну іншу вцілілу колонію. Записується, лише якщо матч має мету престижу.
 [stat band combat]
 Бій
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Discord відкрито. Ви можете повернутися до гри �
 ШІ для всіх колоній під керуванням комп’ютера
 [tundra]
 Тундровий ґрунт
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

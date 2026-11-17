@@ -5,6 +5,7 @@
 #include "GlobalContainer.h"
 #include "CommandLine.h"
 #include "ComputeThreads.h"
+#include "DeviceProfile.h"
 #include "field/GradientBackend.h"
 #include <cstdlib>
 #include <cstring>
@@ -45,7 +46,10 @@ void GlobalContainer::applyCommand(const Cli::Request &request)
         rendererLaunchOverride = GAGCore::parseRendererBackend(r.get("--renderer"));
 	}
 	if (r.has("--graphics-detail"))
+	{
 		settings.setGraphicsDetail(r.get("--graphics-detail") == "full");
+		settings.graphicsDetailAdaptive = false;
+	}
 	if (r.has("--mute"))
 		settings.mute = 1;
 	if (r.has("--no-mute"))
@@ -129,6 +133,11 @@ void GlobalContainer::applyCommand(const Cli::Request &request)
 		GAGCore::DrawableSurface::translationPicturesDirectory = r.get("--output-dir");
 	if (r.command.rfind("dev dump-", 0) == 0)
 		runNoX = true;
+	// The device profile decides Auto defaults; a windowed run also measures
+	// the desktop GPU's memory in the background.
+	DeviceProfile::initialize(r.has("--device-tier") ? DeviceProfile::parseTier(r.get("--device-tier")) : std::nullopt,
+							  !runNoX && (r.command == "play" || r.command == "replay"));
+	settings.resolveAdaptiveDefaults();
 	Online::acceptLaunchRequest(r);
 }
 

@@ -43,9 +43,9 @@ R"legacy_resources(
         "name": "Trees",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          0,
-          60,
-          0
+          255,
+          180,
+          214
         ],
         "levels": [
           {
@@ -170,9 +170,9 @@ R"legacy_resources(
         "name": "Wheat",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          211,
-          207,
-          167
+          242,
+          200,
+          60
         ],
         "levels": [
           {
@@ -297,9 +297,9 @@ R"legacy_resources(
         "name": "Papyrus",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          0,
-          0,
-          0
+          170,
+          230,
+          150
         ],
         "levels": [
           {
@@ -400,9 +400,9 @@ R"legacy_resources(
         "name": "Rocks",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          104,
-          112,
-          124
+          164,
+          164,
+          226
         ],
         "levels": [
           {
@@ -527,9 +527,9 @@ R"legacy_resources(
         "name": "Algae",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          41,
-          157,
-          165
+          206,
+          230,
+          60
         ],
         "levels": [
           {
@@ -654,9 +654,9 @@ R"legacy_resources(
         "name": "Cherry tree",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          255,
-          127,
-          0
+          230,
+          36,
+          64
         ],
         "levels": [
           {
@@ -748,9 +748,9 @@ R"legacy_resources(
         "name": "Orange tree",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          255,
-          127,
-          0
+          252,
+          136,
+          24
         ],
         "levels": [
           {
@@ -842,9 +842,9 @@ R"legacy_resources(
         "name": "Prune tree",
         "sprite": "data/gfx/ressource",
         "minimap": [
-          255,
-          127,
-          0
+          222,
+          232,
+          252
         ],
         "levels": [
           {

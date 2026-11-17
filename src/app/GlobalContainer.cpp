@@ -271,7 +271,13 @@ void GlobalContainer::openLoadingScreen(void)
 #endif
 	GraphicContext::setInitialRendererBackend(GAGCore::resolveRendererPreference(
 		settings.rendererBackend, rendererLaunchOverride, environmentBackend));
-	gfx = Toolkit::initGraphic(settings.screenWidth, settings.screenHeight, settings.screenFlags, "Globulation 2", "glob 2");
+	gfx = Toolkit::initGraphic(settings.screenWidth, settings.screenHeight, startupScreenFlags(settings.screenFlags), "Globulation 2", "glob 2");
+	{
+		const auto &status = gfx->backendSwitchStatus();
+		SDL_Log("BACKEND requested=%s active=%s fallback_reason=%s",
+			std::string(GAGCore::rendererBackendName(status.requested)).c_str(),
+			std::string(GAGCore::rendererBackendName(status.active)).c_str(), status.reason.c_str());
+	}
 	gfx->setBackendPreferenceCallback([this](GAGCore::RendererBackend selected) {
 		settings.rendererBackend = selected;
 		if (!settings.save()) std::cerr << "Could not save renderer preference." << std::endl;
@@ -399,7 +405,8 @@ void GlobalContainer::loadGameGraphics()
 	// load terrain data
 	if (!terrain)
 		terrain = sprite("data/gfx/terrain");
-	terrainCompositor(); // Validate all registered material sources before drawing.
+	// Parses the catalog; material sheets load as maps need them.
+	terrainCompositor();
 	terrainCloud = sprite("data/gfx/cloud");
 
 	// black for unexplored terrain
@@ -447,6 +454,11 @@ void GlobalContainer::requestGameGraphics()
     // standalone frames: its HD atlas would cost about 90 MiB in memory and
     // again on the GPU and never be drawn. The browser's pages still use it.
     Sprite::skipHighResolutionAtlas("data/gfx/terrain");
+    // Resources draw from standalone frames, like every other sprite: their
+    // atlas sampled its whole mip chain trilinearly, where the HD sprite
+    // policy has every renderer sample one level (its fruit and trees drew
+    // in a different per-cell pattern from the other renderers).
+    Sprite::skipHighResolutionAtlas("data/gfx/ressource");
 #endif
     for (const char *name : {"terrain", "cloud", "black", "shade", "ressource", "ressourcemini",
         "mapicon", "statusicon", "area-clearing", "area-forbidden", "area-guard", "area-farm", "bullet", "explosion", "death",
@@ -456,7 +468,10 @@ void GlobalContainer::requestGameGraphics()
 	{
 		if (material.variantBlocks > 1) Sprite::deferHighResolution(material.sprite);
 		Sprite::keepHighResolutionPixels(material.sprite); // The compositor samples them.
-		Toolkit::requestSprite(material.sprite);
+		// Material sheets load on demand (TerrainVisual::MaterialSheets), as a
+		// map, the editor or composition first needs them.
+		if (!terrainSheetsOnDemand())
+			Toolkit::requestSprite(material.sprite);
 		if (!material.decor.sprite.empty())
 		{
 			// The shared decor sheet holds every material's decor, thousands of
@@ -584,11 +599,19 @@ void GlobalContainer::loadOffscreenGraphics()
 	}
 }
 
+bool GlobalContainer::terrainSheetsOnDemand() const
+{
+	// GLOB2_TERRAIN_SHEETS=eager loads every material sheet at startup, as
+	// before, for comparisons.
+	const char *mode = std::getenv("GLOB2_TERRAIN_SHEETS");
+	return !terrainSheetsEager && (!mode || std::string(mode) != "eager");
+}
+
 TerrainVisual::Compositor &GlobalContainer::terrainCompositor()
 {
 	if (!terrainCompositor_)
-		terrainCompositor_ =
-			std::make_shared<TerrainVisual::Compositor>(TerrainVisual::loadCatalog());
+		terrainCompositor_ = std::make_shared<TerrainVisual::Compositor>(
+			TerrainVisual::loadCatalog(), MapAssetBundle::empty(), terrainSheetsOnDemand());
 	return *terrainCompositor_;
 }
 
@@ -608,7 +631,7 @@ std::shared_ptr<TerrainVisual::Compositor> GlobalContainer::terrainCompositorOwn
     if (compositorAssets != assets)
     {
         customTerrainCompositor = std::make_shared<TerrainVisual::Compositor>(
-            TerrainVisual::loadCatalog(assets), assets);
+            TerrainVisual::loadCatalog(assets), assets, terrainSheetsOnDemand());
         compositorAssets = std::move(assets);
     }
     return customTerrainCompositor;

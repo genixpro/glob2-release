@@ -5048,6 +5048,10 @@ Probabilitat estimada que la teva aliança guanyi, mostrejada al llarg de la par
 Prestigi
 [stat prestige about]
 El prestigi de la colònia, que s'obté amb edificis de nivell màxim. Una partida amb objectiu de prestigi acaba quan s'assoleix.
+[stat prestige needed]
+Prestigi necessari per guanyar
+[stat prestige needed about]
+El prestigi que la colònia encara hauria d'obtenir per guanyar per prestigi: prou perquè el prestigi conjunt de la partida arribi a l'objectiu i per superar totes les altres colònies supervivents. Només es registra quan la partida té un objectiu de prestigi.
 [stat band combat]
 Combat
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Cicle %0: %1 ms de temps real
 IA per a totes les colònies controlades per l’ordinador
 [tundra]
 Sòl de tundra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

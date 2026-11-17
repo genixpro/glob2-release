@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include <RenderDevice.h>
 #include <chrono>
+#include <cmath>
 #include <deque>
+#include <list>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -147,22 +149,60 @@ class DeviceRenderBackend final : public RenderBackend
     RenderDevice &device;
     RenderResources &resources;
     RenderFrameRecorder recorder;
-    struct TextureEntry { TextureHandle handle; std::uint64_t lastUse; };
+    // Entries whose owner still has CPU pixels are on `recent` (least recently
+    // used first) and may be evicted and re-created. A retained entry holds the
+    // only copy of a surface whose pixels were released, so it never is; it is
+    // capped at half of its budget class so admission always has room.
+    struct TextureEntry
+    {
+        TextureHandle handle;
+        std::list<const void *>::iterator recentPosition;
+        bool retained = false;
+        std::size_t retainedBytes = 0;
+        TextureDescriptor::BudgetClass category = TextureDescriptor::BudgetClass::General;
+        // Presentations counted when it was last drawn (trim's idle test).
+        std::uint64_t lastFrame = 0;
+    };
     std::unordered_map<const void *, TextureEntry> textures;
-    std::uint64_t useClock = 0;
+    std::list<const void *> recent;
+    std::array<std::size_t, 4> retainedBytes{};
+    std::uint64_t presentedFrames = 0;
+    using TextureIterator = std::unordered_map<const void *, TextureEntry>::iterator;
+    TextureIterator insertEntry(const void *key, TextureHandle handle)
+    {
+        recent.push_back(key);
+        auto found = textures.emplace(key, TextureEntry{handle, std::prev(recent.end())}).first;
+        found->second.lastFrame = presentedFrames;
+        return found;
+    }
+    void touch(TextureEntry &entry)
+    {
+        entry.lastFrame = presentedFrames;
+        if (!entry.retained) recent.splice(recent.end(), recent, entry.recentPosition);
+    }
+    TextureIterator eraseEntry(TextureIterator it)
+    {
+        resources.erase(it->second.handle);
+        if (it->second.retained) retainedBytes[std::size_t(it->second.category)] -= it->second.retainedBytes;
+        else recent.erase(it->second.recentPosition);
+        return textures.erase(it);
+    }
     bool aborted=false,lastPresented=true,intentionalDefer=false,lastIntentionalDefer=false;
+    // Set by the owner for this frame only (see RenderFrame::deferrable).
+    bool deferrableFrame=false;
     std::string fatalReason;
     void abort(){aborted=true;recorder.cancel();}
     void append(DrawPacket value){if(!aborted){recorder.append(std::move(value));if(aborted)recorder.cancel();}}
     bool evictOldest(const void *except)
     {
-        auto oldest = textures.end();
-        for (auto it = textures.begin(); it != textures.end(); ++it)
-            if (it->first != except && (oldest == textures.end() || it->second.lastUse < oldest->second.lastUse)) oldest = it;
-        if (oldest == textures.end()) return false;
-        resources.erase(oldest->second.handle); textures.erase(oldest); return true;
+        // Constant time: at most the first entry is the one being admitted.
+        auto candidate = recent.begin();
+        if (candidate != recent.end() && *candidate == except) ++candidate;
+        if (candidate == recent.end()) return false;
+        eraseEntry(textures.find(*candidate)); return true;
     }
     RenderTransform currentTransform;
+    TextureDescriptor::BudgetClass budgetClass = TextureDescriptor::BudgetClass::General;
     std::optional<SDL_Rect> currentClip, currentTargetScissor;
     TextureSnapshot currentTarget;
     float targetWidth = 0, targetHeight = 0;
@@ -171,7 +211,10 @@ class DeviceRenderBackend final : public RenderBackend
     RenderOperations counts;
     std::uint64_t frameIdentity = 1, captureIdentity = 0, submittedFrameIdentity = 0, presentedFrameIdentity = 0;
     int width, height;
-    TextureSnapshot texture(const void *key, SDL_Surface *source, std::uint64_t revision, bool opaque, std::span<const RenderMipLevel> mipLevels = {})
+    // `linear` records linear sampling for a texture without mip levels, so a
+    // released owner's cached draw (blitCached) samples it the same way.
+    TextureSnapshot texture(const void *key, SDL_Surface *source, std::uint64_t revision, bool opaque, std::span<const RenderMipLevel> mipLevels = {},
+                            bool linear = false)
     {
         if(aborted) throw RenderAdmissionDeferred("Presentation frame already deferred");
         if (!source) return {};
@@ -186,8 +229,18 @@ class DeviceRenderBackend final : public RenderBackend
                 if (bytes > std::min(resources.byteLimit(), std::size_t(64*1024*1024))) throw std::length_error("Authored mip chain exceeds logical budget");
             }
             descriptor.mips = TextureDescriptor::Mips::Generated; descriptor.sampling = TextureDescriptor::Sampling::Linear;
+            // Prepared blocks the device samples replace the RGBA chain in the
+            // snapshot and on the GPU. Without them every level needs pixels.
+            const auto compression = mipLevels.front().compression;
+            if (compression != TextureCompression::Uncompressed && device.capabilities().supports(compression))
+                descriptor.compression = compression;
+            else
+                for (const auto &level : mipLevels)
+                    if (level.pixels.empty()) throw std::invalid_argument("Device cannot sample prepared blocks without pixels");
         }
         descriptor.alpha = opaque ? TextureDescriptor::Alpha::Opaque : TextureDescriptor::Alpha::Straight;
+        descriptor.budgetClass = budgetClass;
+        if (linear) descriptor.sampling = TextureDescriptor::Sampling::Linear;
         // Borrowed terrain-run views often reuse the same surface address and
         // revision zero with new pixels. A missing logical key never caches them.
         if (!key) {
@@ -205,11 +258,13 @@ class DeviceRenderBackend final : public RenderBackend
         auto found = textures.find(key);
         if (found != textures.end()) {
             auto previous = resources.snapshot(found->second.handle);
-            if (previous && previous->descriptor.mips != descriptor.mips) {
+            if (previous && (previous->descriptor.mips != descriptor.mips ||
+                             previous->descriptor.compression != descriptor.compression ||
+                             previous->descriptor.budgetClass != descriptor.budgetClass)) {
                 // The source content revision may be unchanged when an authored
                 // padded chain replaces an ordinary upload. A new handle keeps
                 // old queued pixels and device upload identities independent.
-                resources.erase(found->second.handle); textures.erase(found); found = textures.end();
+                eraseEntry(found); found = textures.end();
             }
         }
         if (found == textures.end()) {
@@ -220,7 +275,7 @@ class DeviceRenderBackend final : public RenderBackend
                 do { handle = resources.create(source, revision, descriptor, mipLevels); } while (!handle && evictOldest(key));
             }
             if (!handle) throw RenderAdmissionDeferred("Texture resource budget exhausted");
-            found = textures.emplace(key, TextureEntry{handle, ++useClock}).first;
+            found = insertEntry(key, handle);
         } else {
             auto previous = resources.snapshot(found->second.handle);
             const bool changed = !previous || previous->contentRevision != revision || previous->descriptor.mips != descriptor.mips;
@@ -235,11 +290,14 @@ class DeviceRenderBackend final : public RenderBackend
                     // retire the cache's old logical revision before admission.
                     resources.erase(found->second.handle);
                     auto replacement = resources.create(source, revision, descriptor, mipLevels);
-                    if (!replacement) { textures.erase(found); throw RenderAdmissionDeferred("Texture resource budget exhausted by in-flight revisions"); }
+                    if (!replacement) {
+                        found->second.handle = {}; eraseEntry(found);
+                        throw RenderAdmissionDeferred("Texture resource budget exhausted by in-flight revisions");
+                    }
                     found->second.handle = replacement;
                 }
             }
-            found->second.lastUse = ++useClock;
+            touch(found->second);
         }
         return resources.snapshot(found->second.handle);
     }
@@ -252,7 +310,7 @@ class DeviceRenderBackend final : public RenderBackend
     DeviceRenderBackend(RenderDevice &device, RenderResources &resources, int w, int h)
         : device(device), resources(resources), recorder([this](RenderFrame frame) {
             if(aborted) return;
-            try { const auto identity=frame.identity; if(!this->device.submit(std::move(frame))) abort(); else submittedFrameIdentity=identity; }
+            try { const auto identity=frame.identity; frame.deferrable=deferrableFrame; if(!this->device.submit(std::move(frame))) abort(); else submittedFrameIdentity=identity; }
             catch(const RenderAdmissionDeferred &){abort();}
             catch(const std::exception &error){fatalReason=error.what();abort();}
         }), width(w), height(h) { recorder.begin(frameIdentity, width, height); }
@@ -305,7 +363,7 @@ class DeviceRenderBackend final : public RenderBackend
                     const SDL_Rect &src, const SDL_FRect &dst, Uint8 alpha) override
     {
         if(aborted)return;
-        auto value = packet(DrawPacket::Kind::Blit); try{value.texture = texture(key, source, revision, false);}catch(const RenderAdmissionDeferred &){abort();return;}
+        auto value = packet(DrawPacket::Kind::Blit); try{value.texture = texture(key, source, revision, false, {}, true);}catch(const RenderAdmissionDeferred &){abort();return;}
         value.source = src; value.destination = dst; value.alpha = alpha; value.linear = true;
         append(std::move(value)); ++counts.blits;
     }
@@ -330,6 +388,35 @@ class DeviceRenderBackend final : public RenderBackend
         value.source = src; value.destination = dst; value.alpha = alpha; value.linear = true;
         append(std::move(value)); ++counts.blits;
     }
+    bool blitTeamColor(const void *key, SDL_Surface *source, std::uint64_t revision,
+                       std::span<const RenderMipLevel> mipLevels, const SDL_Rect &src,
+                       const SDL_FRect &dst, Uint8 alpha, float hue, bool linear) override
+    {
+        if (!device.capabilities().teamColor || !std::isfinite(hue)) return false;
+        if (aborted) return true;
+        auto value = packet(DrawPacket::Kind::Blit);
+        try { value.texture = texture(key, source, revision, false, mipLevels, linear); }
+        catch (const RenderAdmissionDeferred &) { abort(); return true; }
+        value.material = DrawPacket::Material::TeamColor; value.teamHue = hue;
+        value.source = src; value.destination = dst; value.alpha = alpha; value.linear = linear || !mipLevels.empty();
+        append(std::move(value)); ++counts.blits;
+        return true;
+    }
+    bool trianglesTeamColor(std::span<const SDL_Vertex> vertices, const void *key, SDL_Surface *pixels,
+                            std::uint64_t revision, float hue) override
+    {
+        if (!device.capabilities().teamColor || !std::isfinite(hue)) return false;
+        if (vertices.size() > RenderFrame::VertexCapacity) throw std::length_error("Draw packet exceeds vertex capacity");
+        if (aborted) return true;
+        auto value = packet(DrawPacket::Kind::Triangles);
+        try { value.texture = texture(key, pixels, revision, false); }
+        catch (const RenderAdmissionDeferred &) { abort(); return true; }
+        value.material = DrawPacket::Material::TeamColor; value.teamHue = hue;
+        value.vertices.assign(vertices.begin(), vertices.end());
+        append(std::move(value)); ++counts.triangles;
+        return true;
+    }
+    void textureBudgetClass(TextureDescriptor::BudgetClass value) override { budgetClass = value; }
     void prepareTexture(const void *key, SDL_Surface *source, std::uint64_t revision, bool = false) override { if(aborted)return;try{texture(key,source,revision,false);}catch(const RenderAdmissionDeferred &){abort();} }
     void fill(const SDL_FRect &rect, SDL_Color color) override
     {
@@ -358,13 +445,101 @@ class DeviceRenderBackend final : public RenderBackend
     void forget(const void *key) override
     {
         auto found = textures.find(key);
-        if (found != textures.end()) { resources.erase(found->second.handle); textures.erase(found); }
+        if (found != textures.end()) eraseEntry(found);
     }
-    void reset() override { recorder.cancel(); device.reset(); submittedFrameIdentity=presentedFrameIdentity=0;aborted=false;lastPresented=false;intentionalDefer=lastIntentionalDefer=false;fatalReason.clear(); }
-    void present() override { flush();lastPresented=false;lastIntentionalDefer=intentionalDefer;
+    bool hasTexture(const void *key, std::uint64_t revision) const override
+    {
+        const auto found = textures.find(key);
+        if (found == textures.end()) return false;
+        const auto snapshot = resources.snapshot(found->second.handle);
+        return snapshot && snapshot->contentRevision == revision;
+    }
+    // Keeps `key`'s restoration snapshot of `revision` until forgotten, so its
+    // owner can release its CPU pixels: device resets and recovery restore the
+    // texture from it. False (nothing changes) without that snapshot or room.
+    bool retain(const void *key, std::uint64_t revision)
+    {
+        auto found = textures.find(key);
+        if (found == textures.end()) return false;
+        auto &entry = found->second;
+        const auto snapshot = resources.snapshot(entry.handle);
+        if (!snapshot || snapshot->contentRevision != revision) return false;
+        if (entry.retained) return true;
+        const auto category = snapshot->descriptor.budgetClass;
+        auto &held = retainedBytes[std::size_t(category)];
+        if (snapshot->bytes > resources.classLimit(category) / 2 - std::min(held, resources.classLimit(category) / 2))
+            return false;
+        recent.erase(entry.recentPosition);
+        entry.retained = true; entry.retainedBytes = snapshot->bytes; entry.category = category;
+        held += snapshot->bytes;
+        return true;
+    }
+    std::size_t retainedTextureBytes(TextureDescriptor::BudgetClass category) const
+    {
+        return retainedBytes[std::size_t(category)];
+    }
+    std::size_t classLimit(TextureDescriptor::BudgetClass category) const { return resources.classLimit(category); }
+    std::size_t retainedTextureBytes() const
+    {
+        std::size_t total = 0;
+        for (auto bytes : retainedBytes) total += bytes;
+        return total;
+    }
+    // Moves every cached snapshot of `previous` (same registry) here, so a
+    // replacement device restores textures whose owners released their pixels.
+    void adopt(DeviceRenderBackend &previous)
+    {
+        if (&previous.resources != &resources) throw std::invalid_argument("Device textures belong to another registry");
+        for (auto it = textures.begin(); it != textures.end();) it = eraseEntry(it);
+        textures = std::move(previous.textures); recent = std::move(previous.recent);
+        retainedBytes = previous.retainedBytes;
+        // Adopted entries keep their idle age for trim.
+        presentedFrames = std::max(presentedFrames, previous.presentedFrames);
+        previous.textures.clear(); previous.recent.clear(); previous.retainedBytes = {};
+    }
+    bool blitCached(const void *key, const SDL_Rect &src, const SDL_FRect &dst, Uint8 alpha) override
+    {
+        auto found = textures.find(key);
+        if (found == textures.end()) return false;
+        auto snapshot = resources.snapshot(found->second.handle);
+        if (!snapshot) return false;
+        touch(found->second);
+        if (aborted) return true;
+        // The sampling the texture was recorded with: authored chains are linear.
+        auto value = packet(DrawPacket::Kind::Blit);
+        value.linear = snapshot->descriptor.mips == TextureDescriptor::Mips::Generated ||
+            snapshot->descriptor.sampling == TextureDescriptor::Sampling::Linear;
+        value.opaque = snapshot->descriptor.alpha == TextureDescriptor::Alpha::Opaque;
+        value.texture = std::move(snapshot);
+        value.source = src; value.destination = dst; value.alpha = alpha;
+        append(std::move(value)); ++counts.blits;
+        return true;
+    }
+    void reset() override { recorder.cancel(); device.reset(); submittedFrameIdentity=presentedFrameIdentity=0;aborted=false;lastPresented=false;intentionalDefer=lastIntentionalDefer=false;fatalReason.clear();deferrableFrame=false; }
+    // Erases up to `limit` cached snapshots not drawn in the last `idleFrames`
+    // presentations (zero: any not drawn since the last one); their owners keep
+    // the pixels to re-create them on a draw.
+    // Queued and submitted work keep the revisions they reference. Returns how
+    // many went: fewer than `limit` means none is left to trim.
+    // Walks the least-recently-used list from its oldest end, so each step is
+    // constant time: the first entry drawn too recently ends the walk. Retained
+    // entries are not on it; their owners released the pixels.
+    std::size_t trim(std::size_t limit, std::uint64_t idleFrames)
+    {
+        std::size_t erased = 0;
+        while (erased < limit && !recent.empty()) {
+            const auto found = textures.find(recent.front());
+            if (found->second.lastFrame + idleFrames >= presentedFrames) break;
+            eraseEntry(found); ++erased;
+        }
+        return erased;
+    }
+    void present() override { ++presentedFrames;flush();lastPresented=false;lastIntentionalDefer=intentionalDefer;
         if(!fatalReason.empty())throw std::runtime_error(fatalReason);
         if(aborted){device.discardFrame();submittedFrameIdentity=presentedFrameIdentity;}else{device.present();presentedFrameIdentity=submittedFrameIdentity;lastPresented=true;}
-        aborted=false;intentionalDefer=false;recorder.begin(++frameIdentity,width,height); }
+        aborted=false;intentionalDefer=false;deferrableFrame=false;recorder.begin(++frameIdentity,width,height); }
+    void setPresentationHeld(bool held) override { device.setPresentationHeld(held); }
+    void allowDeferral() {deferrableFrame=true;}
     std::uint64_t submittedIdentity() const {return submittedFrameIdentity;}
     bool defer() {
         flush();
@@ -379,6 +554,8 @@ class DeviceRenderBackend final : public RenderBackend
     void nativeLogicalSize(int w, int h) override { logicalSize(w, h); }
     SDL_Surface *capture() override
     {
+        // A frame read back synchronously cannot defer from here on.
+        deferrableFrame=false;
         flush(); if(aborted)throw RenderAdmissionDeferred("Cannot capture deferred presentation frame"); int w, h; device.outputSize(w, h);
         CaptureRequest request; request.identity = ++captureIdentity; request.frameIdentity = submittedFrameIdentity;
         request.width = w; request.height = h;
@@ -396,6 +573,38 @@ std::unique_ptr<RenderDevice> makeSoftwareRenderDevice(SDL_Surface *target)
 std::unique_ptr<RenderBackend> makeDeviceRenderBackend(RenderDevice &device, RenderResources &resources, int width, int height)
 {
     return std::make_unique<DeviceRenderBackend>(device, resources, width, height);
+}
+bool retainDeviceTexture(RenderBackend &backend, const void *key, std::uint64_t revision)
+{
+    auto *device = dynamic_cast<DeviceRenderBackend *>(&backend);
+    return device && device->retain(key, revision);
+}
+std::size_t retainedDeviceTextureBytes(const RenderBackend &backend)
+{
+    auto *device = dynamic_cast<const DeviceRenderBackend *>(&backend);
+    return device ? device->retainedTextureBytes() : 0;
+}
+std::size_t retainedDeviceTextureBytes(const RenderBackend &backend, TextureDescriptor::BudgetClass category)
+{
+    auto *device = dynamic_cast<const DeviceRenderBackend *>(&backend);
+    return device ? device->retainedTextureBytes(category) : 0;
+}
+std::size_t deviceTextureClassLimit(const RenderBackend &backend, TextureDescriptor::BudgetClass category)
+{
+    auto *device = dynamic_cast<const DeviceRenderBackend *>(&backend);
+    return device ? device->classLimit(category) : 0;
+}
+void adoptDeviceTextures(RenderBackend &previous, RenderBackend &replacement)
+{
+    auto *from = dynamic_cast<DeviceRenderBackend *>(&previous);
+    auto *to = dynamic_cast<DeviceRenderBackend *>(&replacement);
+    if (!from || !to) throw std::invalid_argument("Device textures move between device adapters only");
+    to->adopt(*from);
+}
+std::size_t trimDeviceTextures(RenderBackend &backend, std::size_t limit, std::uint64_t idleFrames)
+{
+    auto *device = dynamic_cast<DeviceRenderBackend *>(&backend);
+    return device ? device->trim(limit, idleFrames) : 0;
 }
 bool pushDeviceTarget(RenderBackend &backend, TextureSnapshot target, float width, float height)
 {
@@ -415,6 +624,7 @@ bool recordDevicePacket(RenderBackend &backend, DrawPacket packet)
     device->record(std::move(packet)); return true;
 }
 bool setDeviceTargetScissor(RenderBackend &backend, const SDL_Rect *rect){auto *device=dynamic_cast<DeviceRenderBackend *>(&backend);if(!device)return false;device->setTargetScissor(rect);return true;}
+void allowDeviceFrameDeferral(RenderBackend &backend){if(auto *device=dynamic_cast<DeviceRenderBackend *>(&backend))device->allowDeferral();}
 bool deferDeviceFrame(RenderBackend &backend){auto *device=dynamic_cast<DeviceRenderBackend *>(&backend);return device && device->defer();}
 bool didIntentionallyDeferDeviceFrame(const RenderBackend &backend){auto *device=dynamic_cast<const DeviceRenderBackend *>(&backend);return device && device->intentionallyDeferred();}
 bool didRecordDeviceFrame(const RenderBackend &backend){auto *device=dynamic_cast<const DeviceRenderBackend *>(&backend);return !device || device->recorded();}

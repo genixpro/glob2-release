@@ -5048,6 +5048,10 @@ AI 遙測
 聲望
 [stat prestige about]
 殖民地的聲望，由最高等級的建築物獲得。設有聲望目標的對局會在達到目標時結束。
+[stat prestige needed]
+獲勝所需聲望
+[stat prestige needed about]
+殖民地若要以聲望獲勝仍須取得的聲望：足以讓對局的聲望總和達到目標，並超越其他所有存活的殖民地。僅在對局設有聲望目標時記錄。
 [stat band combat]
 戰鬥
 [stat band starvation]
@@ -7102,3 +7106,33 @@ AI
 所有電腦控制殖民地的 AI
 [tundra]
 苔原地面
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

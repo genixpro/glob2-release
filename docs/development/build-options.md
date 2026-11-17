@@ -141,7 +141,7 @@ code it compiled.
 
 `perf=1` is a native client build in `build/<toolchain>/client/perf` (`perf/o3`
 with `opt=3`). It keeps the full client profile, lossless development assets and
-`-g1` symbols, and does not strip or use `-fwhole-program`, so a profiler can
+`-g1` symbols, and does not strip or use LTO, so a profiler can
 attribute samples and every performance claim is reproducible from one command.
 `tools/dev_build.py perf=1` builds it with the managed compiler cache, through
 the CMake `perf` and `perf-o3` presets' identities.
@@ -261,7 +261,7 @@ it builds the Windows client (`build/mingw/...`) with `WIN32` and
 libraries and `-mwindows` for the client and harnesses but not the console test
 programs. On macOS it builds `build/darwin/...` with Homebrew's (else MacPorts')
 libraries, Apple's frameworks and Objective-C++ sources; release builds keep `-g`
-and skip `-fwhole-program` and `-s`. Its `bundle` target makes `Glob2.app`
+and skip LTO and `-s`. Its `bundle` target makes `Glob2.app`
 (assets, libraries, MoltenVK and a dSYM, through `buildsys/bundle.py`) and
 `package` also `Glob2-<version>.dmg`; `tools/dev_build.py` sets
 `GLOB2_MAC_BUNDLE` for them, which links the pinned PNG/JPEG SDL_image.
@@ -299,10 +299,18 @@ was built last; `--build-dir` or `GLOB2_BUILD_DIR` picks one explicitly.
 
 Tier flags: `GLOB2_CXXFLAGS` and `GLOB2_LINKFLAGS` (`CXXFLAGS=` and
 `LINKFLAGS=` of `tools/dev_build.py`, default `-g`; distributions pass their
-optflags) come first; `dev_fast` replaces every `-g`/`-O` with `-O0 -g1`; `perf=1` compiles
+optflags) come first. Native objects are compiled with `-fPIE`: every target is
+an executable over static archives, and `-fPIC` would make GCC treat each global
+function as interposable and stop inlining it. `dev_fast` replaces every `-g`/`-O` with `-O0 -g1`; `perf=1` compiles
 C++ with `-O2 -g1` (`-O3` with `opt=3`) and links at the same level; `release=1`
-adds `-O3`, links with `-O3 -fwhole-program` and strips with `-s` (test binaries
-keep their symbols) unless `retain_symbols=1`. QuickJS and openlibm compile at
+adds `-O3`, links with `-O3` and strips with `-s` (test binaries
+keep their symbols) unless `retain_symbols=1`. Native release builds also
+optimize the C++ across files at link time: GCC (Linux, MinGW) with `-flto=auto`, clang with
+`-flto=thin` (on Linux only when `ld.lld` is installed, which then links; on macOS
+with a per-executable `-object_path_lto` directory, so the dSYM keeps its debug
+information and concurrent links cannot overwrite each other's ThinLTO objects),
+archiving with the compiler's own `ar` when CMake finds one. Perf builds leave LTO out, so they measure
+a few percent slower than shipped binaries. QuickJS and openlibm compile at
 `-O2` in the optimized tiers and `-O0` otherwise. When ccache is installed it is
 the compiler launcher, with the managed cache directory and settings, and
 `-fdebug-prefix-map=<checkout>=.` makes objects relocatable. `linker=auto` links
@@ -381,14 +389,27 @@ DESTDIR="$stage" cmake --install build/linux/client/release/lean-images
 
 The build generates shader layouts and GLSL variants from
 `libs/gag/shaders/renderer-manifest.json` and the authoritative material sources.
-`GLOB2_GLSLANG` can point to pinned glslang 15.1.0 for offline Vulkan SPIR-V generation;
-without the platform’s offline binaries the experimental SDL GPU family is unavailable.
+Offline Vulkan SPIR-V needs pinned glslang 15.1.0. Local `tools/dev_build.py` builds
+provision it once (`python3 buildsys/glslang_tool.py` does the same by hand): the
+compiler is built from the SHA-256-pinned source archive in `buildsys/glslang.json`
+into the shared development store (`build/mobile-tools/` in isolated mode) and the
+shader step uses it from then on, regenerating an existing build's shaders.
+`GLOB2_GLSLANG` overrides the provisioned compiler and an empty value disables
+SPIR-V; CI jobs and browser builds keep their explicit configuration. glslang is a
+development dependency: nothing at runtime links or ships it. Android packaging
+requires the complete Vulkan set and iOS device packaging the Metal set (see the
+mobile guides); without the platform’s offline binaries the experimental SDL GPU
+family is unavailable. macOS and iOS device builds compile the Metal set
+automatically, provisioning pinned SPIRV-Cross (`buildsys/spirv_cross_tool.py`)
+from verified source the same way; see
+[Apple Metal shaders](../architecture/rendering.md#apple-metal-shaders).
 `GLOB2_NAGA` selects pinned Naga 27.0.0 for browser WGSL. Optional
 `GLOB2_SPIRV_CROSS` and `GLOB2_DXC` select the pinned build-only native translators
 described in the rendering guide; together with glslang they produce Direct3D 12
-DXIL. On Apple build hosts, `GLOB2_METAL_SDK` and
-`GLOB2_METAL_TOOL_LOCK` select the verified offline Metal SDK and tool receipt;
-`DEVELOPER_DIR` scopes the selected Xcode installation. `GLOB2_RENDER_SHADER_INPUT`
+DXIL. Apple builds choose their Metal SDK and tool lock themselves;
+`GLOB2_METAL_SDK` and `GLOB2_METAL_TOOL_LOCK` only apply to an imported prebuilt
+bundle, `GLOB2_METAL_REQUIRE_COMMITTED_LOCK=1` makes release builds fail closed,
+and `DEVELOPER_DIR` scopes the selected Xcode installation. `GLOB2_RENDER_SHADER_INPUT`
 imports prebuilt shaders only after validating source, layout and artifact
 receipts. These paths are described in the rendering guide. No shader translation compiler ships with the game. Generated native assets install under
 `glob2/shaders`; browser GLSL assets are preloaded under `/shaders/webgl2`.

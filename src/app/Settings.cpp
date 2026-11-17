@@ -2,6 +2,7 @@
 // Copyright (C) 2001-2004 Stephane Magnenat & Luc-Olivier de Charrière
 
 #include "Settings.h"
+#include "DeviceProfile.h"
 #include "EngineTiming.h"
 #include "BuildingType.h"
 #include <InterfacePresentation.h>
@@ -40,10 +41,11 @@ Settings::Settings()
 	screenHeight = 600;
 	uiScale = 0;
 	optionFlags = 0;
-#ifdef __EMSCRIPTEN__
-	setGraphicsDetail(false);
-#else
 	setGraphicsDetail(true);
+#ifdef __EMSCRIPTEN__
+	graphicsDetailAdaptive = true;
+#else
+	graphicsDetailAdaptive = false;
 #endif
 	automaticTorus = false;
 	language.clear(); // follow the system until the player picks one
@@ -66,7 +68,8 @@ Settings::Settings()
 	scrollWheelEnabled=true;
 	hiveMindEnabled=true;
 	hiveMindSupervision=true;
-	highResolutionArtwork=true;
+	highResolutionArtworkChoice=AdaptiveChoice::Auto;
+	resolveAdaptiveDefaults();
 	autosaveGames=true;
 	resetDefaultUnitsAssigned();
 	resetDefaultFlagRadius();
@@ -96,6 +99,17 @@ Settings::Settings()
 }
 
 
+unsigned startupScreenFlags(unsigned savedFlags)
+{
+#if defined(__EMSCRIPTEN__)
+	return savedFlags;
+#elif defined(GLOB2_MOBILE)
+	return savedFlags | GraphicContext::PREFERDEVICE;
+#else
+	return savedFlags | GraphicContext::USEGPU | GraphicContext::PREFERDEVICE;
+#endif
+}
+
 void Settings::setGraphicsDetail(bool full)
 {
 	clouds = full;
@@ -107,6 +121,50 @@ void Settings::setGraphicsDetail(bool full)
 	smoothProgressIndicators = full;
 	decorativeAnimations = full;
 	optionFlags &= ~LEGACY_LOW_DETAIL;
+}
+
+const char *Settings::adaptiveChoiceName(AdaptiveChoice choice)
+{
+	return choice == AdaptiveChoice::Off ? "off" : choice == AdaptiveChoice::On ? "on" : "auto";
+}
+
+std::optional<Settings::AdaptiveChoice> Settings::parseAdaptiveChoice(const std::string &text)
+{
+	if (text == "auto") return AdaptiveChoice::Auto;
+	if (text == "off") return AdaptiveChoice::Off;
+	if (text == "on") return AdaptiveChoice::On;
+	return std::nullopt;
+}
+
+bool Settings::isGraphicsDetailEffect(bool Settings::*field)
+{
+	return field == &Settings::clouds || field == &Settings::cloudShadows ||
+		field == &Settings::buildingParticles || field == &Settings::fullMagicEffects ||
+		field == &Settings::translucentPanels || field == &Settings::translucentPathLines ||
+		field == &Settings::smoothProgressIndicators || field == &Settings::decorativeAnimations;
+}
+
+void Settings::chooseEffect(bool Settings::*field, bool on)
+{
+	this->*field = on;
+	if (isGraphicsDetailEffect(field))
+		graphicsDetailAdaptive = false;
+}
+
+void Settings::resolveAdaptiveDefaults()
+{
+	if (graphicsDetailAdaptive)
+		setGraphicsDetail(DeviceProfile::current().tier != DeviceTier::Low);
+	if (highResolutionArtworkChoice == AdaptiveChoice::Auto)
+		highResolutionArtwork = DeviceProfile::current().highResolutionArtwork().on && !highResolutionArtworkSteppedDown;
+	else
+		highResolutionArtwork = highResolutionArtworkChoice == AdaptiveChoice::On;
+}
+
+void Settings::setHighResolutionArtworkChoice(AdaptiveChoice choice)
+{
+	highResolutionArtworkChoice = choice;
+	resolveAdaptiveDefaults();
 }
 
 std::string Settings::getUsername() { return username; }
@@ -133,14 +191,16 @@ void Settings::load(std::string filename)
     introductionOffered = false;
     rendererBackend = GAGCore::RendererBackend::Auto;
     targetRenderFps = 60;
-#ifdef __EMSCRIPTEN__
-	setGraphicsDetail(false);
-#else
 	setGraphicsDetail(true);
+#ifdef __EMSCRIPTEN__
+	graphicsDetailAdaptive = true;
+#else
+	graphicsDetailAdaptive = false;
 #endif
     interfacePresentation="automatic";
     menuTheme="light";
     gameTheme="dark";
+    highResolutionArtworkChoice=AdaptiveChoice::Auto;
 	std::map<std::string, std::string> parsed;
 
 	InputStream *stream = new BinaryInputStream(Toolkit::getFileManager()->openInputStreamBackend(filename));
@@ -188,7 +248,15 @@ void Settings::load(std::string filename)
             rendererBackend = GAGCore::parseRendererBackend(backend->second).value_or(GAGCore::RendererBackend::Auto);
         else if (parsed.count("screenFlags"))
             rendererBackend = (screenFlags & GraphicContext::PORTABLEGPU) ? GAGCore::RendererBackend::PortableSDL :
-                (screenFlags & GraphicContext::USEGPU) ? GAGCore::RendererBackend::LegacyGL : GAGCore::RendererBackend::Software;
+#if defined(GLOB2_MOBILE) || defined(__EMSCRIPTEN__)
+                (screenFlags & GraphicContext::USEGPU) ? GAGCore::RendererBackend::LegacyGL :
+                GAGCore::RendererBackend::Software;
+#else
+                // The old desktop toggle offered only Software or OpenGL, and its
+                // default set no GPU flag. Either answer meant "the best this
+                // machine draws with", which Auto now provides; keep both on Auto.
+                GAGCore::RendererBackend::Auto;
+#endif
 		READ_PARSED_INT(uiScale);
         if (const auto value = parsed.find("targetRenderFps"); value != parsed.end())
         {
@@ -223,6 +291,8 @@ void Settings::load(std::string filename)
 		READ_PARSED_INT(translucentPathLines);
 		READ_PARSED_INT(smoothProgressIndicators);
 		READ_PARSED_INT(decorativeAnimations);
+		// Absent in older profiles: the platform default stands.
+		READ_PARSED_INT(graphicsDetailAdaptive);
 		READ_PARSED_INT(unitInterpolation);
 		READ_PARSED_INT(adaptiveZoomDetail);
 		READ_PARSED_INT(smoothFog);
@@ -241,7 +311,14 @@ void Settings::load(std::string filename)
 		READ_PARSED_INT(edgeScrollWindowed);
 		READ_PARSED_INT(hiveMindEnabled);
 		READ_PARSED_INT(hiveMindSupervision);
-		READ_PARSED_INT(highResolutionArtwork);
+		// Profiles before Auto wrote highResolutionArtwork=1 unconditionally (the
+		// old default), indistinguishable from a choice, so 1 migrates to Auto.
+		// 0 departs from that default and stays an explicit Off.
+		if (const auto choice = parsed.find("highResolutionArtworkChoice"); choice != parsed.end() &&
+			parseAdaptiveChoice(choice->second))
+			highResolutionArtworkChoice = *parseAdaptiveChoice(choice->second);
+		else if (const auto legacy = parsed.find("highResolutionArtwork"); legacy != parsed.end())
+			highResolutionArtworkChoice = std::atoi(legacy->second.c_str()) ? AdaptiveChoice::Auto : AdaptiveChoice::Off;
 		READ_PARSED_INT(autosaveGames);
 		// The file decides the set: absent or empty means nothing enabled, the
 		// default, rather than whatever this object held before.
@@ -282,7 +359,7 @@ void Settings::load(std::string filename)
         // Stock JSON now omits production costs to inherit the unit catalog.
         // This exact known identity shares the frozen stock's preference slots;
         // arbitrary installed/custom catalog identities are never migration targets.
-        constexpr std::string_view inheritedStock = "a4ef27ada2fb3359504894901b56b9d7eefd7a053de4efdbe0c5b92fcec4928e";
+        constexpr std::string_view inheritedStock = "2a338464ec4d8e3baf3aef32e48ca85df536c7161538f47439b3eb3611099481";
         if(savedVersion>=2)
         {
             for(const auto& [key,text]:parsed)
@@ -302,6 +379,10 @@ void Settings::load(std::string filename)
             // variant key, so their preferences carry to the current identities.
             constexpr std::string_view priorFrozenStock = "b7c9b811ca4f519c5d1040219ec6c32cf888b1f0fbbeb63022c573bcc20c6803";
             constexpr std::string_view priorInheritedStock = "2c785bf450d48ee267480a599a0fcad53b3ca26f89758793f68ef90657734f71";
+            // From SIM 152 until SIM 159 set walls to 500 HP for 4 stone, the
+            // identities were these; that change also kept every variant key.
+            constexpr std::string_view sim152FrozenStock = "6b9c36f61e8a9978f44384541827f2cfd86bb4b8b186b3a11fa515bb93ff5fd7";
+            constexpr std::string_view sim152InheritedStock = "a4ef27ada2fb3359504894901b56b9d7eefd7a053de4efdbe0c5b92fcec4928e";
             BuildingsTypes stock; stock.initLegacy();
             const auto currentStock = stock.fingerprint();
             // Each step copies one identity's preferences to the next; explicit
@@ -309,8 +390,11 @@ void Settings::load(std::string filename)
             const std::pair<std::string_view, std::string_view> steps[] = {
                 {priorStock, priorFrozenStock},
                 {priorFrozenStock, priorInheritedStock},
-                {priorFrozenStock, currentStock},
-                {priorInheritedStock, inheritedStock},
+                {priorFrozenStock, sim152FrozenStock},
+                {priorInheritedStock, sim152InheritedStock},
+                {sim152FrozenStock, sim152InheritedStock},
+                {sim152FrozenStock, currentStock},
+                {sim152InheritedStock, inheritedStock},
                 {currentStock, inheritedStock},
             };
             for (std::size_t i=0; i<stock.size(); ++i)
@@ -367,6 +451,7 @@ void Settings::load(std::string filename)
 		READ_PARSED_INT(version);
 	}
 	delete stream;
+	resolveAdaptiveDefaults();
     presentationPreference=parsePresentationPreference(interfacePresentation);
 	
 	if(version < 1)
@@ -409,7 +494,10 @@ bool Settings::save(std::string filename)
 		Utilities::streamprintf(stream, "edgeScrollWindowed=%d\n", edgeScrollWindowed);
 		Utilities::streamprintf(stream, "hiveMindEnabled=%d\n", hiveMindEnabled);
 		Utilities::streamprintf(stream, "hiveMindSupervision=%d\n", hiveMindSupervision);
-		Utilities::streamprintf(stream, "highResolutionArtwork=%d\n", highResolutionArtwork);
+		Utilities::streamprintf(stream, "highResolutionArtworkChoice=%s\n", adaptiveChoiceName(highResolutionArtworkChoice));
+		// Older builds read only this key: Auto keeps their former default (on),
+		// so a round trip through one migrates back to Auto.
+		Utilities::streamprintf(stream, "highResolutionArtwork=%d\n", highResolutionArtworkChoice != AdaptiveChoice::Off);
 		Utilities::streamprintf(stream, "showColonySkins=%d\n", showColonySkins);
 		Utilities::streamprintf(stream, "clouds=%d\n", clouds);
 		Utilities::streamprintf(stream, "cloudShadows=%d\n", cloudShadows);
@@ -419,6 +507,7 @@ bool Settings::save(std::string filename)
 		Utilities::streamprintf(stream, "translucentPathLines=%d\n", translucentPathLines);
 		Utilities::streamprintf(stream, "smoothProgressIndicators=%d\n", smoothProgressIndicators);
 		Utilities::streamprintf(stream, "decorativeAnimations=%d\n", decorativeAnimations);
+		Utilities::streamprintf(stream, "graphicsDetailAdaptive=%d\n", graphicsDetailAdaptive);
 		Utilities::streamprintf(stream, "unitInterpolation=%d\n", unitInterpolation);
         Utilities::streamprintf(stream, "targetRenderFps=%d\n", targetRenderFps);
 		Utilities::streamprintf(stream, "adaptiveZoomDetail=%d\n", adaptiveZoomDetail);

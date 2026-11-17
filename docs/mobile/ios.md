@@ -108,3 +108,28 @@ on copy. Gradient compute loads it independently of rendering, and falls back to
 CPU for unavailable device capabilities. The lock is `buildsys/moltenvk.json`; no
 runtime shader compiler is shipped. Device correctness and signed package launch
 need Apple qualification in addition to cross-platform solver tests.
+
+### SDL GPU Metal shaders
+
+The SDL GPU renderer on iOS needs offline Metal libraries (`.metallib`); the
+pinned SDL GPU does not support the Simulator, so simulator packages simply lack
+it. Device builds compile them automatically on the Mac, as every Apple build does
+(see [Apple Metal shaders](../architecture/rendering.md#apple-metal-shaders)):
+pinned glslang and SPIRV-Cross are built from verified source, and the Metal
+compiler must match a toolchain in the committed `buildsys/metal-tool-lock.json`
+whose Xcode is the pin in `platforms/mobile/toolchain.json`. Device packaging
+(`ios.py configure|build --environment device`) fails unless the build holds the
+complete Metal set; `--allow-missing-sdl-gpu` packages portable SDL only and says
+so. A successful device build verifies the app's Metal libraries against their
+receipts.
+
+#### TestFlight
+
+The TestFlight build job checks that the committed lock lists the runner's pinned
+Xcode (`metal_tool_lock.py --check --sdk iphoneos`), sets
+`GLOB2_METAL_REQUIRE_COMMITTED_LOCK=1`, and compiles the Metal libraries in the
+ordinary build; any mismatch fails it. After an Xcode pin or runner image change,
+run the **Apple Metal tool lock** workflow and commit its reviewed candidate lock.
+A tagged source without a committed lock packages portable SDL only
+(`--allow-missing-sdl-gpu`) with a warning. The `ios-production` workflow promotes
+an uploaded build and does not rebuild shaders.

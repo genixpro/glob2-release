@@ -80,6 +80,32 @@ std::array<unsigned, 128> materialWeights(const TerrainVisual::Coverage &coverag
 } // namespace
 TEST_SUITE("TerrainMaterials")
 {
+	TEST_CASE("HD sources composed below their size are box-filtered in premultiplied colour")
+	{
+		using TerrainVisual::Compositor;
+		// A 4x4 source composed at 2x2: each output texel averages a 2x2 block.
+		Compositor::MaterialPixels source(16);
+		for (int y = 0; y < 4; ++y)
+			for (int x = 0; x < 4; ++x)
+				source[y * 4 + x] = {(unsigned char)(x * 60), (unsigned char)(y * 60), 100, 255};
+		// One block mixes an opaque texel with transparent ones: their colour
+		// must not tint it.
+		source[2] = {200, 10, 10, 255};
+		source[3] = {0, 255, 0, 0};
+		source[6] = {0, 255, 0, 0};
+		source[7] = {0, 255, 0, 0};
+		const Compositor::PreparedMaterialView view{0, 0, 4, source, 2};
+		Compositor::MaterialPixels out;
+		Compositor::boxFilter(view, 2, out);
+		REQUIRE(out.size() == 4);
+		// Top-left: x 0..1, y 0..1, all opaque.
+		CHECK(out[0] == std::array<unsigned char, 4>{30, 30, 100, 255});
+		// Top-right: one opaque texel among three transparent ones.
+		CHECK(out[1] == std::array<unsigned char, 4>{200, 10, 10, 64});
+		// Bottom-right: x 2..3, y 2..3.
+		CHECK(out[3] == std::array<unsigned char, 4>{150, 150, 100, 255});
+	}
+
 	TEST_CASE("connected foliage selects the requested corner mask and keeps legacy decor")
 	{
 		glob2test::HeadlessGlobals globals;
@@ -198,6 +224,81 @@ TEST_SUITE("TerrainMaterials")
 		// A page view prepares them again.
 		compositor.prepareVisible(false, 0, scene, 0, 0, 31, 31);
 		CHECK(compositor.sourceBytes() == prepared);
+	}
+
+	TEST_CASE("an on-demand compositor draws preview colours until a map's sheets arrive [display]")
+	{
+		glob2test::HeadlessGlobals globals({.display = true, .terrainSheetsOnDemand = true});
+		TerrainVisual::Compositor compositor(catalog(), MapAssetBundle::empty(), true);
+		glob2test::HeadlessGame fixture({.wDec = 5, .hDec = 5, .discovered = true});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 32; ++y)
+			for (int x = 0; x < 32; ++x)
+				map.setVertexTerrain(x, y, y < 12 ? WATER : (x < 16 ? SAND : GRASS));
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		const auto &materials = compositor.catalog().materials;
+		const auto grass = compositor.catalog().find("grass");
+		const auto lava = compositor.catalog().find("lava");
+		const auto &grassSheet = materials[grass].sprite, &lavaSheet = materials[lava].sprite;
+		REQUIRE(grassSheet != lavaSheet);
+		// Nothing loaded the material sheets at startup.
+		REQUIRE_FALSE(GAGCore::Toolkit::findSprite(grassSheet));
+		CHECK_FALSE(compositor.materialLoaded(grass));
+
+		// The first answer is the material's preview colour; nothing waits.
+		const auto flat = compositor.phasePixels(grass, 0, 0);
+		REQUIRE(flat.size() == 32 * 32);
+		const auto &preview = materials[grass].preview;
+		const std::array<unsigned char, 4> colour{preview[0], preview[1], preview[2], 255};
+		CHECK(std::all_of(flat.begin(), flat.end(), [&](const auto &p) { return p == colour; }));
+		CHECK(compositor.materialFallbacks() > 0);
+		CHECK(compositor.phaseSource(grass, 0, 0).revision == 0);
+		// Pages leave a cell uncomposed until its sheets are in.
+		const auto grassCell = compositor.describe(scene, 24, 20);
+		CHECK_FALSE(compositor.sheetsReady(grassCell));
+
+		// A short scan finds the map's materials; their sheets decode on the
+		// asset workers and publish within the frame polls' budget.
+		const auto arrivals = compositor.materialArrivals();
+		const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+		while (!compositor.materialsReady(scene))
+		{
+			REQUIRE(std::chrono::steady_clock::now() < deadline);
+			GAGCore::Toolkit::pollAssets(4);
+			SDL_Delay(1);
+		}
+		CHECK(compositor.materialLoaded(grass));
+		CHECK(compositor.sheetsReady(grassCell));
+		CHECK(compositor.materialArrivals() > arrivals);
+		const auto loaded = compositor.phasePixels(grass, 0, 0);
+		CHECK_FALSE(std::all_of(loaded.begin(), loaded.end(), [&](const auto &p) { return p == colour; }));
+		// The same pixels an eagerly loaded compositor composes.
+		TerrainVisual::Compositor eager(catalog());
+		CHECK(eager.phasePixels(grass, 0, 0) == loaded);
+		// A material the map does not hold stays unloaded until asked for.
+		CHECK_FALSE(compositor.materialLoaded(lava));
+
+		// A complete draw can wait for a sheet. Once no map holds it, it goes
+		// after the retired frames' lifetime, and the next ask loads it again.
+		const std::array<TerrainVisual::MaterialId, 1> asked{lava};
+		compositor.finishMaterials(asked);
+		CHECK(compositor.materialLoaded(lava));
+		const auto saved = GAGCore::Sprite::retiredHighResolutionBudget();
+		struct Restore
+		{
+			GAGCore::Sprite::RetiredHighResolutionBudget budget;
+			~Restore() { GAGCore::Sprite::setRetiredHighResolutionBudget(budget); }
+		} restore{saved};
+		GAGCore::Sprite::setRetiredHighResolutionBudget({saved.bytes, 0});
+		SDL_Delay(300);
+		CHECK(compositor.materialsReady(scene));
+		CHECK_FALSE(GAGCore::Toolkit::findSprite(lavaSheet));
+		CHECK_FALSE(compositor.materialLoaded(lava));
+		CHECK(GAGCore::Toolkit::findSprite(grassSheet)); // The map holds it.
+		CHECK(compositor.materialLoaded(grass));
+		compositor.finishMaterials(asked);
+		CHECK(compositor.materialLoaded(lava));
 	}
 
 	TEST_CASE("fertile ground overlays glint sparsely, out of step and on its own cycle")
@@ -336,6 +437,49 @@ TEST_SUITE("TerrainMaterials")
 			}
 		}
 		CHECK_NOTHROW(TerrainVisual::Catalog::parse(document));
+	}
+
+	TEST_CASE("an HD view streams only the decor frames its cells draw [display]")
+	{
+		glob2test::HeadlessGlobals globals(
+			{.display = true, .screenFlags = Uint32(GAGCore::GraphicContext::PORTABLEGPU)});
+		struct Restore { ~Restore() { GAGCore::Sprite::setHighResolution(false); } } restore;
+		GAGCore::Sprite::setHighResolution(true);
+		auto &compositor = globals->terrainCompositor();
+		glob2test::HeadlessGame fixture({.wDec = 6, .hDec = 6, .discovered = true});
+		auto &map = fixture.game.map;
+		for (int y = 0; y < 64; ++y)
+			for (int x = 0; x < 64; ++x)
+				map.setVertexTerrain(x, y, x < 32 ? BOULDERS : (y < 32 ? HEDGE : GRASS));
+		SceneMap scene;
+		glob2test::observeMap(map, scene);
+		auto *decor = compositor.decorSprite(compositor.catalog().find("boulders"));
+		REQUIRE(decor);
+		if (!GAGCore::Sprite::highResolutionRequested()) return; // No HD frames on this backend.
+		// Every frame the cells of the view's pages, widened by one page for
+		// decor reaching in, could draw.
+		std::set<int> drawable, catalogued;
+		const auto tiers = compositor.tierField(scene);
+		for (int y = -16; y < 32; ++y)
+			for (int x = -16; x < 32; ++x)
+				for (const auto &layer : compositor.decorLayers(scene, x, y, tiers.get()))
+					if (layer.sprite == decor && layer.frame >= 0) drawable.insert(layer.frame);
+		for (const char *key : {"boulders", "hedge"})
+		{
+			const auto &d = compositor.catalog().materials[compositor.catalog().find(key)].decor;
+			for (const auto *frames : {&d.full, &d.edge, &d.connected, &d.connectedInterior, &d.connectedForeign})
+				for (int frame : *frames) if (frame >= 0) catalogued.insert(frame);
+		}
+		compositor.declareVisible(0, scene, 0, 0, 15, 15, true);
+		GAGCore::Sprite::finishHighResolution();
+		std::set<int> resident;
+		for (int frame : catalogued)
+			if (decor->baseFrame(unsigned(frame)) != decor->nativeFrame(unsigned(frame))) resident.insert(frame);
+		CHECK_FALSE(resident.empty());
+		for (int frame : resident) CHECK(drawable.contains(frame));
+		// Not every frame the materials in view could ever draw.
+		CHECK(resident.size() < catalogued.size());
+		compositor.declareVisible(0, scene, 0, 0, 15, 15, false);
 	}
 
 	TEST_CASE("connected canopy ground leaves contact shadows to the foliage [display]")
@@ -1700,6 +1844,67 @@ TEST_SUITE("TerrainMaterials")
 					CHECK(mismatches == 0);
 				}
 	}
+	TEST_CASE("animation refreshes of mixed cells match their complete composition [display]")
+	{
+		// A page recomposes only the samples an animation step can change, over
+		// the pixels of the cell's previous composition.
+		glob2test::HeadlessGlobals globals({.display = true});
+		auto definitions = catalog();
+		definitions.compiledPack.clear();
+		TerrainVisual::Compositor compositor(definitions);
+		const auto &c = compositor.catalog();
+		const auto water = c.find("water"), sand = c.find("sand"), grass = c.find("grass"),
+				   deep = c.find("deep_water");
+		const std::vector<std::array<TerrainVisual::MaterialId, 4>> mixes = {
+			{water, sand, water, sand}, {water, water, water, grass}, {sand, grass, water, water},
+			{deep, water, sand, sand}, {grass, sand, grass, sand}};
+		const auto bytes = [](GAGCore::DrawableSurface &s)
+		{
+			const auto *surface = s.getSDLSurface();
+			std::vector<Uint32> result;
+			for (int y = 0; y < surface->h; ++y)
+				for (int x = 0; x < surface->w; ++x)
+					result.push_back(reinterpret_cast<const Uint32 *>(
+						static_cast<const unsigned char *>(surface->pixels) + y * surface->pitch)[x]);
+			return result;
+		};
+		for (int scale : {1, 2})
+			for (const auto &corners : mixes)
+				for (bool calmed : {false, true})
+				{
+					TerrainVisual::Recipe r;
+					r.width = r.height = 32;
+					r.x = 5;
+					r.y = 9;
+					r.corners = corners;
+					if (calmed)
+						r.calm = {255, 120, 0, 40};
+					const auto mask = compositor.mask(r, scale);
+					const auto samples = compositor.animatedSamples(mask);
+					const unsigned animatedSlots = compositor.animatedSlots(mask);
+					const int size = 32 * scale;
+					GAGCore::DrawableSurface refreshed(size, size), complete(size, size);
+					compositor.prepare(false, 0);
+					compositor.compose(r, refreshed.getSDLSurface(), 0, 0, scale, &mask);
+					for (int time : {1, 2, 7, 45, 46, 300, 1201})
+					{
+						compositor.prepare(false, time);
+						TerrainVisual::Compositor::Refresh refresh{animatedSlots, animatedSlots, &samples};
+						compositor.compose(r, refreshed.getSDLSurface(), 0, 0, scale, &mask, &refresh);
+						compositor.compose(r, complete.getSDLSurface(), 0, 0, scale, &mask);
+						INFO("scale " << scale << " corners " << corners[0] << "," << corners[1] << ","
+									  << corners[2] << "," << corners[3] << " calmed " << calmed << " time " << time);
+						CHECK(bytes(refreshed) == bytes(complete));
+						// Without the sample list, unchanged slots alone are skipped.
+						TerrainVisual::Compositor::Refresh slots{animatedSlots, animatedSlots};
+						compositor.compose(r, refreshed.getSDLSurface(), 0, 0, scale, &mask, &slots);
+						CHECK(bytes(refreshed) == bytes(complete));
+					}
+					// Materials without animation leave nothing to refresh.
+					if (!animatedSlots)
+						CHECK(samples.empty());
+				}
+	}
 	TEST_CASE("map seed reseeds variants and boundaries without breaking partitions or edges")
 	{
 		glob2test::HeadlessGlobals globals;
@@ -2721,12 +2926,15 @@ TEST_CASE("owned prepared materials survive animation and share unchanged revisi
                           static_cast<Uint8 *>(original->pixels) + y * original->pitch,
                           32*samplingScale*4) == 0);
     }
-    // Expiring the last publication must not retain unused immutable buffers.
+    // Publications share the compositor's prepared pixels instead of copying
+    // them: expiring the last one leaves those, which the next shares again,
+    // and retains no buffer of its own.
     std::weak_ptr<const TerrainVisual::Compositor::MaterialPixels> released =
         retained->textures[c.find("sand")][0].pixels;
     std::weak_ptr<const TerrainVisual::Catalog> releasedCatalog = retained->definitions;
     retained.reset();
-    CHECK(released.expired());
+    CHECK(released.use_count() == 1);
+    CHECK(compositor.cpuMaterials()->textures[c.find("sand")][0].pixels == released.lock());
     CHECK(releasedCatalog.expired());
 }
 TEST_CASE(

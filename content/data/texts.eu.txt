@@ -5048,6 +5048,10 @@ Zure aliantzak irabazteko aukera estimatua, partida osoan zehar laginduta. Aliat
 Ospea
 [stat prestige about]
 Koloniaren ospea, goi-mailako eraikinekin irabazia. Ospe-helburua duen partida helburua lortzean amaitzen da.
+[stat prestige needed]
+Irabazteko behar den ospea
+[stat prestige needed about]
+Koloniak ospearen bidez irabazteko oraindik lortu beharko lukeen ospea: partidako ospe osoa helburura iristeko eta bizirik dauden gainerako kolonia guztiak gainditzeko adina. Partidak ospe-helburua duenean bakarrik erregistratzen da.
 [stat band combat]
 Borroka
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Beharrezko itxaronaldiak: %0 ms; jabearen elkartzeak: %1 ms; blokeoak: %2 ms
 AA ordenagailuak kontrolatutako kolonia guztientzat
 [tundra]
 Tundrako lurra
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

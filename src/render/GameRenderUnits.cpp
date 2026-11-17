@@ -36,6 +36,7 @@
 #include "unit/render/UnitSkin.h"
 #include "scene/Scene.h"
 #include "UnitEffectArt.h"
+#include "Sunlight.h"
 #include "Utilities.h"
 #include "GameGUI.h"
 #include <SDL3/SDL.h>
@@ -45,13 +46,14 @@
 #include "unit/render/UnitSkin.h"
 #include "FailureShapes.h"
 #include "Building.h"
+#include "StatusSeverity.h"
 #include <algorithm>
 
 
 // Unit rendering. Split from Game_render.cpp.
 
 
-void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene)
+void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY, int screenW, int screenH, int localTeam, Uint32 drawOptions, ViewState& view, const PresentationFrame& scene, bool flightShadowOnly)
 {
 	MapRenderState* drawnRender = globalContainer->settings.adaptiveZoomDetail ? &view.render : nullptr;
 	const SceneEntities &entities = scene.entities;
@@ -175,14 +177,29 @@ void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY,
 	const bool swimming = (unit->action == STOP_SWIM || unit->action == SWIM || pronePhase >= 0) &&
 						  detail.unitSprite > 0;
 	const float reach = meshClass == WARRIOR ? SWIM_REACH_WARRIOR : SWIM_REACH_WORKER;
+	// Walkers carry their ground shadow in the sprite; a flyer's falls on the
+	// ground below it, thrown along the sun by its height (render/Sunlight.h).
+	// drawMapAirUnits draws every flyer's shadow first, over the ground units and
+	// buildings but under all flyers.
+	if (flightShadowOnly)
+	{
+		if (detail.unitSprite > 0 && map.getAirUnit(unit->posX, unit->posY) == gid)
+			if (DrawableSurface *shade = unitSprite->silhouette(imgid, Color(0, 0, 0)))
+				globalContainer->gfx->drawSurface(
+					float(px - decX) + Sunlight::shadowX * Sunlight::flightHeight,
+					float(py - decY) + Sunlight::shadowY * Sunlight::flightHeight,
+					float(unitSprite->getW(imgid)), float(unitSprite->getH(imgid)), shade,
+					faded(Sunlight::flightShadowAlpha));
+		return;
+	}
 	{
 		const GAGCore::RadialFadeScope fade(*globalContainer->gfx,
 			swimming ? swimmerFade(px, py, reach) : GAGCore::RadialFade{});
 		if (detail.unitSprite > 0 &&
 			!view.render.skinPreview().draw(
 				*globalContainer->gfx, meshClass, unit->team, unit->action, dir, delta, px, py,
-				{unitSprite->baseFrame(imgid), unsigned(unitSprite->getW(imgid)),
-				 unsigned(unitSprite->getH(imgid))},
+				{nullptr, unsigned(unitSprite->getW(imgid)), unsigned(unitSprite->getH(imgid)),
+				 unitSprite, unsigned(imgid)},
 				fogAlpha, pronePhase, Uint32(glow.r) << 16 | Uint32(glow.g) << 8 | glow.b, glowAlpha))
 		{
 			globalContainer->gfx->drawSprite(px-decX, py-decY, unitSprite, imgid, fogAlpha);
@@ -292,9 +309,8 @@ void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY,
 	{
 		// A hungry or hurt unit keeps a status badge once every bar has faded,
 		// beside the top right of its body rather than over it.
-		const int food=int((Sint64(unit->hungry)*10)/definition.runtime.foodCapacity);
-		const bool hungry=food<=1;
-		const bool hurt=unit->hp*10<=unit->performance[HP]*6;
+		const int foodCapacity=definition.runtime.foodCapacity;
+		const int food=int((Sint64(unit->hungry)*10)/foodCapacity);
 		anchorBars(px+16, py+25, drawnRender, opacity);
 		drawPointBar(px+1, py+25, LEFT_TO_RIGHT, 10, food, 80, 179, 223, 2, drawnRender, opacity);
 
@@ -302,10 +318,14 @@ void MapDrawer::drawUnit(int x, int y, Uint16 gid, int viewportX, int viewportY,
 		float hpRatio=(float)unit->hp/(float)unit->performance[HP];
 		anchorBars(px+16, py+25, drawnRender, opacity);
 		drawHealthBar(px+1, py+25+3, 10, 1+(int)(9*hpRatio), hpRatio, drawnRender, opacity);
-		if (hurt)
-			drawStatusPip(px+24, py+8, MapOverlayQueue::Hurt, drawnRender, opacity, true);
-		else if (hungry)
-			drawStatusPip(px+24, py+8, MapOverlayQueue::Hungry, drawnRender, opacity, true);
+		// Hunger outranks injury: feeding the unit is what the player can act on.
+		// StatusSeverity says when each badge appears and how red it is.
+		if (StatusSeverity::unitHungry(unit->hungry, foodCapacity))
+			drawStatusPip(px+24, py+8, MapOverlayQueue::Hungry,
+				StatusSeverity::unitHunger(unit->hungry, foodCapacity), drawnRender, opacity, true);
+		else if (StatusSeverity::unitHurt(unit->hp, unit->performance[HP]))
+			drawStatusPip(px+24, py+8, MapOverlayQueue::Hurt,
+				StatusSeverity::unitInjury(unit->hp, unit->performance[HP]), drawnRender, opacity, true);
 
 		const int carriedAlpha=faded(unsigned(view.render.detail.barAll*255));
 		if ((unit->performance[HARVEST]) && (unit->carriedMaterial>=0) && carriedAlpha>0)
@@ -353,6 +373,16 @@ void MapDrawer::drawMapAirUnits(int left, int top, int right, int bot, int sw, i
 {
 	PERF_SCOPE_TIME(AirUnits);
     GAGCore::UnitDrawBatch unitBatch(globalContainer->gfx);
+	// Shadows a flyer's height away can come from a unit above or left of the
+	// visible rows, so the shadow pass reaches a little further.
+	const int reach = int(Sunlight::flightHeight) / 32 + 1;
+	for (int y=top-1-reach; y<=bot; y++)
+		for (int x=left-1-reach; x<=right; x++)
+		{
+			Uint16 gid=scene.map.getAirUnit(x+viewportX, y+viewportY);
+			if (gid!=NOGUID)
+				drawUnit(x, y, gid, viewportX, viewportY, (sw>>5), (sh>>5), localTeam, drawOptions, view, scene, true);
+		}
 	for (int y=top-1; y<=bot; y++)
 		for (int x=left-1; x<=right; x++)
 		{

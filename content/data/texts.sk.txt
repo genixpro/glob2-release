@@ -5048,6 +5048,10 @@ Odhadovaná šanca na víťazstvo vašej aliancie, meraná počas celého zápas
 Prestíž
 [stat prestige about]
 Prestíž kolónie získaná budovami najvyššej úrovne. Zápas s cieľom prestíže sa skončí, keď sa cieľ dosiahne.
+[stat prestige needed]
+Prestíž potrebná na víťazstvo
+[stat prestige needed about]
+Prestíž, ktorú by kolónia ešte musela získať, aby zvíťazila prestížou: dosť na to, aby celková prestíž zápasu dosiahla cieľ, a aby predstihla všetky ostatné prežívajúce kolónie. Zaznamenáva sa, len keď má zápas cieľ prestíže.
 [stat band combat]
 Boj
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Krok %0: %1 ms skutočného času
 UI pre všetky kolónie ovládané počítačom
 [tundra]
 Tundrová pôda
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

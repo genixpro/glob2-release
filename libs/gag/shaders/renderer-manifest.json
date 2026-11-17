@@ -235,6 +235,29 @@
           "offset": 24
         }
       ]
+    },
+    "team-color": {
+      "stride": 32,
+      "attributes": [
+        {
+          "name": "position",
+          "location": 0,
+          "components": 2,
+          "offset": 0
+        },
+        {
+          "name": "vertexColor",
+          "location": 1,
+          "components": 4,
+          "offset": 8
+        },
+        {
+          "name": "texcoord",
+          "location": 2,
+          "components": 2,
+          "offset": 24
+        }
+      ]
     }
   },
   "uniformBlocks": {
@@ -469,6 +492,65 @@
         }
       ]
     },
+    "terrain-direct-hd-fragment": {
+      "stage": "fragment",
+      "set": 3,
+      "binding": 0,
+      "members": [
+        {
+          "name": "mapSize",
+          "type": "vec2"
+        },
+        {
+          "name": "artSize",
+          "type": "vec2"
+        },
+        {
+          "name": "coverageSize",
+          "type": "vec2"
+        },
+        {
+          "name": "variantSize",
+          "type": "vec2"
+        },
+        {
+          "name": "hdCoverageSize",
+          "type": "vec2"
+        },
+        {
+          "name": "hdPreviousSize",
+          "type": "vec2"
+        },
+        {
+          "name": "hdBaseSize",
+          "type": "vec2"
+        },
+        {
+          "name": "animationTime",
+          "type": "float"
+        },
+        {
+          "name": "wholeMapValue",
+          "type": "float"
+        },
+        {
+          "name": "artTilePixels",
+          "type": "float"
+        },
+        {
+          "name": "hdTilePixels",
+          "type": "float"
+        },
+        {
+          "name": "hdPreviousTile",
+          "type": "float"
+        },
+        {
+          "name": "hdBaseTile",
+          "type": "float"
+        }
+      ]
+    },
     "terrain-compose-fragment": {
       "stage": "fragment",
       "set": 3,
@@ -523,6 +605,44 @@
           "type": "uvec4"
         }
       ]
+    },
+    "team-color": {
+      "stage": "vertex",
+      "set": 1,
+      "binding": 0,
+      "members": [
+        {
+          "name": "viewport",
+          "type": "vec2"
+        }
+      ]
+    },
+    "team-color-fragment": {
+      "stage": "fragment",
+      "set": 3,
+      "binding": 0,
+      "members": [
+        {
+          "name": "alpha",
+          "type": "float"
+        },
+        {
+          "name": "linear",
+          "type": "float"
+        },
+        {
+          "name": "premultiplied",
+          "type": "float"
+        },
+        {
+          "name": "levels",
+          "type": "float"
+        },
+        {
+          "name": "uvBounds",
+          "type": "vec4"
+        }
+      ]
     }
   },
   "textures": [
@@ -547,8 +667,10 @@
     "cloud",
     "point",
     "terrain-direct",
+    "terrain-direct-hd",
     "terrain-compose",
-    "terrain-reduce"
+    "terrain-reduce",
+    "team-color"
   ],
   "nativeCompiler": {
     "name": "glslangValidator",
@@ -560,6 +682,13 @@
     "stage": "fragment",
     "set": 2,
     "binding": 0
+  },
+  "teamColorTexture": {
+    "name": "image",
+    "stage": "fragment",
+    "set": 2,
+    "binding": 0,
+    "layoutName": "team_color_image"
   },
   "worldTexture": {
     "name": "world",
@@ -575,7 +704,8 @@
     "pointFragment": "libs/gag/shaders/point-fragment.glsl",
     "terrain-directFragment": "libs/gag/include/DirectTerrainShader.h",
     "terrain-composeFragment": "libs/gag/shaders/terrain-compose-fragment.glsl",
-    "terrain-reduceFragment": "libs/gag/shaders/terrain-reduce-fragment.glsl"
+    "terrain-reduceFragment": "libs/gag/shaders/terrain-reduce-fragment.glsl",
+    "team-colorFragment": "libs/gag/shaders/team-color-fragment.glsl"
   },
   "webgpuCompiler": {
     "name": "naga-cli",
@@ -657,6 +787,56 @@
       "stage": "fragment",
       "set": 2,
       "binding": 7,
+      "type": "sampler2D"
+    }
+  ],
+  "terrainDirectHdTextures": [
+    {
+      "name": "hdIndex",
+      "layoutName": "terrain_direct_hdIndex",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 8,
+      "type": "sampler2D"
+    },
+    {
+      "name": "hdCoverage",
+      "layoutName": "terrain_direct_hdCoverage",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 9,
+      "type": "sampler2D"
+    },
+    {
+      "name": "hdEdges",
+      "layoutName": "terrain_direct_hdEdges",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 10,
+      "type": "sampler2D"
+    },
+    {
+      "name": "hdPreviousIndex",
+      "layoutName": "terrain_direct_hdPreviousIndex",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 11,
+      "type": "sampler2D"
+    },
+    {
+      "name": "hdPreviousCoverage",
+      "layoutName": "terrain_direct_hdPreviousCoverage",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 12,
+      "type": "sampler2D"
+    },
+    {
+      "name": "hdPreviousEdges",
+      "layoutName": "terrain_direct_hdPreviousEdges",
+      "stage": "fragment",
+      "set": 2,
+      "binding": 13,
       "type": "sampler2D"
     }
   ],

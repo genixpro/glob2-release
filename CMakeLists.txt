@@ -473,10 +473,16 @@ add_custom_command(OUTPUT "${stamps}/skin-materials"
 
 file(GLOB shader_globs CONFIGURE_DEPENDS "${GLOB2_ROOT}/libs/gag/shaders/*.glsl")
 glob2_bridge(shader_inputs shader-inputs)
+# The macOS app compiles SDL GPU's Metal libraries automatically (buildsys/renderer_shaders.py).
+set(shader_apple_sdk)
+if(GLOB2_PLATFORM STREQUAL "darwin")
+  set(shader_apple_sdk --apple-sdk macosx)
+endif()
 add_custom_command(OUTPUT "${stamps}/shaders"
   BYPRODUCTS "${GLOB2_OUT}/shaders/RendererShaderLayouts.h"
-  COMMAND ${bridge} shaders --builddir "${GLOB2_OUT}" --stamp "${stamps}/shaders"
-  DEPENDS "${GLOB2_BRIDGE}" "${GLOB2_ROOT}/buildsys/renderer_shaders.py" ${shader_inputs}
+  COMMAND ${bridge} shaders --builddir "${GLOB2_OUT}" --stamp "${stamps}/shaders" ${shader_apple_sdk}
+  DEPENDS "${GLOB2_BRIDGE}" "${GLOB2_ROOT}/buildsys/renderer_shaders.py" "${GLOB2_ROOT}/buildsys/glslang_tool.py"
+          "${GLOB2_ROOT}/buildsys/spirv_cross_tool.py" "${GLOB2_ROOT}/buildsys/spirv-cross.json" ${shader_inputs}
           "${GLOB2_ROOT}/tools/shaders/gradient_compute.py" "${GLOB2_ROOT}/tools/shaders/gradient_preparation_rules.py"
   WORKING_DIRECTORY "${GLOB2_ROOT}" COMMENT "Generating renderer shader assets" VERBATIM)
 
@@ -551,8 +557,11 @@ if(GLOB2_MODE STREQUAL "release" AND NOT GLOB2_RETAIN_SYMBOLS AND NOT darwin)
   list(REMOVE_ITEM cxxflags -g)
   list(REMOVE_ITEM linkflags -g)
 endif()
-list(APPEND cxxflags -std=gnu++20 -Wall -fPIC)
-list(APPEND cflags -fPIC)
+# Every native target is an executable over static archives, so position-independent
+# executable code suffices; -fPIC would make GCC treat each global function as
+# interposable and stop inlining it within its own file.
+list(APPEND cxxflags -std=gnu++20 -Wall -fPIE)
+list(APPEND cflags -fPIE)
 # Uninitialized-read diagnostics (DET_INIT=zero|pattern), an environment variable.
 if(DEFINED ENV{DET_INIT} AND NOT "$ENV{DET_INIT}" STREQUAL "")
   list(APPEND cxxflags "-ftrivial-auto-var-init=$ENV{DET_INIT}")
@@ -567,8 +576,33 @@ if(GLOB2_MODE STREQUAL "perf")
 elseif(GLOB2_MODE STREQUAL "release")
   list(APPEND cxxflags -O3)
   list(APPEND linkflags -O3)
-  if(NOT darwin)
-    list(APPEND linkflags -fwhole-program)
+  # Native release builds optimize the C++ across files at link time: GCC (Linux,
+  # MinGW) with full LTO, clang with ThinLTO. QuickJS and openlibm stay out (their
+  # objects take only CFLAGS). The archives hold LTO objects, so they are written with
+  # the compiler's own archiver where CMake found one (macOS's ar reads bitcode itself).
+  find_program(GLOB2_LLD_PROGRAM ld.lld)
+  set(release_lto)
+  if((GLOB2_PLATFORM STREQUAL "linux" OR windows) AND CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(release_lto -flto=auto)
+  elseif(darwin AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    set(release_lto -flto=thin)
+    # The dSYM reads its debug information from these objects. ld64 names them
+    # <N>.arm64.thinlto.o inside the directory, so each executable needs its own:
+    # links that run concurrently in one directory overwrite each other's objects
+    # and fail with undefined ".llvm.<hash>" symbols (ld creates the directory).
+    list(APPEND linkflags "-Wl,-object_path_lto,${CMAKE_BINARY_DIR}/lto-objects/$<TARGET_PROPERTY:NAME>")
+  elseif(GLOB2_PLATFORM STREQUAL "linux" AND CMAKE_CXX_COMPILER_ID MATCHES "Clang" AND GLOB2_LLD_PROGRAM)
+    # GNU ld cannot read LLVM bitcode without a plugin; lld always can.
+    set(release_lto -flto=thin)
+    list(APPEND linkflags -fuse-ld=lld)
+  endif()
+  if(release_lto)
+    list(APPEND cxxflags ${release_lto})
+    list(APPEND linkflags ${release_lto})
+    if(CMAKE_CXX_COMPILER_AR AND CMAKE_CXX_COMPILER_RANLIB)
+      set(CMAKE_AR "${CMAKE_CXX_COMPILER_AR}")
+      set(CMAKE_RANLIB "${CMAKE_CXX_COMPILER_RANLIB}")
+    endif()
   endif()
   if(NOT GLOB2_RETAIN_SYMBOLS AND NOT darwin)
     list(APPEND cxxflags -s)
@@ -583,9 +617,7 @@ if(GLOB2_SIZE_OPTIMIZATION)
   list(APPEND ccflags -ffunction-sections -fdata-sections)
   list(APPEND linkflags -Wl,--gc-sections)
   if(GLOB2_SIZE_OPTIMIZATION STREQUAL "lto" OR GLOB2_SIZE_OPTIMIZATION STREQUAL "size")
-    # GCC's linker plugin decides visibility; -fwhole-program would change it under LTO.
     list(APPEND ccflags -flto)
-    list(REMOVE_ITEM linkflags -fwhole-program)
     list(APPEND linkflags -flto)
   endif()
   if(GLOB2_SIZE_OPTIMIZATION STREQUAL "size")
@@ -1082,6 +1114,9 @@ foreach(program IN LISTS GLOB2_HARNESS_PROGRAMS)
   else()
     glob2_objects_of(linked glob2_client ${${prefix}_LINK_SOURCES})
     list(APPEND sources "${linked}")
+    # Client sources use libgag helpers (ThreadSupport thread roles); the static
+    # archive contributes only the objects they reference.
+    list(APPEND inputs gag)
   endif()
   add_executable(${program} EXCLUDE_FROM_ALL ${sources})
   set_target_properties(${program} PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${GLOB2_OUT}/src")

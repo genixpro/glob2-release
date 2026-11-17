@@ -26,8 +26,10 @@
 #include "GameGUIKeyActions.h"
 #include "CreditScreen.h"
 #include "CompileProfile.h"
+#include "DeviceAdaptationSession.h"
 #include <iostream>
 #include "EditorEntry.h"
+
 #include "LANMenuScreen.h"
 #include "OnlineHubScreen.h"
 #include "InviteLink.h"
@@ -41,6 +43,12 @@
 #include <optional>
 #ifdef HAVE_CONFIG_H
 #include <glob2/BuildConfig.h>
+
+namespace
+{
+// First-screen frames drawn but not shown after loading (Application::Application).
+constexpr unsigned MenuSettleFrames = 30;
+}
 #endif
 
 namespace
@@ -180,6 +188,13 @@ Application::Application()
 	};
 	mcp->configure(globalContainer->settings.mcpEnabled, globalContainer->settings.mcpPort);
 #endif
+	// The first screen's first frames after loading (the main menu and the
+	// colony behind it, or a first-run question in front of it) are drawn but
+	// not shown, so every renderer streams terrain, artwork and atlases and
+	// settles before the player sees anything; the last loading-screen frame
+	// stays up meanwhile (about half a second), as the game's introduction does.
+	if (globalContainer->gfx && !globalContainer->runNoX)
+		globalContainer->gfx->holdPresentation(MenuSettleFrames);
 	if (GAGCore::ApplicationHost::storageRestoreFailed())
 	{
 		auto &strings = *GAGCore::Toolkit::getStringTable();
@@ -349,6 +364,9 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 	}
 	const auto &events = *delivered;
 	Online::pump();
+	// Memory signals and the VRAM probe, also while hidden: a trim in the
+	// background is when the system judges the app's size.
+	DeviceAdaptation::serviceFrame(events);
 	auto filtered = events;
 	if (GAGCore::ApplicationHost::takeVisibilityChange(hidden))
 	{

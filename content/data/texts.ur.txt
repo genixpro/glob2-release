@@ -5016,6 +5016,10 @@ AI کی قابلِ رسائی ٹیلی میٹری نہیں۔
 وقار
 [stat prestige about]
 بستی کا وقار، جو اعلیٰ ترین سطح کی عمارتوں سے ملتا ہے۔ وقار کے ہدف والا میچ ہدف پورا ہونے پر ختم ہو جاتا ہے۔
+[stat prestige needed]
+جیتنے کے لیے درکار وقار
+[stat prestige needed about]
+وہ وقار جو بستی کو وقار سے جیتنے کے لیے ابھی مزید کمانا ہوگا: اتنا کہ میچ کا مجموعی وقار ہدف تک پہنچ جائے، اور باقی بچی ہر دوسری بستی سے آگے نکل جائے۔ صرف تب درج ہوتا ہے جب میچ میں وقار کا ہدف ہو۔
 [stat band combat]
 لڑائی
 [stat band starvation]
@@ -7102,3 +7106,33 @@ MCP سرور چالو کریں
 مستقل حکم کو اپ ڈیٹ کرنا ناکام رہا۔ آپ کا حکم اس ڈیوائس پر عارضی طور پر روکا گیا ہے؛ متعلقہ کنٹرول استعمال کرکے دوبارہ کوشش کریں۔
 [tundra]
 ٹنڈرا کی زمین
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

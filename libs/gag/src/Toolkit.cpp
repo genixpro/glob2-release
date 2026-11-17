@@ -13,6 +13,7 @@
 #include <SpriteLoad.h>
 #include <chrono>
 #include <algorithm>
+#include <set>
 
 #include <GraphicContext.h>
 
@@ -21,6 +22,7 @@ namespace GAGCore
 	namespace {
         std::unique_ptr<AssetLoader> assetLoader;
         std::map<std::string, std::unique_ptr<SpriteLoad>> loadingSprites;
+        std::set<std::string> failedSprites;
         // Progress units (SpriteLoad::progressTotal) of the sprite loads that have finished.
         double completedSpriteWork = 0;
     }
@@ -55,6 +57,7 @@ namespace GAGCore
 	void Toolkit::close(void)
 	{
         loadingSprites.clear();
+        failedSprites.clear();
 		assetLoader.reset();
         completedSpriteWork = 0;
 		for (SpriteMap::iterator it=spriteMap.begin(); it!=spriteMap.end(); ++it)
@@ -83,8 +86,11 @@ namespace GAGCore
     void Toolkit::requestSprite(const std::string& name, bool variableAtlas)
     {
         if (spriteMap.contains(name) || loadingSprites.contains(name)) return;
+        failedSprites.erase(name);
         loadingSprites[name] = std::make_unique<SpriteLoad>(name, variableAtlas);
     }
+    bool Toolkit::spriteLoading(const std::string& name) { return loadingSprites.contains(name); }
+    bool Toolkit::spriteFailed(const std::string& name) { return failedSprites.contains(name); }
     Sprite *Toolkit::findSprite(const std::string& name)
     {
         auto found = spriteMap.find(name);
@@ -97,6 +103,8 @@ namespace GAGCore
             return std::max(std::chrono::milliseconds::zero(),
                 std::chrono::ceil<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()));
         };
+        // A low-memory trim frees its next bounded step once a frame.
+        if (gc) gc->servicePresentationTrim();
         // Consume ready HD output before more reads/decodes can spend this
         // turn's whole budget and leave large prepared buffers accumulating.
         Sprite::pollHighResolutionUntil(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline.time_since_epoch()).count());
@@ -104,7 +112,7 @@ namespace GAGCore
             if (it->second->pollUntil(deadline)) {
                 auto sprite = it->second->take();
                 if (sprite) spriteMap[it->first] = sprite.release();
-                else std::cerr << it->second->error() << std::endl;
+                else { std::cerr << it->second->error() << std::endl; failedSprites.insert(it->first); }
                 completedSpriteWork += it->second->progressTotal();
                 it = loadingSprites.erase(it);
             } else ++it;

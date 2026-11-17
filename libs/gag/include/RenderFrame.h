@@ -5,6 +5,8 @@
 #include <optional>
 #include <span>
 #include <array>
+#include <deque>
+#include <vector>
 
 namespace GAGCore
 {
@@ -104,6 +106,26 @@ inline std::array<std::int32_t,56> surfUniforms(const WeightedComposeData &data)
     }
     return values;
 }
+// An RGBA8 device texture its owner writes in place, with no CPU copy of its
+// pixels. Writes queue here until a submitted frame applies them, in order and
+// before that frame draws; a frame that is dropped leaves them queued. The
+// device marks the texture lost when it no longer holds what was applied
+// (reset, or over its budget); the owner then starts again.
+struct StreamedTexture
+{
+    int width = 0, height = 0;
+    bool linear = false;
+    struct Write { SDL_Rect rect; std::vector<std::uint8_t> rgba; };
+    std::deque<Write> writes;
+    std::size_t queuedBytes = 0;
+    std::uint64_t applied = 0; // Writes applied by the device, ever.
+    bool lost = false;
+    void write(SDL_Rect rect, std::vector<std::uint8_t> rgba)
+    {
+        queuedBytes += rgba.size();
+        writes.push_back({rect, std::move(rgba)});
+    }
+};
 struct DirectTerrainDraw
 {
     enum Texture { Cells, MaskIndex, Art, Coverage, Edges, Variants, Discovery, ShoreCalm, Count };
@@ -112,12 +134,32 @@ struct DirectTerrainDraw
     std::array<TextureSnapshot, Count> textures;
     float animationTime = 0;
     bool wholeMap = false;
+    // Streamed draws (devices with directTerrainStreaming) use the terrain-direct-hd
+    // shader: artwork and coverage masks streamed at the display density, as
+    // Legacy GL draws them. Every texture is then streamed; Coverage and Edges
+    // hold the whole-map base masks, MaskIndex the low-resolution art of every
+    // variant (drawn for variants the art atlas does not hold), and a null entry
+    // (no fallback or base atlas) binds a placeholder.
+    enum HdTexture { HdIndex = Count, HdCoverage, HdEdges, HdPreviousIndex, HdPreviousCoverage, HdPreviousEdges, StreamedCount };
+    std::array<std::shared_ptr<StreamedTexture>, StreamedCount> streamed;
+    // Logical sizes for the streamed shader: scalar and record textures are packed.
+    struct HdUniforms
+    {
+        float mapSize[2]{}, artSize[2]{}, variantSize[2]{}, hdCoverageSize[2]{}, hdPreviousSize[2]{}, hdBaseSize[2]{};
+        // The resident low-resolution art bound at MaskIndex, as the shader's coverageSize.
+        float lowArtSize[2]{1, 1};
+        float artTilePixels = 32, hdTilePixels = 0, hdPreviousTile = 0, hdBaseTile = 0;
+    } hd;
+    bool isStreamed() const { return streamed[Cells] != nullptr; }
 };
 struct DrawPacket
 {
     enum class Kind { Fill, Blit, Triangles, ScreenTriangles, Barrier, Clear, MeshTriangles, WeightedCompose, DirectTerrain };
     Kind kind = Kind::Fill;
-    enum class Material { Primitive, WorldLit, Cloud, SmoothPoint, Skin, SkinRig };
+    // TeamColor: a Blit whose texels take the CPU team recolour
+    // (DrawableSurface::shiftHSV) by teamHue degrees, per texel before
+    // filtering. Devices advertise it with RenderDeviceCapabilities::teamColor.
+    enum class Material { Primitive, WorldLit, Cloud, SmoothPoint, Skin, SkinRig, TeamColor };
     enum class Blend { Automatic, SourceOver, Premultiplied, Additive, Opaque };
     enum class Depth { Disabled, Less, LessEqual };
     enum class Cull { Disabled, Back };
@@ -151,6 +193,8 @@ struct DrawPacket
     std::vector<SDL_Vertex> vertices;
     bool opaque = false, linear = false;
     Uint8 alpha = 255;
+    // Per-vertex, so team draws of one texture batch across hues.
+    float teamHue = 0;
     bool compatible(const DrawPacket &) const;
 };
 struct RenderFrame
@@ -161,6 +205,10 @@ struct RenderFrame
     int logicalWidth = 0, logicalHeight = 0;
     std::vector<DrawPacket> packets;
     std::size_t vertexCount = 0;
+    // The owner shows the previous frame if this one defers, and no
+    // synchronous capture will read it: a device may defer it to spread work
+    // (such as texture creation) over later frames.
+    bool deferrable = false;
     // Returns only adjacent compatible spans; never changes painter order.
     std::size_t batchEnd(std::size_t begin) const;
 };

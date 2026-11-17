@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "GraphicContextPrivate.h"
 #include <cstring>
+#include <list>
+#include <vector>
 #include <SoftwareFramePresenter.h>
 #include <algorithm>
 #include <RenderDevice.h>
@@ -28,6 +30,7 @@ void glob2_surface_finish(int success);
 void glob2_surface_error(char *destination, int size);
 int glob2_surface_webgl_available();
 int glob2_surface_webgpu_available();
+int glob2_surface_startup_uses_gl();
 }
 #endif
 SDL_Surface *GraphicContext::getSDLSurface()
@@ -67,6 +70,11 @@ bool GraphicContext::flushDeviceFrame()
 bool GraphicContext::presentedDeviceFrame() const
 {
     return !renderDevice() || didPresentDeviceFrame(*renderer);
+}
+
+void GraphicContext::allowDeviceFrameDeferral()
+{
+    if (renderDevice()) GAGCore::allowDeviceFrameDeferral(*renderer);
 }
 
 bool GraphicContext::deferDeviceFrame()
@@ -124,7 +132,7 @@ RendererCapabilities GraphicContext::rendererCapabilities() const
     return {.accelerated = gl || bool(portableRenderer) || bool(presentationDevice), .torus = gl || (presentationDevice && presentationDevice->capabilities().torus),
         .liveSkins = gl || (presentationDevice && presentationDevice->capabilities().skinMaterials), .textureFiltering = gl || bool(portableRenderer) || bool(presentationDevice),
         .asynchronousCapture = presentationDevice && presentationDevice->capabilities().asynchronousCapture,
-        .alphaMapCellCentres = gl || bool(presentationDevice), .cloudLayers = gl || bool(presentationDevice),
+        .alphaMapCellCentres = gl || bool(presentationDevice), .cloudLayers = gl || bool(portableRenderer) || bool(presentationDevice),
         .textureMipmaps = gl || bool(presentationDevice)};
 }
 
@@ -164,6 +172,85 @@ std::vector<RendererAvailability> GraphicContext::rendererAvailability() const
         choices.push_back({backend, available, std::move(reason)});
     }
     return choices;
+}
+
+namespace
+{
+// Auto's order for the game (PREFERDEVICE), one row per platform. Measurements
+// choose it; see "Runtime backend selection" in docs/architecture/rendering.md
+// for the numbers and when to revisit. Software always follows the row, and
+// Legacy GL is dropped from builds without OpenGL.
+using RB = RendererBackend;
+#if defined(GLOB2_MOBILE)
+// Android and iOS: SDL GPU (Vulkan, Metal) first, as the fully GPU renderer
+// (user decision, 2026-11-17); Portable SDL when its device or shaders are
+// unavailable, as in the iOS Simulator.
+constexpr RB PreferredRendererOrder[] = {RB::SDLGPU, RB::PortableSDL};
+#elif defined(__APPLE__)
+// macOS: the Retina memory scenario gave programmable GL the best tail (p99
+// 29.3 ms, max 108); SDL GPU (Metal) the smallest footprint; Legacy GL the
+// largest footprint and a 163 ms max.
+constexpr RB PreferredRendererOrder[] = {RB::ProgrammableGL, RB::SDLGPU, RB::LegacyGL, RB::PortableSDL};
+#else
+// Linux and Windows: programmable GL had the lowest median and memory with a
+// p99 close to Legacy GL's; SDL GPU had the worst tail.
+constexpr RB PreferredRendererOrder[] = {RB::ProgrammableGL, RB::LegacyGL, RB::SDLGPU, RB::PortableSDL};
+#endif
+}
+
+std::vector<RendererBackend> GraphicContext::automaticRendererOrder(Uint32 flags)
+{
+#ifdef __EMSCRIPTEN__
+    // On a probed WebGL2 surface browsers prefer programmable GL, which needs no
+    // fixed-function emulation, then Legacy GL (builds with it), then Software.
+    // WebGPU stays opt-in.
+    (void)flags;
+    if (glob2_surface_startup_uses_gl()) {
+        std::vector<RendererBackend> order{RendererBackend::ProgrammableGL};
+#ifdef HAVE_OPENGL
+        order.push_back(RendererBackend::LegacyGL);
+#endif
+        order.push_back(RendererBackend::Software);
+        return order;
+    }
+    return {RendererBackend::Software};
+#else
+    std::vector<RendererBackend> order;
+    if (flags & PREFERDEVICE) {
+        for (auto backend : PreferredRendererOrder) {
+#ifndef HAVE_OPENGL
+            if (backend == RendererBackend::LegacyGL) continue;
+#endif
+            order.push_back(backend);
+        }
+    }
+#ifdef GLOB2_MOBILE
+    else order.push_back(RendererBackend::PortableSDL);
+#else
+#ifdef HAVE_OPENGL
+    else if (flags & USEGPU) order.push_back(RendererBackend::LegacyGL);
+#endif
+    else if (flags & PORTABLEGPU) order.push_back(RendererBackend::PortableSDL);
+#endif
+    order.push_back(RendererBackend::Software);
+    return order;
+#endif
+}
+
+RendererBackend GraphicContext::fallbackAfter(RendererBackend failed) const
+{
+    const auto choices = rendererAvailability();
+    const auto usable = [&](RendererBackend backend) {
+        return backend != failed && std::any_of(choices.begin(), choices.end(), [&](const auto &choice) {
+            return choice.backend == backend && choice.available;
+        });
+    };
+    // The next family in Auto's order after the failed one; a family outside
+    // the order (an explicit choice) falls to the start of it.
+    const auto position = std::find(automaticOrder.begin(), automaticOrder.end(), failed);
+    for (auto i = position == automaticOrder.end() ? automaticOrder.begin() : position + 1; i != automaticOrder.end(); ++i)
+        if (usable(*i)) return *i;
+    return RendererBackend::Software;
 }
 
 bool GraphicContext::requestBackendSwitch(RendererBackend backend)
@@ -498,14 +585,73 @@ void GraphicContext::captureScreenshot()
     } catch (const RenderAdmissionDeferred &) {}
     catch (const std::exception &error) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Screenshot: %s", error.what()); pendingScreenshot.clear(); }
 }
+std::size_t GraphicContext::retainedDeviceSnapshotBytes() const
+{
+    return deviceRenderer ? retainedDeviceTextureBytes(*deviceRenderer) : 0;
+}
+namespace { std::list<PresentationTrimSubscription *> trimSubscriptions; }
+PresentationTrimSubscription::PresentationTrimSubscription(Handler value) : handler(std::move(value))
+{
+    trimSubscriptions.push_back(this);
+}
+PresentationTrimSubscription::~PresentationTrimSubscription() { trimSubscriptions.remove(this); }
+void PresentationTrimSubscription::notify(PresentationTrim reason)
+{
+    // A handler may destroy another cache; copy the list first.
+    const std::vector<PresentationTrimSubscription *> current(trimSubscriptions.begin(), trimSubscriptions.end());
+    for (auto *subscription : current)
+        if (std::find(trimSubscriptions.begin(), trimSubscriptions.end(), subscription) != trimSubscriptions.end() &&
+            subscription->handler)
+            subscription->handler(reason);
+}
+// A foreground trim erases at most this many snapshots a frame, and only those
+// not drawn for two frames, so the view's own textures are never re-uploaded.
+constexpr std::size_t SnapshotTrimsPerFrame = 64;
+constexpr std::uint64_t SnapshotTrimIdleFrames = 2;
+void GraphicContext::trimPresentationMemory(PresentationTrim reason)
+{
+    const bool background = reason == PresentationTrim::Background;
+    if (presentationDevice) {
+        // Completed GPU copies that logical snapshots restore; in-flight work,
+        // unfinished uploads and rendered targets stay.
+        try { presentationDevice->trimRetiredResources(); }
+        catch (const std::exception &error) { SDL_LogWarn(SDL_LOG_CATEGORY_APPLICATION, "Presentation trim: %s", error.what()); }
+    }
+    if (deviceRenderer) {
+        snapshotTrimPending = true;
+        // Nothing is drawn in the background: no frame to spread the work over.
+        if (background) {
+            while (trimDeviceTextures(*deviceRenderer, SnapshotTrimsPerFrame, 0) == SnapshotTrimsPerFrame) {}
+            snapshotTrimPending = false;
+        }
+    }
+    Sprite::trimRetiredHighResolution(background);
+    PresentationTrimSubscription::notify(reason);
+}
+void GraphicContext::servicePresentationTrim()
+{
+    if (!snapshotTrimPending) return;
+    if (!deviceRenderer ||
+        trimDeviceTextures(*deviceRenderer, SnapshotTrimsPerFrame, SnapshotTrimIdleFrames) < SnapshotTrimsPerFrame)
+        snapshotTrimPending = false;
+}
 void GraphicContext::recoverPresentationDevice()
 {
     cancelCaptures();
     resetDeviceSkinState(); deviceTargetStates.clear();
     ++glContextGeneration;
-    renderer = nullptr; deviceRenderer.reset(); presentationDevice.reset();
+    // Snapshots move to the replacement adapter, so surfaces whose pixels were
+    // released draw again; the old adapter never touches its lost device.
+    auto previous = std::move(deviceRenderer);
+    renderer = nullptr; presentationDevice.reset();
+    struct DiscardOnFailure {
+        std::unique_ptr<RenderBackend> &adapter;
+        ~DiscardOnFailure() { if (adapter) { adapter.reset(); Sprite::discardUnbackedHighResolution(); } }
+    } discardOnFailure{previous};
     // Recompile programs and recreate every graphics object after context loss.
     // Logical source pixels and immutable geometry remain owned by the registry.
+    // Device renderers present in window pixels (HiDPI), with or without GL.
+    SDL_GetWindowSizeInPixels(window, &drawableW, &drawableH);
     if (configuredBackend == RendererBackend::ProgrammableGL)
         presentationDevice = makeProgrammableGLDevice(window, rendererShaderDirectory());
 #ifndef __EMSCRIPTEN__
@@ -513,7 +659,9 @@ void GraphicContext::recoverPresentationDevice()
 #else
     else presentationDevice = makeWebGPURenderDevice(window);
 #endif
+    selectDeviceBlockCompression(*presentationDevice);
     deviceRenderer = makeDeviceRenderBackend(*presentationDevice, *deviceResources, getW(), getH());
+    if (previous) { adoptDeviceTextures(*previous, *deviceRenderer); previous.reset(); }
     renderer = deviceRenderer.get(); renderer->clip(&clipRect); resetRenderPacing();
 }
 void GraphicContext::handleDeviceFailure(const std::string &reason)
@@ -525,7 +673,7 @@ void GraphicContext::handleDeviceFailure(const std::string &reason)
     // device cannot provide a completed CPU image for the transition.
     recoveringBackend = true; nextBackendPersists = false;
     nextBackend = backendStatus.active == RendererBackend::WebGPU && programmableGLCompiled()
-        ? RendererBackend::ProgrammableGL : RendererBackend::Software;
+        ? RendererBackend::ProgrammableGL : fallbackAfter(backendStatus.active);
     backendStatus.phase = RendererSwitchPhase::Queued;
     applyQueuedBackend();
 }

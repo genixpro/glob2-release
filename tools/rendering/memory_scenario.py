@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -32,15 +33,22 @@ PLAYERS = ('castor', 'cortex', 'castor', 'cortex')
 GAUGES = (
     ('cpu_surface_bytes', 'Decoded pixels held by surfaces'),
     ('cpu_high_resolution_bytes', '  of which HD artwork'),
+    ('cpu_team_color_bytes', 'CPU team recolours'),
+    ('team_color_frames', 'CPU team recolours (frames)'),
     ('cpu_compositor_bytes', 'Terrain compositor copies'),
     ('cpu_prepared_bytes', 'Upload staging'),
+    ('device_snapshot_bytes', 'Device restoration snapshots'),
+    ('device_retained_bytes', '  of which retained for released pixels'),
     ('gpu_surface_bytes', 'GPU sprite and atlas textures'),
     ('gpu_array_bytes', 'GPU texture-array pages'),
     ('gpu_direct_terrain_bytes', 'GPU direct terrain'),
+    ('cpu_terrain_page_pixel_bytes', 'Terrain page CPU pixels'),
     ('gpu_terrain_page_bytes', 'GPU terrain pages'),
     ('gpu_frame_cache_bytes', 'GPU frame cache'),
     ('gpu_skin_atlas_bytes', 'GPU skin atlas'),
     ('gpu_view_tile_bytes', 'GPU view tiles'),
+    ('gpu_backend_texture_bytes', 'Portable renderer textures'),
+    ('device_resource_bytes', 'Render device resources'),
 )
 
 
@@ -90,7 +98,33 @@ def process_memory(pid):
             sample['gpu_driver'] = sum(clients.values())
     except OSError:
         pass
+    if 'gpu_driver' not in sample and (used := nvidia_memory(pid)) is not None:
+        sample['gpu_driver'] = used
     return sample
+
+
+_nvidia = {'available': shutil.which('nvidia-smi') is not None, 'last': 0.0, 'value': None}
+
+
+def nvidia_memory(pid):
+    """The NVIDIA driver's per-process memory (no DRM fdinfo there), at most once a second."""
+    if not _nvidia['available']:
+        return None
+    now = time.monotonic()
+    if now - _nvidia['last'] < 1.0:
+        return _nvidia['value']
+    _nvidia['last'] = now
+    try:
+        text = subprocess.run(['nvidia-smi', '-q', '-d', 'PIDS'], capture_output=True, text=True,
+                              timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        _nvidia['available'] = False
+        return None
+    # Each process block names its PID and, a few lines on, its memory in MiB.
+    used = [int(m) * MIB for p, m in re.findall(r'Process ID\s*:\s*(\d+)(?:(?!Process ID).)*?Used GPU Memory\s*:\s*(\d+)\s*MiB',
+                                                 text, re.S) if int(p) == pid]
+    _nvidia['value'] = sum(used) if used else None
+    return _nvidia['value']
 
 
 def run(args, directory):
@@ -109,6 +143,8 @@ def run(args, directory):
     })
     if args.zoom:
         environment['GLOB2_BENCH_ZOOM'] = str(args.zoom)
+    if args.trim_at is not None:
+        environment['GLOB2_BENCH_TRIM_AT'] = str(args.trim_at)
     if args.capture:
         environment['GLOB2_BENCH_CAPTURE'] = str(directory / 'final.ppm')
     command = [str(binary), '--renderer', args.renderer, '--no-fullscreen', '--mute', '--window-size', args.window_size]
@@ -172,8 +208,10 @@ def table(summary, baseline=None):
     before = baseline or {}
     lines.append(row('Process resident memory', summary['peak_rss_bytes'], before.get('peak_rss_bytes')))
     lines.append(row('GPU driver memory', summary['peak_gpu_driver_bytes'], before.get('peak_gpu_driver_bytes')))
+    count = lambda value: 'n/a' if value is None else str(value)
     for key, name in GAUGES:
-        lines.append(row(name, summary['peaks'][key], before.get('peaks', {}).get(key)))
+        lines.append(row(name, summary['peaks'].get(key), before.get('peaks', {}).get(key),
+                         count if key.endswith('_frames') else mib))
     lines.append(row('Image decodes (count)', summary['image_decodes'], before.get('image_decodes'), str))
     lines.append(row('Image decode output', summary['image_decoded_bytes'], before.get('image_decoded_bytes')))
     for key in ('frame_median_ms', 'frame_p95_ms', 'frame_p99_ms', 'frame_max_ms'):
@@ -194,6 +232,7 @@ def main():
     parser.add_argument('--zoom', type=float,
                         help='Start of the zoom cycle, which reaches four times this (default: the minimum zoom)')
     parser.add_argument('--capture', action='store_true', help='Save the last frame as final.ppm')
+    parser.add_argument('--trim-at', type=int, help='Send a low-memory presentation trim at this measured frame')
     parser.add_argument('--settle-frames', type=int, default=600,
                         help='Frames at the starting view before the camera moves, as a game starts: '
                              'background work such as the whole-map base mask finishes')

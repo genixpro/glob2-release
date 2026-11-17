@@ -5016,6 +5016,10 @@ Anslått sjanse for at alliansen din vinner, registrert med jevne mellomrom gjen
 Prestisje
 [stat prestige about]
 Koloniens prestisje, opptjent av bygninger på toppnivå. En kamp med et prestisjemål avsluttes når det er nådd.
+[stat prestige needed]
+Prestisje som trengs for å vinne
+[stat prestige needed about]
+Prestisjen kolonien fortsatt måtte opptjene for å vinne på prestisje: nok til at kampens samlede prestisje når målet, og til å gå forbi hver annen overlevende koloni. Registreres bare når kampen har et prestisjemål.
 [stat band combat]
 Kamp
 [stat band starvation]
@@ -7102,3 +7106,33 @@ Spillsteg %0: %1 ms forløpt tid
 Kunne ikke lagre skriptet i %0
 [tundra]
 Tundramark
+[replay stopped %0]
+
+[replay stopped help]
+
+[settings Auto artwork high %0]
+
+[settings Auto artwork original %0]
+
+[settings Auto artwork stepped down memory]
+
+[settings Auto artwork stepped down slow]
+
+[settings Keep original artwork]
+
+[settings device memory %0]
+
+[settings device low RAM]
+
+[settings device cores %0]
+
+[settings device video memory %0]
+
+[settings device tier override %0]
+
+[settings device unknown]
+
+[artwork stepped down notice]
+
+[room large map for device]
+

@@ -23,10 +23,14 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
 set(web "${GLOB2_ROOT}/platforms/web")
 set(bridge "${Python3_EXECUTABLE}" "${GLOB2_BRIDGE}")
 set(ports --use-port=zlib)
+# Release builds compile the game and link at -O3, as native release builds do;
+# QuickJS and openlibm keep -O2 (buildsys/javascript.py), like their native builds.
 if(GLOB2_WEB_RELEASE STREQUAL "release")
-  set(optimization -O2)
+  set(optimization -O3)
+  set(javascript_optimization -O2)
 else()
   set(optimization -O0)
+  set(javascript_optimization -O0)
 endif()
 find_program(GLOB2_WEB_CCACHE ccache)
 # ccache around em++ (unless Emscripten's EM_COMPILER_WRAPPER caches inside it),
@@ -194,7 +198,7 @@ foreach(variant IN LISTS GLOB2_WEB_VARIANTS)
   add_library(glob2_web_${variant} OBJECT EXCLUDE_FROM_ALL ${web_sources})
   target_compile_options(glob2_web_${variant} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${cxxflags}>" ${ccflags})
   target_include_directories(glob2_web_${variant} PRIVATE ${includes})
-  glob2_web_javascript(glob2_web_${variant}_javascript "${ccflags}" ${optimization} "${includes}")
+  glob2_web_javascript(glob2_web_${variant}_javascript "${ccflags}" ${javascript_optimization} "${includes}")
   foreach(target glob2_web_${variant} glob2_web_${variant}_javascript)
     target_compile_definitions(${target} PRIVATE ${official_definitions})
     add_dependencies(${target} glob2_web_${variant}_generated)
@@ -246,7 +250,10 @@ foreach(variant IN LISTS GLOB2_WEB_VARIANTS)
   glob2_web_flags(unused_cxx unused_cc test_link "" "" "${link}")
   set(game_link ${test_link} --pre-js "${GLOB2_OUT}/asset-manifest.js" --pre-js "${web}/asset-loader.js")
   # SDL_ttf's static archive requires HarfBuzz; HarfBuzz in turn uses FreeType.
-  set(libraries -L${sdl}/lib -lSDL3_ttf -lSDL3_image -lSDL3_net -lSDL3 -lharfbuzz -lfreetype -lwebpdemux
+  # The SDL prefix can sit under a path with spaces (the shared dependency store
+  # in ~/Library/Application Support); target_link_directories quotes it, where a
+  # raw -L item in target_link_libraries would be split.
+  set(libraries -lSDL3_ttf -lSDL3_image -lSDL3_net -lSDL3 -lharfbuzz -lfreetype -lwebpdemux
       -lwebpmux -lwebp -lsharpyuv)
   foreach(name IN LISTS GLOB2_WEB_OPUS_LIBRARIES)
     list(APPEND libraries "${opus}/lib/lib${name}.a")
@@ -264,6 +271,7 @@ foreach(variant IN LISTS GLOB2_WEB_VARIANTS)
   add_executable(${runtime} EXCLUDE_FROM_ALL $<TARGET_OBJECTS:glob2_web_${variant}>
                  $<TARGET_OBJECTS:glob2_web_${variant}_javascript>)
   glob2_web_link_options(${runtime} ${game_link})
+  target_link_directories(${runtime} PRIVATE "${sdl}/lib")
   target_link_libraries(${runtime} PRIVATE ${libraries})
   set_target_properties(${runtime} PROPERTIES OUTPUT_NAME index RUNTIME_OUTPUT_DIRECTORY "${out}"
                         LINK_DEPENDS "${link_inputs};${GLOB2_OUT}/asset-manifest.js" LINKER_LANGUAGE CXX
@@ -314,12 +322,41 @@ foreach(variant IN LISTS GLOB2_WEB_VARIANTS)
   add_executable(${harness} EXCLUDE_FROM_ALL "${production_objects}"
                  $<TARGET_OBJECTS:glob2_web_${variant}_javascript> ${test_objects})
   glob2_web_link_options(${harness} ${harness_link})
+  target_link_directories(${harness} PRIVATE "${sdl}/lib")
   target_link_libraries(${harness} PRIVATE ${libraries})
   set_target_properties(${harness} PROPERTIES OUTPUT_NAME script-tests RUNTIME_OUTPUT_DIRECTORY "${out}"
                         LINK_DEPENDS "${link_inputs}" LINKER_LANGUAGE CXX)
   add_dependencies(${harness} glob2_web_assets glob2_web_${variant} glob2_web_${variant}_guard)
   glob2_web_launcher(${harness} "${environment}")
   list(APPEND web_aliases ${harness})
+
+  # ---- render-parity.js: torus-render-benchmark in the browser (tools/rendering/browser_parity.py) ----
+  # Test-only, never packaged: the same scene setup and capture as the native
+  # renderer parity matrix, linked with the game's objects and asset packages.
+  # Its frame loop blocks, so only the threaded runtime (an application worker)
+  # can run it; epoxy/gl.h resolves to Emscripten's GL headers.
+  if(threads)
+    set(parity glob2_web_${variant}_render_parity)
+    set(parity_source "${GLOB2_ROOT}/src/render/torus/TorusRenderBenchmark.cpp")
+    add_executable(${parity} EXCLUDE_FROM_ALL "${production_objects}"
+                   $<TARGET_OBJECTS:glob2_web_${variant}_javascript> "${parity_source}")
+    set_source_files_properties("${parity_source}" PROPERTIES
+      COMPILE_DEFINITIONS "SDL_MAIN_HANDLED;main=glob2ApplicationMain")
+    target_compile_options(${parity} PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:${cxxflags}>" ${ccflags})
+    target_compile_definitions(${parity} PRIVATE ${official_definitions})
+    target_include_directories(${parity} PRIVATE "${web}/parity/include" ${includes} "${GLOB2_ROOT}/test"
+                               "${GLOB2_ROOT}/test/support" "${GLOB2_ROOT}/libs/gag/src")
+    glob2_web_link_options(${parity} ${game_link} --pre-js "${web}/parity/read-pixels-rgb.js")
+    target_link_directories(${parity} PRIVATE "${sdl}/lib")
+    target_link_libraries(${parity} PRIVATE ${libraries})
+    set_target_properties(${parity} PROPERTIES OUTPUT_NAME render-parity RUNTIME_OUTPUT_DIRECTORY "${out}"
+                          LINK_DEPENDS "${link_inputs};${GLOB2_OUT}/asset-manifest.js;${web}/parity/read-pixels-rgb.js"
+                          LINKER_LANGUAGE CXX)
+    add_dependencies(${parity} glob2_web_assets glob2_web_${variant} glob2_web_${variant}_generated
+                     glob2_web_${variant}_guard)
+    glob2_web_launcher(${parity} "${environment}")
+    add_custom_target(web-render-parity DEPENDS ${parity})
+  endif()
 endforeach()
 set_source_files_properties("${GLOB2_ROOT}/test/support/TestMain.cpp" PROPERTIES
   COMPILE_DEFINITIONS "SDL_MAIN_HANDLED;main=glob2ApplicationMain")
