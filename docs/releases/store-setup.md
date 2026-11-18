@@ -16,9 +16,10 @@ operations; preserve each platform's existing release controls.
 ## Canonical listing translations
 
 The [marketing translation repository](https://github.com/Globulation2/glob2-marketing/tree/main/translations)
-owns the approved English master, terminology, 32 translated catalogs, source
-fingerprints and independent AI review records. Change that source first when
-editing listing language; translations need renewed review when their English
+owns the approved English master, terminology, 44 translated catalogs
+(45 including English), source fingerprints and independent AI review records.
+Change that source first when editing listing language; translations need renewed
+review when their English
 source or translated text changes. AI review is not native-speaker validation.
 
 In a checkout of the marketing repository, validate and generate merge inputs:
@@ -30,8 +31,10 @@ python3 translations/tools/storefront.py export --out /tmp/glob2-storefront-expo
 
 Merge the generated Fastlane locale text into `fastlane/metadata/android/`,
 preserving existing changelogs and release metadata. This tree feeds F-Droid;
-its neutral locale directories are deliberate. The separate `google-play/`
-export uses Play locale identifiers and still requires console verification.
+its neutral locale directories are deliberate and cover all 45 canonical locales.
+Keep F-Droid directory mappings separate from console locale identifiers.
+The separate `google-play/` export uses Play locale identifiers and still
+requires console verification.
 Do not upload the F-Droid directory tree as ready Play metadata. Merge AppStream summary,
 description paragraphs and screenshot captions into the corresponding existing
 nodes in `content/data/org.globulation2.Globulation2.metainfo.xml`; the exported fragment
@@ -49,6 +52,60 @@ is unverified; keep its maintained approved English fields until native support
 is established. Never concatenate multiple languages into a single listing.
 
 ## Store setup
+
+### Steam
+
+The existing Steam pipeline stages **Windows only**. Finish Steamworks partner
+onboarding and create the product before configuring CI; the pipeline does not
+create an account, pay the app fee, or complete legal, tax or banking declarations.
+Use the assigned product AppID and its Windows content DepotID, never example IDs.
+Configure the installation directory and the Windows launch executable
+`glob2.exe`, publish the app configuration, and verify the depot is included in
+the developer/test package.
+
+Follow Valve's [SteamPipe setup and CI instructions](https://partner.steamgames.com/doc/sdk/uploading).
+Use a dedicated build account with access to this app and the **Edit App Metadata**
+and **Publish App Changes To Steam** permissions. Authenticate it interactively
+with SteamCMD on a trusted machine, completing Steam Guard there, then verify
+passwordless login with its saved `config/config.vdf`. Treat that file as a
+credential: base64 encoding does not make it public-safe.
+
+In `genixpro/glob2-release`, configure the protected `steam-release` environment:
+
+| Kind | Name | Value |
+| --- | --- | --- |
+| Variable | `STEAM_APP_ID` | Assigned numeric AppID |
+| Variable | `STEAM_WINDOWS_DEPOT_ID` | Assigned numeric Windows DepotID |
+| Variable | `STEAM_BUILD_USERNAME` | Dedicated account's Steam login name |
+| Secret | `STEAM_CONFIG_VDF_BASE64` | Base64-encoded authenticated `config.vdf` |
+
+Transfer the credential directly from the local file to the environment secret;
+never paste it into issues, logs, public variables or this repository. Valve
+notes that SteamCMD can update the saved login configuration. The current runner
+does not save those updates back to GitHub; refresh the secret from a trusted
+authenticated session if login stops working. Do not disable Steam Guard to
+work around a login failure.
+
+Dispatch `steam-windows-package.yml` from the release mirror's `master` with an
+immutable public release `tag`, such as `vVERSION`. Its preflight resolves that
+tag in `Globulation2/glob2`; release compilation, packaging and the Windows runtime
+smoke test must all pass. The output `glob2-steam-windows-<source SHA>` includes
+the game, assets, DLL closure, `SHA256SUMS.txt` and `source-commit.txt`.
+
+When the account configuration is ready, dispatch `steam-windows-upload.yml`
+from that same mirror branch with the selected tag. It rebuilds and tests the
+candidate before requesting access to `steam-release`, then checks depot hashes
+and source identity before SteamPipe upload. The environment requires an approval
+from `genixpro`; retain that gate. This creates an **unpublished build** and does
+not set a Steam branch live.
+
+Verify the uploaded BuildID and Windows depot in Steamworks, assign it to a test
+branch and install through Steam. Check launch, assets, campaign play, save/load
+and multiplayer before promotion. Build upload, test-branch availability, store
+review, build review and public release are separate states; complete Steam's
+release checklist and verify the public result before recording the game as live.
+The current pipeline supplies no macOS or Linux Steam depot and makes no Steam
+Deck qualification claim.
 
 ### Epic Games Store
 
