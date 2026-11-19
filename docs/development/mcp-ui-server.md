@@ -3,7 +3,9 @@
 Desktop builds expose the game's mouse and keyboard interface to local MCP clients.
 Enable **Settings → MCP server**, then copy the endpoint. The default is disabled, with
 port 27202 and endpoint `http://127.0.0.1:27202/mcp`. Enablement and port are stored in
-the local settings profile. Changes take effect immediately; a failed bind is shown in
+the local settings profile. `glob2 play --mcp-port PORT` (also `replay`) enables the
+listener on PORT for that run only and saves nothing; the first edit to the MCP
+settings during that run adopts the launch values as the saved choice. Changes take effect immediately; a failed bind is shown in
 the submenu and **Retry listener** attempts it again. During a restart, **Starting**
 means the prior listener is draining before the replacement binds; this does not block
 the game loop. Browser, Android, iOS and relay builds do not expose this category or
@@ -33,6 +35,27 @@ uses `server/discover` and stateless requests. Supply `MCP-Protocol-Version`,
 version. Results contain resultType and serverInfo metadata. Header mismatch returns
 -32020, unsupported protocol version -32022, and unknown methods -32601. Tools discovery
 supplies cache metadata.
+
+## Self-description
+
+The server is written for agents that know nothing about the game and cannot read this
+repository. Both protocol versions return `instructions` (what the game is, the call
+sequence, where to start and links to the repository and this guide) and a
+`serverInfo` with `title`, `description` and `websiteUrl`: in the 2025-11-25
+`initialize` result and in the 2026-07-28 `server/discover` result. The read-only
+`game_guide` tool serves longer topics (`overview`, `gameplay`, `screens`, `hud`,
+`actions`, `control`, `hive`, `troubleshooting`, `links`); every topic carries the
+links to the repository, these guides, Hive scripting and the tutorial lesson
+scripts. Its text lives in `src/mcp/Guide.cpp` and must stay true to the game's
+behavior: update it with the HUD, menus or rules it describes.
+
+Tool descriptions say what each tool is for in game terms. Only `ui_status`,
+`ui_acquire_control` and `ui_screenshot` publish an output schema, which keeps
+`tools/list` under the 25,000-byte budget that `MCP/tools explain themselves within a
+discovery size budget` enforces. Error results name what failed and the next step,
+for example which ui_act check failed (unknown surface, missing key, stale revision
+with the current one, disabled, hidden, blocked or unsupported action) or how to
+regain control.
 
 The 2025-11-25 adapter supports `initialize`, `notifications/initialized`, `ping`,
 `tools/list` and `tools/call`. Initialize supplies protocolVersion, capabilities, and
@@ -65,6 +88,7 @@ not depend on the OS pointer position.
 
 | Tool | Semantics |
 | --- | --- |
+| game_guide | Game rules, menus, HUD, placement, control and errors by topic, with links. No lease required. |
 | ui_status | Dimensions, availability, frame_id, viewport_id and controller. No lease required. |
 | ui_screenshot | Next capturable complete game frame, as inline base64 PNG plus metadata. No lease required. |
 | ui_acquire_control / ui_release_control | Acquire a token / release its lease and inputs. |
@@ -80,6 +104,17 @@ not depend on the OS pointer position.
 | ui_act | Activate, select, set a value or scroll an inspected control; target revision required. |
 | ui_wait | Observe a screen, control state or revision; default 10 seconds, maximum 30. |
 | ui_renew_control | Renew the current token's five-minute control lease. |
+| game_world | Your colony in map tiles: status (free/total units, prestige, win chance), recent alerts (attacks, completions) with tiles, buildings with id, top-left tile, size, level, site and workers, unit counts and your warriors by training level, hungry and injured units, known resources with the nearest tile, other teams' buildings in sight and remembered under fog, recent placements and the placeable names with sizes. `detail: full` adds unit lists; `area` filters by tiles. No lease required. |
+| game_place | Place a building site or flag by name with its top-left on a tile, through the same checks as a click; `near` searches outward for room. Buildings need explored ground and never overlap the caller's pending placements; refusals say why. |
+| game_building | Change one of your buildings or flags by id and generation: worker request (capped at the building's limit, reported), priority, Swarm production ratios, flag range, upgrade, repair, cancel_upgrade, destroy, cancel_destroy, or move a flag. Uses the validated script order path. |
+| game_zone | Paint or erase a forbidden, guard or clearing zone over a tile rectangle. |
+| game_view | Centre the camera on a tile and return its screen point (`tile_screen`, in inspection logical pixels). |
+
+The `game_*` tools follow fog of war: they report only what the player's colony sees
+now or has seen. Other teams' buildings out of sight are reported as last seen (from a
+memory refreshed every 50 ticks from the same visibility as Hive observations, and
+corrected only when the tile is in view again); resources come from the same
+last-seen memory; another team's hit points and warrior training are never reported.
 | hive_status | Local scripting availability, match-session identity and limits. |
 | hive_api | Shared player JavaScript API and authoritative local control contract. |
 | hive_run | Queue one bounded script invocation with a deduplicated operation key. |
@@ -106,7 +141,9 @@ steps, and releases temporary holds. A screen transition that truncates an event
 fails the call; undelivered releases remain queued for a later dispatch boundary.
 Failures such as stale viewport, lost control, unavailable frames and cancelled capture
 are tool results with isError; malformed JSON, invalid arguments and protocol errors
-are JSON-RPC errors. An error may report input_started when earlier gesture steps were
+are JSON-RPC errors. An invalid-argument message names the field and the broken rule,
+for example `Invalid argument: ui_drag.points[]: missing required property "x"`. An
+error may report input_started when earlier gesture steps were
 emitted; never infer that a failure guarantees no side effects. Screenshots include
 in-game dialogs and overlays, with native output resolution and top-left orientation.
 Buffers are owned through worker PNG encoding; recording and ordinary screenshots
@@ -185,7 +222,11 @@ and renderer checks are separate from simulation/save/replay continuity.
 ## Typed interaction and scaled captures
 
 `ui_inspect` accepts `surface` (an instance ID), `subtree` (a stable key), `token`
-(optional) and `screenshot` (default false). Controls report their own `revision`.
+(optional), `screenshot` (default false) and `compact` (default false). `compact`
+also applies to `ui_act`, `ui_wait` and `ui_acquire_control` inspections: it replaces
+keyless, unlabelled, inert layout containers with their children, omits fields at
+their defaults, keeps `revision` only on actionable controls and marks controls with
+no visible area as `hidden`. Typical menu inspections shrink to a third of their size. Controls report their own `revision`.
 Snapshot bounds use the owning surface's logical pixels; `viewport` records that
 space. They can differ from native screenshot pixels under interface scaling or
 HiDPI. Prefer semantic actions for controls and captured-image coordinates for
@@ -208,7 +249,9 @@ fails after input was consumed, `inspection_error` reports that separately;
 `ui_wait` accepts `timeout_ms` (default 10000, maximum 30000) and `condition`.
 A condition can name `screen`, `key`, `enabled`, `selected`, `focused`, `blocked`,
 `visible`, `value`, and/or `revision_after`. It may use the same surface/subtree
-filters. Waits do not occupy the action queue. Timeout returns the latest relevant
+filters. A control that has disappeared counts as not visible, so `{key, visible:
+false}` is satisfied by its absence unless the condition also names another property
+of that control. Waits do not occupy the action queue. Timeout returns the latest relevant
 inspection with `satisfied: false`. At most eight waits may remain pending; excess
 waits fail immediately with an actionable error. This leaves HTTP connections and
 request capacity available for actions and inspections that can satisfy observers.
@@ -234,13 +277,24 @@ that ownership. Building/editor targets bind entity generations, and compact pla
 confirmation binds the construction type and world position. Informational unit and
 resource panels remain read-only. Map, minimap and replay progress are canvas controls;
 use captured-image coordinates for spatial gestures and Hive for player-visible world
-records. Native OS dialogs remain outside this interface.
+records. A control reports `blocked` when any overlay intersects it, so the map canvas
+reads as blocked while a lesson card or other panel covers part of it; coordinate
+gestures still reach its uncovered part. The desktop HUD's top-bar counters are
+read-only `label` controls under `game/stats/` (workers, explorers and warriors as
+free/total, prestige, win chance, converted in and out). `game/placement` is a read-only
+label naming the active placement tool: `none`, `building:<type>`, `flag:<type>` or
+`zone:<kind>:paint|erase`. A flag's assignment slider is labelled for the unit it
+requests (Assigned warriors or explorers). Building and flag palette entries are labelled
+with the player-facing names; their keys keep the stable type names. Native OS dialogs
+remain outside this interface.
 
 ## Linux stdio launcher
 
 `python3 tools/mcp_stdio.py` connects to the default loopback endpoint, reusing a
-compatible running game or starting `glob2` from `PATH`. Enable Settings → MCP server
-in the game profile first. Startup defaults to one 30-second budget (maximum 120),
+compatible running game or starting `glob2` from `PATH`. A game it starts receives
+`play --mcp-port PORT` (from `--url`) unless the arguments name another command or
+their own `--mcp-port`; `--no-launch-flag` instead relies on Settings → MCP server.
+`--help` describes the options and links the repository and this guide. Startup defaults to one 30-second budget (maximum 120),
 including the initial probe and capability discovery. A listening but unresponsive or
 incompatible endpoint fails without starting a second game; only connection refusal
 starts the configured executable. Override the

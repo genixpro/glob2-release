@@ -105,7 +105,10 @@ class EmulatorSmokeTests(unittest.TestCase):
                 (home/'bin/java').touch()
                 with self.subTest(system=system), patch('developer_apk.platform.system', return_value=system), patch('developer_apk.platform.machine', return_value=machine):
                     with patch.dict('developer_apk.os.environ', {'GLOB2_DEV_MODE':'isolated'}, clear=True):
-                        self.assertEqual(developer_apk.java_environment(task)['JAVA_HOME'], str(home))
+                        environment = developer_apk.java_environment(task)
+                        self.assertEqual(environment['JAVA_HOME'], str(home))
+                        # SDK launchers such as apksigner find java on PATH.
+                        self.assertTrue(environment['PATH'].startswith(str(home/'bin')))
                     with patch.dict('developer_apk.os.environ', {'JAVA_HOME': '/explicit/jdk', 'GLOB2_DEV_MODE':'isolated'}, clear=True):
                         self.assertEqual(developer_apk.java_environment(task)['JAVA_HOME'], '/explicit/jdk')
 
@@ -400,19 +403,87 @@ class EmulatorEnvironmentTests(unittest.TestCase):
             shutil.copyfile(root/'platforms/mobile/android-tools.json', task/'platforms/mobile/android-tools.json')
             lock = json.loads((task/'platforms/mobile/emulator.json').read_text())
             sdk = task/'build/mobile-tools/android-sdk'
-            for path, version in [('emulator', lock['emulator_revision']), ('system-images/android-35/default/x86_64', lock['image_revision'])]:
+            for path, version in [('emulator', lock['emulator_revision']), ('system-images/android-35/default/x86_64', lock['image_revision']), ('cmdline-tools/19.0', '19.0')]:
                 directory = sdk/path
                 directory.mkdir(parents=True)
                 (directory/'source.properties').write_text('Pkg.Revision='+version+'\n')
+            (sdk/'licenses').mkdir()
             config = task/'build/mobile-tools/avd/glob2-api35-x64.avd/config.ini'
+            view = task/'build/mobile-tools/sdk-view'
             def create(*args, **kwargs):
-                self.assertEqual(kwargs['env']['ANDROID_HOME'], str(sdk))
-                self.assertEqual(kwargs['env']['ANDROID_SDK_ROOT'], str(sdk))
+                # avdmanager sees a view whose tools and image directories are real.
+                self.assertEqual(kwargs['env']['ANDROID_HOME'], str(view))
+                self.assertEqual(kwargs['env']['ANDROID_SDK_ROOT'], str(view))
+                for path in ('cmdline-tools/19.0', 'system-images/android-35/default/x86_64'):
+                    self.assertFalse((view/path).is_symlink())
+                    self.assertEqual((view/path/'source.properties').resolve(), (sdk/path/'source.properties').resolve())
                 config.parent.mkdir(parents=True)
-                config.write_text('image.sysdir.1=system-images/android-35/default/x86_64/\n')
+                config.write_text('image.sysdir.1=artifacts/elsewhere/\n')
             with patch.object(emulator, 'ROOT', task), patch.dict(os.environ, {'ANDROID_HOME': '/runner/shared/sdk', 'GLOB2_DEV_MODE':'isolated'}), patch.object(sys, 'argv', ['emulator.py','configure','--arch','x86_64']), patch.object(emulator.subprocess, 'run', side_effect=create):
                 emulator.main()
             self.assertIn('hw.lcd.width=320', config.read_text())
+            self.assertIn('image.sysdir.1=system-images/android-35/default/x86_64/', config.read_text())
+            self.assertFalse(view.exists())
+            self.assertTrue((sdk/'cmdline-tools/19.0/source.properties').is_file())
+
+
+class AndroidDeviceRunnerTests(unittest.TestCase):
+    """The device-side chunk script, run here with the host shell and a stand-in binary."""
+
+    def run_chunk(self, cases, binary):
+        import os
+        import subprocess
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'platforms/mobile'))
+        import android_device_tests as runner
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / 'bin').mkdir()
+        (root / 'source').mkdir()
+        (root / 'run-cases.sh').write_text(runner.DEVICE_SCRIPT)
+        fake = root / 'bin/fake-tests'
+        fake.write_text('#!/bin/sh\n' + binary)
+        fake.chmod(0o755)
+        lines = [runner.SEPARATOR.join((str(index), str(limit), runner.run_tests.doctest_pattern(suite),
+                                        runner.run_tests.doctest_pattern(name)))
+                 for index, (limit, suite, name) in enumerate(cases)]
+        (root / 'cases.list').write_text('\n'.join(lines) + '\n')
+        env = dict(os.environ, PATH=str(root / 'bin') + os.pathsep + os.environ['PATH'])
+        subprocess.run(['sh', str(root / 'run-cases.sh'), 'fake-tests', str(root / 'cases.list'), str(root / 'out')],
+                       check=True, env=env, timeout=60)
+        out = root / 'out'
+        self.assertTrue((out / 'finished').is_file())
+        return runner, out
+
+    def test_each_case_runs_alone_with_its_suite_and_a_timeout(self):
+        # Prints its arguments one per line; "sleep" in a case name hangs it.
+        binary = ('for argument in "$@"; do echo "$argument"; done\n'
+                  'case "$*" in *sleep*) sleep 30;; *fails*) exit 1;; esac\n'
+                  'for argument in "$@"; do case "$argument" in -o=*) echo "<testsuites><testcase name=\'x\'/></testsuites>" > "${argument#-o=}";; esac; done\n')
+        runner, out = self.run_chunk([(30, 'Suite, A', 'first, with comma [tag]'), (30, '', 'no suite fails'),
+                                      (1, 'Hang', 'sleep forever')], binary)
+        first = (out / '0.log').read_text().splitlines()
+        self.assertIn('-tc=first\\, with comma [tag]', first)
+        self.assertIn('-ts=Suite\\, A', first)
+        self.assertFalse(any(line.startswith('-ts=') for line in (out / '1.log').read_text().splitlines()))
+        codes = [int((out / f'{index}.exit').read_text()) for index in range(3)]
+        self.assertEqual(codes[0], 0)
+        self.assertEqual(runner.outcome(codes[0], (out / '0.xml').read_text()), 'pass')
+        self.assertEqual(runner.outcome(codes[1], ''), 'crash')
+        self.assertEqual(runner.outcome(codes[2], ''), 'timeout')
+
+    def test_outcomes_need_an_executed_case(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'platforms/mobile'))
+        import android_device_tests as runner
+        passed = '<testsuites><testcase name="a"/></testsuites>'
+        failed = '<testsuites><testcase name="a"><failure message="CHECK"/></testcase></testsuites>'
+        skipped = '<testsuites><testcase name="a"><skipped/></testcase></testsuites>'
+        self.assertEqual(runner.outcome(0, passed), 'pass')
+        self.assertEqual(runner.outcome(0, skipped), 'fail')
+        self.assertEqual(runner.outcome(1, failed), 'fail')
+        self.assertEqual(runner.outcome(134, ''), 'crash')
+        self.assertEqual(runner.outcome(None, ''), 'crash')
+        self.assertEqual(runner.failure_details(failed, 'log')[0], 'CHECK')
 
 
 class IOSSmokeFailureTests(unittest.TestCase):

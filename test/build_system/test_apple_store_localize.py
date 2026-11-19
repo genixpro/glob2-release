@@ -126,6 +126,27 @@ class AppleLocalizationTests(unittest.TestCase):
             with self.subTest(change=change),self.assertRaisesRegex(ValueError,'baseline'):tool.run(api,api.plan,'apply',baseline)
             self.assertFalse(api.writes())
 
+    def test_withdrawn_version_can_be_localized_without_changing_review_or_build(self):
+        api = FakeAPI()
+        api.versions[0]['attributes']['appVersionState'] = 'DEVELOPER_REJECTED'
+        api.infos[0]['attributes']['state'] = 'DEVELOPER_REJECTED'
+        original_versions = copy.deepcopy(api.versions)
+        original_build = copy.deepcopy(api.attached)
+        result = self.inspect_apply(api)
+        self.assertTrue(result['verified'])
+        self.assertEqual(api.versions, original_versions)
+        self.assertEqual(api.attached, original_build)
+        self.assertFalse(any('/reviewSubmissions' in path for _, path, _ in api.calls))
+
+    def test_review_and_distribution_states_refuse_every_write(self):
+        for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW', 'READY_FOR_DISTRIBUTION',
+                      'PENDING_DEVELOPER_RELEASE', 'PENDING_APPLE_RELEASE', 'READY_FOR_REVIEW'):
+            api = FakeAPI()
+            api.versions[0]['attributes']['appVersionState'] = state
+            with self.subTest(state=state), self.assertRaisesRegex(ValueError, 'editable draft'):
+                tool.run(api, api.plan, 'inspect')
+            self.assertFalse(api.writes())
+
     def test_wrong_state_build_platform_and_ambiguous_info_refuse_writes(self):
         for failure in ('review','build','platform','ambiguous','live-only','bundle'):
             api=FakeAPI()
@@ -162,6 +183,59 @@ class AppleLocalizationTests(unittest.TestCase):
         api=FakeAPI();self.inspect_apply(api);api.calls=[]
         result=self.inspect_apply(api)
         self.assertEqual(result['pendingWrites'],0);self.assertFalse(api.writes())
+
+    def test_existing_empty_support_urls_are_filled_without_touching_other_urls(self):
+        api = FakeAPI(plan('MAC_OS'))
+        self.inspect_apply(api)
+        records = tool.locale_map(api.version_locales['target'])
+        records['ca']['attributes']['supportUrl'] = None
+        records['ru']['attributes']['supportUrl'] = ''
+        records['th']['attributes']['supportUrl'] = 'https://example.com/custom-support'
+        records['ca']['attributes']['marketingUrl'] = None
+        original_other = copy.deepcopy(api.version_locales['other'])
+        original_info = copy.deepcopy(api.info_locales)
+        api.calls = []
+        result = self.inspect_apply(api)
+        self.assertEqual(result['pendingWrites'], 2)
+        for method, path, body in api.writes():
+            self.assertEqual(method, 'PATCH')
+            self.assertEqual(body['data']['attributes'], {'supportUrl': 'https://example.com/target/support'})
+            self.assertIn(body['data']['id'], (records['ca']['id'], records['ru']['id']))
+        records = tool.locale_map(api.version_locales['target'])
+        self.assertIsNone(records['ca']['attributes']['marketingUrl'])
+        self.assertEqual(records['th']['attributes']['supportUrl'], 'https://example.com/custom-support')
+        self.assertEqual(api.version_locales['other'], original_other)
+        self.assertEqual(api.info_locales, original_info)
+
+    def test_missing_primary_support_url_refuses_every_write(self):
+        api = FakeAPI()
+        api.version_locales['target'][0]['attributes']['supportUrl'] = None
+        with self.assertRaisesRegex(ValueError, 'inheritance URL'):
+            tool.run(api, api.plan, 'inspect')
+        self.assertFalse(api.writes())
+
+    def test_pending_shared_info_is_read_only_when_all_reviewed_text_matches(self):
+        for state in ('WAITING_FOR_REVIEW', 'IN_REVIEW'):
+            api = FakeAPI(plan('MAC_OS'))
+            self.inspect_apply(api)
+            api.infos[0]['attributes']['state'] = state
+            tool.locale_map(api.version_locales['target'])['ca']['attributes']['supportUrl'] = None
+            original_info = copy.deepcopy(api.info_locales)
+            api.calls = []
+            result = self.inspect_apply(api)
+            self.assertEqual(result['pendingWrites'], 1)
+            self.assertEqual(api.info_locales, original_info)
+            self.assertTrue(all('/appStoreVersionLocalizations/' in path for _, path, _ in api.writes()))
+
+    def test_pending_shared_info_with_any_untranslated_field_refuses_writes(self):
+        api = FakeAPI(plan('MAC_OS'))
+        self.inspect_apply(api)
+        api.infos[0]['attributes']['state'] = 'WAITING_FOR_REVIEW'
+        api.info_locales['draft'][1]['attributes']['subtitle'] = 'Changed in review'
+        api.calls = []
+        with self.assertRaisesRegex(ValueError, 'shared AppInfo'):
+            tool.run(api, api.plan, 'inspect')
+        self.assertFalse(api.writes())
 
     def test_explained_server_auto_creation_is_updated_without_duplicate_posts(self):
         api=FakeAPI(automatic=True);self.inspect_apply(api)

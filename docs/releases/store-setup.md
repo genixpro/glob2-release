@@ -63,7 +63,10 @@ The owner-only `apple-store-localize.yml` workflow runs `prepare` without Apple
 credentials, then uses the existing protected `ios-testflight` environment for
 `inspect` or `apply`. Its reports contain counts and digests, never raw store
 snapshots, review contacts or authentication material. The explicit platform,
-version and already-attached build must match an unsubmitted editable draft.
+version and already-attached build must match an unsubmitted editable draft
+(`PREPARE_FOR_SUBMISSION` or `DEVELOPER_REJECTED` after withdrawal). The helper
+never withdraws or submits a review; waiting/in-review and distribution states
+remain blocked.
 For the current candidates these are `IOS` / `0.11.601` / `1002501` and
 `MAC_OS` / `0.11.6` / `2026111801`.
 
@@ -72,13 +75,18 @@ the identical source/target inputs. Any intervening listing, media, build or
 release-option change invalidates that baseline. Run platforms sequentially:
 iOS inspect/apply, then a fresh Mac inspect/apply, because AppInfo is shared and
 Apple may automatically create related localization records on other platforms.
+If another platform has already submitted the shared AppInfo, the helper may
+read that pending record only when all 38 reviewed names/subtitles already
+match exactly; it never changes pending shared information or selects live info.
 After an interrupted apply, inspect again; already-correct fields are skipped
 and existing resources are never deleted or blindly recreated.
 
 Writes are limited to AppInfo name/subtitle and version description, promotional
 text and keywords, plus reviewed iOS What's New. Mac What's New is preserved.
 New locale URLs inherit the current English privacy/support/marketing values;
-existing URLs, privacy text and other fields remain exact. New screenshot and
+populated existing URLs, privacy text and other fields remain exact. Existing
+mapped platform locales with a blank required support URL also inherit the
+current primary-locale support URL; optional blank URLs stay blank. New screenshot and
 preview sets stay empty for primary-language fallback. Complete readback checks
 all intended values, existing asset identities/order and unchanged fields, and
 accepts only explained empty/primary-inherited automatically created locales.
