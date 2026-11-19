@@ -327,8 +327,13 @@ artifacts plus transfer state, and `disk_reserve_bytes: 2147483648` (2 GiB).
 Concurrent collectors reserve an artifact's remaining transfer size before
 receiving it. Quota pressure defers collection and new dispatch; uncollected
 worker evidence remains intact. `status` reports used, reserved, budget and free
-bytes. Record larger campaign allowances explicitly in the experiment manifest
-when the intended evidence requires them. Frozen build caches are accounted for
+bytes. Collection checks the budget against a walk of the results directory at
+most every 30 seconds, adding each artifact as it is committed; `status` always
+walks afresh. Reservations are replaced atomically but not fsynced: they are a
+soft claim a resumed transfer renews. A collection pass moves up to 64 chunks of
+one artifact, so a gameplay log of tens of MiB arrives in one pass. Record larger
+campaign allowances explicitly in the experiment manifest when the intended
+evidence requires them. Frozen build caches are accounted for
 separately by the worker cache budget; derived report exports are not included in
 the coordinator artifact-transfer allowance.
 
@@ -582,7 +587,9 @@ unsupported combinations remain reported failures rather than being filtered out
   independent AI draws, allowing repeated AI implementations even when the pool
   contains enough distinct entries. The default `"distinct"` samples without
   replacement when possible and falls back to replacement for smaller pools.
-  In 2v2, the two team AIs are sampled, preserving homogeneous pairs. These two
+  In 2v2, the two team AIs are sampled, preserving homogeneous pairs.
+  `"mirror"` draws one AI per game and seats it everywhere, so every side plays
+  the same strategy (the win probability refit uses this). These two
   controls require `sample_games` and cannot be combined with `balanced_duels`.
   Explicit `ffa_colonies` requires an `ffa` entry in `formats`. Counts above four
   need the same generator/size preflight as any other nonstandard cohort.
