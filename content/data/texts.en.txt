@@ -3050,6 +3050,14 @@ Automatic
 Compact
 [settings Spacious]
 Spacious
+[settings Desktop]
+Desktop
+[settings Tablet]
+Tablet
+[settings Phone]
+Phone
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.
 [settings Menu theme]
@@ -6280,6 +6288,12 @@ Could not save your choice. Please try again.
 Left hand
 [Right hand]
 Right hand
+[Use desktop layout]
+Use desktop layout
+[desktop layout confirm title]
+Use the desktop layout?
+[desktop layout confirm body]
+The game will switch to the mouse and keyboard interface. You can change this later in Settings under Interface layout.
 [stat ground movement]
 Ground movement
 [stat ground movement about]

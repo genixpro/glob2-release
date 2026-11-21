@@ -3066,6 +3066,14 @@ Automatikoa
 Trinkoa
 [settings Spacious]
 Zabala
+[settings Desktop]
+
+[settings Tablet]
+
+[settings Phone]
+
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+
 [More]
 Gehiago
 [No items]
@@ -6298,6 +6306,12 @@ Ezin izan da zure aukera gorde. Saiatu berriro.
 Ezkerreko eskua
 [Right hand]
 Eskuineko eskua
+[Use desktop layout]
+Erabili mahaigaineko diseinua
+[desktop layout confirm title]
+Mahaigaineko diseinua erabili nahi duzu?
+[desktop layout confirm body]
+Jokoa sagu eta teklatuaren interfazera aldatuko da. Geroago alda dezakezu Ezarpenak atalean, Interfazearen diseinua aukeran.
 [discord copy failed]
 Ezin izan da esteka kopiatu. Hautatu goiko gonbidapena eskuz kopiatzeko.
 [Destroy this building?]

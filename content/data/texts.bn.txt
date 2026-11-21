@@ -3050,6 +3050,14 @@ HP ≤25/50/75%
 ঘনবিন্যস্ত
 [settings Spacious]
 প্রশস্ত
+[settings Desktop]
+
+[settings Tablet]
+
+[settings Phone]
+
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+
 [settings Spacious uses a side panel when there is room. Compact uses a toolbar and drawers.]
 জায়গা থাকলে প্রশস্ত বিন্যাসে পাশের প্যানেল থাকে। ঘনবিন্যস্ত বিন্যাসে টুলবার ও খোলা-বন্ধ করা প্যানেল থাকে।
 [settings Menu theme]
@@ -6278,6 +6286,12 @@ MCP সার্ভার চালু করুন
 বাম হাত
 [Right hand]
 ডান হাত
+[Use desktop layout]
+ডেস্কটপ লেআউট ব্যবহার করুন
+[desktop layout confirm title]
+ডেস্কটপ লেআউট ব্যবহার করবেন?
+[desktop layout confirm body]
+গেমটি মাউস ও কিবোর্ডের ইন্টারফেসে চলে যাবে। পরে সেটিংসে "ইন্টারফেস লেআউট" থেকে এটি বদলাতে পারবেন।
 [stat ground movement]
 স্থলে চলাচল
 [stat ground movement about]

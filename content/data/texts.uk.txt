@@ -3066,6 +3066,14 @@ OpenGL недоступний у цій збірці.
 Компактне
 [settings Spacious]
 Просторе
+[settings Desktop]
+
+[settings Tablet]
+
+[settings Phone]
+
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+
 [More]
 Більше
 [No items]
@@ -6298,6 +6306,12 @@ Discord відкрито. Ви можете повернутися до гри �
 Ліва рука
 [Right hand]
 Права рука
+[Use desktop layout]
+Використати компонування для ПК
+[desktop layout confirm title]
+Використати компонування для ПК?
+[desktop layout confirm body]
+Гра перейде на інтерфейс для миші та клавіатури. Пізніше це можна змінити в налаштуваннях, у пункті «Компонування інтерфейсу».
 [discord copy failed]
 Не вдалося скопіювати посилання. Виділіть запрошення вище, щоб скопіювати його вручну.
 [Destroy this building?]

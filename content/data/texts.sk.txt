@@ -3066,6 +3066,14 @@ Automatické
 Kompaktné
 [settings Spacious]
 Priestranné
+[settings Desktop]
+
+[settings Tablet]
+
+[settings Phone]
+
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+
 [More]
 Viac
 [No items]
@@ -6298,6 +6306,12 @@ Vašu voľbu sa nepodarilo uložiť. Skúste to znova.
 Ľavá ruka
 [Right hand]
 Pravá ruka
+[Use desktop layout]
+Použiť rozloženie pre počítač
+[desktop layout confirm title]
+Použiť rozloženie pre počítač?
+[desktop layout confirm body]
+Hra sa prepne na rozhranie pre myš a klávesnicu. Neskôr to môžete zmeniť v Nastaveniach v položke Rozloženie rozhrania.
 [discord copy failed]
 Odkaz sa nepodarilo skopírovať. Vyberte pozvánku vyššie a skopírujte ju ručne.
 [Destroy this building?]

@@ -3066,6 +3066,14 @@ Automàtica
 Compacta
 [settings Spacious]
 Espaiosa
+[settings Desktop]
+
+[settings Tablet]
+
+[settings Phone]
+
+[settings Automatic follows the window size and touchscreen. Desktop uses the mouse interface, Tablet the touch interface with a side panel, and Phone the touch toolbar and drawers.]
+
 [More]
 Més
 [No items]
@@ -6298,6 +6306,12 @@ No s’ha pogut desar la teva tria. Torna-ho a provar.
 Mà esquerra
 [Right hand]
 Mà dreta
+[Use desktop layout]
+Utilitza la disposició d’escriptori
+[desktop layout confirm title]
+Vols utilitzar la disposició d’escriptori?
+[desktop layout confirm body]
+El joc canviarà a la interfície de ratolí i teclat. Pots canviar-ho més endavant a Configuració, a Disposició de la interfície.
 [discord copy failed]
 No s’ha pogut copiar l’enllaç. Selecciona la invitació de dalt per copiar-la manualment.
 [Destroy this building?]
