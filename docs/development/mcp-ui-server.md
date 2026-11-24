@@ -127,6 +127,7 @@ not depend on the OS pointer position.
 | game_view | Centre the camera on a tile and return its screen point (`tile_screen`, in inspection logical pixels). Optional `zoom` sets the HUD's map zoom first (1 is 100%; clamped to the HUD's range, up to 5; 0 fits the whole map, like the zoom bar's Fit) and the reply reports `zoom` and `zoom_range`. |
 | game_chat | Send an in-game chat message as the local player, as the chat box's Send would (to the recipients the chat box addresses). It needs no chat box, focus or keystrokes. Like the other `game_*` tools, it works only in a local match with a human player, never online or LAN. |
 | game_time | `status` (no lease), `pause`, `resume` or `step` with `ticks` (1–3000, default 30) for the local match. Reports `tick`, `paused`, `paused_by` (`agent`, `player`, `menu` or `none`), `steps_remaining`, `speed` and `ticks_per_second`. |
+| game_stats | Statistics over time from the same metric catalog as the game's panels (`stats/MetricCatalog.h`), each with per-team series (`seconds`, `values` or `band_values`, thinned to `points`, default 60, at most 300) and a summary over every sample (`latest`, `peak`, `low`, and a counter's `total`). `list: true` names the metrics; `metrics` picks up to 16; `split` shows their parts. In a match: your colony only, exactly the in-game Statistics panel, plus the top bar; no other team and no win-probability history, which reads hidden opponent state. On the `end_game` screen, while it is shown: every team of the finished match with name, colour, outcome, the overview figures and the win probability history, as the results screen charts them. No lease required. |
 
 The `game_*` tools follow fog of war: they report only what the player's colony sees
 now or has seen. Other teams' buildings out of sight are reported as last seen (from a
@@ -265,7 +266,8 @@ and renderer checks are separate from simulation/save/replay continuity.
 ## Typed interaction and scaled captures
 
 `ui_inspect` accepts `surface` (an instance ID), `subtree` (a stable key), `token`
-(optional), `screenshot` (default false) and `compact` (default false). `compact`
+(optional), `screenshot` (default false) and `compact` (default true; pass false for
+the full tree). `compact`
 also applies to `ui_act`, `ui_wait` and `ui_acquire_control` inspections: it replaces
 keyless, unlabelled, inert layout containers with their children, omits fields at
 their defaults, keeps `revision` only on actionable controls and marks controls with
@@ -306,6 +308,8 @@ returns `inspection_error` alongside the valid token; renew or use that token ra
 than acquiring control again.
 
 Screenshot requests and input `capture_after` accept `max_width` and `max_height`.
+Without either, images are scaled to at most 1280 pixels wide, so a HiDPI window does
+not produce a multi-megabyte reply; pass a larger `max_width` for native detail.
 Images preserve aspect ratio within integer rounding and never upscale. Native readback
 is owned by the request; resizing and PNG encoding run on the HTTP worker. Each image
 has `capture_id`, returned-image `width`/`height`, native dimensions and `viewport_id`.
