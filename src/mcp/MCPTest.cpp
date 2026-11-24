@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "Availability.h"
+#include "OnlineUIFixtures.h"
 #include <chrono>
 #if GLOB2_DESKTOP_MCP
 // Establish WinSock2 before SDL fixtures can include Windows headers.
@@ -56,7 +57,7 @@ TEST_CASE("MCP/protocol adapters validate metadata and discover all tools")
 	CHECK(discover.status == 200);
 	CHECK(discover.body["result"]["resultType"] == "complete");
 	auto listed = p.receive(modern("tools/list").dump(), {"2026-07-28", "tools/list", ""});
-	CHECK(listed.body["result"]["tools"].size() == 27);
+	CHECK(listed.body["result"]["tools"].size() == 29);
 	CHECK(listed.body["result"].contains("cacheScope"));
 	CHECK(
 		p.receive(modern("tools/list").dump(), {"2026-07-28", "wrong", ""}).body["error"]["code"] ==
@@ -283,11 +284,19 @@ TEST_CASE("MCP/tools explain themselves within a discovery size budget")
 		guide = guide || tool["name"] == "game_guide";
 	}
 	CHECK(guide);
-	// Every client pays for discovery in context; keep it bounded. 25 KB covers the 27
-	// tools including the game_* map tools.
+	// Every client pays for discovery in context; keep it bounded. 25 KB covers the 29
+	// tools including the game_* map and time tools.
 	const auto bytes = Json{{"tools", tools}}.dump().size();
 	INFO("tools/list bytes: " << bytes);
 	CHECK(bytes < 25000);
+	// Time steps and zoom are bounded by the schema, before reaching the game.
+	Context context;
+	CHECK_THROWS_WITH_AS(registry.call(context, "game_time", {{"action", "step"}, {"ticks", 0}}, "test"),
+						 doctest::Contains("ticks"), std::invalid_argument);
+	CHECK_THROWS_AS(registry.call(context, "game_time", {{"action", "rewind"}}, "test"),
+					std::invalid_argument);
+	CHECK_THROWS_WITH_AS(registry.call(context, "game_view", {{"token", "t"}, {"x", 1}, {"y", 1}, {"zoom", 6}}, "test"),
+						 doctest::Contains("zoom"), std::invalid_argument);
 }
 TEST_CASE("MCP/game guide serves every topic with links and rejects unknown topics")
 {
@@ -841,6 +850,55 @@ TEST_CASE("MCP/leases input dispatch cancellation viewport and capture [network]
 	service.configure(true, port, true);
 	waitForListener(service, ListenerState::Running);
 	CHECK(service.status() == "Running");
+}
+
+TEST_CASE("MCP/server stays off during a quick match among players without MCP [network]")
+{
+	glob2test::HeadlessGlobals globals(
+		{.display = true, .width = 640, .height = 480, .beforeLoad = [](GlobalContainer &g) {
+			 g.settings.rendererBackend = GAGCore::RendererBackend::Software;
+		 }});
+	UIService service(*globalContainer->gfx);
+	const int port = unusedLoopbackPort();
+	// Switching MCP on while the match starts or runs must not open the listener.
+	auto hold = std::make_unique<UnassistedMatchHold>();
+	service.configure(true, port);
+	CHECK(service.listenerState() == ListenerState::Disabled);
+	// The match ends: the next configure (every frame) starts it.
+	hold.reset();
+	CHECK(!suspendedForUnassistedMatch());
+	service.configure(true, port);
+	waitForListener(service, ListenerState::Running);
+	CHECK(service.listenerState() == ListenerState::Running);
+	// A match starting with MCP already on stops it again, until its last hold goes.
+	hold = std::make_unique<UnassistedMatchHold>();
+	{
+		UnassistedMatchHold results;
+		hold.reset();
+		service.configure(true, port);
+		CHECK(service.listenerState() == ListenerState::Disabled);
+	}
+	CHECK(!suspendedForUnassistedMatch());
+}
+
+TEST_CASE("MCP/a quick match among players without MCP holds the server off until its result goes")
+{
+	glob2test::HeadlessGlobals globals({.loadStrings = true});
+	REQUIRE(!suspendedForUnassistedMatch());
+	{
+		auto match = OnlineUIFixtures::startingMatch();
+		// From assignment, before the engine exists: the start screen is covered too.
+		CHECK(suspendedForUnassistedMatch());
+		auto result = match->result();
+		match.reset();
+		// The results screen keeps the result, and with it the hold.
+		CHECK(suspendedForUnassistedMatch());
+	}
+	CHECK(!suspendedForUnassistedMatch());
+	{
+		auto assisted = OnlineUIFixtures::startingMatch(true);
+		CHECK(!suspendedForUnassistedMatch());
+	}
 }
 
 TEST_CASE("MCP/input boundaries preserve observation and cancel truncated batches [network]")
@@ -1764,8 +1822,18 @@ TEST_CASE("MCP/game tools read without control and act only under the lease [net
 	CHECK(execute("game_building", {{"token", token}, {"id", 0}, {"generation", 1}}).error.empty());
 	CHECK(execute("game_zone", {{"token", token}, {"zone", "guard"}, {"x", 1}, {"y", 1},
 								{"width", 2}, {"height", 2}}).error.empty());
+	CHECK_FALSE(execute("game_chat", {{"token", "stale"}, {"text", "hi"}}).error.empty());
+	CHECK(execute("game_chat", {{"token", token}, {"text", "hi"}}).error.empty());
 	CHECK(reached == std::vector<std::string>{"game_world", "game_place", "game_view",
-											  "game_building", "game_zone"});
+											  "game_building", "game_zone", "game_chat"});
+	// game_time status is a read; pausing, resuming and stepping are control.
+	CHECK(execute("game_time", {{"action", "status"}}).error.empty());
+	CHECK_FALSE(execute("game_time", {{"action", "pause"}}).error.empty());
+	CHECK_FALSE(execute("game_time", {{"action", "step"}, {"token", "stale"}, {"ticks", 5}}).error.empty());
+	CHECK(execute("game_time", {{"action", "step"}, {"token", token}, {"ticks", 5}}).error.empty());
+	CHECK(execute("game_view", {{"token", token}, {"x", 1}, {"y", 1}, {"zoom", 0.5}}).error.empty());
+	CHECK(reached.size() == 9);
+	CHECK(reached.back() == "game_view");
 
 	// A control that has disappeared satisfies a wait for it to be not visible...
 	const auto gone = execute("ui_wait", {{"timeout_ms", 2000},

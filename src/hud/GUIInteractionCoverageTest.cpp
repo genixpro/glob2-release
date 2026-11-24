@@ -2390,6 +2390,56 @@ TEST_CASE("MCP game tools read the colony, place by tile and centre the view" *
 	CHECK(std::abs(view.at("tile_screen").at("y").get<int>() -
 				   int(camera.offsetY + camera.height / 2)) <= 1);
 	CHECK_THROWS(commander.call("game_view", {{"x", 100000}, {"y", 0}}));
+
+	// zoom reuses the HUD camera's limits and keeps the tile centred at the new scale.
+	const auto zoomed = commander.call("game_view", {{"x", 30}, {"y", 25}, {"zoom", 2}});
+	CHECK(camera.zoom == doctest::Approx(2));
+	CHECK(zoomed.at("zoom") == doctest::Approx(2));
+	CHECK(zoomed.at("tile_pixels") == doctest::Approx(64));
+	CHECK(zoomed.at("zoom_range")[1] == doctest::Approx(MapCamera::MAX_ZOOM));
+	CHECK(std::abs(zoomed.at("tile_screen").at("x").get<int>() -
+				   int(camera.offsetX + camera.width / 2)) <= 1);
+	CHECK(zoomed.at("view").at("width").get<int>() < rect.at("width").get<int>());
+	commander.call("game_view", {{"x", 30}, {"y", 25}, {"zoom", 0}});
+	CHECK(camera.zoom == doctest::Approx(camera.minimumZoom()));
+	commander.call("game_view", {{"x", 30}, {"y", 25}, {"zoom", 1}});
+	CHECK(camera.zoom == doctest::Approx(1));
+	commander.call("game_view", {{"x", 30}, {"y", 25}});
+	CHECK(camera.zoom == doctest::Approx(1)); // Omitted zoom leaves it alone.
+
+	// game_time holds the match with the client-side hard pause, steps a budget and
+	// resumes, without queueing an order; a menu pause blocks stepping until resumed.
+	auto time = [&](Json args) { return commander.call("game_time", std::move(args)); };
+	auto status = time({{"action", "status"}});
+	CHECK(status.at("paused") == false);
+	CHECK(status.at("paused_by") == "none");
+	CHECK(status.at("tick") == world.game.stepCounter);
+	CHECK(status.at("speed") == "1x");
+	CHECK(status.at("ticks_per_second") == doctest::Approx(30));
+	status = time({{"action", "pause"}});
+	CHECK(world.gui.hardPause);
+	CHECK(world.gui.simulationHeld());
+	CHECK(status.at("paused") == true);
+	CHECK(status.at("paused_by") == "agent");
+	status = time({{"action", "step"}, {"ticks", 12}});
+	CHECK(world.gui.hardPause);
+	CHECK(world.gui.heldSteps == 12);
+	CHECK_FALSE(world.gui.simulationHeld());
+	CHECK(status.at("steps_remaining") == 12);
+	CHECK(status.at("target_tick") == world.game.stepCounter + 12);
+	world.gui.spendHeldStep();
+	CHECK(time({{"action", "status"}}).at("steps_remaining") == 11);
+	status = time({{"action", "resume"}});
+	CHECK_FALSE(world.gui.hardPause);
+	CHECK(world.gui.heldSteps == 0);
+	CHECK(status.at("paused") == false);
+	CHECK(world.gui.orderQueue.empty());
+	world.gui.gamePaused = true; // As after the menu's Pause.
+	CHECK(time({{"action", "status"}}).at("paused_by") == "menu");
+	CHECK_THROWS_WITH(time({{"action", "step"}}), doctest::Contains("resume first"));
+	time({{"action", "resume"}});
+	CHECK_FALSE(world.gui.orderQueue.empty()); // The ordinary, recorded resume order.
+	world.gui.gamePaused = false;
 }
 
 TEST_CASE("MCP game tools keep fog of war: last-seen buildings, no enemy health, explored ground only" *
@@ -2479,6 +2529,114 @@ TEST_CASE("MCP game tools keep fog of war: last-seen buildings, no enemy health,
 	CHECK(followUp[0].at("status") == "pending");
 }
 
+TEST_CASE("MCP game_world shows own stock and Inn happiness, reports losses and polls briefly" *
+		  doctest::test_suite("GUIInteractionCoverage"))
+{
+	glob2test::HeadlessGlobals globals({.seed = 19});
+	PresentationFrame published; // Outlives the GUI that points at it.
+	glob2test::HeadlessGame world({.wDec = 6, .hDec = 6, .teams = 2, .discovered = true, .clearImmobile = true,
+								   .loadDefaultRace = true, .header = true});
+	REQUIRE(world.addBuilding("swarm", 4, 4));
+	auto *inn = world.addBuilding("inn", 12, 4);
+	auto *hospital = world.addBuilding("hospital", 20, 4);
+	auto *school = world.addBuilding("school", 28, 4);
+	auto *enemyInn = world.addBuilding("inn", 40, 40, 0, 1);
+	REQUIRE(inn);
+	REQUIRE(hospital);
+	REQUIRE(school);
+	REQUIRE(enemyInn);
+	inn->setMaterial(WHEAT, 5);
+	inn->setMaterial(CHERRY, 3);
+	enemyInn->setMaterial(WHEAT, 8);
+	enemyInn->setMaterial(PRUNE, 9);
+	const auto me = world.game.teams[0]->me;
+	world.game.map.setMapDiscovered(30, 30, 20, 20, me);
+	world.game.map.switchFogOfWar();
+	world.game.map.setMapDiscovered(30, 30, 20, 20, me);
+	world.gui.localPlayer = world.gui.localTeamNo = 0;
+	world.gui.localTeam = world.team;
+	world.game.players[0]->type = BasePlayer::P_LOCAL;
+	world.game.snapshots().invalidateBoundary();
+	world.gui.rebuildBuildingChoices(false);
+	world.gui.prepareLocalPresentation(published);
+	world.gui.setPublishedScene(&published);
+	Hive::LocalCommander commander(world.gui, [](Json input)
+	{
+		std::promise<Json> ready;
+		ready.set_value(Hive::invoke(input));
+		return ready.get_future();
+	});
+	auto ownBuilding = [](const Json &state, const char *type)
+	{
+		for (const auto &b : state.at("colony").at("buildings"))
+			if (b.at("type") == type)
+				return b;
+		return Json();
+	};
+
+	// The panel's stock with capacities, units inside and the happiness the Inn offers:
+	// wheat, plus one level for the cherries it holds.
+	auto state = commander.call("game_world", Json::object());
+	const auto ownInn = ownBuilding(state, "inn");
+	REQUIRE(ownInn.is_object());
+	const auto capacity = [&](int material) { return "/" + std::to_string(inn->type->maxMaterial[material]); };
+	CHECK(ownInn.at("stock").at("food") == "5" + capacity(WHEAT));
+	CHECK(ownInn.at("stock").at("cherries") == "3" + capacity(CHERRY));
+	CHECK(ownInn.at("stock").at("prunes") == "0" + capacity(PRUNE));
+	CHECK(ownInn.at("inside") == "0/" + std::to_string(inn->maxUnitInside));
+	CHECK(ownInn.at("happiness") == 2);
+	CHECK(ownInn.at("happiness") == inn->availableHappynessLevel());
+	CHECK_FALSE(ownBuilding(state, "swarm").contains("happiness"));
+	// Another team's Inn shows nothing of its stock or happiness.
+	REQUIRE(state.at("others").at("buildings").size() == 1);
+	const auto &theirs = state.at("others").at("buildings")[0];
+	CHECK_FALSE(theirs.contains("stock"));
+	CHECK_FALSE(theirs.contains("happiness"));
+	CHECK_FALSE(theirs.contains("inside"));
+	CHECK(state.at("losses").at("buildings_destroyed").empty());
+	CHECK(state.at("losses").at("units_converted_away_since_last_read") == 0);
+
+	// A destroyed building and a demolished one are reported apart, with tiles, ahead
+	// of other alerts; conversion counts come from the colony's exact counter.
+	const auto ownSchool = ownBuilding(state, "school");
+	REQUIRE(ownSchool.is_object());
+	commander.call("game_building", {{"id", ownSchool.at("id")}, {"generation", ownSchool.at("generation")},
+									 {"action", "destroy"}});
+	hospital->kill();
+	school->kill();
+	world.game.teams[0]->unitConversionLost = 3;
+	world.game.snapshots().invalidateBoundary();
+	state = commander.call("game_world", Json::object());
+	const auto &alerts = state.at("alerts");
+	REQUIRE(alerts.size() >= 2);
+	std::set<std::string> kinds = {alerts[0].at("kind"), alerts[1].at("kind")};
+	CHECK(kinds == std::set<std::string>{"building_destroyed", "building_demolished"});
+	const auto &destroyed = state.at("losses").at("buildings_destroyed");
+	REQUIRE(destroyed.size() == 1);
+	CHECK(destroyed[0].at("type") == "hospital");
+	CHECK(destroyed[0].at("x") == 20);
+	CHECK(destroyed[0].at("y") == 4);
+	CHECK(state.at("losses").at("units_converted_away_total") == 3);
+	CHECK(state.at("losses").at("units_converted_away_since_last_read") == 3);
+	CHECK_FALSE(ownBuilding(state, "hospital").is_object());
+
+	// Brief: status, losses and one line per building, without the costlier sections.
+	const auto brief = commander.call("game_world", {{"detail", "brief"}});
+	for (const char *section : {"status", "units", "forces", "alerts", "losses", "buildings"})
+		CHECK(brief.contains(section));
+	for (const char *section : {"colony", "others", "resources", "placeable", "view"})
+		CHECK_FALSE(brief.contains(section));
+	CHECK(brief.at("losses").at("units_converted_away_since_last_read") == 0);
+	CHECK(brief.at("buildings").size() == 2);
+	std::string innLine;
+	for (const auto &line : brief.at("buildings"))
+		if (line.get<std::string>().starts_with("inn #"))
+			innLine = line;
+	CHECK(innLine.find(" at 12,4 ") != std::string::npos);
+	CHECK(innLine.find(" food 5" + capacity(WHEAT)) != std::string::npos);
+	CHECK(innLine.find(" happiness 2") != std::string::npos);
+}
+
 TEST_CASE("MCP game_building and game_zone queue the panel's orders and report caps" *
 		  doctest::test_suite("GUIInteractionCoverage"))
 {
@@ -2527,6 +2685,18 @@ TEST_CASE("MCP game_building and game_zone queue the panel's orders and report c
 	REQUIRE(move);
 	CHECK(move->x == 33);
 	CHECK(move->y == 34);
+	// A range above the flag type's maximum is capped and reported, not refused, so
+	// the rest of the change still applies.
+	result = commander.call("game_building", {{"id", flag->gid}, {"generation", flag->scriptIdentity},
+											  {"action", "move"}, {"x", 30}, {"y", 31},
+											  {"range", 10}, {"workers", 13}});
+	CHECK(result.at("range_capped_at") == flag->type->maxUnitStayRange);
+	orders = queued();
+	REQUIRE(orders.size() == 3);
+	auto range = std::dynamic_pointer_cast<OrderModifyFlag>(orders[1]);
+	REQUIRE(range);
+	CHECK(range->range == flag->type->maxUnitStayRange);
+	CHECK(std::dynamic_pointer_cast<OrderMoveFlag>(orders[2]));
 	// A stale generation or another team's id is refused, nothing queued.
 	CHECK_THROWS(commander.call("game_building", {{"id", swarm->gid}, {"generation", swarm->scriptIdentity + 1},
 												  {"workers", 1}}));
@@ -2541,4 +2711,18 @@ TEST_CASE("MCP game_building and game_zone queue the panel's orders and report c
 	CHECK(zone->centerY == 12);
 	CHECK(zone->maxX - zone->minX == 3);
 	CHECK(zone->maxY - zone->minY == 2);
+	// Chat queues the chat box's message, to the chat box's recipients; empty text
+	// queues nothing.
+	world.gui.chatMask = 0x5;
+	const auto chat = commander.call("game_chat", {{"text", "hello allies"}});
+	CHECK(chat.at("sent") == true);
+	orders = queued();
+	REQUIRE(orders.size() == 1);
+	auto message = std::dynamic_pointer_cast<MessageOrder>(orders[0]);
+	REQUIRE(message);
+	CHECK(message->recipientsMask == 0x5);
+	CHECK(message->messageOrderType == MessageOrder::NORMAL_MESSAGE_TYPE);
+	CHECK(std::string(message->getText()) == "hello allies");
+	CHECK_THROWS(commander.call("game_chat", {{"text", ""}}));
+	CHECK(queued().empty());
 }

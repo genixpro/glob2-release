@@ -4,6 +4,7 @@
 #include <deque>
 #include <set>
 #include "Building.h"
+#include "Material.h"
 #include "Map.h"
 #include <map>
 #include <cmath>
@@ -31,6 +32,7 @@ namespace
 LocalCommander *active = nullptr; // main thread only
 std::atomic<std::uint64_t> sessions{0};
 constexpr std::size_t JournalCapacity = 256;
+constexpr unsigned AlertTicks = 1500; // how long game_world keeps reporting an alert
 } // namespace
 Json playerAPI()
 {
@@ -208,6 +210,10 @@ Json LocalCommander::call(const std::string &tool, const Json &args)
 		return place(args);
 	if (tool == "game_view")
 		return view(args);
+	if (tool == "game_chat")
+		return chat(args);
+	if (tool == "game_time")
+		return time(args);
 	if (tool == "game_building")
 		return building(args);
 	if (tool == "game_zone")
@@ -538,7 +544,8 @@ void LocalCommander::update()
 }
 Json LocalCommander::world(const Json &args)
 {
-	const bool full = args.value("detail", std::string("summary")) == "full";
+	const auto detail = args.value("detail", std::string("summary"));
+	const bool full = detail == "full", brief = detail == "brief";
 	const int limit = args.value("limit", 100);
 	int ax = 0, ay = 0, aw = std::numeric_limits<int>::max(), ah = aw;
 	if (args.contains("area"))
@@ -555,6 +562,54 @@ Json LocalCommander::world(const Json &args)
 	boundary(
 		[&]
 		{
+			// What the panel of a selected building shows: each stock the HUD lists with
+			// its capacity (sites: delivered of needed), units inside, and for an Inn the
+			// happiness it offers (1 with wheat, +1 per fruit it holds more of than units
+			// inside; 0 when it cannot feed).
+			const auto describeStock = [&](Json &record, const Json &observed, const BuildingType &type)
+			{
+				Json stock = Json::object();
+				const auto materials = observed.value("materials", Json::array());
+				for (unsigned i = 0; i < MaterialCount && i < materials.size(); ++i)
+					if (type.maxMaterial[i] && gui.drawnScene().materialVisible(i))
+						stock[std::string(MaterialKeys[i])] =
+							std::to_string(materials[i].get<int>()) + "/" + std::to_string(type.maxMaterial[i]);
+				if (type.maxBullets)
+					stock["bullets"] = std::to_string(observed.value("bullets", 0)) + "/" +
+									   std::to_string(type.maxBullets);
+				if (!stock.empty())
+					record["stock"] = std::move(stock);
+				auto *building = gui.game.teams[team]->myBuildings[Building::GIDtoID(observed.value("id", 0))];
+				if (!building || type.isBuildingSite)
+					return;
+				if (type.maxUnitInside)
+					record["inside"] = std::to_string(building->unitsInside.size()) + "/" +
+									   std::to_string(building->maxUnitInside);
+				if (type.canFeedUnit)
+					record["happiness"] = building->availableHappynessLevel();
+			};
+			// One line per building for detail brief.
+			const auto briefLine = [](const Json &record)
+			{
+				const auto number = [&](const char *field, int fallback)
+				{ return std::to_string(record.value(field, fallback)); };
+				std::string line = record.value("type", std::string()) + " #" + number("id", 0) + " gen " +
+								   number("generation", 0) + " L" + number("level", 1) + " at " +
+								   number("x", 0) + "," + number("y", 0);
+				if (record.contains("site"))
+					line += " site";
+				line += " hp " + number("hp", 0) + "/" + number("max_hp", 0);
+				if (record.contains("workers"))
+					line += " workers " + number("workers", 0);
+				if (record.contains("stock"))
+					for (const auto &[material, amount] : record.at("stock").items())
+						line += " " + material + " " + amount.get<std::string>();
+				if (record.contains("inside"))
+					line += " inside " + record.at("inside").get<std::string>();
+				if (record.contains("happiness"))
+					line += " happiness " + number("happiness", 0);
+				return line;
+			};
 			auto scope = observations.captureObservation();
 			observations.observe();
 			const auto units = json(observations.query("units", {}));
@@ -589,6 +644,8 @@ Json LocalCommander::world(const Json &args)
 						record["workers"] = b["workers"];
 					if (type && type->isVirtual && b.contains("range"))
 						record["range"] = b["range"];
+					if (type)
+						describeStock(record, b, *type);
 					counts["buildings"] = counts["buildings"].get<int>() + 1;
 					if (int(own.size()) < limit)
 						own.push_back(std::move(record));
@@ -662,7 +719,8 @@ Json LocalCommander::world(const Json &args)
 										 {"width", type ? type->width : 1},
 										 {"height", type ? type->height : 1}});
 				}
-			// Other teams' buildings seen earlier and now under fog, as last seen.
+			// Other teams' buildings seen earlier and now under fog, as last seen. The
+			// refresh also notes which of the colony's own buildings are gone.
 			memoryTracked = true;
 			refreshMemory();
 			std::set<int> listed;
@@ -690,7 +748,7 @@ Json LocalCommander::world(const Json &args)
 				maxX = std::max(maxX, bx), maxY = std::max(maxY, by);
 			}
 			Json resources = Json::object();
-			if (cx >= 0)
+			if (cx >= 0 && !brief)
 			{
 				const int radius = args.value("resource_radius", 24);
 				const int w = gui.game.map.getW(), h = gui.game.map.getH();
@@ -718,16 +776,45 @@ Json LocalCommander::world(const Json &args)
 					resources[key] = {{"tiles", r.tiles}, {"amount", r.amount},
 									  {"nearest", {{"x", r.x}, {"y", r.y}, {"distance", r.distance}}}};
 			}
-			// The HUD's event rows: attacks, finished buildings, conversions, with tiles.
-			Json alerts = Json::array();
+			// Losses first: buildings gone since recent refreshes, then the HUD's event
+			// rows (attacks, conversions, finished buildings) with their tiles.
+			const auto now = gui.game.stepCounter;
+			Json alerts = Json::array(), lostBuildings = Json::array();
+			for (auto it = losses.rbegin(); it != losses.rend(); ++it)
+			{
+				const unsigned age = now > it->tick ? now - it->tick : 0;
+				if (age > AlertTicks)
+					continue;
+				Json loss = {{"event", (it->demolished ? "Building demolished: " : "Building destroyed: ") + it->type},
+							 {"kind", it->demolished ? "building_demolished" : "building_destroyed"},
+							 {"x", it->x}, {"y", it->y}, {"count", 1}, {"ticks_ago", age}};
+				if (!it->demolished)
+					lostBuildings.push_back({{"type", it->type}, {"x", it->x}, {"y", it->y}, {"ticks_ago", age}});
+				alerts.push_back(std::move(loss));
+			}
+			static const char *const eventKinds[GESize] = {"unit_attacked", "unit_converted_away",
+													  "unit_converted_to_you", "building_attacked",
+													  "building_completed"};
+			Json events = Json::array();
 			for (const auto &row : gui.gameEvents().rows())
 			{
-				const unsigned age = gui.game.stepCounter > row.lastTick ? gui.game.stepCounter - row.lastTick : 0;
-				if (age > 1500)
+				const unsigned age = now > row.lastTick ? now - row.lastTick : 0;
+				if (age > AlertTicks)
 					continue;
-				alerts.push_back({{"event", row.label}, {"x", row.x}, {"y", row.y},
-								  {"count", row.count}, {"ticks_ago", age}});
+				Json alert = {{"event", row.label}, {"kind", row.type < GESize ? eventKinds[row.type] : "event"},
+							  {"x", row.x}, {"y", row.y}, {"count", row.count}, {"ticks_ago", age}};
+				(row.type == GEUnitLostConversion ? alerts : events).push_back(std::move(alert));
 			}
+			for (auto &e : events)
+				alerts.push_back(std::move(e));
+			// Conversions are rate-limited as events; the colony's counter is exact.
+			const int convertedAway = gui.game.teams[team]->unitConversionLost;
+			Json lossSummary = {{"buildings_destroyed", lostBuildings},
+								{"units_converted_away_total", convertedAway},
+								{"units_converted_to_you_total", gui.game.teams[team]->unitConversionGained},
+								{"units_converted_away_since_last_read",
+								 convertedAwaySeen < 0 ? 0 : convertedAway - convertedAwaySeen}};
+			convertedAwaySeen = convertedAway;
 			// Follow up recent game_place requests: a queued order can still be refused
 			// by the game, or its site destroyed before it was built.
 			Json followUp = Json::array();
@@ -750,6 +837,20 @@ Json LocalCommander::world(const Json &args)
 			Json visibleUnits = Json::object();
 			for (const auto &[k, n] : otherUnits)
 				visibleUnits[k] = n;
+			const Json forces = {{"your_warriors_by_attack_level", ownWarriors},
+								 {"your_hungry_units", hungry},
+								 {"your_injured_units", injured}};
+			if (brief)
+			{
+				result = {{"tick", gui.game.stepCounter}, {"team", team},	   {"status", status},
+						  {"units", ownUnits},			   {"forces", forces}, {"alerts", alerts},
+						  {"losses", lossSummary},		   {"buildings", Json::array()}};
+				for (const auto &b : own)
+					result["buildings"].push_back(briefLine(b));
+				if (!followUp.empty())
+					result["placements"] = followUp;
+				return;
+			}
 			result = {{"tick", gui.game.stepCounter},
 					  {"team", team},
 					  {"map", {{"width", gui.game.map.getW()}, {"height", gui.game.map.getH()}}},
@@ -757,13 +858,12 @@ Json LocalCommander::world(const Json &args)
 					  {"others", {{"buildings", others}, {"units_by_team_and_type", visibleUnits}}},
 					  {"counts", counts},
 					  {"status", status},
-					  {"forces", {{"your_warriors_by_attack_level", ownWarriors},
-								  {"your_hungry_units", hungry},
-								  {"your_injured_units", injured}}},
+					  {"forces", forces},
 					  {"resources", resources},
 					  {"placeable", placeable}};
 			result["others"]["remembered_buildings"] = remembered;
 			result["alerts"] = alerts;
+			result["losses"] = lossSummary;
 			if (!followUp.empty())
 				result["placements"] = followUp;
 			if (full)
@@ -772,6 +872,8 @@ Json LocalCommander::world(const Json &args)
 				result["others"]["unit_list"] = seen;
 			}
 		});
+	if (brief)
+		return result;
 	const auto &camera = gui.camera;
 	result["view"] = {{"x", int(std::floor(camera.originX / 32))},
 					  {"y", int(std::floor(camera.originY / 32))},
@@ -813,6 +915,10 @@ Json LocalCommander::view(const Json &args)
 	if (x < 0 || y < 0 || x >= int(gui.game.map.getW()) || y >= int(gui.game.map.getH()))
 		throw std::runtime_error("Tile (" + std::to_string(x) + ", " + std::to_string(y) +
 								 ") is outside the map; read its size from game_world");
+	// Zoom first, about the view's centre, so the tile ends up centred at the new scale.
+	if (args.contains("zoom") && !gui.setMapZoom(args.at("zoom").get<double>()))
+		throw std::runtime_error("Zoom is unavailable while the torus view reveals itself; "
+								 "try again in a moment");
 	gui.centreViewOnTile(x + 0.5, y + 0.5);
 	const auto &camera = gui.camera;
 	const auto point = camera.worldToScreen((x + 0.5) * 32, (y + 0.5) * 32);
@@ -823,8 +929,75 @@ Json LocalCommander::view(const Json &args)
 			  {"height", int(std::ceil(camera.visibleH() / 32))}}},
 			{"tile_screen", {{"x", int(point.first)}, {"y", int(point.second)}}},
 			{"tile_pixels", 32 * camera.zoom},
+			{"zoom", camera.zoom},
+			{"zoom_range", {camera.minimumZoom(), MapCamera::MAX_ZOOM}},
 			{"note", "tile_screen is the tile's centre in the logical pixels ui_inspect bounds use; "
 					 "with a screenshot, prefer its capture_id coordinates."}};
+}
+Json LocalCommander::chat(const Json &args)
+{
+	const std::string text = args.at("text");
+	if (!gui.sendChatFromAutomation(text))
+		throw std::runtime_error("Chat text is empty");
+	return {{"sent", true},
+			{"text", text},
+			{"note", "Queued like the chat box's Send: the message shows in the game's "
+					 "message area, from your player name, after the next simulation step."}};
+}
+Json LocalCommander::time(const Json &args)
+{
+	// call() has checked this is the local human player's own match: no network
+	// peers, replay or spectating, where the player could hard-pause too.
+	if (!gui.canChangeGameSpeed())
+		throw std::runtime_error("Time control is only for local matches without network players");
+	const auto action = args.value("action", std::string("status"));
+	unsigned steps = 0;
+	if (action == "pause")
+	{
+		gui.heldSteps = 0;
+		gui.agentPaused = true;
+		gui.hardPause = true;
+	}
+	else if (action == "resume")
+	{
+		gui.heldSteps = 0;
+		gui.agentPaused = false;
+		gui.hardPause = false;
+		// A pause from the menu or the Pause key is the ordinary, recorded pause.
+		if (gui.gamePaused)
+			gui.requestPause(false);
+	}
+	else if (action == "step")
+	{
+		if (gui.gamePaused)
+			throw std::runtime_error("The match is paused from its menu or the Pause key; call "
+									 "game_time resume first, then pause and step");
+		steps = args.value("ticks", 30u);
+		gui.agentPaused = true;
+		gui.heldSteps = steps;
+		gui.hardPause = true;
+	}
+	const unsigned left = gui.heldSteps.load();
+	Json result = {{"tick", tick},
+				   {"paused", bool(gui.gamePaused) || gui.simulationHeld()},
+				   {"paused_by", gui.gamePaused	   ? "menu"
+								 : !gui.hardPause ? "none"
+								 : gui.agentPaused ? "agent"
+												   : "player"},
+				   {"steps_remaining", left},
+				   {"speed", globalContainer->settings.getGameSpeedText()},
+				   {"ticks_per_second", gui.targetTickRate()}};
+	if (action == "step")
+	{
+		result["target_tick"] = tick + steps;
+		result["note"] = "Stepping runs the ticks at the current speed, then holds again; "
+						 "check game_time status until steps_remaining is 0. Orders sent while "
+						 "paused (game_place, clicks) apply as the next ticks run.";
+	}
+	else if (result["paused"] == true)
+		result["note"] = "Paused: no ticks run. You can still read, place, click and type; "
+						 "orders apply once the match runs again (resume or step).";
+	return result;
 }
 void LocalCommander::refreshMemory()
 {
@@ -834,16 +1007,23 @@ void LocalCommander::refreshMemory()
 	auto scope = observations.captureObservation();
 	observations.observe();
 	std::set<int> visible;
+	std::map<int, Owned> owned;
 	for (const auto &b : json(observations.query("buildings", {})))
 	{
 		const int owner = b.value("team", -1);
-		if (owner == team)
-			continue;
 		const int gid = b.value("id", -1);
 		const auto *type = gui.game.buildingsTypes.get(b.value("type", 0));
 		if (!type || type->isVirtual)
 			continue;
 		const std::string key = b.value("key", std::string());
+		if (owner == team)
+		{
+			const auto *building = gui.game.teams[team]->myBuildings[Building::GIDtoID(gid)];
+			owned[gid] = {key.substr(0, key.find('.')), b.value("x", 0), b.value("y", 0),
+						  b.value("generation", 0u),
+						  building && building->buildingState == Building::WAITING_FOR_DESTRUCTION};
+			continue;
+		}
 		seenBuildings[gid] = {{"type", key.substr(0, key.find('.'))}, {"x", b.value("x", 0)},
 							  {"y", b.value("y", 0)}, {"width", type->width}, {"height", type->height},
 							  {"team", owner}, {"last_seen_tick", gui.game.stepCounter}};
@@ -854,6 +1034,20 @@ void LocalCommander::refreshMemory()
 		const auto cell = observations.cell(it->second.value("x", 0), it->second.value("y", 0));
 		it = cell.visible && !visible.count(it->first) ? seenBuildings.erase(it) : std::next(it);
 	}
+	// Own buildings that are gone since the last refresh. An identity reused by a new
+	// building has another generation, so the earlier one is gone too.
+	for (const auto &[gid, before] : ownBuildings)
+	{
+		const auto now = owned.find(gid);
+		if (now != owned.end() && now->second.generation == before.generation)
+			continue;
+		losses.push_back({before.type, before.x, before.y, gui.game.stepCounter,
+						  before.demolishing || demolitionOrders.count(gid) > 0});
+		demolitionOrders.erase(gid);
+	}
+	while (losses.size() > 32)
+		losses.pop_front();
+	ownBuildings = std::move(owned);
 }
 void LocalCommander::submit(const std::vector<Json> &descriptors)
 {
@@ -882,8 +1076,10 @@ Json LocalCommander::building(const Json &args)
 	const Json ref = {{"id", args.at("id")}, {"generation", args.at("generation")}};
 	std::vector<Json> orders;
 	Json changed = Json::array();
-	// A request above the building's unit limit is capped, and the reply says so.
+	// A request above the building's unit limit, or a flag range above its type's
+	// maximum, is capped, and the reply says so.
 	int limit = MAX_BUILDING_WORKER_REQUEST;
+	int maximumRange = -1;
 	boundary(
 		[&]
 		{
@@ -891,9 +1087,12 @@ Json LocalCommander::building(const Json &args)
 			if (Building::GIDtoTeam(id) != team)
 				return;
 			if (const auto *b = gui.game.teams[team]->myBuildings[Building::GIDtoID(id)])
+			{
 				limit = std::min(limit, int(b->type->semantics.assignmentLimit));
+				maximumRange = b->type->maxUnitStayRange;
+			}
 		});
-	int requested = 0;
+	int requested = 0, rangeRequested = 0;
 	if (args.contains("workers"))
 	{
 		requested = args.at("workers");
@@ -916,7 +1115,9 @@ Json LocalCommander::building(const Json &args)
 	}
 	if (args.contains("range"))
 	{
-		orders.push_back({{"type", "range"}, {"building", ref}, {"range", args.at("range")}});
+		rangeRequested = args.at("range");
+		const int range = maximumRange >= 0 ? std::min(rangeRequested, maximumRange) : rangeRequested;
+		orders.push_back({{"type", "range"}, {"building", ref}, {"range", range}});
 		changed.push_back("range");
 	}
 	if (args.contains("action"))
@@ -929,9 +1130,15 @@ Json LocalCommander::building(const Json &args)
 		else if (a == "cancel_upgrade")
 			orders.push_back({{"type", "cancelConstruction"}, {"building", ref}, {"workers", args.value("workers", 1)}});
 		else if (a == "destroy")
+		{
 			orders.push_back({{"type", "delete"}, {"building", ref}});
+			demolitionOrders.insert(args.at("id").get<int>());
+		}
 		else if (a == "cancel_destroy")
+		{
 			orders.push_back({{"type", "cancelDelete"}, {"building", ref}});
+			demolitionOrders.erase(args.at("id").get<int>());
+		}
 		else if (a == "move")
 		{
 			if (!args.contains("x") || !args.contains("y"))
@@ -945,6 +1152,8 @@ Json LocalCommander::building(const Json &args)
 							"step; read game_world to confirm."}};
 	if (requested > limit)
 		result["workers_capped_at"] = limit;
+	if (maximumRange >= 0 && rangeRequested > maximumRange)
+		result["range_capped_at"] = maximumRange;
 	if (orders.empty())
 		throw std::runtime_error("Nothing to change: pass workers, priority, production, range or action");
 	submit(orders);
