@@ -16,6 +16,15 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ENTITLEMENTS = ROOT / "platforms/macos/AppStore.entitlements"
+# Product copyright line decided by the project owner on 2026-11-25.
+APP_COPYRIGHT = (
+    "© 2006–2026 Bradley Arsenault. © 2001–2008 Stephane Magnenat. "
+    "© the Globulation 2 contributors."
+)
+# Declared Age Range (src/app/AgeGate.h, platforms/apple/AgeSignal.swift) is a
+# restricted entitlement: only a profile whose App ID has the capability may
+# carry it, so ad hoc test builds leave it out (the game then asks its own question).
+AGE_RANGE_ENTITLEMENT = "com.apple.developer.declared-age-range"
 ICONS = ROOT / "content/data/icons"
 ICON_MASTER = ROOT / "content-src/icons/app/glob2-icon-1024.png"
 sys.path.insert(0, str(ROOT / "buildsys"))
@@ -66,6 +75,10 @@ def distribution_entitlements(profile_path, bundle_id):
         entitlements = plistlib.load(file)
     entitlements["com.apple.application-identifier"] = app_id
     entitlements["com.apple.developer.team-identifier"] = team_ids[0]
+    if not claims.get(AGE_RANGE_ENTITLEMENT):
+        raise ValueError("provisioning profile lacks Declared Age Range: enable the capability on the "
+                         "App ID and download the profile again (docs/releases/ios-app-store.md)")
+    entitlements[AGE_RANGE_ENTITLEMENT] = True
     return entitlements
 
 
@@ -121,7 +134,7 @@ def main():
     # The arm64 release and its bundled Homebrew libraries are built on macos-26.
     info["LSMinimumSystemVersion"] = "26.0"
     info["LSApplicationCategoryType"] = "public.app-category.strategy-games"
-    info["NSHumanReadableCopyright"] = "Copyright Globulation 2 contributors"
+    info["NSHumanReadableCopyright"] = APP_COPYRIGHT
     with info_path.open("wb") as file:
         plistlib.dump(info, file)
     run("plutil", "-lint", info_path)
