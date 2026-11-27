@@ -152,6 +152,7 @@ PLATFORM_STACK_PATHS = (
     'services/online/packages/db/migrations/', 'services/online/apps/api/src/main.ts',
     'services/online/apps/worker/src/main.ts', 'services/online/apps/engine-agent/src/main.ts',
     'services/online/apps/music-worker/', 'services/online/apps/ai-music-worker/',
+    'services/online/apps/crash-worker/src/main.ts',
 )
 TRANSPORT_HARNESSES = {'NetConnectionHarness.cpp', 'NativeMultiplayerPeer.cpp', 'WssTransportHarness.cpp',
                        'WssListenerHarness.cpp', 'LANDiscoveryHarness.cpp', 'run-network-transport-tests.py'}
@@ -262,7 +263,7 @@ def select(paths, labels=(), known=False):
                 add(path, 'native', 'map_generators', 'compatibility')
             else:
                 add(path, 'native')
-        elif path.startswith(('buildsys/', 'cmake/', 'libs/usl/', 'content/data/terrain/', 'content/data/resources/', 'content/data/units/')) or path in {'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'libs/gag/include/AudioFormat.h', 'tools/image_encoding.json', 'tools/terrain_tileset.py', 'tools/terrain_catalog.py', 'tools/test_terrain_tileset.py'} or unclassified(path):
+        elif path.startswith(('buildsys/', 'cmake/', 'libs/usl/', 'content/data/terrain/', 'content/data/resources/', 'content/data/units/')) or path in {'CMakeLists.txt', 'CMakePresets.json', 'vcpkg.json', 'libs/gag/include/AudioFormat.h', 'tools/image_encoding.json', 'tools/sprite-quality-curves.json', 'tools/terrain_tileset.py', 'tools/terrain_catalog.py', 'tools/test_terrain_tileset.py'} or unclassified(path):
             add(path, *FLAGS)
         elif path.startswith(('test/fixtures/', 'test/maxima/fixtures/', 'test/support/', '.github/')) or path in {
             'test/run_tests.py', 'test/ci_native_shard_plan.py', 'test/ci-native-auxiliary.json',

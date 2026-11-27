@@ -304,7 +304,10 @@ an executable over static archives, and `-fPIC` would make GCC treat each global
 function as interposable and stop inlining it. `dev_fast` replaces every `-g`/`-O` with `-O0 -g1`; `perf=1` compiles
 C++ with `-O2 -g1` (`-O3` with `opt=3`) and links at the same level; `release=1`
 adds `-O3`, links with `-O3` and strips with `-s` (test binaries
-keep their symbols) unless `retain_symbols=1`. Native release builds also
+keep their symbols) unless `retain_symbols=1`. Outside macOS, release builds
+compile with `-g1` instead of `-g`, and the client links unstripped with a build ID,
+is copied to `src/glob2.debug` (`glob2.exe.debug`) and is then stripped, so the
+release workflows can upload its [crash symbols](../multiplayer/crash-reports.md#symbols). Native release builds also
 optimize the C++ across files at link time: GCC (Linux, MinGW) with `-flto=auto`, clang with
 `-flto=thin` (on Linux only when `ld.lld` is installed, which then links; on macOS
 with a per-executable `-object_path_lto` directory, so the dSYM keeps its debug
@@ -447,7 +450,10 @@ store requirements separately; a feature profile does not establish acceptance.
 Each capability can be overridden with `feature_commander`,
 `feature_authoring_links`, `feature_community_ai` and
 `feature_community_generators` (0 or 1). Restricted China/Amazon editions still
-force Commander and authoring links off. Resolved capabilities are recorded in
+force Commander and authoring links off. `problem_reports=0` keeps
+[Report a Problem](../multiplayer/problem-reports.md) to Save to file, never
+uploading; it defaults to off for China/Amazon editions, and the F-Droid
+(`android.py --fdroid`) and Fedora package builds pass it. Resolved capabilities are recorded in
 `identity.json` beside the build outputs and in generated `BuildConfig.h`.
 Distinct profiles use isolated output directories; dependencies remain shared.
 An explicit `--build` directory refuses an incompatible existing identity.

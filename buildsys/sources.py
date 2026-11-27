@@ -301,6 +301,7 @@ CLIENT_SOURCES = (
     'ui/screens/HandPreferenceScreen.cpp',
     'ui/screens/AudioPreferenceScreen.cpp',
     'ui/screens/AgeQuestionScreen.cpp',
+    'ui/screens/ProblemReportScreen.cpp',
     'ui/DiscordCommunity.cpp',
     'map/Map.cpp',
     'map/TerrainProperties.cpp',
@@ -583,6 +584,8 @@ CLIENT_SOURCES = (
     'map/Sector.cpp',
     'app/Settings.cpp',
     'app/AgeGate.cpp',
+    'app/ProblemReport.cpp',
+    'app/CrashCapture.cpp',
     'app/PortalPolicy.cpp',
     'app/SystemLanguage.cpp',
     'app/DeviceProfile.cpp',
@@ -951,11 +954,12 @@ MOBILE_SOURCES = ('platforms/web/VoiceRecorder.cpp', 'platforms/mobile/MobilePat
                   'platforms/mobile/Documents.cpp', 'platforms/mobile/CertificateTrust.cpp',
                   'platforms/mobile/TemporaryFiles.cpp')
 ANDROID_SOURCES = ('platforms/mobile/android/Documents.cpp', 'platforms/mobile/android/CertificateTrust.cpp',
-                   'platforms/mobile/android/AgeSignal.cpp')
+                   'platforms/mobile/android/AgeSignal.cpp', 'platforms/mobile/android/CrashCapture.cpp')
 IOS_SOURCES = ('platforms/mobile/ios/SafeArea.mm', 'platforms/mobile/ios/Documents.mm',
-               'platforms/mobile/ios/LaunchLinks.mm', 'platforms/mobile/ios/CertificateTrust.cpp')
+               'platforms/mobile/ios/LaunchLinks.mm', 'platforms/mobile/ios/CertificateTrust.cpp',
+               'platforms/mobile/ios/CrashCapture.mm')
 # iOS compiles this one with automatic reference counting.
-IOS_ARC_SOURCES = ('platforms/mobile/ios/Documents.mm',)
+IOS_ARC_SOURCES = ('platforms/mobile/ios/Documents.mm', 'platforms/mobile/ios/CrashCapture.mm')
 
 
 def mobile_sources(target):

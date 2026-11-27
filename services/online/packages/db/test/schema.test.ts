@@ -997,6 +997,52 @@ const typedColumns: ColumnLists = {
     'details',
     'created_at',
   ],
+  crash_reports: [
+    'id',
+    'submission_id',
+    'kind',
+    'install_id',
+    'version',
+    'version_minor',
+    'sim_revision',
+    'distribution',
+    'platform',
+    'os',
+    'device_class',
+    'device_tier',
+    'description',
+    'size',
+    'attachments',
+    'bundle_key',
+    'received_at',
+    'status',
+    'group_id',
+    'reason',
+    'frames',
+    'match_tick',
+    'match_seed',
+    'processed_at',
+  ],
+  crash_releases: ['version', 'first_upload_at'],
+  crash_symbols: [
+    'kind',
+    'module',
+    'debug_id',
+    'version',
+    'os',
+    'arch',
+    'size',
+    'blob_key',
+    'uploaded_at',
+  ],
+  crash_groups: [
+    'id',
+    'signature',
+    'first_version',
+    'last_version',
+    'first_seen_at',
+    'last_seen_at',
+  ],
   blobs: [
     'sha256',
     'size',
@@ -1548,6 +1594,9 @@ describe('migrations', () => {
         '0058_generator_studio',
         '0059_unit_catalogs',
         '0060_age_bands',
+        '0061_crash_reports',
+        '0062_crash_groups',
+        '0063_java_crash_reports',
       ]);
       expect(
         (
@@ -1617,7 +1666,7 @@ describe('migrations', () => {
         existing.db,
       );
       const upgraded = await migrateToLatest(existing.db);
-      expect(upgraded).toHaveLength(39);
+      expect(upgraded).toHaveLength(42);
       expect(upgraded.every((migration) => migration.status === 'Success')).toBe(true);
       expect(
         await existing.db
@@ -1772,6 +1821,9 @@ describe('migrations', () => {
         ['0058_generator_studio', 'Success'],
         ['0059_unit_catalogs', 'Success'],
         ['0060_age_bands', 'Success'],
+        ['0061_crash_reports', 'Success'],
+        ['0062_crash_groups', 'Success'],
+        ['0063_java_crash_reports', 'Success'],
       ]);
       for (const table of [
         'colony_skin_versions',
@@ -1923,6 +1975,9 @@ describe('migrations', () => {
         ['0058_generator_studio', 'Success'],
         ['0059_unit_catalogs', 'Success'],
         ['0060_age_bands', 'Success'],
+        ['0061_crash_reports', 'Success'],
+        ['0062_crash_groups', 'Success'],
+        ['0063_java_crash_reports', 'Success'],
       ]);
       expect(
         await db

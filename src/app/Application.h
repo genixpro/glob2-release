@@ -40,12 +40,19 @@ class Application : public GAGCore::ApplicationHost::Loop
 	std::uint32_t lastFrame = 0;
 	int pendingViewportWidth = 0, pendingViewportHeight = 0;
 	bool hidden = false;
+	// A web portal holds the game for an ad or its own pause (ApplicationHost::hostHeld).
+	bool held = false;
 	bool framed = false, drawn = false; // startup phase marks (GAGCore::StartupPhase)
 	bool quitting = false;
-	void mainMenu();
+	// Asks the first-run questions still unanswered, else opens the main menu;
+	// true when it opened the main menu. A portal's first visit starts in the
+	// introduction lesson instead (PortalPolicy::landsInFirstLesson).
+	bool mainMenu();
 	void installStagedAssets();
 	void choose(int choice);
 	void withAgeBand(std::function<void()> next);
 	std::uint64_t ageRequest = 0; ///< the newest withAgeBand request
+	bool crashesOffered = false; ///< the last run's crashes were looked at
+	void offerCrashReports();
 
 };

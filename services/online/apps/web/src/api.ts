@@ -4,6 +4,9 @@ import { t } from './messages.ts';
 // origin, so requests carry the web session cookie (set by /signin); writes are
 // same-origin fetches, which the API's CSRF check accepts.
 import type {
+  AdminCrashReportList,
+  AdminCrashReportDetail,
+  AdminCrashGroupList,
   AiProfile,
   PlayerDirectory,
   AdminAccount,
@@ -182,6 +185,16 @@ export const api = {
     request<AdminAccount>('POST', `/api/v1/admin/accounts/${id}/ban`, {
       body: { banned, ...(reason ? { reason } : {}) },
     }),
+  adminCrashReports: (query: Query = {}, signal?: AbortSignal) =>
+    get<AdminCrashReportList>('/api/v1/admin/crash-reports', query, signal),
+  adminCrashReport: (id: string, signal?: AbortSignal) =>
+    get<AdminCrashReportDetail>(
+      `/api/v1/admin/crash-reports/${encodeURIComponent(id)}`,
+      {},
+      signal,
+    ),
+  adminCrashGroups: (query: Query = {}, signal?: AbortSignal) =>
+    get<AdminCrashGroupList>('/api/v1/admin/crash-groups', query, signal),
   adminMatches: (query: Query = {}, signal?: AbortSignal) =>
     get<MatchList>('/api/v1/admin/matches', query, signal),
   adminReports: (query: Query = {}, signal?: AbortSignal) =>

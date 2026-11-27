@@ -113,6 +113,18 @@ jobs:
           python3 tools/dev_build.py target=web release=1 client_profile=free $EDITION_ARGUMENTS -j$(nproc) web-package
           python3 platforms/web/package-static.py --source "$SOURCE" --output "$OUTPUT"
           python3 platforms/web/package-static.py --verify "$OUTPUT"
+      - name: Hand over crash symbols
+        if: ${{ (inputs.publish || inputs.gamejolt) && hashFiles('tools/symbols/dump_syms.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: crash-symbols-browser${{ matrix.artifact }}
+          path: |
+            ${{ matrix.source }}/index.wasm
+            ${{ matrix.source }}/index.js.symbols
+            ${{ matrix.source }}/threaded/index.wasm
+            ${{ matrix.source }}/threaded/index.js.symbols
+          if-no-files-found: error
+          retention-days: 7
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: client-build-browser${{ matrix.artifact }}
@@ -125,7 +137,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [build, crash-symbols]
     if: inputs.publish
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -217,12 +229,12 @@ jobs:
 
   # Web portals host their own copy of the browser game, so every browser release
   # also produces each portal's upload from the same verified package (no rebuild).
-  # Game Jolt uploads with gjpush (the gamejolt job); for the others, download the
-  # <portal>-upload artifact and submit it on the portal's dashboard
-  # (docs/releases/<portal>.md).
-  # Yandex Games (100 MB unpacked) and Poki (small file size) reject the full
-  # package and wait on the small download build; package-portal.py fails above a
-  # portal's limit, so adding them here before that build would fail the release.
+  # Each leg packages one edition: the standard browser-release artifact, or the
+  # download-size lite edition (browser-release-lite) for the portals that need a
+  # small download (CrazyGames, Poki) or limit the unpacked size (Yandex Games:
+  # 100 MB, which only lite meets). Game Jolt uploads with gjpush (the gamejolt
+  # job); for the others, download the <portal>-upload or <portal>-lite-upload
+  # artifact and submit it on the portal's dashboard (docs/releases/<portal>.md).
   portals:
     needs: build
     runs-on: ubuntu-24.04
@@ -232,7 +244,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        portal: [gamepix, crazygames, newgrounds, gamejolt, gamedistribution]
+        include:
+          - {portal: gamepix, edition: ''}
+          - {portal: newgrounds, edition: ''}
+          - {portal: gamejolt, edition: ''}
+          - {portal: gamedistribution, edition: ''}
+          - {portal: crazygames, edition: -lite}
+          - {portal: poki, edition: -lite}
+          - {portal: yandex, edition: -lite}
     steps:
       # The packager comes from this workflow's revision: release tags can predate it.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -252,17 +271,18 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: browser-release
+          name: browser-release${{ matrix.edition }}
           path: candidate
       - name: Package and verify the portal upload
         env:
           TAG: ${{ inputs.tag }}
           PORTAL: ${{ matrix.portal }}
+          EDITION: ${{ matrix.edition }}
           # Empty until the game is registered; the packager then uses a placeholder ID.
           GLOB2_GAMEDISTRIBUTION_GAME_ID: ${{ vars.GLOB2_GAMEDISTRIBUTION_GAME_ID }}
         run: |
           set -euo pipefail
-          zip="upload/glob2-${TAG#v}-$PORTAL.zip"
+          zip="upload/glob2-${TAG#v}-$PORTAL$EDITION.zip"
           python3 platforms/web/package-portal.py candidate --portal "$PORTAL" \
             --design-system design-system --output "$zip"
           {
@@ -271,7 +291,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: ${{ matrix.portal }}-upload
+          name: ${{ matrix.portal }}${{ matrix.edition }}-upload
           path: upload/
           if-no-files-found: error
           compression-level: 0
@@ -280,7 +300,7 @@ jobs:
   # gamejolt-upload artifact as a browser build. The gamejolt-release environment
   # holds GJPUSH_TOKEN and needs the owner's approval (docs/releases/gamejolt.md).
   gamejolt:
-    needs: portals
+    needs: [portals, crash-symbols]
     if: inputs.gamejolt
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -334,3 +354,13 @@ jobs:
           gjpush --game "$GAMEJOLT_GAME_ID" --package "$GAMEJOLT_PACKAGE_ID" \
             --release "$version" --browser "upload/glob2-${TAG#v}-gamejolt.zip"
           echo "Pushed \`glob2-${TAG#v}-gamejolt.zip\` to Game Jolt as release $version." >> "$GITHUB_STEP_SUMMARY"
+
+  # Uploads this release's crash symbols before anything is published
+  # (docs/multiplayer/crash-reports.md#symbols).
+  crash-symbols:
+    needs: build
+    if: ${{ inputs.publish || inputs.gamejolt }}
+    uses: ./.github/workflows/crash-symbols.yml
+    with:
+      version: ${{ inputs.tag }}
+      artifacts: crash-symbols-browser*

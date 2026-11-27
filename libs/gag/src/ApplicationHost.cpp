@@ -206,11 +206,17 @@ std::unique_ptr<Persistence> persistStorage()
 namespace { std::atomic<bool> linksAllowed{true}; }
 void setExternalLinksAllowed(bool allowed) { linksAllowed = allowed; }
 bool externalLinksAllowed() { return linksAllowed; }
+namespace { std::atomic<bool> fullscreenAllowed{true}; }
+void setFullscreenControlAllowed(bool allowed) { fullscreenAllowed = allowed; }
+bool fullscreenControlAllowed() { return fullscreenAllowed; }
 std::string portalDescription()
 {
 	const char *value = SDL_getenv("GLOB2_PORTAL");
 	return value ? value : "";
 }
+// Only browser portal packages show ads.
+bool matchBreak(MatchBreak) { return false; }
+bool hostHeld() { return false; }
 bool openUrl(const std::string &url, UrlPurpose purpose)
 {
 	if (url.rfind("https://", 0) != 0 && url.rfind("http://", 0) != 0)
@@ -262,9 +268,24 @@ bool copyText(const std::string &text)
 	return SDL_SetClipboardText(text.c_str());
 }
 void importChanged(const char *) {}
+namespace
+{
+std::function<void(const char *)> &screenObserver()
+{
+	static std::function<void(const char *)> observer;
+	return observer;
+}
+}
+void setScreenObserver(std::function<void(const char *)> observer)
+{
+	screenObserver() = std::move(observer);
+}
 void screenChanged(const char *name) {
 #ifdef GLOB2_MOBILE
     SDL_Log("Glob2 screen ready: %s", name);
+#else
+    if (screenObserver())
+        screenObserver()(name);
 #endif
 }
 void simulationAdvanced(std::uint32_t) {}

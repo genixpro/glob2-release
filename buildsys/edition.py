@@ -15,6 +15,9 @@ them changes what the simulation computes; a build without an AI or generator
 simply cannot start or load a game that uses it.
 """
 
+import json
+from pathlib import Path
+
 # Every switch but hd_assets also removes code or interface; the browser-only
 # switches (WEB_FEATURES) stay on in native builds.
 COMPILE_FEATURES = (
@@ -47,19 +50,23 @@ ASSET_FEATURES = (
     'page_font',          # the launcher's own font (the page then uses the browser's)
 )
 FEATURES = COMPILE_FEATURES + ASSET_FEATURES
-DEFAULT_WEBP_QUALITY = 90
+# The standard edition's lossy WebP quality: the packager's own (tools/package_assets.py).
+_ENCODING = json.loads((Path(__file__).resolve().parents[1] / 'tools/image_encoding.json').read_text())
+DEFAULT_WEBP_QUALITY = _ENCODING['quality']
+# The standard browser sprite groups' perceptual target (tools/sprite-quality-curves.json).
+DEFAULT_SPRITE_TARGET = _ENCODING['spriteTargets'].get('web', _ENCODING['spriteTargets']['default'])
 # Switches only the browser build has; native editions keep them standard.
 WEB_FEATURES = ('hd_assets', 'video_assets', 'renderer_gl', 'renderer_software', 'renderer_webgpu',
                 'harfbuzz', 'sdl_extras', 'premade_maps', 'unused_files', 'page_font')
 # Browser data and link settings: name -> (standard, lite, kind). Kinds: 'int' within
 # its range, 'bool', or a tuple of the allowed values.
 SETTINGS = {
-    'webp_quality': (DEFAULT_WEBP_QUALITY, 70, (1, 100)),   # lossy WebP quality
+    'webp_quality': (DEFAULT_WEBP_QUALITY, 75, (1, 100)),   # lossy WebP quality (docs/development/package-size.md)
+    'sprite_target': (DEFAULT_SPRITE_TARGET, 70, (0, 100)), # sprite groups' SSIMULACRA2 target (package-size.md)
     'web_opt': ('O3', 'O3', ('O3', 'Os', 'Oz')),            # compile and link optimization (lite keeps speed)
     'web_assertions': (True, False, 'bool'),                # Emscripten runtime assertions
     'web_closure': (False, False, 'bool'),                  # Closure-compile the JavaScript glue
     'music_bitrate': (0, 24, (0, 48)),                      # kbps of the checked-in music copies; 0 the originals
-    'sheet_sprites': (False, True, 'bool'),                 # pack terrain decor and small families into sheets
     'variant_blocks': (0, 1, (0, 4)),                       # terrain variant blocks kept; 0 all
     'native_stones': (False, True, 'bool'),                 # stone maps at native resolution (no HD art)
     'terrain_fallbacks': (False, True, 'bool'),             # draw materials with their small_build_fallback

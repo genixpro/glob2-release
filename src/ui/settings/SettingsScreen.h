@@ -35,7 +35,8 @@ class SettingsScreen : public Glob2UI::Screen
 		Experiments,
 		CustomAIs,
 		CustomGenerators,
-        MCPServer
+        MCPServer,
+		Privacy
 	};
 	enum class Kind
 	{
@@ -80,6 +81,9 @@ class SettingsScreen : public Glob2UI::Screen
 	// Stable semantic interface, also used by native integration tests.
 	void selectCategory(Category category);
 	std::vector<Category> visibleCategories() const;
+	// Whether Display offers the Window mode (fullscreen) choice: never in a
+	// portal, whose page has its own fullscreen button (src/app/PortalPolicy.h).
+	static bool offersWindowMode();
 	Category category() const { return current; }
 	// Rows with their laid-out rectangles.
 	const std::vector<Row> &rows();
@@ -156,6 +160,7 @@ class SettingsScreen : public Glob2UI::Screen
 	void buildHiveMind();
 	// Settings > Recording (SettingsScreenRecording.cpp): controls, hotkey, FFmpeg status.
 	void buildRecording();
+	void buildPrivacy();
     void buildMCP();
     std::string mcpStatus;
 	// Rebuild the Recording tab when session state changes.

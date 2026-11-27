@@ -128,6 +128,28 @@ std::unique_ptr<Persistence> persistStorage();
 // portal mode can be tried outside a browser. src/app/PortalPolicy.h parses it.
 std::string portalDescription();
 
+// Natural breaks in play, for web portal packages that show ads between
+// matches (platforms/web/portal-core.js, docs/releases/web-portals.md#ad-breaks).
+// The game reports every local match: Starting before its first tick, Ended
+// when its results show, Left when the player leaves it for the menu. Within a
+// match it also reports Paused when play stops for the in-game menu or a pause
+// and Resumed when play continues; those mark gameplay only and never run an ad.
+// The host decides whether a break runs an ad. matchBreak returns true when the
+// host now holds the game for one; a caller about to start a match then waits
+// until hostHeld() is false. Native hosts, and pages without a portal, return false.
+enum class MatchBreak
+{
+	Starting,
+	Ended,
+	Left,
+	Paused,
+	Resumed,
+};
+bool matchBreak(MatchBreak point);
+// Whether the host holds the game: an ad break, or a portal SDK's own pause.
+// The application then runs no screen frames, so the simulation and input stop.
+bool hostHeld();
+
 // What an openUrl call opens. A portal that forbids external links still lets
 // the online sign-in page open when it allows sign-in (src/app/PortalPolicy.h).
 enum class UrlPurpose
@@ -139,6 +161,11 @@ enum class UrlPurpose
 // nothing for UrlPurpose::Link and returns false. On by default.
 void setExternalLinksAllowed(bool allowed);
 bool externalLinksAllowed();
+// Off in portal mode, where the portal's page offers its own fullscreen button
+// and some portals (CrazyGames) forbid the game's: F11 then does nothing and
+// Settings offers no window mode. On by default.
+void setFullscreenControlAllowed(bool allowed);
+bool fullscreenControlAllowed();
 
 // Opens an http(s) URL in the system browser (a new tab on the web). Returns
 // false when the host cannot, or a popup blocker refused it; browsers allow it
@@ -163,6 +190,9 @@ bool copyText(const std::string &text);
 
 // Read-only diagnostics; hosts decide whether and how to publish them.
 void screenChanged(const char *name);
+// Also told every screenChanged name, on every host (Report a Problem keeps
+// them as breadcrumbs in its log tail). Empty removes it.
+void setScreenObserver(std::function<void(const char *)> observer);
 void importChanged(const char *state);
 void simulationAdvanced(std::uint32_t tick);
 void matchFrame(bool paused);

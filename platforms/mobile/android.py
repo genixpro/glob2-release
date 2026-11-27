@@ -11,7 +11,7 @@ import subprocess
 import sys
 sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'buildsys'))
 from build_layout import build_identity, default_directory, BuildLock, PACKAGE_VERSION
-from dev_build import dependency_identity
+from dev_build import dependency_identity, crash_capture
 import official_instance
 from mobile_toolchain import ROOT, LOCK, discover
 from mobile_artifacts import verify_android_shared_library, verify_android_symbols, verify_android_archive_symbols
@@ -157,12 +157,17 @@ def main():
         return
     arches=('arm64-v8a','armeabi-v7a') if args.amazon_apk else (args.arch,)
     base_options={'target':'android','release':int(args.release),'china':int(args.china)}
+    # F-Droid builds keep Report a Problem's Save to file but never upload.
+    if args.fdroid: base_options['problem_reports']=0
     outputs={abi:ROOT/default_directory(build_identity(dict(base_options,arch=abi,
              amazon=int(args.amazon_apk)))) for abi in arches}
     dependency_outputs={abi:ROOT/default_directory(build_identity(dict(base_options,arch=abi))) for abi in arches}
     dependency_identities={abi:dependency_identity(build_identity(dict(base_options,arch=abi))) for abi in arches}
     dependency_toolchains={abi:discover(dependency_identities[abi], {'android_sdk':str(sdk)})['fingerprint'] for abi in arches}
     prefixes={abi:dependency_prefix(ROOT, dependency_identities[abi], dependency_toolchains[abi]) for abi in arches}
+    # Builds that send crash reports package Crashpad's handler beside libmain.so
+    # (platforms/mobile/android/CrashCapture.cpp).
+    crash_handler=crash_capture(build_identity(dict(base_options,arch=args.arch,amazon=int(args.amazon_apk))))
     # SDL GPU on Android needs Vulkan SPIR-V, which only the pinned build-only
     # glslang produces. Provision it rather than silently packaging without it.
     native_env=dict(os.environ)
@@ -173,6 +178,7 @@ def main():
     for abi in arches:
         subprocess.run([sys.executable,str(ROOT/'tools/dev_build.py'),'target=android','arch='+abi,
             'release='+str(int(args.release)),'china='+str(int(args.china)),'amazon='+str(int(args.amazon_apk)),
+            *(['problem_reports=0'] if args.fdroid else []),
             'android_sdk='+str(sdk),'mobile_deps='+str(prefixes[abi]),'-j'+str(args.jobs)],cwd=ROOT,env=native_env,check=True)
         renderer_shaders.require_sdl_gpu_shaders(outputs[abi]/'shaders','android')
     with BuildLock(output):
@@ -199,7 +205,9 @@ def main():
             'official_instance_host':official_instance.host(official_instance.origin()),
             # Google Play Age Signals: the Play-only library goes into the Google Play
             # build alone (platforms/mobile/android-play/, src/app/AgeGate.h).
-            'play_age_signals':not (args.fdroid or args.amazon_apk or args.china)},indent=2)+'\n')
+            'play_age_signals':not (args.fdroid or args.amazon_apk or args.china),
+            # Android only runs an executable from the extracted library directory.
+            'crash_handler':crash_handler},indent=2)+'\n')
         generated=project/'app/generated'
         if generated.exists(): shutil.rmtree(generated)
         generated.mkdir(parents=True)
@@ -214,6 +222,12 @@ def main():
                 if filename.endswith('.so'): shutil.copy2(prefixes[abi]/filename,jni/Path(filename).name)
             triple={'arm64-v8a':'aarch64-linux-android','armeabi-v7a':'arm-linux-androideabi','x86_64':'x86_64-linux-android'}[abi]
             shutil.copy2(prebuilt/'sysroot/usr/lib'/triple/'libc++_shared.so',jni/'libc++_shared.so')
+            if crash_handler:
+                # The release handler in every build: it only writes the minidump.
+                handler=prefixes[abi]/'tools/crashpad/crashpad_handler'
+                if not handler.is_file():
+                    raise ValueError('Dependency bundle lacks the Crashpad handler; rebuild dependencies')
+                shutil.copy2(handler,jni/'libcrashpad_handler.so')
             for library in jni.glob('*.so'):
                 verify_android_shared_library(library,abi)
             library_sets.append({p.name for p in jni.glob('*.so')})
@@ -224,7 +238,9 @@ def main():
         validate_bundle(prefixes[args.arch], dependency_identities[args.arch], dependency_toolchains[args.arch])
         if not java.is_dir(): raise ValueError('Dependency bundle lacks pinned SDL Java sources; rebuild dependencies')
         shutil.copytree(java,generated/'java')
-        exported = export_packaged_assets(output, args.release, args.sprite_packing, args.jobs)
+        # The native build's directory differs from the project's when the build
+        # settings do (F-Droid's problem_reports=0), so take its outputs from there.
+        exported = export_packaged_assets(outputs[args.arch], args.release, args.sprite_packing, args.jobs)
         assets=generated/'assets/glob2-bundle'
         if assets.exists(): shutil.rmtree(assets)
         assets.parent.mkdir(parents=True, exist_ok=True)
@@ -254,7 +270,7 @@ def main():
             verify_apk_assets(bundle, 'base/assets/glob2-bundle/')
             print('Verified SDL GPU Vulkan shaders:',verify_apk_sdl_gpu(bundle, 'base/assets/glob2-bundle/'))
             member='base/lib/'+args.arch+'/libmain.so'
-            build_id=verify_android_archive_symbols(bundle,output/'lib/libmain.so',member,readelf)
+            build_id=verify_android_archive_symbols(bundle,outputs[args.arch]/'lib/libmain.so',member,readelf)
             bundle.with_suffix('.json').write_text(json.dumps({'sha256':hashlib.sha256(bundle.read_bytes()).hexdigest(),
                 'version_code':args.version_code,'build_id':build_id,'architecture':args.arch},indent=2)+'\n')
             print('Verified Android symbol build ID:',build_id)

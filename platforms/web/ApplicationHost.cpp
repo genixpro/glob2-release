@@ -63,7 +63,7 @@ struct HostState {
     bool active = false;
     // Keep this packed-double layout in sync with sampleHostState's JS writes.
     enum Slot { FrameGate, RestorePending, Visibility, Width, Height, Presentation,
-                Count = Presentation + 10 };
+                Held = Presentation + 10, Count };
     double values[Count]{};
 };
 thread_local HostState hostState;
@@ -150,6 +150,8 @@ void sampleHostState(bool consume = true)
         const v = Module.presentationMetrics;
         if (v) HEAPF64.set([v.width,v.height,v.safe.left,v.safe.top,v.safe.right,v.safe.bottom,
             v.keyboardInset,+v.touch,+v.pointer,+v.hover], offset + 5);
+        // A portal ad break or SDK pause (portal-core.js glob2PortalHost).
+        HEAPF64[offset + 15] = +!!globalThis.glob2PortalHost?.held;
     }, host.values, EM_ASM_INT({ return typeof GLctx !== 'undefined' && GLctx && GLctx.isContextLost() ? 1 : 0; }), HostState::Count, consume);
 }
 struct HostFrameScope {
@@ -353,6 +355,9 @@ bool presentationMetrics(ViewportMetrics& metrics,InputCapabilities& input)
 namespace { std::atomic<bool> linksAllowed{true}; }
 void setExternalLinksAllowed(bool allowed) { linksAllowed = allowed; }
 bool externalLinksAllowed() { return linksAllowed; }
+namespace { std::atomic<bool> fullscreenAllowed{true}; }
+void setFullscreenControlAllowed(bool allowed) { fullscreenAllowed = allowed; }
+bool fullscreenControlAllowed() { return fullscreenAllowed; }
 // The portal packager writes window.GLOB2_PORTAL before the game scripts; it is
 // read once at startup (src/app/PortalPolicy.cpp). Anything but undefined is
 // passed on, so a malformed value still puts the game in portal mode.
@@ -374,6 +379,25 @@ std::string portalDescription()
     std::string result(text);
     free(text);
     return result;
+}
+// portal-core.js installs glob2PortalHost in portal packages; elsewhere there is
+// no host to ask and nothing is held.
+bool matchBreak(MatchBreak point)
+{
+    const char* name = point == MatchBreak::Starting ? "start"
+                     : point == MatchBreak::Ended    ? "end"
+                     : point == MatchBreak::Left     ? "leave"
+                     : point == MatchBreak::Paused   ? "pause"
+                                                     : "resume";
+    return MAIN_THREAD_EM_ASM_INT({
+        try { return globalThis.glob2PortalHost?.matchBreak?.(UTF8ToString($0)) ? 1 : 0; }
+        catch (error) { console.warn('Portal break failed', error); return 0; }
+    }, name) != 0;
+}
+bool hostHeld()
+{
+    if (hostState.active) return hostState.values[HostState::Held] != 0;
+    return MAIN_THREAD_EM_ASM_INT({ return globalThis.glob2PortalHost?.held ? 1 : 0; }) != 0;
 }
 bool openUrl(const std::string& url, UrlPurpose purpose)
 {
@@ -634,7 +658,21 @@ public:
 }
 std::unique_ptr<Persistence> persistStorage() { return std::make_unique<BrowserPersistence>(); }
 void importChanged(const char* state) { diagnostics.import = state; }
-void screenChanged(const char* name) { diagnostics.screen = diagnostics.screenClass = name; }
+namespace
+{
+std::function<void(const char *)> &screenObserver()
+{
+    static std::function<void(const char *)> observer;
+    return observer;
+}
+}
+void setScreenObserver(std::function<void(const char *)> observer) { screenObserver() = std::move(observer); }
+void screenChanged(const char* name)
+{
+    diagnostics.screen = diagnostics.screenClass = name;
+    if (screenObserver())
+        screenObserver()(name);
+}
 void simulationAdvanced(std::uint32_t tick) {
     diagnostics.tick = tick; diagnostics.hasTick = true; diagnostics.screen = "match";
 }

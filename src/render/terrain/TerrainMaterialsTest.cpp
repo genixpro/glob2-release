@@ -12,6 +12,7 @@
 #include <numeric>
 #include "TerrainMaterials.h"
 #include "TerrainCompositor.h"
+#include "TerrainArtBorder.h"
 #include "TerrainCatalogIO.h"
 #include "render/SoftwareTerrainCache.h"
 #include "render/scene/SceneMap.h"
@@ -1659,11 +1660,12 @@ TEST_SUITE("TerrainMaterials")
 		using TerrainVisual::shoreCalmAt;
 		// Full calm at the shoreline, fading out within the reach and smoothly.
 		CHECK(shoreCalmAt(0) == 0);
-		CHECK(shoreCalmAt(1) == 215); // The adjacent water vertex is half a tile from shore.
+		CHECK(shoreCalmAt(1) == 244); // The adjacent water vertex is half a tile from shore.
 		CHECK(shoreCalmAt(1) > shoreCalmAt(2));
 		CHECK(shoreCalmAt(2) > 0);
-		CHECK(shoreCalmAt(4) == 40); // Waves still calm at one and a half tiles.
-		CHECK(shoreCalmAt(9) == 0); // Beyond the two-tile reach.
+		CHECK(shoreCalmAt(4) == 174); // Waves still calm at one and a half tiles,
+		CHECK(shoreCalmAt(9) == 81);  // and at two and a half.
+		CHECK(shoreCalmAt(25) == 0);  // Beyond the four-tile reach.
 		CHECK(TerrainVisual::shoreCalm({255, 255, 255, 255}, 37, 200) == 255);
 		CHECK(TerrainVisual::shoreCalm({}, 37, 200) == 0);
 		CHECK(TerrainVisual::shoreCalm({200, 0, 200, 0}, 0, 128) == 200);
@@ -2878,8 +2880,15 @@ TEST_CASE("selected terrain preparation bounds pixels and preserves retained sna
         }
         auto selected = compositor.cpuMaterials();
         const auto [selectedPixels, selectedVariants] = retainedPixels(selected);
-        CHECK(selectedVariants == 1);
-        CHECK(selectedPixels == std::size_t(blended.size * blended.size));
+        // Animated water filters across tile edges, so its chosen variant brings
+        // its art neighbours (Compositor::includeBoundarySources), and no more.
+        std::set<unsigned> neighbourhood{0};
+        if (TerrainVisual::hasArtNeighbors(c.materials[water]))
+            for (int dy = -1; dy <= 1; ++dy)
+                for (int dx = -1; dx <= 1; ++dx)
+                    neighbourhood.insert(TerrainVisual::artNeighbor(c.materials[water], 0, dx, dy));
+        CHECK(selectedVariants == neighbourhood.size());
+        CHECK(selectedPixels == neighbourhood.size() * std::size_t(blended.size * blended.size));
         // The byte admission includes catalog metadata, but its live pixel payload
         // is one chosen variant rather than the complete 256-variant bank.
         CHECK(selected->bytes >= selectedPixels * sizeof(TerrainVisual::Compositor::MaterialPixels::value_type));

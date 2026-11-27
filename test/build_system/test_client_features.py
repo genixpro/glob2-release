@@ -5,7 +5,7 @@ import unittest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'buildsys'))
 from client_features import resolve, header
 from build_layout import build_identity, default_directory
-from dev_build import dependency_identity
+from dev_build import crash_capture, dependency_identity
 
 class ClientFeaturesTests(unittest.TestCase):
     def test_release_is_free_and_development_is_full(self):
@@ -27,6 +27,27 @@ class ClientFeaturesTests(unittest.TestCase):
         override = resolve({'client_profile': 'full', 'feature_commander': 'off'})
         self.assertFalse(override['client_features']['commander'])
         self.assertTrue(override['client_features']['authoring_links'])
+
+    def test_problem_reports_upload_except_where_compiled_out(self):
+        self.assertTrue(resolve({'release': 1})['problem_reports'])
+        self.assertIn('#define GLOB2_PROBLEM_REPORTS 1', header(resolve({'release': 1})))
+        self.assertIn('#define GLOB2_DISTRIBUTION_NAME "app_store"', header(resolve({'target': 'ios'})))
+        for args in ({'china': 1}, {'amazon': 1, 'target': 'android'}, {'problem_reports': 0}):
+            with self.subTest(args=args):
+                self.assertFalse(resolve(args)['problem_reports'])
+        fdroid = build_identity({'target': 'android', 'release': 1, 'problem_reports': 0}, 'linux')
+        play = build_identity({'target': 'android', 'release': 1}, 'linux')
+        self.assertIn('#define GLOB2_PROBLEM_REPORTS 0', header(fdroid))
+        self.assertNotEqual(default_directory(fdroid), default_directory(play))
+        # F-Droid's bundle leaves Crashpad out (docs/multiplayer/crash-reports.md);
+        # otherwise it is the Play bundle, and the Fire tablet edition shares that.
+        self.assertEqual(dependency_identity(fdroid), dict(dependency_identity(play), crash_capture=False))
+        amazon = build_identity({'target': 'android', 'release': 1, 'amazon': 1}, 'linux')
+        self.assertNotIn('crash_capture', dependency_identity(amazon))
+        self.assertTrue(crash_capture(play))
+        self.assertFalse(crash_capture(fdroid) or crash_capture(amazon))
+        self.assertFalse(crash_capture(build_identity({'target': 'ios', 'release': 1}, 'darwin')))
+        with self.assertRaises(ValueError): resolve({'problem_reports': 'maybe'})
 
     def test_invalid_values_fail_closed(self):
         for args in ({'client_profile': 'unknown'}, {'distribution': 'unknown'}, {'feature_commander': 'auto'}):

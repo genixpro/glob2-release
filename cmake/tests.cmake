@@ -124,6 +124,8 @@ set(GLOB2_ENGINE_TESTS_0_SOURCES
     src/ui/settings/SettingsBuildingsTest.cpp
     src/app/SystemLanguageTest.cpp
     src/app/AgeGateTest.cpp
+    src/app/ProblemReportTest.cpp
+    src/app/CrashCaptureTest.cpp
     src/game/orders/GuardAreaBalanceTest.cpp
     src/ui/UIIconsTest.cpp
     src/game/screens/CustomGameSetupHarness.cpp
@@ -220,6 +222,7 @@ set(GLOB2_ENGINE_TESTS_2_SOURCES
     src/render/TerrainAnimationTest.cpp
     src/render/torus/TorusRenderIntegrationTest.cpp
     src/app/PortalModeTest.cpp
+    src/game/screens/MatchPlayReporterTest.cpp
     src/app/AdaptiveSettingsTest.cpp
     src/game/orders/FarmAreaTest.cpp
     src/game/GameSpeedTest.cpp
@@ -1414,6 +1417,8 @@ set(GLOB2_ANDROID_ENGINE_TESTS_0_SOURCES
     src/ui/settings/SettingsBuildingsTest.cpp
     src/app/SystemLanguageTest.cpp
     src/app/AgeGateTest.cpp
+    src/app/ProblemReportTest.cpp
+    src/app/CrashCaptureTest.cpp
     src/game/orders/GuardAreaBalanceTest.cpp
     src/ui/UIIconsTest.cpp
     src/game/screens/CustomGameSetupHarness.cpp
@@ -1494,6 +1499,7 @@ set(GLOB2_ANDROID_ENGINE_TESTS_1_SOURCES
     src/render/TerrainAnimationTest.cpp
     src/render/torus/TorusRenderIntegrationTest.cpp
     src/app/PortalModeTest.cpp
+    src/game/screens/MatchPlayReporterTest.cpp
     src/app/AdaptiveSettingsTest.cpp
     src/game/orders/FarmAreaTest.cpp
     src/game/GameSpeedTest.cpp

@@ -21,6 +21,7 @@
 #include "AgeQuestionScreen.h"
 #include "AgeGate.h"
 #include "PortalPolicy.h"
+#include "tutorial/TutorialModel.h"
 #include "IntroductionOfferScreen.h"
 #include "CustomGameScreen.h"
 #include "MessageScreen.h"
@@ -32,6 +33,8 @@
 #include "KeyboardManager.h"
 #include "GameGUIKeyActions.h"
 #include "CreditScreen.h"
+#include "ProblemReportScreen.h"
+#include "CrashCapture.h"
 #include "CompileProfile.h"
 #include "DeviceAdaptationSession.h"
 #include <iostream>
@@ -246,8 +249,32 @@ Application::~Application()
 #endif
 }
 
-void Application::mainMenu()
+bool Application::mainMenu()
 {
+	if (PortalPolicy::landsInFirstLesson(globalContainer->settings.introductionOffered,
+										 GAGCore::ApplicationHost::storageRestoreFailed()))
+	{
+		// Portals want new players in gameplay at once. Like accepting the
+		// first-run offer, this marks the introduction offered; a failed save only
+		// means the next visit starts in the lesson again, so it never blocks.
+		globalContainer->settings.introductionOffered = true;
+		try
+		{
+			if (globalContainer->settings.save())
+				GAGCore::ApplicationHost::persistStorage();
+		}
+		catch (const std::exception &)
+		{
+		}
+		// Nothing lies beneath the lesson: leaving it asks the questions it
+		// skipped, then opens the main menu (and the lesson list when chosen).
+		singlePlayer.introduction([this](int navigation)
+		{
+			if (mainMenu() && navigation == Tutorial::Lessons)
+				singlePlayer.lessons();
+		});
+		return false;
+	}
 #ifdef GLOB2_MOBILE
 	const bool mobileAudio = true;
 #else
@@ -257,23 +284,24 @@ void Application::mainMenu()
 	{
 		screens.push(std::make_unique<AudioPreferenceScreen>(),
 			[this](GAGGUI::Screen &, int) { mainMenu(); });
-		return;
+		return false;
 	}
-	if (Glob2UI::touchPresentation() && !globalContainer->settings.thumbSideChosen)
+	if (HandPreferenceScreen::needed())
 	{
 		screens.push(std::make_unique<HandPreferenceScreen>(&screens),
 			[this](GAGGUI::Screen &, int) { mainMenu(); });
-		return;
+		return false;
 	}
     if (!globalContainer->settings.introductionOffered && !GAGCore::ApplicationHost::storageRestoreFailed())
     {
         screens.push(std::make_unique<IntroductionOfferScreen>(),
             [this](GAGGUI::Screen &,int result) { mainMenu(); if (result==1) singlePlayer.introduction(); });
-        return;
+        return false;
     }
 	// Rebuild translated labels after returning from settings.
 	screens.push(std::make_unique<MainMenuScreen>(),
 				 [this](GAGGUI::Screen &, int choice) { choose(choice); });
+	return true;
 }
 
 void Application::choose(int choice)
@@ -297,6 +325,9 @@ void Application::choose(int choice)
 		break;
 	case MainMenuScreen::CREDITS:
 		screens.push(std::make_unique<CreditScreen>());
+		break;
+	case MainMenuScreen::REPORT_PROBLEM:
+		screens.push(std::make_unique<ProblemReportScreen>());
 		break;
 	case MainMenuScreen::EDITOR:
 		// A compile_profile=core build has no editor; the button then only explains why.
@@ -352,6 +383,49 @@ void Application::withAgeBand(std::function<void()> next)
 		}
 		screens.push(std::make_unique<AgeQuestionScreen>(), [next](GAGGUI::Screen &, int) { next(); });
 	});
+}
+
+// Crash reports are opt-in (docs/multiplayer/crash-reports.md#consent): a
+// player who may send is asked, unless they chose Always send; players under
+// 13, or who never said their age, are never asked and keep the crash for Save
+// to file.
+void Application::offerCrashReports()
+{
+	const auto userDir = ProblemReport::userDirectory();
+	if (CrashCapture::pending(userDir).empty())
+		return;
+	const auto consent = globalContainer->settings.alwaysSendCrashReports ? CrashCapture::Consent::Always
+																		   : CrashCapture::Consent::Ask;
+	switch (CrashCapture::decide(ProblemReport::currentSendPolicy(), consent))
+	{
+	case CrashCapture::Action::KeepLocal:
+		return;
+	case CrashCapture::Action::Send:
+		CrashCapture::queueAll(userDir);
+		return;
+	case CrashCapture::Action::Ask:
+		break;
+	}
+	auto &strings = *GAGCore::Toolkit::getStringTable();
+	auto prompt = std::make_unique<MessageScreen>(
+		strings.getString("[crash prompt title]"), strings.getString("[crash prompt message]"),
+		std::vector<std::string>{strings.getString("[crash prompt send]"), strings.getString("[crash prompt always]"),
+								 strings.getString("[crash prompt dont send]")});
+	screens.push(std::move(prompt),
+				 [userDir](GAGGUI::Screen &, int choice)
+				 {
+					 if (choice == 1)
+					 {
+						 globalContainer->settings.alwaysSendCrashReports = true;
+						 if (!globalContainer->settings.save())
+							 std::cerr << "Could not save the crash report choice." << std::endl;
+					 }
+					 if (choice == 0 || choice == 1)
+						 CrashCapture::queueAll(userDir);
+					 else if (choice == 2)
+						 CrashCapture::discardAll(userDir);
+					 // Quitting with the question open leaves them for next time.
+				 });
 }
 
 // The browser installs some data after the main menu is up (buildsys/web_assets.py);
@@ -454,6 +528,15 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 		globalContainer->gfx->resetRenderPacing();
 		screens.suspendExecution();
 	}
+	// A web portal holds the game while an ad plays between matches, or while its
+	// SDK pauses it (ApplicationHost::hostHeld): like a hidden page, no screen
+	// frame runs, so the simulation and input stop until the portal releases it.
+	if (const bool nowHeld = GAGCore::ApplicationHost::hostHeld(); nowHeld != held)
+	{
+		held = nowHeld;
+		globalContainer->gfx->resetRenderPacing();
+		screens.suspendExecution();
+	}
 #if GLOB2_DESKTOP_MCP
 	if (hidden)
 		screens.pollInputReceipts();
@@ -482,7 +565,7 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 		return false;
 	};
 	std::erase_if(filtered, recordingShortcut);
-	if (hidden)
+	if (hidden || held)
 	{
 #if GLOB2_DESKTOP_MCP
 		// Visibility suspension already cancels buffered consumer receipts.
@@ -597,6 +680,14 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 	}
 
 #endif
+	// Crashes of earlier runs, once the main menu is up; MetricKit may deliver
+	// one later in the run.
+	if (CrashCapture::built() && screens.running() && dynamic_cast<MainMenuScreen *>(screens.top()) &&
+		(!crashesOffered || CrashCapture::takeArrival()))
+	{
+		crashesOffered = true;
+		offerCrashReports();
+	}
 	if (!screens.running())
 	{
 		if (screens.result() == GAGGUI::Screen::QUIT_APPLICATION)
@@ -613,13 +704,13 @@ bool Application::frame(std::uint32_t tick, const std::vector<SDL_Event> &incomi
 
 void Application::draw()
 {
-    if (!hidden) (quitting ? shutdownScreens : screens).draw();
+    if (!hidden && !held) (quitting ? shutdownScreens : screens).draw();
     if (!drawn) { drawn = true; GAGCore::StartupPhase::mark("application:drawn"); }
 }
 
 std::uint32_t Application::delay(std::uint32_t now)
 {
-	if (hidden)
+	if (hidden || held)
 		return 100;
 	const auto elapsed = static_cast<std::uint32_t>(now - lastFrame);
 	return (quitting ? shutdownScreens : screens).delay(now, elapsed < 40 ? 40 - elapsed : 0);

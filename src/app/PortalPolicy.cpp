@@ -26,6 +26,7 @@ Policy parse(std::string_view description)
 	};
 	policy.externalLinks = granted("externalLinks");
 	policy.onlineSignIn = granted("onlineSignIn");
+	policy.ads = granted("ads");
 	if (const auto it = json.find("name"); it != json.end() && it->is_string())
 		policy.name = it->get<std::string>();
 	return policy;
@@ -52,5 +53,6 @@ void install(const Policy &policy)
 {
 	installed() = policy;
 	GAGCore::ApplicationHost::setExternalLinksAllowed(policy.externalLinks);
+	GAGCore::ApplicationHost::setFullscreenControlAllowed(!policy.portal);
 }
 } // namespace PortalPolicy

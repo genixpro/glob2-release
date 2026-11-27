@@ -170,6 +170,69 @@ export interface AdminAuditLogTable {
   created_at: Timestamp;
 }
 
+export interface CrashReportsTable {
+  id: string;
+  submission_id: string;
+  kind: 'problem' | 'crash' | 'metrickit' | 'web' | 'java';
+  install_id: string;
+  version: string;
+  version_minor: number;
+  sim_revision: number;
+  distribution: string;
+  platform: string;
+  os: string;
+  device_class: string;
+  device_tier: string;
+  description: string;
+  size: number;
+  attachments: DefaultedJson<{ name: string; size: number }[]>;
+  bundle_key: Nullable<string>;
+  received_at: Timestamp;
+  status: Defaulted<'none' | 'pending' | 'done' | 'failed'>;
+  group_id: Nullable<string>;
+  reason: Nullable<string>;
+  frames: NullableJson<CrashFrameRow[]>;
+  match_tick: Nullable<number>;
+  match_seed: Nullable<number>;
+  processed_at: NullableTimestamp;
+}
+
+/** A symbolicated frame (protocol CrashFrame). */
+export interface CrashFrameRow {
+  module: string;
+  offset: string;
+  function?: string;
+  file?: string;
+  line?: number;
+  inGame: boolean;
+}
+
+export interface CrashReleasesTable {
+  version: string;
+  first_upload_at: Timestamp;
+}
+
+export interface CrashSymbolsTable {
+  kind: 'breakpad' | 'wasm';
+  module: string;
+  debug_id: string;
+  version: string;
+  os: string;
+  arch: string;
+  size: number;
+  blob_key: string;
+  uploaded_at: Timestamp;
+}
+
+export interface CrashGroupsTable {
+  id: Generated<string>;
+  signature: string;
+  first_version: string;
+  last_version: string;
+  first_seen_at: Timestamp;
+  last_seen_at: Timestamp;
+}
+
 export interface BlobsTable {
   sha256: string;
   size: number;
@@ -1532,6 +1595,10 @@ export interface Database {
   auth_flows: AuthFlowsTable;
   entitlements: EntitlementsTable;
   admin_audit_log: AdminAuditLogTable;
+  crash_reports: CrashReportsTable;
+  crash_releases: CrashReleasesTable;
+  crash_symbols: CrashSymbolsTable;
+  crash_groups: CrashGroupsTable;
   blobs: BlobsTable;
   image_webp_renditions: { source_sha256: string; webp_sha256: string };
   relays: RelaysTable;

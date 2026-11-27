@@ -1091,6 +1091,13 @@ points, like every other metric: the framework measures and draws it at
 (`TrueTypeFont::updateRenderScale`). One text size then holds on every touch
 surface. Pointer hosts keep the authored pixel sizes times the preference, so
 desktop layouts are unchanged at 100% (`applyTextSize()` holds the rule).
+Dialogs over gameplay and the editor (`Glob2UI::InGameDialog`) are the exception:
+when their surface is drawn smaller than one pixel per point (`unit` above 1, as
+the 800x600 floor makes it in a 674x322 portal frame or a pointer-driven portrait
+phone), authored pixels would shrink to about 7 px while their point-sized buttons
+do not, so they size text in points as touch hosts do
+(`ui::applyScaledSurfaceText`, from `InGameDialog::adjustPresentation`). At one
+pixel per point (native desktops, large browser windows) nothing changes.
 
 - The player's preference (`Settings::textSizePercent`, 100–150%, in Settings
   > Display and the in-game options) sets `GAGCore::userTextScale` through
@@ -1255,8 +1262,10 @@ Only the main menu's launch buttons use the Heading font for buttons.
 ### Theme
 
 `Theme` carries a palette of semantic colour tokens (ink, muted, paper, panel,
-field, rail, line, accent, accentInk, selected, hover, focus, scrim, disabled,
-danger, success, warning, shadow, pressed, backdrop, neutral, placeholder), the
+field, input, rail, line, accent, accentInk, selected, hover, focus, scrim, disabled,
+danger, success, warning, shadow, pressed, backdrop, neutral, placeholder; `field`
+fills buttons and choices, `input` the text fields and editors the player types
+in, so the two never look alike), the
 HUD tokens drawn outside the controls (`hud`: ink, paper, field, selected,
 border, readout, the dial colours, destroy, erasePreview), the menu `backdrop`,
 font roles (Title, Heading, Body, Support, Caption mapped to toolkit font names)
@@ -1390,7 +1399,9 @@ numeric choices remain readable. The gameplay action strip retains its
 game-specific sprites and labels, which distinguish construction, flags and team tools.
 
 Original SVGs and a source manifest live in `content-src/icons/tabler/`, pinned to
-Tabler v3.48.0. Generated PNG sources live in `content/data/gui/`; the distributed MIT notice is
+Tabler v3.48.0. Generated PNG sources live in `content/data/gui/`, one sprite per raster
+size: `tabler-<pixels>-<i>.png` is manifest icon `i`, and `tabler.txt` lists the icon
+names in frame order for `uiIcon`. Exports pack each size into a sprite sheet. The distributed MIT notice is
 `content/data/tabler-icons-license.txt`. Ordinary builds convert the committed sources to
 WebP in the runtime tree and need no SVG renderer or network access. To regenerate with the pinned development tool:
 
@@ -1463,7 +1474,11 @@ Finger pans on `scroll`, `listView` and `textEditor` (the nodes whose
 Nodes keep an `int` offset that is always clamped, which is what
 `NodeState::scroll` persists, plus a transient `overscroll()` displacement that
 is painted and hit-tested but never saved; `scrollTo()` sets the clamped offset
-and `setOverscroll()` the stretch. Mouse drags and conventional wheel events never coast or stretch. `Host::animating()` reports a coast or bounce
+and `setOverscroll()` the stretch. Mouse drags and conventional wheel events never coast or stretch. A wheel
+event scrolls by its steps times the theme's control height; fractions of a step
+(browsers send 100 CSS pixels as one step, so touchpads deliver hundredths) carry
+over in the host until they make a whole pixel, while the region and direction
+stay the same. `Host::animating()` reports a coast or bounce
 in progress and `UIScreen::executionDelay` frames every 16 ms meanwhile.
 The three preference sliders under Settings › Controls (and the in-game
 Options dialog on touch) tune the feel through `GAGCore::scrollTuning()`; 0
