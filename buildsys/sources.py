@@ -586,6 +586,7 @@ CLIENT_SOURCES = (
     'app/AgeGate.cpp',
     'app/ProblemReport.cpp',
     'app/CrashCapture.cpp',
+    'app/CrashCapturePlatform.cpp',
     'app/PortalPolicy.cpp',
     'app/SystemLanguage.cpp',
     'app/DeviceProfile.cpp',
@@ -841,6 +842,13 @@ PLATFORM_TRUST_SOURCES = {
     'darwin': ('platforms/mobile/CertificateTrust.cpp', 'platforms/mobile/ios/CertificateTrust.cpp'),
     'mingw': ('platforms/mobile/CertificateTrust.cpp', 'src/net/WindowsCertificateTrust.cpp'),
 }
+# The crash-capture layer a desktop client adds where it is not in
+# app/CrashCapturePlatform.cpp: MetricKit on macOS (src/app/CrashCapture.h).
+PLATFORM_CRASH_SOURCES = {
+    'darwin': ('platforms/apple/CrashCapture.mm',),
+}
+# The source that starts Crashpad on Linux, which alone sees Crashpad's headers.
+CRASHPAD_SOURCE = 'src/app/CrashCapturePlatform.cpp'
 # The relay's entry point and the sources of glob2-relay-tests beside the relay objects.
 RELAY_MAIN_SOURCE = 'relay/RelayMain.cpp'
 RELAY_TEST_SOURCES = ('relay/RelayTestMain.cpp', 'relay/RelayTicketTest.cpp', 'relay/RelayAdmissionTest.cpp')
@@ -849,7 +857,8 @@ RELAY_TEST_SOURCES = ('relay/RelayTestMain.cpp', 'relay/RelayTicketTest.cpp', 'r
 # The SSE4.1 copy of them, which native x86 builds compile with -msse4.1 (CMakeLists.txt).
 SSE41_SOURCES = ('libs/gag/src/EtcpakSse41.cpp',)
 ETCPAK_SOURCES = ('third_party/etcpak/etcpak/ProcessDxtc.cpp', 'third_party/etcpak/etcpak/ProcessRGB.cpp',
-                  'third_party/etcpak/etcpak/Tables.cpp', 'third_party/etcpak/etcpak/Dither.cpp')
+                  'third_party/etcpak/etcpak/Tables.cpp', 'third_party/etcpak/etcpak/Dither.cpp',
+                  'third_party/etcpak/etcpak/bc7enc.cpp')
 # ARM's ASTC encoder (astcenc's core library), for render devices that sample
 # ASTC 4x4. The browser build leaves it out with AstcEncoder.cpp.
 ASTCENC_SOURCES = tuple('third_party/astcenc/astcenc/astcenc_' + name + '.cpp' for name in (
@@ -957,9 +966,9 @@ ANDROID_SOURCES = ('platforms/mobile/android/Documents.cpp', 'platforms/mobile/a
                    'platforms/mobile/android/AgeSignal.cpp', 'platforms/mobile/android/CrashCapture.cpp')
 IOS_SOURCES = ('platforms/mobile/ios/SafeArea.mm', 'platforms/mobile/ios/Documents.mm',
                'platforms/mobile/ios/LaunchLinks.mm', 'platforms/mobile/ios/CertificateTrust.cpp',
-               'platforms/mobile/ios/CrashCapture.mm')
+               'platforms/apple/CrashCapture.mm')
 # iOS compiles this one with automatic reference counting.
-IOS_ARC_SOURCES = ('platforms/mobile/ios/Documents.mm', 'platforms/mobile/ios/CrashCapture.mm')
+IOS_ARC_SOURCES = ('platforms/mobile/ios/Documents.mm', 'platforms/apple/CrashCapture.mm')
 
 
 def mobile_sources(target):

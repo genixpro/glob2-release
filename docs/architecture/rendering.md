@@ -632,8 +632,14 @@ live in `deviceThresholds`:
 A phone or tablet that reports no memory is Mid: Safari, every iOS browser and
 Firefox have no `navigator.deviceMemory`, and most such phones hold 4 to 8 GB.
 A discrete desktop GPU with less than 1 GiB of device-local memory also starts
-with original artwork. `GLOB2_DEVICE_TIER=low|mid|high` or
-`play --device-tier low|mid|high` overrides the tier for testing.
+with original artwork. A High phone, and a High desktop that reports at least
+15 GiB, take the large [render budget](#runtime-backend-selection)
+(`DeviceProfile::largeRenderBudget`, `render_budget=large` in telemetry); an
+override decides it outright. `GLOB2_DEVICE_TIER=low|mid|high` or
+`play --device-tier low|mid|high` overrides the tier for testing. Desktops with 8 or
+more hardware threads encode HD artwork as BC7 where the device samples it, others
+as BC3 (`DeviceProfile::bc7Artwork`, `hd_blocks=bc7|bc3` in telemetry; see
+[texture preparation](#runtime-backend-selection)); the tier does not change it.
 
 **Auto semantics.** Adaptive settings have an Auto state, and Auto is the
 default; Original and High resolution are explicit choices that the device never
@@ -667,7 +673,14 @@ path, when the OS reports memory pressure or the game sustains hitches: 40
 presented frames over 50 ms within 15 seconds, outside the first 20 seconds of a
 match and ignoring gaps over a second (an O(1) ring of timestamps). The player is
 told once in game, and Settings > Display offers to keep original artwork as the
-default. Memory signals respond by severity (`DeviceAdaptation::respond`):
+default. Hitches while HD frames were short of device room (refused it, or evicted
+to make it, since the match started or the last trigger) first hold HD admission
+for the rest of the match instead (`Sprite::holdHighResolutionAdmission`): the
+frames already uploaded keep drawing HD, the others draw native, and nothing more
+loads, uploads or is evicted, so a view whose HD frames do not fit stops paying for
+them. If the hitches continue while held, HD steps down as before; the next match
+starts unheld. Holds are logged (`held=1`) but not announced. Memory signals respond
+by severity (`DeviceAdaptation::respond`):
 
 | Signal | Response |
 | --- | --- |
@@ -1293,17 +1306,21 @@ in a quarter of the memory of RGBA. The 4x4 blocks of premultiplied colour step
 slightly along the edges where a frame's base and team layers meet (about 2% of the
 zoomed-in game screen differs from the portable renderer in the parity scenes).
 `GLOB2_HD_BLOCK_COMPRESSION=0` draws them uncompressed instead. SDL GPU and programmable GL sample
-block-compressed HD artwork where the device reports the format (`RenderDeviceCapabilities::bc3Textures`, `astc4x4Textures`;
-programmable GL reports BC3 with `GL_EXT_texture_compression_s3tc` and ASTC 4x4 on
+block-compressed HD artwork where the device reports the format (`RenderDeviceCapabilities::bc3Textures`, `bc7Textures`, `astc4x4Textures`;
+programmable GL reports BC3 with `GL_EXT_texture_compression_s3tc`, BC7 with
+`GL_ARB_texture_compression_bptc` or `GL_EXT_texture_compression_bptc`, and ASTC 4x4 on
 GL ES contexts with `GL_KHR_texture_compression_astc_ldr`, never in the browser). On entering the device,
-asset workers prepare each HD chain as premultiplied BC3 (`PremultipliedBC3`,
+asset workers prepare each HD chain as premultiplied BC7 (`PremultipliedBC7`,
+etcpak's bc7enc) where the device samples BC7 and the [device profile](#device-profile-and-adaptive-defaults)
+wants it (a desktop with 8 or more hardware threads, `AssetImage::bc7Wanted`), as
+premultiplied BC3 (`PremultipliedBC3`,
 etcpak) where the device samples BC3 (desktop GPUs), otherwise as premultiplied
 ASTC 4x4 (`PremultipliedASTC4x4`, astcenc) where it samples ASTC (phones), and
 otherwise not at all (`preferredDeviceBlockCompression`); the draw passes the
 blocks with the RGBA levels, and the adapter stores a
 compressed `TextureRevision` holding only the blocks of the levels at least 4x4,
 charged at their size. The device uploads them unchanged into a
-`BC3_RGBA_UNORM` or `ASTC_4x4_UNORM` texture, a quarter of the RGBA chain on the GPU and in the
+`BC7_RGBA_UNORM`, `BC3_RGBA_UNORM` or `ASTC_4x4_UNORM` texture, a quarter of the RGBA chain on the GPU and in the
 restoration snapshot, and restores trimmed or lost textures from them. Workers
 keep only the blocks of those levels, and a chain prepared earlier releases its
 RGBA levels once the blocks reach the device; a device that
@@ -1313,8 +1330,10 @@ format sample RGBA. Only asset workers encode blocks: a chain the draw must
 prepare itself (mutated content, or released pixels on a device without the
 blocks' format) gets RGBA levels and no blocks, so the render thread never runs
 an encoder and never waits for one; the HD loader keeps drawing the native
-frame until the worker's chain arrives. `GLOB2_TEXTURE_COMPRESSION=none|bc3|astc`
-restricts the formats SDL GPU and programmable GL report, for comparisons (`astc` exercises the
+frame until the worker's chain arrives. The startup log names the chosen format
+(`HD artwork blocks: bc7`). `GLOB2_TEXTURE_COMPRESSION=none|bc3|bc7|astc`
+restricts the formats SDL GPU and programmable GL report, for comparisons (`bc3` measures the
+BC3 path on a BC7 desktop; `astc` exercises the
 phone path on a desktop GPU that samples ASTC, such as Mesa's lavapipe). The class budgets stay
 byte budgets, so the same budget holds about four times as much compressed artwork.
 
@@ -1329,7 +1348,25 @@ measures every 32nd shipped HD frame's chain. On a desktop x86-64 core (perf
 build) ASTC takes about 6 to 7 ms per frame (worst about 200 ms for the largest
 padded chains), about 200 s for all 31,541 shipped frames on one thread, while
 etcpak's BC3 takes about 0.6 ms per frame; that tenfold gap is why BC3 stays the
-choice wherever it is sampled. Phones encode with NEON on slower cores, so expect
+choice wherever it is sampled on phones and smaller desktops.
+
+BC7 encoding uses bc7enc with equal RGBA weights (its perceptual YCbCr weights
+lost up to 95 levels of alpha in the smallest mips of premultiplied frames) and
+16 of mode 1's 64 partitions. In the `ImageAssets` decode check it keeps colour
+within 1.2 to 5.5 RMSE and alpha within 1 from 16 pixels, where BC3 allows 12
+and 18. On a Ryzen 7 6800H core (perf build) it takes about 8 ms per HD frame
+(all 64 partitions: 11.7 ms; none: 2.8 ms, which fails the check) against BC3's
+0.5 ms and ASTC's 4.3 ms, so only desktops with 8 or more hardware threads (7 or
+more asset workers) take it. In the [renderer memory scenario](../development/rendering-benchmarks.md#renderer-memory)
+on SDL GPU (RTX 3070 Ti Laptop, `--zoom 1 --frames 480`, three alternating runs of
+each), frame times stay within run-to-run noise of BC3 (median 2.15 against
+2.11 ms, p95 11.9 against 10.7 ms, p99 17.1 against 16.7 ms), HD draws stay at
+99.6%, and the draws left native while their frame loads go from about 124 to
+132 (166 with all partitions). Memory is unchanged: both formats store 16 bytes
+per block. `GLOB2_BC7_PARTITIONS`, `GLOB2_BC7_UBER_LEVEL`, `GLOB2_BC7_WEIGHTS=perceptual`
+and `GLOB2_BC7_ALPHA_WEIGHT` change the encoder for measurement.
+
+Phones encode with NEON on slower cores, so expect
 a few times the desktop time per frame on each asset worker; the HD loader
 requests only visible frames and a short lookahead, and keeps drawing the native
 frame meanwhile. The added code is about 205 KB on Android `arm64-v8a` and
@@ -1421,10 +1458,28 @@ backgrounded game first. Each mobile class still holds twice its largest single
 texture (the 22.4 MiB authored HD terrain block, 16 MiB skin atlas pages, sixteen
 downsampled 1024x1024 terrain pages), since a class limit is also the largest
 texture it admits; GPU terrain composition falls back to CPU pages when the view's
-pages exceed the TerrainPage class. `GLOB2_RENDER_BUDGET=mobile` (or `desktop`)
-overrides the choice to measure one platform's budget on another, and
+pages exceed the TerrainPage class.
+
+Devices with memory to spare take a large budget, chosen once at startup from the
+[device profile](#device-profile-and-adaptive-defaults)
+(`GAGCore::selectPlatformRenderBudget`, before any presentation device exists).
+`RenderBudget::mobileLarge`, for a High-tier phone (about 8 GB), holds 320 MiB in
+total: General 128, SkinAtlas 32, TerrainPage 96, TerrainMask 32 MiB and 48 MiB of
+geometry. The standard phone General class leaves HD frames 18 MiB, less than a busy
+view draws, so on such a phone they were evicted and uploaded again every few
+seconds; 128 MiB leaves them 48. `RenderBudget::desktopLarge`, for a desktop that
+reports at least 15 GiB, holds 1 GiB: General 512, SkinAtlas 64, TerrainPage 256,
+TerrainMask 64 MiB and 96 MiB of geometry, room for a 2x (Retina) view zoomed out
+over a large map. The browser never takes a large budget, since its Wasm heap has a
+fixed maximum, and a desktop VRAM probe that finishes later does not change it.
+Each budget also carries the terrain caches' limits (`RenderBudget::Terrain`), so
+they scale with it; see [software rendering](software-rendering.md).
+`GLOB2_RENDER_BUDGET=desktop|mobile|desktop-large|mobile-large`
+overrides the choice to measure one budget on another device, and
 `GLOB2_RENDER_BUDGET_TOTAL_MIB` replaces the total alone (the class limits stay),
-for tests and memory experiments that need the combined limit to bind. WebGPU keeps its own limits.
+for tests and memory experiments that need the combined limit to bind. Test binaries
+choose the platform's standard budget before any fixture runs, so results do not
+depend on the test machine's memory. WebGPU keeps its own limits.
 
 `SDL_EVENT_LOW_MEMORY` and backgrounding (`SDL_EVENT_WILL_ENTER_BACKGROUND`,
 `SDL_EVENT_DID_ENTER_BACKGROUND`) call `GraphicContext::trimPresentationMemory`,

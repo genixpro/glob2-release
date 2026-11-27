@@ -588,6 +588,7 @@ set(GLOB2_CLIENT_SOURCES
     src/app/AgeGate.cpp
     src/app/ProblemReport.cpp
     src/app/CrashCapture.cpp
+    src/app/CrashCapturePlatform.cpp
     src/app/PortalPolicy.cpp
     src/app/SystemLanguage.cpp
     src/app/DeviceProfile.cpp
@@ -969,6 +970,7 @@ set(GLOB2_GAG_SOURCES
     third_party/etcpak/etcpak/ProcessRGB.cpp
     third_party/etcpak/etcpak/Tables.cpp
     third_party/etcpak/etcpak/Dither.cpp
+    third_party/etcpak/etcpak/bc7enc.cpp
     third_party/astcenc/astcenc/astcenc_averages_and_directions.cpp
     third_party/astcenc/astcenc/astcenc_block_sizes.cpp
     third_party/astcenc/astcenc/astcenc_color_quantize.cpp
@@ -1585,6 +1587,7 @@ set(GLOB2_ANDROID_SOURCES
     src/app/AgeGate.cpp
     src/app/ProblemReport.cpp
     src/app/CrashCapture.cpp
+    src/app/CrashCapturePlatform.cpp
     src/app/PortalPolicy.cpp
     src/app/SystemLanguage.cpp
     src/app/DeviceProfile.cpp
@@ -1788,6 +1791,7 @@ set(GLOB2_ANDROID_SOURCES
     third_party/etcpak/etcpak/ProcessRGB.cpp
     third_party/etcpak/etcpak/Tables.cpp
     third_party/etcpak/etcpak/Dither.cpp
+    third_party/etcpak/etcpak/bc7enc.cpp
     third_party/astcenc/astcenc/astcenc_averages_and_directions.cpp
     third_party/astcenc/astcenc/astcenc_block_sizes.cpp
     third_party/astcenc/astcenc/astcenc_color_quantize.cpp
@@ -2417,6 +2421,7 @@ set(GLOB2_IOS_SOURCES
     src/app/AgeGate.cpp
     src/app/ProblemReport.cpp
     src/app/CrashCapture.cpp
+    src/app/CrashCapturePlatform.cpp
     src/app/PortalPolicy.cpp
     src/app/SystemLanguage.cpp
     src/app/DeviceProfile.cpp
@@ -2537,7 +2542,7 @@ set(GLOB2_IOS_SOURCES
     platforms/mobile/ios/Documents.mm
     platforms/mobile/ios/LaunchLinks.mm
     platforms/mobile/ios/CertificateTrust.cpp
-    platforms/mobile/ios/CrashCapture.mm
+    platforms/apple/CrashCapture.mm
     libs/gag/src/AssetLoader.cpp
     libs/gag/src/EtcpakSse41.cpp
     libs/gag/src/AstcEncoder.cpp
@@ -2625,6 +2630,7 @@ set(GLOB2_IOS_SOURCES
     third_party/etcpak/etcpak/ProcessRGB.cpp
     third_party/etcpak/etcpak/Tables.cpp
     third_party/etcpak/etcpak/Dither.cpp
+    third_party/etcpak/etcpak/bc7enc.cpp
     third_party/astcenc/astcenc/astcenc_averages_and_directions.cpp
     third_party/astcenc/astcenc/astcenc_block_sizes.cpp
     third_party/astcenc/astcenc/astcenc_color_quantize.cpp
@@ -2667,7 +2673,7 @@ set(GLOB2_IOS_SOURCES
 # buildsys/sources.py IOS_ARC_SOURCES.
 set(GLOB2_IOS_ARC_SOURCES
     platforms/mobile/ios/Documents.mm
-    platforms/mobile/ios/CrashCapture.mm
+    platforms/apple/CrashCapture.mm
 )
 
 # Mobile sources compiled with GLOB2_STRICT_CXXFLAGS (javascript.strict_numeric_source).
@@ -3418,6 +3424,7 @@ set(GLOB2_WEB_SOURCES
     src/app/AgeGate.cpp
     src/app/ProblemReport.cpp
     src/app/CrashCapture.cpp
+    src/app/CrashCapturePlatform.cpp
     src/app/PortalPolicy.cpp
     src/app/SystemLanguage.cpp
     src/app/DeviceProfile.cpp
@@ -3612,6 +3619,7 @@ set(GLOB2_WEB_SOURCES
     third_party/etcpak/etcpak/ProcessRGB.cpp
     third_party/etcpak/etcpak/Tables.cpp
     third_party/etcpak/etcpak/Dither.cpp
+    third_party/etcpak/etcpak/bc7enc.cpp
     libs/usl/src/code.cpp
     libs/usl/src/debug.cpp
     libs/usl/src/interpreter.cpp
@@ -3883,6 +3891,13 @@ set(GLOB2_MINGW_TRUST_SOURCES
     platforms/mobile/CertificateTrust.cpp
     src/net/WindowsCertificateTrust.cpp
 )
+
+# sources.PLATFORM_CRASH_SOURCES: the darwin crash-capture layer.
+set(GLOB2_DARWIN_CRASH_SOURCES
+    platforms/apple/CrashCapture.mm
+)
+
+set(GLOB2_CRASHPAD_SOURCE src/app/CrashCapturePlatform.cpp)
 
 # buildsys/sources.py RELAY_TEST_SOURCES: glob2-relay-tests beside the relay objects.
 set(GLOB2_RELAY_TEST_SOURCES

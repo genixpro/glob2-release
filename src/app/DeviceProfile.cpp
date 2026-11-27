@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "DeviceProfile.h"
 
+#include <AssetLoader.h>
 #include <MobilePlatform.h>
+#include <RenderResources.h>
 #include <ThreadSupport.h>
 
 #include <SDL3/SDL_cpuinfo.h>
@@ -102,6 +104,28 @@ DeviceDecision DeviceProfile::highResolutionArtwork() const
 	return {true, reason, reasonValue};
 }
 
+DeviceDecision DeviceProfile::largeRenderBudget() const
+{
+	if (inputs.browser)
+		return {false, reason, reasonValue};
+	// Overrides decide outright, so one device can measure both budgets.
+	if (reason == DeviceReason::Override || inputs.mobile)
+		return {tier == DeviceTier::High, reason, reasonValue};
+	// A desktop is High from 6 GiB, but the large budget wants more: its
+	// textures may be system memory (integrated and Apple GPUs) as well.
+	const auto memory = memoryMiB();
+	return {tier == DeviceTier::High && memory >= deviceThresholds.largeBudgetDesktopMemoryAtLeastMiB,
+			DeviceReason::Memory, memory};
+}
+
+DeviceDecision DeviceProfile::bc7Artwork() const
+{
+	// Not a tier: the encode cost falls on the asset workers, one per thread
+	// but one. Unknown thread counts keep BC3.
+	return {!inputs.mobile && !inputs.browser && inputs.cores >= deviceThresholds.bc7CoresAtLeast,
+			DeviceReason::Cores, inputs.cores};
+}
+
 DeviceMapSize DeviceProfile::newMapSize() const
 {
 	const auto &t = deviceThresholds;
@@ -172,7 +196,9 @@ std::string DeviceProfile::telemetryFields() const
 		<< " vram_source=" << inputs.vramSource << " auto_artwork=" << (artwork.on ? "high" : "original")
 		<< " auto_artwork_reason=" << reasonName(artwork.reason)
 		<< " serial_runtime=" << int(inputs.serialRuntime) << " auto_map_size=" << (1 << newMapSize().shift)
-		<< " auto_colonies=" << newGameColonies();
+		<< " auto_colonies=" << newGameColonies()
+		<< " render_budget=" << (largeRenderBudget().on ? "large" : "standard")
+		<< " hd_blocks=" << (bc7Artwork().on ? "bc7" : "bc3");
 	return out.str();
 }
 
@@ -224,6 +250,9 @@ DeviceInputs probeCheap()
 	inputs.cores = std::thread::hardware_concurrency();
 	inputs.mobile = GAGCore::platformIsMobile();
 	inputs.serialRuntime = !GAGCore::ThreadSupport::available;
+#ifdef __EMSCRIPTEN__
+	inputs.browser = true;
+#endif
 #ifdef __ANDROID__
 	probeAndroid(inputs);
 #endif
@@ -389,6 +418,14 @@ void DeviceProfile::initialize(std::optional<DeviceTier> commandLine, bool probe
 		}
 #endif
 		s.build(inputs);
+		// Before the first presentation device: budgets are fixed at first use.
+		const bool large = s.profile->largeRenderBudget().on;
+		const auto budget = inputs.mobile ? (large ? GAGCore::RenderBudget::mobileLarge() : GAGCore::RenderBudget::mobile())
+										  : (large ? GAGCore::RenderBudget::desktopLarge() : GAGCore::RenderBudget::desktop());
+		if (!GAGCore::selectPlatformRenderBudget(budget))
+			SDL_Log("Render budget already in use; keeping %s", GAGCore::RenderBudget::name(GAGCore::platformRenderBudget()));
+		// Before the first presentation device chooses its block format.
+		GAGCore::AssetImage::bc7Wanted = s.profile->bc7Artwork().on;
 	}
 	if (probeVram) // windowed runs; headless tools keep their output clean
 		SDL_Log("Device profile: %s", current().telemetryFields().c_str());
