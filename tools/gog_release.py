@@ -28,6 +28,18 @@ REQUIRED_ASSETS = (
     "data/fonts/sans.ttf", "data/gfx/ressource0.png",
     "maps/SmallForTwo.map.gz",
 ) + packaged_assets(ROOT)
+
+def packed_asset(root, asset):
+    """Optimized exports ship a data PNG as WebP, or pack a numbered frame
+    such as data/gfx/ressource0.png into its family's ressource.sheet (#1950)."""
+    path = Path(asset)
+    if not (asset.startswith("data/") and path.suffix == ".png"):
+        return False
+    family = path.stem.rstrip("0123456789")
+    return ((root / path.with_suffix(".webp")).is_file() or
+            bool(family) and (root / path.parent / f"{family}.sheet").is_file())
+
+
 VERSION_PATTERN = re.compile(r'^PACKAGE_VERSION = "([0-9]+(?:\.[0-9]+)+)"$', re.MULTILINE)
 LIBRARY_PATTERN = re.compile(r"^\s*(\S+)\s+=>\s+(/\S+)", re.MULTILINE)
 SYSTEM_LIBRARY_PREFIXES = (
@@ -210,9 +222,7 @@ def verify_manifest(depot, platform):
         root = depot / "share/glob2"
     reject_retired_assets(root)
     for asset in REQUIRED_ASSETS:
-        if not (root / asset).is_file() and not (
-                asset.startswith("data/") and asset.endswith(".png") and
-                (root / Path(asset).with_suffix(".webp")).is_file()):
+        if not (root / asset).is_file() and not packed_asset(root, asset):
             raise ValueError(f"missing asset: {asset}")
     executable = {"windows": depot / "glob2.exe",
                   "linux": depot / "start.sh",
