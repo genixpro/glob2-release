@@ -106,6 +106,19 @@ class GOGReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing asset"):
             verify_manifest(self.depot, "windows")
 
+    def test_packed_sprite_sheet_can_replace_png(self):
+        # Optimized exports pack ressource0.png into ressource.sheet (#1950).
+        png = self.depot / "data/gfx/ressource0.png"
+        sheet = self.depot / "data/gfx/ressource.sheet"
+        sheet.write_bytes(b"packed sheet")
+        png.unlink()
+        write_manifest(self.depot, self.metadata)
+        self.assertEqual(verify_manifest(self.depot, "windows"), self.metadata)
+        sheet.unlink()
+        write_manifest(self.depot, self.metadata)
+        with self.assertRaisesRegex(ValueError, "missing asset"):
+            verify_manifest(self.depot, "windows")
+
     def test_linux_bundles_sdl3_from_original_dependency_paths(self):
         for sdl_name in ("libSDL3.so.0", "libSDL2-2.0.so.0"):
             with self.subTest(runtime=sdl_name):
